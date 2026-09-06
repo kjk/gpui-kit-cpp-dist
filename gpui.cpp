@@ -7345,6 +7345,19 @@ El* El::SelRange(int lo, int hi, Rgba color) {
     return this;
 }
 
+El* El::ExtraSelRanges(const Selection* ranges, int n) {
+    extraSels = ranges;
+    nExtraSels = n;
+    return this;
+}
+
+El* El::ExtraCarets(const int* offsets, int n, Rgba color) {
+    extraCarets = offsets;
+    nExtraCarets = n;
+    caretColor = color;
+    return this;
+}
+
 El* El::CaretOut(float* outX, float* outY) {
     caretOutX = outX;
     caretOutY = outY;
@@ -7697,6 +7710,11 @@ El* El::TrapId(int v) {
 }
 El* El::Tip(Str s) {
     style.tooltip = s;
+    return this;
+}
+El* El::TipPlacement(int placement) {
+    style.tooltipPlacement =
+        placement >= 0 && placement <= 3 ? (int8_t)placement : (int8_t)-1;
     return this;
 }
 El* El::Id(Str s) {
@@ -9984,6 +10002,38 @@ static void DrawBar(PaintCtx* ctx, const ChartSeries& c, int i, float bx,
     }
 }
 
+void TextLayoutDrawSpans(PaintCtx* ctx, TextLayout* layout, Str text, float x,
+                         float y, Rgba base, const TextSpan* spans, int n) {
+    if (PaintTextLayoutSpans(ctx, layout, text, x, y, base, spans, n)) return;
+    Bounds rects[32] = {};
+    int at = 0;
+    for (int i = 0; i <= n; i++) {
+        int lo = i < n ? spans[i].lo : text.len;
+        int hi = i < n ? spans[i].hi : text.len;
+        if (lo > at) {
+            int count = TextLayoutRangeRects(layout, text, at, lo, rects, 32);
+            for (int r = 0; r < count; r++) {
+                CanvasPushClip(ctx, x + rects[r].x, y + rects[r].y, rects[r].w,
+                               rects[r].h);
+                TextLayoutDraw(ctx, layout, x, y, base, false);
+                CanvasPopClip(ctx);
+            }
+        }
+        if (i >= n || hi <= lo) {
+            at = lo > at ? lo : at;
+            continue;
+        }
+        int count = TextLayoutRangeRects(layout, text, lo, hi, rects, 32);
+        for (int r = 0; r < count; r++) {
+            CanvasPushClip(ctx, x + rects[r].x, y + rects[r].y, rects[r].w,
+                           rects[r].h);
+            TextLayoutDraw(ctx, layout, x, y, spans[i].color, false);
+            CanvasPopClip(ctx);
+        }
+        at = hi;
+    }
+}
+
 static void PaintTextSpans(PaintCtx* ctx, El* e, float font, Rgba base) {
     float maxW = e->laidMaxW > 0 ? e->laidMaxW : e->w;
     TextLayout* layout =
@@ -10008,34 +10058,8 @@ static void PaintTextSpans(PaintCtx* ctx, El* e, float font, Rgba base) {
                            rects[r].w, rects[r].h, sp.bg);
         }
     }
-
-    int at = 0;
-    for (int i = 0; i <= e->nSpans; i++) {
-        int lo = i < e->nSpans ? e->spans[i].lo : e->text.len;
-        int hi = i < e->nSpans ? e->spans[i].hi : e->text.len;
-        if (lo > at) {
-
-            int n = TextLayoutRangeRects(layout, e->text, at, lo, rects, 32);
-            for (int r = 0; r < n; r++) {
-                CanvasPushClip(ctx, e->x + rects[r].x, e->y + rects[r].y,
-                               rects[r].w, rects[r].h);
-                TextLayoutDraw(ctx, layout, e->x, e->y, base, false);
-                CanvasPopClip(ctx);
-            }
-        }
-        if (i >= e->nSpans || hi <= lo) {
-            at = lo > at ? lo : at;
-            continue;
-        }
-        int n = TextLayoutRangeRects(layout, e->text, lo, hi, rects, 32);
-        for (int r = 0; r < n; r++) {
-            CanvasPushClip(ctx, e->x + rects[r].x, e->y + rects[r].y,
-                           rects[r].w, rects[r].h);
-            TextLayoutDraw(ctx, layout, e->x, e->y, e->spans[i].color, false);
-            CanvasPopClip(ctx);
-        }
-        at = hi;
-    }
+    TextLayoutDrawSpans(ctx, layout, e->text, e->x, e->y, base, e->spans,
+                        e->nSpans);
 
     for (int i = 0; i < e->nSpans; i++) {
         const TextSpan& sp = e->spans[i];
@@ -10618,10 +10642,8 @@ static void PaintOverlays(PaintCtx* ctx, El* e) {
     }
 }
 
-static void PaintCaret(PaintCtx* ctx, El* e, float font) {
-    if (e->caretOff < 0 || e->caretColor.a == 0) {
-        return;
-    }
+static void PaintCaretAt(PaintCtx* ctx, El* e, float font, int off,
+                         bool lineEndAffinity, bool primary) {
     float x = e->x;
     float y = e->y;
     float h = e->h;
@@ -10633,12 +10655,11 @@ static void PaintCaret(PaintCtx* ctx, El* e, float font) {
                            ElTextWeight(e), e->style.lineHeight, nullptr);
         if (tl) {
             Bounds r[32] = {};
-            int off = e->caretOff;
             if (off > e->text.len) {
                 off = e->text.len;
             }
             int n = 0;
-            if (off > 0 && (e->caretLineEndAffinity || off == e->text.len)) {
+            if (off > 0 && (lineEndAffinity || off == e->text.len)) {
 
                 n = TextLayoutRangeRects(tl, e->text, 0, off, r, 32);
                 if (n > 0) {
@@ -10659,16 +10680,28 @@ static void PaintCaret(PaintCtx* ctx, El* e, float font) {
         }
     }
 
-    if (e->input) {
+    if (primary && e->input) {
         e->input->caretX = x - e->x;
     }
-    if (e->caretOutX) {
+    if (primary && e->caretOutX) {
         *e->caretOutX = x;
     }
-    if (e->caretOutY) {
+    if (primary && e->caretOutY) {
         *e->caretOutY = y + h;
     }
     CanvasFillRect(ctx, x, y, e->caretW, h, e->caretColor);
+}
+
+static void PaintCaret(PaintCtx* ctx, El* e, float font) {
+    if (e->caretColor.a == 0) {
+        return;
+    }
+    if (e->caretOff >= 0) {
+        PaintCaretAt(ctx, e, font, e->caretOff, e->caretLineEndAffinity, true);
+    }
+    for (int i = 0; i < e->nExtraCarets; i++) {
+        PaintCaretAt(ctx, e, font, e->extraCarets[i], false, false);
+    }
 }
 
 void PaintEl(PaintCtx* ctx, El* e) {
@@ -10773,6 +10806,7 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         hr.onHover = e->onHover;
         hr.onMouseMove = e->onMouseMove;
         hr.tooltip = e->style.tooltip;
+        hr.tooltipPlacement = e->style.tooltipPlacement;
         hr.onMouseDown = e->onMouseDown;
         hr.onMouseUp = e->onMouseUp;
         hr.mouseDownPhase = e->mouseDownPhase;
@@ -11035,6 +11069,16 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
                            ElTextWeight(e), e->style.lineHeight, e->x, e->y, lo,
                            hi, e->selColor);
         }
+
+        for (int i = 0; i < e->nExtraSels; i++) {
+            const Selection& r = e->extraSels[i];
+            if (r.end > r.start) {
+                PaintTextRange(
+                    ctx, e->text, font, e->laidMaxW > 0 ? e->laidMaxW : e->w,
+                    e->style.wrap, ElTextWeight(e), e->style.lineHeight, e->x,
+                    e->y, r.start, r.end, e->selColor);
+            }
+        }
         if (e->markLo >= 0 && e->markHi > e->markLo) {
             PaintTextUnderline(
                 ctx, e->text, font, e->laidMaxW > 0 ? e->laidMaxW : e->w,
@@ -11140,8 +11184,13 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
                                    : RuntimeStyleNow(ctx->app).foreground;
         float s = e->w > 0 ? e->w : 16;
 
-        Str path = e->iconPath.s ? e->iconPath : IconNamePath(e->icon);
-        SvgDraw(ctx, path, e->x, e->y, s, c, e->style.rotate);
+        if (e->iconSvg.s) {
+
+            SvgDrawXml(ctx, e->iconSvg, e->x, e->y, s, c, e->style.rotate);
+        } else {
+            Str path = e->iconPath.s ? e->iconPath : IconNamePath(e->icon);
+            SvgDraw(ctx, path, e->x, e->y, s, c, e->style.rotate);
+        }
     } else if (e->kind == ElKind::Progress) {
         const RuntimeStyle& th = RuntimeStyleNow(ctx->app);
         Background track = BackgroundOpacity(th.progress, 0.2f);
@@ -14010,7 +14059,8 @@ enum PrimKind : uint8_t {
     kPPathGradient,
     kPPathStroke,
     kPImage,
-    kPText
+    kPText,
+    kPTextSpans
 };
 
 enum PrimFlag : uint8_t {
@@ -14083,12 +14133,21 @@ struct HashBag {
     int mask = 0;
 };
 
+struct TextRec {
+    Str text;
+    TextSpan* spans = nullptr;
+    int count = 0;
+    uint64_t hash = 0;
+};
+
 struct State {
     Vec<Prim> cur;
     Vec<Prim> prev;
     Vec<PathRec> paths;
     Vec<uint8_t> verbs;
     Vec<float> pts;
+    Arena* textArena = nullptr;
+    Vec<TextRec> texts;
 
     Vec<float> clipStack;
     Bounds clip = {};
@@ -14204,7 +14263,9 @@ static uint64_t HashPrim(const Prim& p) {
     memcpy(&c1, &p.color2, 4);
     w[9] = ((uint64_t)c1 << 32) | c0;
     w[10] = p.resourceGeneration;
-    w[11] = (p.path >= 0 && p.path < gPaths.len) ? gPaths[p.path].hash : 0;
+    w[11] = p.kind == kPTextSpans                  ? gActive->texts[p.path].hash
+            : (p.path >= 0 && p.path < gPaths.len) ? gPaths[p.path].hash
+                                                   : 0;
     uint64_t h = kHashSeed;
     for (int i = 0; i < 12; i++) {
         h ^= w[i];
@@ -14293,10 +14354,13 @@ static Prim* gpui_scene_Emit(PaintCtx* ctx, uint8_t kind, Bounds bbox) {
     return &gCur[gCur.len - 1];
 }
 
-static void ReleaseImages(State* s) {
+static void ReleaseResources(State* s) {
     for (Prim& p : s->cur) {
         if (p.kind == kPImage && p.ref) {
             RenderImageRelease((RenderImage*)p.ref);
+            p.ref = nullptr;
+        } else if ((p.kind == kPText || p.kind == kPTextSpans) && p.ref) {
+            TextLayoutRelease((TextLayout*)p.ref);
             p.ref = nullptr;
         }
     }
@@ -14309,7 +14373,9 @@ void FrameBegin(PaintCtx* ctx) {
     }
     gRecording = true;
     gSkipPresent = false;
-    ReleaseImages(gActive);
+    ReleaseResources(gActive);
+    if (gActive->textArena) gActive->textArena->Reset();
+    VecClear(gActive->texts);
     VecClear(gCur);
     VecClear(gPaths);
     VecClear(gVerbs);
@@ -14627,6 +14693,7 @@ void RecTextDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
     p->g1 = y;
     p->g2 = sz.w;
     p->g3 = sz.h;
+    TextLayoutAddRef(tl);
     p->ref = tl;
     p->resourceGeneration = TextLayoutGeneration(tl);
     p->color = PaintFade(ctx, c);
@@ -14634,6 +14701,34 @@ void RecTextDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
     if (clip) {
         p->flags |= kFClip;
     }
+}
+
+bool RecTextDrawSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x, float y,
+                      Rgba base, const TextSpan* spans, int n) {
+    if (!gActive->textArena) {
+        gActive->textArena = ArenaNew();
+    }
+    Arena* a = gActive->textArena;
+    if (!a) return false;
+    Str copy = StrDup(a, text);
+    auto* runs = (TextSpan*)Alloc(a, n * (int)sizeof(TextSpan));
+    if (!copy.s || !runs) return false;
+    uint64_t hash = kHashSeed;
+    for (int i = 0; i < n; i++) {
+        runs[i] = spans[i];
+        runs[i].color = PaintFade(ctx, spans[i].color);
+        uint32_t color = 0;
+        memcpy(&color, &runs[i].color, 4);
+        hash = (hash ^ (uint32_t)runs[i].lo) * 0x100000001b3ull;
+        hash = (hash ^ (uint32_t)runs[i].hi) * 0x100000001b3ull;
+        hash = (hash ^ color) * 0x100000001b3ull;
+    }
+    RecTextDraw(ctx, tl, x, y, base, false, 0);
+    Prim& p = gCur[gCur.len - 1];
+    p.kind = kPTextSpans;
+    p.path = gActive->texts.len;
+    VecAppend(gActive->texts, TextRec{copy, runs, n, hash});
+    return true;
 }
 
 static void SortByLayer(Vec<Prim>& v) {
@@ -14773,7 +14868,8 @@ void Free(PaintCtx* ctx) {
     gActive = s;
     s->recording = false;
     CacheClear();
-    ReleaseImages(s);
+    ReleaseResources(s);
+    ArenaDelete(s->textArena);
     VecReset(s->cur);
     VecReset(s->prev);
     VecReset(s->paths);
@@ -15122,6 +15218,12 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
             case kPText:
                 TextLayoutDraw(ctx, (TextLayout*)p.ref, p.g0, p.g1, p.color,
                                (p.flags & kFClip) != 0, p.e0);
+                break;
+            case kPTextSpans:
+                TextLayoutDrawSpans(ctx, (TextLayout*)p.ref,
+                                    gActive->texts[p.path].text, p.g0, p.g1,
+                                    p.color, gActive->texts[p.path].spans,
+                                    gActive->texts[p.path].count);
                 break;
             case kPPathFill:
             case kPPathGradient:
@@ -16445,6 +16547,9 @@ struct OpsCache {
 static OpsCache gCache[kMaxCache];
 static int gCacheN = 0;
 
+struct XmlOpsCache;
+static void XmlCacheClear();
+
 void SvgCacheClear() {
     for (int i = 0; i < kMaxCache; i++) {
         if (gCache[i].owned) {
@@ -16453,6 +16558,7 @@ void SvgCacheClear() {
         gCache[i] = {};
     }
     gCacheN = 0;
+    XmlCacheClear();
 }
 
 static OpsCache* CacheSlotFor(Str assetPath) {
@@ -16543,6 +16649,82 @@ bool SvgDraw(PaintCtx* ctx, Str assetPath, float x, float y, float size,
     int len = 0;
     const uint8_t* ops = SvgDrawOpsFor(assetPath, &len);
     return SvgDrawOps(ctx, ops, len, x, y, size, size, color, turns);
+}
+
+static const int kMaxXmlCache = 32;
+
+struct XmlOpsCache {
+    uint64_t hash = 0;
+    int xmlLen = 0;
+    uint8_t* data = nullptr;
+    int len = 0;
+};
+
+static XmlOpsCache gXmlCache[kMaxXmlCache];
+static int gXmlCacheN = 0;
+
+static uint64_t XmlHash(Str xml) {
+
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < xml.len; i++) {
+        h ^= (uint8_t)xml.s[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+const uint8_t* SvgDrawOpsForXml(Str xml, int* lenOut) {
+    *lenOut = 0;
+    if (!xml.s || xml.len <= 0) {
+        return nullptr;
+    }
+    uint64_t hash = XmlHash(xml);
+    for (int i = 0; i < kMaxXmlCache; i++) {
+        if (gXmlCache[i].data && gXmlCache[i].hash == hash &&
+            gXmlCache[i].xmlLen == xml.len) {
+            *lenOut = gXmlCache[i].len;
+            return gXmlCache[i].data;
+        }
+    }
+    DrawOpsBuilder b;
+    if (!SvgToDrawOps(xml, &b)) {
+        return nullptr;
+    }
+    uint8_t* buf = AllocArray<uint8_t>(b.data.len);
+    if (!buf) {
+        return nullptr;
+    }
+    memcpy(buf, b.data.els, (size_t)b.data.len);
+    if (gXmlCacheN >= kMaxXmlCache) {
+        gXmlCacheN = 0;
+    }
+    XmlOpsCache* e = &gXmlCache[gXmlCacheN++];
+    if (e->data) {
+        Free(nullptr, e->data);
+    }
+    e->hash = hash;
+    e->xmlLen = xml.len;
+    e->data = buf;
+    e->len = b.data.len;
+    *lenOut = e->len;
+    return e->data;
+}
+
+bool SvgDrawXml(PaintCtx* ctx, Str xml, float x, float y, float size,
+                Rgba color, float turns) {
+    int len = 0;
+    const uint8_t* ops = SvgDrawOpsForXml(xml, &len);
+    return SvgDrawOps(ctx, ops, len, x, y, size, size, color, turns);
+}
+
+static void XmlCacheClear() {
+    for (int i = 0; i < kMaxXmlCache; i++) {
+        if (gXmlCache[i].data) {
+            Free(nullptr, gXmlCache[i].data);
+        }
+        gXmlCache[i] = {};
+    }
+    gXmlCacheN = 0;
 }
 
 Str IconNamePath(IconName name) {
@@ -16770,6 +16952,24 @@ bool SvgRasterize(PaintApp* pa, Str assetPath, int px, Rgba color,
         return false;
     }
     bool drew = SvgDraw(&ctx, assetPath, 0, 0, (float)px, color);
+    bool ok = PaintTargetEndOffscreen(&ctx, outBgra);
+    return drew && ok;
+}
+
+bool SvgRasterizeXml(PaintApp* pa, Str xml, int px, Rgba color,
+                     uint8_t* outBgra) {
+    if (!pa || px <= 0 || !outBgra) {
+        return false;
+    }
+    PaintCtx ctx = {};
+    ctx.pa = pa;
+    ctx.dpi = 96;
+    ctx.viewW = (float)px;
+    ctx.viewH = (float)px;
+    if (!PaintTargetBeginOffscreen(&ctx, px, px)) {
+        return false;
+    }
+    bool drew = SvgDrawXml(&ctx, xml, 0, 0, (float)px, color);
     bool ok = PaintTargetEndOffscreen(&ctx, outBgra);
     return drew && ok;
 }
@@ -17137,6 +17337,19 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
 
     win->paint.opacity = 1.f;
     VecClear(win->paint.hits);
+
+    {
+        Vec<ScrollRect>& now = win->paint.scrolls;
+        Vec<ScrollRect>& was = win->prevScrolls;
+        int len = now.len, cap = now.cap;
+        ScrollRect* els = now.els;
+        now.len = was.len;
+        now.cap = was.cap;
+        now.els = was.els;
+        was.len = len;
+        was.cap = cap;
+        was.els = els;
+    }
     VecClear(win->paint.scrolls);
     VecClear(win->paint.texts);
     VecClear(win->paint.inputs);
@@ -17201,7 +17414,12 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
             int offset =
                 InputIndexForPosition(s, &win->paint, s->autoScroll.lastDrag.x,
                                       s->autoScroll.lastDrag.y, &affinity);
-            InputSelectToWithAffinity(s, win->app, win, offset, affinity);
+            if (s->columnSelectStart >= 0) {
+                InputBuildColumnarSelection(s, win->app, win,
+                                            s->columnSelectStart, offset);
+            } else {
+                InputSelectToWithAffinity(s, win->app, win, offset, affinity);
+            }
         }
         WindowRequestAnimationFrame(win);
     }
@@ -17790,13 +18008,26 @@ static void InputPress(Window* win, const MouseDownEvent& in) {
         InputIndexForPosition(s, &win->paint, in.x, in.y, &lineEndAffinity);
 
     if (InputClickDefinition(s, win->app, win, offset,
-                             in.modifiers.Secondary())) {
+                             in.modifiers.Secondary() && !in.modifiers.alt)) {
         return;
     }
     if (in.clickCount >= 3) {
         InputSelectLine(s, win->app, win, offset);
     } else if (in.clickCount == 2) {
         InputSelectWord(s, win->app, win, offset);
+    } else if (InputIsMultiLine(s) && in.button == MouseButton::Left &&
+               in.modifiers.alt) {
+
+        bool block = in.modifiers.shift;
+#if GPUI_OS_LINUX
+        block = block || in.modifiers.control;
+#endif
+        if (block) {
+            InputMoveToWithAffinity(s, win->app, win, offset, lineEndAffinity);
+        } else {
+            InputAddCursorAt(s, win->app, win, offset);
+        }
+        s->columnSelectStart = offset;
     } else if (in.modifiers.shift) {
         InputSelectToWithAffinity(s, win->app, win, offset, lineEndAffinity);
     } else {
@@ -17946,6 +18177,18 @@ static ScrollRect* ScrollRectById(Window* win, int id) {
     for (int i = win->paint.scrolls.len - 1; i >= 0; i--) {
         if (win->paint.scrolls[i].id == id) {
             return &win->paint.scrolls[i];
+        }
+    }
+    return nullptr;
+}
+
+const ScrollRect* WindowLastScrollRect(const Window* win, int id) {
+    if (!win || id == 0) {
+        return nullptr;
+    }
+    for (int i = win->prevScrolls.len - 1; i >= 0; i--) {
+        if (win->prevScrolls[i].id == id) {
+            return &win->prevScrolls[i];
         }
     }
     return nullptr;
@@ -18114,11 +18357,12 @@ static void DispatchMouseMove(Window* win, const MouseMoveEvent& in) {
         const HitRect* now = HitRectById(win, id);
         Str tip = now ? now->tooltip : Str{};
         Bounds tipAt = now ? now->bounds : Bounds{};
+        int tipPlacement = now ? now->tooltipPlacement : -1;
         WindowHoverChanged(win, win->hoverId, id);
         win->hoverId = id;
 
         if (tip.s) {
-            TooltipRequestShow(win, tip, tipAt);
+            TooltipRequestShow(win, tip, tipAt, tipPlacement);
         } else {
             TooltipRequestHide(win);
         }
@@ -18168,7 +18412,13 @@ static void DispatchMouseMove(Window* win, const MouseMoveEvent& in) {
         s->autoScroll.hasLastDrag = true;
         bool affinity = false;
         int offset = InputIndexForPosition(s, &win->paint, x, y, &affinity);
-        InputSelectToWithAffinity(s, win->app, win, offset, affinity);
+
+        if (s->columnSelectStart >= 0) {
+            InputBuildColumnarSelection(s, win->app, win, s->columnSelectStart,
+                                        offset);
+        } else {
+            InputSelectToWithAffinity(s, win->app, win, offset, affinity);
+        }
 
         float delta = 0;
         if (!InputIsSingleLine(s) &&
@@ -18453,8 +18703,12 @@ static void DispatchMouseUp(Window* win, const MouseUpEvent& in) {
     SliderRelease(win);
 
     if (win->input && win->input->selecting) {
+        if (win->input->selectedRange.IsEmpty()) {
+            win->input->selectionReversed = false;
+        }
         win->input->selecting = false;
         win->input->hasSelectedWordRange = false;
+        win->input->columnSelectStart = -1;
         win->input->autoScroll.Stop();
     }
 
@@ -18892,6 +19146,8 @@ bool BlinkVisible(App* app, EntityId handle) {
     return b->paused || b->visible;
 }
 
+static const double kAnimationFrameInterval = 0.016;
+
 static bool WindowAnimationDue(Window* win, double now) {
     if (!win || !(win->anim || win->opts.anim || win->animFrame)) {
         return false;
@@ -18899,8 +19155,7 @@ static bool WindowAnimationDue(Window* win, double now) {
     if (win->lastDrawTime <= 0) {
         return true;
     }
-    double interval = win->active ? 0.016 : kInactiveFrameInterval;
-    return now >= win->lastDrawTime + interval;
+    return now >= win->lastDrawTime + kAnimationFrameInterval;
 }
 
 void WindowTimerTick(Window* win) {
@@ -18965,9 +19220,9 @@ int WindowTimerMs(Window* win) {
     double soonest = -1;
     if (win->anim || win->opts.anim || win->animFrame) {
 
-        double interval = win->active ? 0.016 : kInactiveFrameInterval;
-        double target =
-            (win->lastDrawTime > 0) ? (win->lastDrawTime + interval) : now;
+        double target = (win->lastDrawTime > 0)
+                            ? (win->lastDrawTime + kAnimationFrameInterval)
+                            : now;
         if (target < now) {
             target = now;
         }
@@ -22577,6 +22832,21 @@ El* DialogClose::New(Ctx* cx, int clickId) {
     return UiRoot(a, StrL("dialog-close"), clickId)
         ->OnClickAction(action::Cancel());
 }
+El* DialogCloseActivation(El* button) {
+    if (!button) {
+        return nullptr;
+    }
+    return button->AriaLabel(StrL("Close"))->OnClickAction(action::Cancel());
+}
+El* DialogClose::WithTrigger(Ctx* cx, El* trigger, int clickId) {
+    Arena* a = cx->a;
+
+    El* root = UiRoot(a, StrL("dialog-close"), clickId);
+    if (trigger) {
+        root->Child(trigger);
+    }
+    return root;
+}
 
 Dialog* Dialog::New(Ctx* cx) {
     Arena* a = cx->a;
@@ -23014,18 +23284,25 @@ El* RenderSplit(const AreaCtx& ac, int node) {
     box->BoundsOut(&n.bounds);
 
     int grows = -1;
+    bool allSized = true;
+    float totalSize = 0;
     for (int i = 0; i < n.child.len; i++) {
         if (DockNodeVisible(s, n.child[i])) {
             grows = i;
+            allSized = allSized && n.size[i] > 0;
+            totalSize += n.size[i];
         }
     }
     for (int i = 0; i < n.child.len; i++) {
         if (!DockNodeVisible(s, n.child[i])) {
             continue;
         }
-        El* wrap = Div(a)->FlexCol();
-        if (i == grows) {
+        El* wrap = Div(a)->FlexCol()->MinW(0)->MinH(0);
+
+        bool flexible = allSized && totalSize > 0;
+        if (flexible || n.size[i] <= 0) {
             wrap->Flex1();
+            if (flexible) wrap->Grow(n.size[i]);
             if (horizontal) {
                 wrap->H(kFill);
             } else {
@@ -24105,6 +24382,62 @@ void register_panel(App* app, Str panelName, PanelRegistryBuild build,
 #line 1 "src/base/dock_state.cpp"
 
 namespace gpui {
+
+static int PaneNodeToState(const PaneNode* node, const PanelSource& source,
+                           DockAreaState* out) {
+    Str name = node->paneKind == PaneKind::Split  ? StrL("StackPanel")
+               : node->paneKind == PaneKind::Tabs ? StrL("TabPanel")
+                                                  : StrL("Tiles");
+    int ix = out->NewNode(name);
+    out->nodes[ix]
+        .kind = node->paneKind == PaneKind::Split  ? PanelInfoKind::Stack
+                : node->paneKind == PaneKind::Tabs ? PanelInfoKind::Tabs
+                                                   : PanelInfoKind::Tiles;
+    out->nodes[ix].axis = node->axis;
+    out->nodes[ix].activeIndex = node->activeIx;
+    if (node->paneKind == PaneKind::Split) {
+        for (int i = 0; i < node->children.len; i++) {
+            int child = PaneNodeToState(node->children[i], source, out);
+            VecAppend(out->nodes[ix].children, child);
+
+            float size = i < node->sizeKnown.len && node->sizeKnown[i]
+                             ? node->sizes[i]
+                             : 0;
+            VecAppend(out->nodes[ix].sizes, size);
+        }
+    } else {
+        bool tiles = node->paneKind == PaneKind::Tiles;
+        int count = tiles ? node->tiles.len : node->panels.len;
+        for (int i = 0; i < count; i++) {
+            PanelId panel = tiles ? node->tiles[i].panel : node->panels[i];
+            int child = out->NewNode(source.panelName
+                                         ? source.panelName(source.data, panel)
+                                         : StrL(""));
+            if (source.dump)
+                source.dump(source.data, panel, &out->nodes[child]);
+            VecAppend(out->nodes[ix].children, child);
+            if (tiles) {
+                TileMeta meta;
+                meta.bounds = node->tiles[i].bounds;
+                meta.zIndex = node->tiles[i].zIndex;
+                VecAppend(out->nodes[ix].metas, meta);
+            }
+        }
+    }
+    return ix;
+}
+
+int PaneTree::ToState(const PanelSource& source, DockAreaState* out) const {
+    if (!root || !out) return -1;
+    const PaneNode* persisted = root;
+
+    if (rootKind == RootKind::Split && root->paneKind == PaneKind::Split &&
+        root->children.len == 1 &&
+        root->children[0]->paneKind == PaneKind::Tiles) {
+        persisted = root->children[0];
+    }
+    return PaneNodeToState(persisted, source, out);
+}
 
 void DockAreaState::Clear() {
     for (int i = 0; i < nodes.len; i++) {
@@ -27143,6 +27476,8 @@ namespace input {
         return id;                                    \
     }
 
+GPUI_INPUT_ACTION(AddCursorAbove, "input::AddCursorAbove")
+GPUI_INPUT_ACTION(AddCursorBelow, "input::AddCursorBelow")
 GPUI_INPUT_ACTION(Backspace, "input::Backspace")
 GPUI_INPUT_ACTION(Copy, "input::Copy")
 GPUI_INPUT_ACTION(Cut, "input::Cut")
@@ -27255,6 +27590,17 @@ void InputInitKeys() {
         {"shift-right", input::SelectRight(), ctx},
         {"shift-up", input::SelectUp(), ctx},
         {"shift-down", input::SelectDown(), ctx},
+
+#if GPUI_OS_MAC
+        {"cmd-alt-up", input::AddCursorAbove(), ctx},
+        {"cmd-alt-down", input::AddCursorBelow(), ctx},
+#elif GPUI_OS_WINDOWS
+        {"ctrl-alt-up", input::AddCursorAbove(), ctx},
+        {"ctrl-alt-down", input::AddCursorBelow(), ctx},
+#else
+        {"shift-alt-up", input::AddCursorAbove(), ctx},
+        {"shift-alt-down", input::AddCursorBelow(), ctx},
+#endif
         {"home", input::MoveHome(), ctx},
         {"end", input::MoveEnd(), ctx},
         {"shift-home", input::SelectToStartOfLine(), ctx},
@@ -27482,6 +27828,12 @@ InputAction InputActionOf(uint32_t id, intptr_t arg) {
     }
     if (id == input::SelectUp()) {
         return InputAction::SelectUp;
+    }
+    if (id == input::AddCursorAbove()) {
+        return InputAction::AddCursorAbove;
+    }
+    if (id == input::AddCursorBelow()) {
+        return InputAction::AddCursorBelow;
     }
     if (id == input::Undo()) {
         return InputAction::Undo;
@@ -27979,6 +28331,47 @@ static const float kInputLineH = 20.f;
 static float DisplayLineH(const InputState* s, int row, float lineH);
 static float DisplayRowDocY(const InputState* s, int row, float lineH);
 
+static void RowExtraCursors(Arena* a, El* el, const InputState* state,
+                            const InputEditorStyle& style, int start, int len,
+                            bool caret) {
+    int n = state->extraCursors.len;
+    auto* sels = (Selection*)Alloc(a, n * (int)sizeof(Selection));
+    auto* carets = (int*)Alloc(a, n * (int)sizeof(int));
+    if (!sels || !carets) {
+        return;
+    }
+    int nSels = 0;
+    int nCarets = 0;
+    for (int i = 0; i < n; i++) {
+        const CursorSelection& c = state->extraCursors[i];
+        int lo = c.range.start - start;
+        int hi = c.range.end - start;
+        if (lo < 0) {
+            lo = 0;
+        }
+        if (hi > len) {
+            hi = len;
+        }
+        if (!c.IsEmpty() && lo < hi) {
+            sels[nSels++] = Selection{lo, hi};
+        }
+        int cur = c.Cursor();
+        if (caret && cur >= start && cur <= start + len) {
+            carets[nCarets++] = cur - start;
+        }
+    }
+    if (nSels > 0) {
+        if (el->selLo < 0) {
+
+            el->SelRange(-1, -1, style.selection);
+        }
+        el->ExtraSelRanges(sels, nSels);
+    }
+    if (nCarets > 0) {
+        el->ExtraCarets(carets, nCarets, style.caret);
+    }
+}
+
 static Str MaskedRun(Arena* a, Str text) {
     int chars = 0;
     for (int i = 0; i < text.len; i++) {
@@ -28384,8 +28777,9 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         int at =
             inside ? InputIndexForPosition(state, &cx->win->paint, mx, my) : -1;
 
-        bool secondary =
-            inside && !state->selecting && cx->win->mouseModifiers.Secondary();
+        bool secondary = inside && !state->selecting &&
+                         cx->win->mouseModifiers.Secondary() &&
+                         !cx->win->mouseModifiers.alt;
         if (secondary && state->definitionProvider) {
             InputHoverDefinition(state, at);
         } else {
@@ -28672,6 +29066,9 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                       state->cursorLineEndAffinity);
 
             el->CaretOut(&state->caretWinX, &state->caretWinY);
+        }
+        if (state->extraCursors.len > 0) {
+            RowExtraCursors(a, el, state, style, start, line.len, caret);
         }
 
         El* guides = nullptr;
@@ -29585,6 +29982,16 @@ float InputCursorSurroundingPadding(bool isAutoGrow, int overrideLines,
 
 void InputScrollToCaret(InputState* s, float caretX, float caretY,
                         InputMoveDir dir) {
+
+    InputScrollToCaretWithPadding(s, caretX, caretY, dir,
+                                  dir != InputMoveDir::None
+                                      ? InputScrollPadding::SurroundingLines
+                                      : InputScrollPadding::Minimal);
+}
+
+void InputScrollToCaretWithPadding(InputState* s, float caretX, float caretY,
+                                   InputMoveDir dir,
+                                   InputScrollPadding padding) {
     if (!s) {
         return;
     }
@@ -29610,7 +30017,7 @@ void InputScrollToCaret(InputState* s, float caretX, float caretY,
     }
 
     if (s->viewH > 0) {
-        bool surrounding = dir != InputMoveDir::None &&
+        bool surrounding = padding == InputScrollPadding::SurroundingLines &&
                            s->mode.kind == LayoutModeKind::CodeEditor;
         if (surrounding) {
             int visible = lineH > 0 ? (int)(s->viewH / lineH) : 0;
@@ -29658,6 +30065,14 @@ void InputScrollToCursor(InputState* s, InputMoveDir dir) {
 }
 
 void InputScrollToOffset(InputState* s, int offset, InputMoveDir dir) {
+    InputScrollToOffsetWithPadding(s, offset, dir,
+                                   dir != InputMoveDir::None
+                                       ? InputScrollPadding::SurroundingLines
+                                       : InputScrollPadding::Minimal);
+}
+
+void InputScrollToOffsetWithPadding(InputState* s, int offset, InputMoveDir dir,
+                                    InputScrollPadding padding) {
     if (!s) {
         return;
     }
@@ -29665,7 +30080,7 @@ void InputScrollToOffset(InputState* s, int offset, InputMoveDir dir) {
     int row = RopeOffsetToPoint(InputValue(s), offset).row;
     row = FoldMapNearestVisibleLine(&s->folds, row);
     float y = DisplayRowDocY(s, row, lineH);
-    InputScrollToCaret(s, -1, y, dir);
+    InputScrollToCaretWithPadding(s, -1, y, dir, padding);
 }
 
 void InputMoveToWithAffinity(InputState* s, App* app, Window* win, int offset,
@@ -29679,6 +30094,7 @@ void InputMoveToWithAffinity(InputState* s, App* app, Window* win, int offset,
         offset = t.len;
     }
     s->cursorLineEndAffinity = lineEndAffinity;
+    InputRemoveExtraCursors(s);
     s->selectedRange = SelectionAt(offset);
     s->hasSelectedWordRange = false;
     PauseBlink(s, app, win);
@@ -29733,6 +30149,7 @@ void InputSelectTo(InputState* s, App* app, Window* win, int offset) {
 
 void InputSelectAll(InputState* s, App* app, Window* win) {
     UndoBreakCoalescing(&s->undo);
+    InputRemoveExtraCursors(s);
     s->cursorLineEndAffinity = false;
     s->selectedRange = Selection{0, InputValue(s).len};
     s->selectionReversed = false;
@@ -29769,6 +30186,7 @@ void InputSelectWord(InputState* s, App* app, Window* win, int offset) {
         return;
     }
     UndoBreakCoalescing(&s->undo);
+    InputRemoveExtraCursors(s);
     s->cursorLineEndAffinity = false;
     s->selectedRange = Selection{a, b};
     s->selectionReversed = false;
@@ -29782,12 +30200,393 @@ void InputSelectLine(InputState* s, App* app, Window* win, int offset) {
     int b = 0;
     TextLineRangeAt(InputValue(s), offset, &a, &b);
     UndoBreakCoalescing(&s->undo);
+    InputRemoveExtraCursors(s);
     s->cursorLineEndAffinity = false;
     s->selectedRange = Selection{a, b};
     s->selectionReversed = false;
     s->hasSelectedWordRange = false;
     Notify(app, win);
 }
+
+int InputCursorCount(const InputState* s) {
+    return 1 + s->extraCursors.len;
+}
+
+void InputRemoveExtraCursors(InputState* s) {
+    s->extraCursors.len = 0;
+}
+
+static CursorSelection ActiveCursor(const InputState* s) {
+    CursorSelection c;
+    c.range = s->selectedRange;
+    c.reversed = s->selectionReversed;
+    c.preferredColumn = s->preferredColumn;
+    c.preferredX = s->preferredX;
+    return c;
+}
+
+static void SetActiveCursor(InputState* s, const CursorSelection& c) {
+    s->selectedRange = c.range;
+    s->selectionReversed = c.reversed;
+    s->preferredColumn = c.preferredColumn;
+    s->preferredX = c.preferredX;
+}
+
+static CursorSelection* AllCursors(Arena* a, const InputState* s, int* n) {
+    *n = InputCursorCount(s);
+    auto* out = (CursorSelection*)Alloc(a, *n * (int)sizeof(CursorSelection));
+    out[0] = ActiveCursor(s);
+    for (int i = 0; i < s->extraCursors.len; i++) {
+        out[i + 1] = s->extraCursors[i];
+    }
+    return out;
+}
+
+static void SetAllCursors(InputState* s, const CursorSelection* sels, int n) {
+    if (n <= 0) {
+        return;
+    }
+    SetActiveCursor(s, sels[0]);
+    s->extraCursors.len = 0;
+    for (int i = 1; i < n; i++) {
+        VecAppend(s->extraCursors, sels[i]);
+    }
+}
+
+template <class F>
+static auto WithCursor(InputState* s, const CursorSelection& c, bool active,
+                       F f) {
+    CursorSelection saved = ActiveCursor(s);
+    bool affinity = s->cursorLineEndAffinity;
+    SetActiveCursor(s, c);
+    if (!active) {
+        s->cursorLineEndAffinity = false;
+    }
+    auto r = f();
+    SetActiveCursor(s, saved);
+    s->cursorLineEndAffinity = affinity;
+    return r;
+}
+
+static bool HasCursorAt(const InputState* s, int offset) {
+    if (InputCursor(s) == offset) {
+        return true;
+    }
+    for (int i = 0; i < s->extraCursors.len; i++) {
+        if (s->extraCursors[i].Cursor() == offset) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void InputMergeOverlappingCursors(InputState* s) {
+    if (s->extraCursors.len == 0) {
+        return;
+    }
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+
+    auto* order = (int*)Alloc(a, n * (int)sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int j = i;
+        while (j > 0 && all[order[j - 1]].range.start > all[i].range.start) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = i;
+    }
+    auto* merged = (CursorSelection*)Alloc(a, n * (int)sizeof(CursorSelection));
+    int m = 0;
+    int activeAt = -1;
+    for (int k = 0; k < n; k++) {
+        const CursorSelection& c = all[order[k]];
+        bool isActive = order[k] == 0;
+        if (m > 0 && c.range.start <= merged[m - 1].range.end) {
+
+            CursorSelection& last = merged[m - 1];
+            bool didMerge = c.range.start != last.range.start ||
+                            c.range.end != last.range.end;
+            if (c.range.end > last.range.end) {
+                last.range.end = c.range.end;
+            }
+            if (isActive) {
+                activeAt = m - 1;
+                last.reversed = c.reversed;
+            }
+
+            if (didMerge) {
+                last.preferredColumn = -1;
+                last.preferredX = -1;
+            }
+            continue;
+        }
+        if (isActive) {
+            activeAt = m;
+        }
+        merged[m++] = c;
+    }
+
+    if (activeAt > 0) {
+        CursorSelection t = merged[0];
+        merged[0] = merged[activeAt];
+        merged[activeAt] = t;
+    }
+    SetAllCursors(s, merged, m);
+}
+
+void InputAddCursorAt(InputState* s, App* app, Window* win, int offset) {
+    if (!InputIsMultiLine(s)) {
+        return;
+    }
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    for (int i = 0; i < n; i++) {
+        if (all[i].range.Contains(offset)) {
+            return;
+        }
+        if (all[i].IsEmpty() && all[i].Cursor() == offset) {
+            return;
+        }
+    }
+    UndoBreakCoalescing(&s->undo);
+    CursorSelection c;
+    c.range = SelectionAt(offset);
+    VecAppend(s->extraCursors, c);
+    Notify(app, win);
+}
+
+static int WrappedRowStarts(const InputState* s, PaintCtx* ctx, Str line,
+                            Arena* a, int** outStarts) {
+    float maxW = s->lastBounds.w;
+    float font = s->lastFont;
+    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
+    float lineMult = lineH / font;
+    float endX = 0, endY = 0, endH = 0;
+    if (!TextPointAt(ctx, line, font, maxW, true, line.len, &endX, &endY, &endH,
+                     s->lastMono, lineMult, true)) {
+        return 0;
+    }
+    float rowH = endH > 0 ? endH : lineH;
+    int rows = (int)(endY / rowH + 0.5f) + 1;
+    if (rows < 1) {
+        rows = 1;
+    }
+    int* starts = (int*)Alloc(a, rows * (int)sizeof(int));
+    starts[0] = 0;
+    for (int k = 1; k < rows; k++) {
+        int at = TextIndexAt(ctx, line, font, maxW, true, 0,
+                             ((float)k + 0.5f) * rowH, s->lastMono, lineMult);
+        starts[k] = at > starts[k - 1] ? at : starts[k - 1];
+    }
+    *outStarts = starts;
+    return rows;
+}
+
+struct WrapPoint {
+    int line = 0;
+    int row = 0;
+    int column = 0;
+};
+
+static bool WrapPointAt(const InputState* s, PaintCtx* ctx, Str t, int offset,
+                        Arena* a, WrapPoint* out) {
+    RopePoint p = RopeOffsetToPoint(t, offset);
+    Str line = RopeSliceLine(t, p.row);
+    int* starts = nullptr;
+    int rows = WrappedRowStarts(s, ctx, line, a, &starts);
+    if (rows == 0) {
+        return false;
+    }
+    int local = offset - RopeLineStartOffset(t, p.row);
+    int k = rows - 1;
+    while (k > 0 && starts[k] > local) {
+        k--;
+    }
+    out->line = p.row;
+    out->row = k;
+    out->column = local - starts[k];
+    return true;
+}
+
+static PaintCtx* DisplayCtx(const InputState* s, Window* win) {
+    if (!win || !s->softWrap) {
+        return nullptr;
+    }
+    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
+    if (s->lastBounds.w <= 0 || s->lastFont <= 0 || lineH <= 0) {
+        return nullptr;
+    }
+    return &win->paint;
+}
+
+static bool ColumnarRowsDisplay(const InputState* s, PaintCtx* ctx, Str t,
+                                int lo, int hi, Arena* a,
+                                CursorSelection** outSels, int* outN) {
+    WrapPoint ps, pe;
+    if (!WrapPointAt(s, ctx, t, lo, a, &ps) ||
+        !WrapPointAt(s, ctx, t, hi, a, &pe)) {
+        return false;
+    }
+    int col0 = ps.column <= pe.column ? ps.column : pe.column;
+    int col1 = ps.column <= pe.column ? pe.column : ps.column;
+    bool folding = LayoutModeIsFolding(s->mode);
+
+    int nLines = pe.line - ps.line + 1;
+    auto* lineStarts = (int**)Alloc(a, nLines * (int)sizeof(int*));
+    int* lineRows = (int*)Alloc(a, nLines * (int)sizeof(int));
+    int cap = 0;
+    for (int i = 0; i < nLines; i++) {
+        lineStarts[i] = nullptr;
+        lineRows[i] = 0;
+        if (folding && FoldMapLineHidden(&s->folds, ps.line + i)) {
+            continue;
+        }
+        Str text = RopeSliceLine(t, ps.line + i);
+        lineRows[i] = WrappedRowStarts(s, ctx, text, a, &lineStarts[i]);
+        if (lineRows[i] == 0) {
+            return false;
+        }
+        cap += lineRows[i];
+    }
+    auto* sels = (CursorSelection*)Alloc(a, cap * (int)sizeof(CursorSelection));
+    int m = 0;
+    for (int i = 0; i < nLines; i++) {
+        int rows = lineRows[i];
+        if (rows == 0) {
+            continue;
+        }
+        int line = ps.line + i;
+        Str text = RopeSliceLine(t, line);
+        int lineStart = RopeLineStartOffset(t, line);
+        int* starts = lineStarts[i];
+        int kFrom = line == ps.line ? ps.row : 0;
+        int kTo = line == pe.line ? pe.row : rows - 1;
+        if (kTo > rows - 1) {
+            kTo = rows - 1;
+        }
+        for (int k = kFrom; k <= kTo; k++) {
+            int rs = starts[k];
+            int re = k + 1 < rows ? starts[k + 1] : text.len;
+            int a0 = lineStart + (rs + col0 < re ? rs + col0 : re);
+            int a1 = lineStart + (rs + col1 < re ? rs + col1 : re);
+            CursorSelection c;
+            c.range = Selection{RopeClipOffset(t, a0, Bias::Left),
+                                RopeClipOffset(t, a1, Bias::Left)};
+            sels[m++] = c;
+        }
+    }
+    *outSels = sels;
+    *outN = m;
+    return true;
+}
+
+void InputBuildColumnarSelection(InputState* s, App* app, Window* win,
+                                 int startOffset, int endOffset) {
+    if (!InputIsMultiLine(s)) {
+        return;
+    }
+    UndoBreakCoalescing(&s->undo);
+    Str t = InputValue(s);
+    int lo = startOffset <= endOffset ? startOffset : endOffset;
+    int hi = startOffset <= endOffset ? endOffset : startOffset;
+    if (lo < 0) {
+        lo = 0;
+    }
+    if (hi > t.len) {
+        hi = t.len;
+    }
+    Arena* a = GetTempArena();
+    CursorSelection* sels = nullptr;
+    int m = 0;
+    PaintCtx* ctx = DisplayCtx(s, win);
+    if (!ctx || !ColumnarRowsDisplay(s, ctx, t, lo, hi, a, &sels, &m)) {
+
+        RopePoint ps = RopeOffsetToPoint(t, lo);
+        RopePoint pe = RopeOffsetToPoint(t, hi);
+        int col0 = ps.column <= pe.column ? ps.column : pe.column;
+        int col1 = ps.column <= pe.column ? pe.column : ps.column;
+        bool folding = LayoutModeIsFolding(s->mode);
+        int rows = pe.row - ps.row + 1;
+        sels = (CursorSelection*)Alloc(a, rows * (int)sizeof(CursorSelection));
+        m = 0;
+        for (int row = ps.row; row <= pe.row; row++) {
+            if (folding && FoldMapLineHidden(&s->folds, row)) {
+                continue;
+            }
+            int lineStart = RopeLineStartOffset(t, row);
+            int lineLen = RopeLineLen(t, row);
+            int a0 = lineStart + (col0 < lineLen ? col0 : lineLen);
+            int a1 = lineStart + (col1 < lineLen ? col1 : lineLen);
+            CursorSelection c;
+            c.range = Selection{RopeClipOffset(t, a0, Bias::Left),
+                                RopeClipOffset(t, a1, Bias::Left)};
+            sels[m++] = c;
+        }
+    }
+    if (m == 0) {
+        sels = (CursorSelection*)Alloc(a, (int)sizeof(CursorSelection));
+        CursorSelection c;
+        c.range = SelectionAt(hi);
+        sels[m++] = c;
+    }
+    SetAllCursors(s, sels, m);
+    s->cursorLineEndAffinity = false;
+    s->hasSelectedWordRange = false;
+    Notify(app, win);
+}
+
+static Str SelectedTexts(Arena* a, const InputState* s) {
+    if (s->extraCursors.len == 0) {
+        return InputSelectedValue(s);
+    }
+    Str t = InputValue(s);
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    auto* order = (int*)Alloc(a, n * (int)sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int j = i;
+        while (j > 0 && all[order[j - 1]].range.start > all[i].range.start) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = i;
+    }
+    int total = 0;
+    int parts = 0;
+    for (int k = 0; k < n; k++) {
+        const CursorSelection& c = all[order[k]];
+        if (!c.IsEmpty()) {
+            total += c.range.Len();
+            parts++;
+        }
+    }
+    if (parts == 0) {
+        return {};
+    }
+    total += parts - 1;
+    char* buf = (char*)Alloc(a, total + 1);
+    int w = 0;
+    for (int k = 0; k < n; k++) {
+        const CursorSelection& c = all[order[k]];
+        if (c.IsEmpty()) {
+            continue;
+        }
+        if (w > 0) {
+            buf[w++] = '\n';
+        }
+        memcpy(buf + w, t.s + c.range.start, (size_t)c.range.Len());
+        w += c.range.Len();
+    }
+    buf[w] = 0;
+    return Str(buf, w);
+}
+
+static bool ReplaceAtEveryCursor(InputState* s, App* app, Window* win,
+                                 Str newText, bool hasIntent,
+                                 EditIntent requested);
 
 static bool IsValidInput(const InputState* s, Str text) {
     if (text.len == 0) {
@@ -29871,6 +30670,17 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
     s->undo.hasPendingIntent = false;
     if (!InputIsEditable(s)) {
         return false;
+    }
+    if (InputIsMultiLine(s)) {
+
+        bool multiCursor = !range && !s->imeMarking && s->extraCursors.len > 0;
+        if (multiCursor) {
+            return ReplaceAtEveryCursor(s, app, win, newText, hasIntent,
+                                        requested);
+        }
+        if (range) {
+            InputRemoveExtraCursors(s);
+        }
     }
     Selection selBefore = s->selectedRange;
     if (win && BlinkVisible(app, s->blink)) {
@@ -29977,6 +30787,125 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
     base_input_Emit(s, app, win, InputEvent{InputEventKind::Change});
     Notify(app, win);
     return true;
+}
+
+static EditIntent TypingIntent(const Selection* ranges, int n, Str newText) {
+    if (newText.len == 0) {
+        return EditIntent::Atomic;
+    }
+    for (int i = 0; i < newText.len; i++) {
+        if (newText.s[i] == '\n' || newText.s[i] == '\r') {
+            return EditIntent::Atomic;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!ranges[i].IsEmpty()) {
+            return EditIntent::Atomic;
+        }
+    }
+    return EditIntent::Typing;
+}
+
+bool InputReplaceTextInRanges(InputState* s, App* app, Window* win,
+                              const Selection* ranges, const Str* texts,
+                              int n) {
+    bool hasIntent = s->undo.hasPendingIntent;
+    EditIntent requested = s->undo.pendingIntent;
+    s->undo.hasPendingIntent = false;
+    if (!InputIsEditable(s) || n <= 0) {
+        return false;
+    }
+    Arena* a = GetTempArena();
+
+    auto* desc = (int*)Alloc(a, n * (int)sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int j = i;
+        while (j > 0 && ranges[desc[j - 1]].start < ranges[i].start) {
+            desc[j] = desc[j - 1];
+            j--;
+        }
+        desc[j] = i;
+    }
+
+    int nBefore = 0;
+    CursorSelection* before = AllCursors(a, s, &nBefore);
+    EditIntent collapse = hasIntent ? requested : EditIntent::Atomic;
+    for (int i = 0; i < nBefore; i++) {
+        if (collapse == EditIntent::Backspace) {
+            before[i].range = SelectionAt(before[i].range.end);
+            before[i].reversed = false;
+        } else if (collapse == EditIntent::DeleteForward) {
+            before[i].range = SelectionAt(before[i].range.start);
+            before[i].reversed = false;
+        }
+    }
+
+    bool group = n > 1;
+    if (group) {
+        UndoBeginTransaction(&s->undo);
+    }
+    bool ok = true;
+    for (int k = 0; k < n; k++) {
+        int i = desc[k];
+        s->undo.hasPendingIntent = hasIntent;
+        s->undo.pendingIntent = requested;
+        Selection r = ranges[i];
+        if (!InputReplaceTextInRange(s, app, win, &r, texts[i])) {
+            ok = false;
+        }
+    }
+
+    Str t = InputValue(s);
+    auto* result = (int*)Alloc(a, n * (int)sizeof(int));
+    int delta = 0;
+    for (int k = n - 1; k >= 0; k--) {
+        int i = desc[k];
+        int off = ranges[i].start + delta + texts[i].len;
+        result[i] = off > t.len ? t.len : off;
+        delta += texts[i].len - (ranges[i].end - ranges[i].start);
+    }
+    auto* out = (CursorSelection*)Alloc(a, n * (int)sizeof(CursorSelection));
+    for (int i = 0; i < n; i++) {
+        out[i] = CursorSelection{};
+        out[i].range = SelectionAt(result[i]);
+    }
+    SetAllCursors(s, out, n);
+    InputMergeOverlappingCursors(s);
+    s->cursorLineEndAffinity = false;
+    s->hasSelectedWordRange = false;
+    UpdatePreferredColumn(s);
+    if (group) {
+
+        int nAfter = 0;
+        CursorSelection* after = AllCursors(a, s, &nAfter);
+        UndoRecordSelections(&s->undo, before, nBefore, after, nAfter);
+        UndoCommitTransaction(&s->undo);
+    }
+    Notify(app, win);
+    return ok;
+}
+
+static bool ReplaceAtEveryCursor(InputState* s, App* app, Window* win,
+                                 Str newText, bool hasIntent,
+                                 EditIntent requested) {
+    InputMergeOverlappingCursors(s);
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    auto* ranges = (Selection*)Alloc(a, n * (int)sizeof(Selection));
+    auto* texts = (Str*)Alloc(a, n * (int)sizeof(Str));
+    for (int i = 0; i < n; i++) {
+        ranges[i] = all[i].range;
+        texts[i] = newText;
+    }
+    EditIntent intent =
+        hasIntent ? requested : TypingIntent(ranges, n, newText);
+    UndoBeginTransactionWith(&s->undo, intent);
+    s->undo.hasPendingIntent = true;
+    s->undo.pendingIntent = intent;
+    bool ok = InputReplaceTextInRanges(s, app, win, ranges, texts, n);
+    UndoCommitTransaction(&s->undo);
+    return ok;
 }
 
 bool InputMarkedRange(const InputState* s, Selection* out) {
@@ -30105,6 +31034,7 @@ static void ReplaceText(InputState* s, App* app, Window* win, Str value) {
 }
 
 static void base_input_ResetSelection(InputState* s) {
+    InputRemoveExtraCursors(s);
     s->cursorLineEndAffinity = false;
     if (InputIsSingleLine(s)) {
         s->selectedRange = SelectionAt(InputValue(s).len);
@@ -30145,6 +31075,7 @@ void InputInsert(InputState* s, App* app, Window* win, Str value) {
 
 void InputClean(InputState* s, App* app, Window* win) {
     ReplaceText(s, app, win, Str{});
+    InputRemoveExtraCursors(s);
     s->selectedRange = {};
     s->selectionReversed = false;
     Notify(app, win);
@@ -31308,31 +32239,285 @@ static VerticalTarget VerticalTargetFor(const InputState* s, Window* win,
     return out;
 }
 
-static void MoveVertical(InputState* s, App* app, Window* win, int lines) {
+struct MoveTarget {
+    int offset = 0;
+    bool lineEndAffinity = false;
+    bool anchors = false;
+    int preferredColumn = -1;
+    float preferredX = -1;
+};
+
+static MoveTarget TargetAt(int offset, bool lineEndAffinity = false) {
+    MoveTarget t;
+    t.offset = offset;
+    t.lineEndAffinity = lineEndAffinity;
+    return t;
+}
+
+static MoveTarget TargetOf(const VerticalTarget& v) {
+    MoveTarget t;
+    t.offset = v.offset;
+    t.lineEndAffinity = v.lineEndAffinity;
+    t.anchors = true;
+    t.preferredColumn = v.preferredColumn;
+    t.preferredX = v.preferredX;
+    return t;
+}
+
+static void ApplyAnchors(InputState* s, CursorSelection* c,
+                         const MoveTarget& t) {
+    if (t.anchors) {
+        c->preferredColumn = t.preferredColumn;
+        c->preferredX = t.preferredX;
+    } else {
+        c->preferredColumn = RopeOffsetToPoint(InputValue(s), c->Cursor())
+                                 .column;
+        c->preferredX = -1;
+    }
+}
+
+template <class F>
+static void MoveAllCursors(InputState* s, App* app, Window* win, F f) {
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    auto* targets = (MoveTarget*)Alloc(a, n * (int)sizeof(MoveTarget));
+    for (int i = 0; i < n; i++) {
+        targets[i] = f(all[i], i == 0);
+    }
+    InputMoveToWithAffinity(s, app, win, targets[0].offset,
+                            targets[0].lineEndAffinity);
+    CursorSelection active = ActiveCursor(s);
+    ApplyAnchors(s, &active, targets[0]);
+    SetActiveCursor(s, active);
+    int len = InputValue(s).len;
+    for (int i = 1; i < n; i++) {
+        int off = targets[i].offset;
+        CursorSelection c;
+        c.range = SelectionAt(off < 0 ? 0 : (off > len ? len : off));
+        ApplyAnchors(s, &c, targets[i]);
+        VecAppend(s->extraCursors, c);
+    }
+    InputMergeOverlappingCursors(s);
+}
+
+static void ExtendSelection(CursorSelection* c, int offset) {
+    if (c->reversed) {
+        c->range.start = offset;
+    } else {
+        c->range.end = offset;
+    }
+    if (c->range.end < c->range.start) {
+        c->reversed = !c->reversed;
+        int t = c->range.start;
+        c->range.start = c->range.end;
+        c->range.end = t;
+    }
+}
+
+template <class F>
+static void SelectAllCursorsTo(InputState* s, App* app, Window* win, F f) {
+    UndoBreakCoalescing(&s->undo);
+    PauseBlink(s, app, win);
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    auto* targets = (MoveTarget*)Alloc(a, n * (int)sizeof(MoveTarget));
+    for (int i = 0; i < n; i++) {
+        targets[i] = f(all[i], i == 0);
+    }
+    InputSelectToWithAffinity(s, app, win, targets[0].offset,
+                              targets[0].lineEndAffinity);
+    if (targets[0].anchors) {
+        s->preferredX = targets[0].preferredX;
+        s->preferredColumn = targets[0].preferredColumn;
+    }
+    int len = InputValue(s).len;
+    for (int i = 1; i < n; i++) {
+        int off = targets[i].offset;
+        CursorSelection c = s->extraCursors[i - 1];
+        ExtendSelection(&c, off < 0 ? 0 : (off > len ? len : off));
+        if (c.IsEmpty() || targets[i].anchors) {
+            ApplyAnchors(s, &c, targets[i]);
+        }
+        s->extraCursors[i - 1] = c;
+    }
+    InputMergeOverlappingCursors(s);
+}
+
+static void MoveVertical(InputState* s, App* app, Window* win, int lines,
+                         bool collapse) {
     if (InputIsSingleLine(s)) {
         return;
     }
     Str t = InputValue(s);
-    VerticalTarget to = VerticalTargetFor(s, win, lines, t, InputCursor(s));
     PauseBlink(s, app, win);
-    InputMoveToWithAffinity(s, app, win, to.offset, to.lineEndAffinity);
-    s->preferredX = to.preferredX;
-    s->preferredColumn = to.preferredColumn;
+    MoveAllCursors(s, app, win, [&](const CursorSelection& c, bool active) {
+        CursorSelection from = c;
+        if (collapse && !c.IsEmpty()) {
+            from.range = SelectionAt(lines < 0 ? c.range.start : c.range.end);
+            from.reversed = false;
+            from.preferredColumn = -1;
+            from.preferredX = -1;
+        }
+        return WithCursor(s, from, active, [&] {
+            return TargetOf(VerticalTargetFor(s, win, lines, t, from.Cursor()));
+        });
+    });
 }
 
 static void SelectVertical(InputState* s, App* app, Window* win, int lines) {
     if (InputIsSingleLine(s)) {
         return;
     }
-    UndoBreakCoalescing(&s->undo);
     Str t = InputValue(s);
-    VerticalTarget to = VerticalTargetFor(s, win, lines, t, InputCursor(s));
-    PauseBlink(s, app, win);
-    InputSelectToWithAffinity(s, app, win, to.offset, to.lineEndAffinity);
-    s->preferredX = to.preferredX;
-    s->preferredColumn = to.preferredColumn;
+    SelectAllCursorsTo(s, app, win, [&](const CursorSelection& c, bool active) {
+        return WithCursor(s, c, active, [&] {
+            return TargetOf(VerticalTargetFor(s, win, lines, t, c.Cursor()));
+        });
+    });
 
     InputScrollToCursor(s, lines < 0 ? InputMoveDir::Up : InputMoveDir::Down);
+}
+
+static void AddCursorVertical(InputState* s, App* app, Window* win, int lines) {
+    if (!InputIsMultiLine(s)) {
+        return;
+    }
+    PauseBlink(s, app, win);
+
+    UndoBreakCoalescing(&s->undo);
+    Str t = InputValue(s);
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    int newest = -1;
+    for (int i = 0; i < n; i++) {
+        const CursorSelection& c = all[i];
+        int off = c.Cursor();
+        VerticalTarget to = WithCursor(s, c, i == 0, [&] {
+            return VerticalTargetFor(s, win, lines, t, off);
+        });
+        if (to.offset == off || HasCursorAt(s, to.offset)) {
+            continue;
+        }
+        CursorSelection added;
+        added.range = SelectionAt(to.offset);
+        added.preferredColumn = to.preferredColumn;
+        added.preferredX = to.preferredX;
+        VecAppend(s->extraCursors, added);
+        newest = to.offset;
+    }
+
+    if (newest >= 0) {
+        InputScrollToOffset(s, newest, InputMoveDir::None);
+    }
+    Notify(app, win);
+}
+
+static void DeleteSelections(InputState* s, App* app, Window* win,
+                             EditIntent collapsedIntent, bool forward) {
+    if (!InputIsEditable(s)) {
+        return;
+    }
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* cursors = AllCursors(a, s, &n);
+    bool allEmpty = true;
+    for (int i = 0; i < n; i++) {
+        allEmpty = allEmpty && cursors[i].IsEmpty();
+    }
+    EditIntent intent = allEmpty ? collapsedIntent : EditIntent::Atomic;
+    auto* targets =
+        (CursorSelection*)Alloc(a, n * (int)sizeof(CursorSelection));
+    for (int i = 0; i < n; i++) {
+        CursorSelection c = cursors[i];
+        if (c.IsEmpty()) {
+            int off = c.Cursor();
+            int other = WithCursor(s, c, i == 0, [&] {
+                return forward ? InputNextBoundary(s, off)
+                               : InputPreviousBoundary(s, off);
+            });
+            c.range =
+                Selection{off < other ? off : other, off < other ? other : off};
+            c.reversed = false;
+        }
+        targets[i] = c;
+    }
+    UndoBeginTransactionWith(&s->undo, intent);
+    UndoRecordSelections(&s->undo, cursors, n, cursors, n);
+    SetAllCursors(s, targets, n);
+    s->undo.hasPendingIntent = true;
+    s->undo.pendingIntent = intent;
+    InputReplaceTextInRange(s, app, win, nullptr, Str{});
+    int nAfter = 0;
+    CursorSelection* after = AllCursors(a, s, &nAfter);
+    UndoRecordSelections(&s->undo, cursors, n, after, nAfter);
+    UndoCommitTransaction(&s->undo);
+    PauseBlink(s, app, win);
+}
+
+static bool PasteLinesToCursors(InputState* s, App* app, Window* win,
+                                Str text) {
+    InputMergeOverlappingCursors(s);
+    int count = InputCursorCount(s);
+    int lines = 1;
+    for (int i = 0; i < text.len; i++) {
+        if (text.s[i] == '\n') {
+            lines++;
+        }
+    }
+    if (count < 2 || lines != count) {
+        return false;
+    }
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* all = AllCursors(a, s, &n);
+    auto* ranges = (Selection*)Alloc(a, n * (int)sizeof(Selection));
+    auto* texts = (Str*)Alloc(a, n * (int)sizeof(Str));
+    auto* parts = (Str*)Alloc(a, n * (int)sizeof(Str));
+    int at = 0;
+    for (int k = 0; k < n; k++) {
+        int end = at;
+        while (end < text.len && text.s[end] != '\n') {
+            end++;
+        }
+        parts[k] = Str(text.s + at, end - at);
+        at = end + 1;
+    }
+    for (int i = 0; i < n; i++) {
+
+        int rank = 0;
+        for (int j = 0; j < n; j++) {
+            if (all[j].range.start < all[i].range.start ||
+                (all[j].range.start == all[i].range.start && j < i)) {
+                rank++;
+            }
+        }
+        ranges[i] = all[i].range;
+        texts[i] = parts[rank];
+    }
+    InputReplaceTextInRanges(s, app, win, ranges, texts, n);
+    InputScrollToCursor(s, InputMoveDir::None);
+    return true;
+}
+
+static void RestoreCursors(InputState* s, const CursorSelection* sels, int n) {
+    Arena* a = GetTempArena();
+    int len = InputValue(s).len;
+    auto* out = (CursorSelection*)Alloc(a, n * (int)sizeof(CursorSelection));
+    for (int i = 0; i < n; i++) {
+        out[i] = sels[i];
+        if (out[i].range.start > len) {
+            out[i].range.start = len;
+        }
+        if (out[i].range.end > len) {
+            out[i].range.end = len;
+        }
+    }
+    SetAllCursors(s, out, n);
+    InputMergeOverlappingCursors(s);
+    s->cursorLineEndAffinity = false;
 }
 
 static void DeleteRange(InputState* s, App* app, Window* win, int a, int b) {
@@ -31350,7 +32535,7 @@ static void DoCopy(InputState* s, Window* win) {
     if (!InputIsCopyable(s) || !win) {
         return;
     }
-    ClipboardSetText(win, InputSelectedValue(s));
+    ClipboardSetText(win, SelectedTexts(GetTempArena(), s));
 }
 
 static void DoUndo(InputState* s, App* app, Window* win) {
@@ -31363,9 +32548,13 @@ static void DoUndo(InputState* s, App* app, Window* win) {
             Selection r = t->changes[i].newRange;
             InputReplaceTextInRange(s, app, win, &r, t->changes[i].oldText);
         }
-        s->cursorLineEndAffinity = false;
-        s->selectedRange = sel;
-        s->selectionReversed = false;
+        if (t->nSelsBefore > 0) {
+            RestoreCursors(s, t->selsBefore, t->nSelsBefore);
+        } else {
+            s->cursorLineEndAffinity = false;
+            s->selectedRange = sel;
+            s->selectionReversed = false;
+        }
     }
     UndoSetIgnoring(&s->undo, false);
 }
@@ -31379,9 +32568,13 @@ static void DoRedo(InputState* s, App* app, Window* win) {
             Selection r = t->changes[i].oldRange;
             InputReplaceTextInRange(s, app, win, &r, t->changes[i].newText);
         }
-        s->cursorLineEndAffinity = false;
-        s->selectedRange = sel;
-        s->selectionReversed = false;
+        if (t->nSelsAfter > 0) {
+            RestoreCursors(s, t->selsAfter, t->nSelsAfter);
+        } else {
+            s->cursorLineEndAffinity = false;
+            s->selectedRange = sel;
+            s->selectionReversed = false;
+        }
     }
     UndoSetIgnoring(&s->undo, false);
 }
@@ -31398,144 +32591,197 @@ static Str TabIndent(const InputState* s) {
     return tab;
 }
 
-static int StartOfLineOfSelection(const InputState* s) {
-    if (InputIsSingleLine(s)) {
-        return 0;
-    }
-    Str t = InputValue(s);
-    Selection r = s->selectedRange;
-    int off = r.start < r.end ? r.start : r.end;
-    return RopeLineStartOffset(t, RopeOffsetToPoint(t, off).row);
-}
-
-static int LineLenAt(Str text, int at) {
-    int i = at;
-    while (i < text.len && text.s[i] != '\n') {
-        i++;
-    }
-    return i - at;
-}
-
 static bool IndentReady(const InputState* s) {
     return InputIsMultiLine(s) && ModeIsIndentable(s);
 }
 
-static bool DoIndent(InputState* s, App* app, Window* win, bool block) {
-    if (!IndentReady(s)) {
+enum class IndentDirection {
+    Indent,
+    Outdent
+};
+
+static bool LineHasTab(Str t, int lineStart, Str tab) {
+    return t.len - lineStart >= tab.len &&
+           StrEq(Str(t.s + lineStart, tab.len), tab);
+}
+
+static int CountEditsWithStartAtOrBefore(const Selection* edits, int n,
+                                         int offset) {
+    int c = 0;
+    for (int i = 0; i < n; i++) {
+        if (edits[i].start <= offset) {
+            c++;
+        }
+    }
+    return c;
+}
+
+static void ComputeBlockIndent(Arena* a, const InputState* s,
+                               IndentDirection dir, Str tab,
+                               const CursorSelection* sels, int n,
+                               Selection** outEdits, int* nEdits,
+                               CursorSelection** outSels) {
+    Str t = InputValue(s);
+    int cap = 0;
+    for (int i = 0; i < n; i++) {
+        cap += RopeOffsetToPoint(t, sels[i].range.end).row -
+               RopeOffsetToPoint(t, sels[i].range.start).row + 1;
+    }
+    int* rows = (int*)Alloc(a, cap * (int)sizeof(int));
+    int nRows = 0;
+    for (int i = 0; i < n; i++) {
+        int r0 = RopeOffsetToPoint(t, sels[i].range.start).row;
+        int r1 = RopeOffsetToPoint(t, sels[i].range.end).row;
+        for (int r = r0; r <= r1; r++) {
+
+            int j = nRows;
+            while (j > 0 && rows[j - 1] > r) {
+                j--;
+            }
+            if (j > 0 && rows[j - 1] == r) {
+                continue;
+            }
+            memmove(rows + j + 1, rows + j, (size_t)(nRows - j) * sizeof(int));
+            rows[j] = r;
+            nRows++;
+        }
+    }
+    auto* edits = (Selection*)Alloc(a, nRows * (int)sizeof(Selection));
+    int m = 0;
+    for (int k = 0; k < nRows; k++) {
+        int lineStart = RopeLineStartOffset(t, rows[k]);
+        if (dir == IndentDirection::Indent) {
+            edits[m++] = Selection{lineStart, lineStart};
+        } else if (LineHasTab(t, lineStart, tab)) {
+            edits[m++] = Selection{lineStart, lineStart + tab.len};
+        }
+    }
+    auto mapOffset = [&](int offset) {
+        if (dir == IndentDirection::Indent) {
+            return offset +
+                   CountEditsWithStartAtOrBefore(edits, m, offset) * tab.len;
+        }
+        int preceding = 0;
+        while (preceding < m && edits[preceding].end <= offset) {
+            preceding++;
+        }
+        int partial = 0;
+        if (preceding < m && offset > edits[preceding].start) {
+            partial = offset - edits[preceding].start;
+        }
+        return offset - preceding * tab.len - partial;
+    };
+    auto* out = (CursorSelection*)Alloc(a, n * (int)sizeof(CursorSelection));
+    for (int i = 0; i < n; i++) {
+        out[i] = sels[i];
+        out[i].range.start = mapOffset(sels[i].range.start);
+        out[i].range.end = mapOffset(sels[i].range.end);
+        out[i].preferredColumn = -1;
+        out[i].preferredX = -1;
+    }
+    *outEdits = edits;
+    *nEdits = m;
+    *outSels = out;
+}
+
+static void ComputeInlineIndent(Arena* a, const InputState* s,
+                                IndentDirection dir, Str tab,
+                                const CursorSelection* sels, int n,
+                                Selection** outEdits, int* nEdits,
+                                CursorSelection** outSels) {
+    Str t = InputValue(s);
+    auto* ranges = (Selection*)Alloc(a, n * (int)sizeof(Selection));
+    int nRanges = 0;
+    for (int i = 0; i < n; i++) {
+        int cursor = sels[i].Cursor();
+        Selection r;
+        if (dir == IndentDirection::Indent) {
+            r = Selection{cursor, cursor};
+        } else {
+            int start =
+                RopeLineStartOffset(t, RopeOffsetToPoint(t, cursor).row);
+            if (!LineHasTab(t, start, tab)) {
+                continue;
+            }
+            r = Selection{start, start + tab.len};
+        }
+        int j = nRanges;
+        while (j > 0 && ranges[j - 1].start > r.start) {
+            ranges[j] = ranges[j - 1];
+            j--;
+        }
+        ranges[j] = r;
+        nRanges++;
+    }
+    auto* edits = (Selection*)Alloc(a, n * (int)sizeof(Selection));
+    int m = 0;
+    int lastEnd = -1;
+    for (int i = 0; i < nRanges; i++) {
+        if (lastEnd >= 0 && ranges[i].start < lastEnd) {
+            continue;
+        }
+        lastEnd = ranges[i].end;
+        edits[m++] = ranges[i];
+    }
+    auto* out = (CursorSelection*)Alloc(a, n * (int)sizeof(CursorSelection));
+    for (int i = 0; i < n; i++) {
+        int cursor = sels[i].Cursor();
+        int at = cursor;
+        if (dir == IndentDirection::Indent) {
+            at += CountEditsWithStartAtOrBefore(edits, m, cursor) * tab.len;
+        } else {
+            int removed = 0;
+            for (int k = 0; k < m; k++) {
+                int e = edits[k].end < cursor ? edits[k].end : cursor;
+                int b = edits[k].start < cursor ? edits[k].start : cursor;
+                removed += e - b;
+            }
+            at -= removed;
+        }
+        out[i] = CursorSelection{};
+        out[i].range = SelectionAt(at);
+    }
+    *outEdits = edits;
+    *nEdits = m;
+    *outSels = out;
+}
+
+static bool ApplyIndent(InputState* s, App* app, Window* win,
+                        IndentDirection dir, bool block) {
+    if (!InputIsEditable(s) || !IndentReady(s)) {
         return false;
     }
     Str tab = TabIndent(s);
-    Selection sel = s->selectedRange;
-    bool isSelected = !sel.IsEmpty();
+    Arena* a = GetTempArena();
+    int n = 0;
+    CursorSelection* before = AllCursors(a, s, &n);
+    bool useBlock = block;
+    for (int i = 0; i < n; i++) {
+        useBlock = useBlock || !before[i].IsEmpty();
+    }
+    Selection* edits = nullptr;
+    int nEdits = 0;
+    CursorSelection* after = nullptr;
+    if (useBlock) {
+        ComputeBlockIndent(a, s, dir, tab, before, n, &edits, &nEdits, &after);
+    } else {
+        ComputeInlineIndent(a, s, dir, tab, before, n, &edits, &nEdits, &after);
+    }
+    if (nEdits == 0) {
+        return true;
+    }
+    auto* texts = (Str*)Alloc(a, nEdits * (int)sizeof(Str));
+    for (int i = 0; i < nEdits; i++) {
+        texts[i] = dir == IndentDirection::Indent ? tab : Str{};
+    }
+    UndoBeginTransaction(&s->undo);
     s->undo.hasPendingIntent = true;
     s->undo.pendingIntent = EditIntent::Atomic;
-    if (!isSelected && !block) {
-        Selection at = SelectionAt(sel.start);
-        InputReplaceTextInRange(s, app, win, &at, tab);
-        s->selectedRange = SelectionAt(sel.start + tab.len);
-        s->selectionReversed = false;
-        PauseBlink(s, app, win);
-        return true;
-    }
-
-    int startOffset = StartOfLineOfSelection(s);
-    Str before = InputValue(s);
-    Str src = Str(before.s + startOffset, sel.end - startOffset);
-    int nLines = 1;
-    for (int i = 0; i < src.len; i++) {
-        if (src.s[i] == '\n') {
-            nLines++;
-        }
-    }
-    int added = tab.len * nLines;
-    Str out = AllocStrTemp(src.len + added);
-    int w = 0;
-    int i = 0;
-    for (;;) {
-        int lineLen = LineLenAt(src, i);
-        memcpy(out.s + w, tab.s, (size_t)tab.len);
-        w += tab.len;
-        memcpy(out.s + w, src.s + i, (size_t)lineLen);
-        w += lineLen;
-        i += lineLen;
-        if (i >= src.len) {
-            break;
-        }
-        out.s[w++] = '\n';
-        i++;
-    }
-    Selection r = {startOffset, sel.end};
-    InputReplaceTextInRange(s, app, win, &r, out);
-
-    s->selectedRange = isSelected
-                           ? Selection{startOffset, sel.end + added}
-                           : Selection{sel.start + added, sel.end + added};
-    s->selectionReversed = false;
-    PauseBlink(s, app, win);
-    Notify(app, win);
-    return true;
-}
-
-static int SatSub(int a, int b) {
-    return a > b ? a - b : 0;
-}
-
-static bool DoOutdent(InputState* s, App* app, Window* win) {
-    if (!IndentReady(s)) {
-        return false;
-    }
-    Str tab = TabIndent(s);
-    Selection sel = s->selectedRange;
-    Str before = InputValue(s);
-    s->undo.hasPendingIntent = true;
-    s->undo.pendingIntent = EditIntent::Atomic;
-    if (sel.IsEmpty()) {
-
-        int offset = StartOfLineOfSelection(s);
-        if (before.len - offset < tab.len ||
-            !StrEq(Str(before.s + offset, tab.len), tab)) {
-            s->undo.hasPendingIntent = false;
-            return true;
-        }
-        Selection r = {offset, offset + tab.len};
-        InputReplaceTextInRange(s, app, win, &r, Str{});
-        s->selectedRange = SelectionAt(SatSub(sel.start, tab.len));
-        s->selectionReversed = false;
-        PauseBlink(s, app, win);
-        return true;
-    }
-    int startOffset = StartOfLineOfSelection(s);
-    Str src = Str(before.s + startOffset, sel.end - startOffset);
-    Str out = AllocStrTemp(src.len);
-    int removed = 0;
-    int w = 0;
-    int i = 0;
-    for (;;) {
-        int lineLen = LineLenAt(src, i);
-        int skip = 0;
-        if (lineLen >= tab.len && StrEq(Str(src.s + i, tab.len), tab)) {
-            skip = tab.len;
-            removed += tab.len;
-        }
-        memcpy(out.s + w, src.s + i + skip, (size_t)(lineLen - skip));
-        w += lineLen - skip;
-        i += lineLen;
-        if (i >= src.len) {
-            break;
-        }
-        out.s[w++] = '\n';
-        i++;
-    }
-    if (removed == 0) {
-        s->undo.hasPendingIntent = false;
-        return true;
-    }
-    out.len = w;
-    out.s[w] = 0;
-    Selection r = {startOffset, sel.end};
-    InputReplaceTextInRange(s, app, win, &r, out);
-    s->selectedRange = Selection{startOffset, SatSub(sel.end, removed)};
-    s->selectionReversed = false;
+    InputReplaceTextInRanges(s, app, win, edits, texts, nEdits);
+    SetAllCursors(s, after, n);
+    UndoRecordSelections(&s->undo, before, n, after, n);
+    UndoCommitTransaction(&s->undo);
+    InputScrollToCursor(s, InputMoveDir::None);
     PauseBlink(s, app, win);
     Notify(app, win);
     return true;
@@ -31557,49 +32803,54 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
 
         case InputAction::MoveLeft:
             PauseBlink(s, app, win);
-            InputMoveTo(s, app, win,
-                        s->selectedRange.IsEmpty()
-                            ? InputPreviousBoundary(s, InputCursor(s))
-                            : s->selectedRange.start);
+            MoveAllCursors(s, app, win, [&](const CursorSelection& c, bool) {
+                return TargetAt(c.IsEmpty()
+                                    ? InputPreviousBoundary(s, c.Cursor())
+                                    : c.range.start);
+            });
             return true;
         case InputAction::MoveRight:
             PauseBlink(s, app, win);
-            InputMoveTo(s, app, win,
-                        s->selectedRange.IsEmpty()
-                            ? InputNextBoundary(s, s->selectedRange.end)
-                            : s->selectedRange.end);
+            MoveAllCursors(s, app, win, [&](const CursorSelection& c, bool) {
+                return TargetAt(c.IsEmpty() ? InputNextBoundary(s, c.range.end)
+                                            : c.range.end);
+            });
             return true;
         case InputAction::MoveUp:
             if (InputIsSingleLine(s)) {
                 return false;
             }
-            if (!s->selectedRange.IsEmpty()) {
-                InputMoveTo(s, app, win, s->selectedRange.start);
-            }
-            MoveVertical(s, app, win, -1);
+            MoveVertical(s, app, win, -1, true);
             return true;
         case InputAction::MoveDown:
             if (InputIsSingleLine(s)) {
                 return false;
             }
-            if (!s->selectedRange.IsEmpty()) {
-                InputMoveTo(s, app, win, s->selectedRange.end);
-            }
-            MoveVertical(s, app, win, 1);
+            MoveVertical(s, app, win, 1, true);
             return true;
         case InputAction::MovePageUp:
-            MoveVertical(s, app, win, -LayoutModeRows(s->mode));
+            MoveVertical(s, app, win, -LayoutModeRows(s->mode), false);
             return InputIsMultiLine(s);
         case InputAction::MovePageDown:
-            MoveVertical(s, app, win, LayoutModeRows(s->mode));
+            MoveVertical(s, app, win, LayoutModeRows(s->mode), false);
             return InputIsMultiLine(s);
         case InputAction::MoveHome:
             PauseBlink(s, app, win);
-            InputMoveTo(s, app, win, InputStartOfLine(s, win));
+            MoveAllCursors(s, app, win,
+                           [&](const CursorSelection& c, bool active) {
+                               return WithCursor(s, c, active, [&] {
+                                   return TargetAt(InputStartOfLine(s, win));
+                               });
+                           });
             return true;
         case InputAction::MoveEnd:
             PauseBlink(s, app, win);
-            InputMoveToWithAffinity(s, app, win, InputEndOfLine(s, win), true);
+            MoveAllCursors(
+                s, app, win, [&](const CursorSelection& c, bool active) {
+                    return WithCursor(s, c, active, [&] {
+                        return TargetAt(InputEndOfLine(s, win), true);
+                    });
+                });
             return true;
         case InputAction::MoveToStart:
             InputMoveTo(s, app, win, 0);
@@ -31608,20 +32859,33 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             InputMoveTo(s, app, win, t.len);
             return true;
         case InputAction::MoveToPreviousWord:
-            InputMoveTo(s, app, win, InputPreviousStartOfWord(s));
+            MoveAllCursors(s, app, win,
+                           [&](const CursorSelection& c, bool active) {
+                               return WithCursor(s, c, active, [&] {
+                                   return TargetAt(InputPreviousStartOfWord(s));
+                               });
+                           });
             return true;
         case InputAction::MoveToNextWord:
-            InputMoveTo(s, app, win, InputNextEndOfWord(s));
+            MoveAllCursors(s, app, win,
+                           [&](const CursorSelection& c, bool active) {
+                               return WithCursor(s, c, active, [&] {
+                                   return TargetAt(InputNextEndOfWord(s));
+                               });
+                           });
             return true;
 
         case InputAction::SelectLeft:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win,
-                          InputPreviousBoundary(s, InputCursor(s)));
+            SelectAllCursorsTo(
+                s, app, win, [&](const CursorSelection& c, bool) {
+                    return TargetAt(InputPreviousBoundary(s, c.Cursor()));
+                });
             return true;
         case InputAction::SelectRight:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win, InputNextBoundary(s, InputCursor(s)));
+            SelectAllCursorsTo(
+                s, app, win, [&](const CursorSelection& c, bool) {
+                    return TargetAt(InputNextBoundary(s, c.Cursor()));
+                });
             return true;
         case InputAction::SelectUp:
             SelectVertical(s, app, win, -1);
@@ -31633,32 +32897,59 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             InputSelectAll(s, app, win);
             return true;
         case InputAction::SelectToStart:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win, 0);
+            SelectAllCursorsTo(s, app, win, [&](const CursorSelection&, bool) {
+                return TargetAt(0);
+            });
             return true;
         case InputAction::SelectToEnd:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win, t.len);
+            SelectAllCursorsTo(s, app, win, [&](const CursorSelection&, bool) {
+                return TargetAt(t.len);
+            });
             return true;
         case InputAction::SelectToStartOfLine:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win, InputStartOfLine(s, win));
+            SelectAllCursorsTo(
+                s, app, win, [&](const CursorSelection& c, bool active) {
+                    return WithCursor(s, c, active, [&] {
+                        return TargetAt(InputStartOfLine(s, win));
+                    });
+                });
             return true;
         case InputAction::SelectToEndOfLine:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectToWithAffinity(s, app, win, InputEndOfLine(s, win),
-                                      true);
+            SelectAllCursorsTo(
+                s, app, win, [&](const CursorSelection& c, bool active) {
+                    return WithCursor(s, c, active, [&] {
+                        return TargetAt(InputEndOfLine(s, win), true);
+                    });
+                });
             return true;
         case InputAction::SelectToPreviousWordStart:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win, InputPreviousStartOfWord(s));
+            SelectAllCursorsTo(
+                s, app, win, [&](const CursorSelection& c, bool active) {
+                    return WithCursor(s, c, active, [&] {
+                        return TargetAt(InputPreviousStartOfWord(s));
+                    });
+                });
             return true;
         case InputAction::SelectToNextWordEnd:
-            UndoBreakCoalescing(&s->undo);
-            InputSelectTo(s, app, win, InputNextEndOfWord(s));
+            SelectAllCursorsTo(s, app, win,
+                               [&](const CursorSelection& c, bool active) {
+                                   return WithCursor(s, c, active, [&] {
+                                       return TargetAt(InputNextEndOfWord(s));
+                                   });
+                               });
             return true;
+        case InputAction::AddCursorAbove:
+            AddCursorVertical(s, app, win, -1);
+            return InputIsMultiLine(s);
+        case InputAction::AddCursorBelow:
+            AddCursorVertical(s, app, win, 1);
+            return InputIsMultiLine(s);
 
         case InputAction::Backspace: {
+            if (s->extraCursors.len > 0) {
+                DeleteSelections(s, app, win, EditIntent::Backspace, false);
+                return true;
+            }
             EditIntent intent = EditIntent::Atomic;
             if (s->selectedRange.IsEmpty()) {
                 InputSelectTo(s, app, win,
@@ -31676,6 +32967,10 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             return true;
         }
         case InputAction::Delete: {
+            if (s->extraCursors.len > 0) {
+                DeleteSelections(s, app, win, EditIntent::DeleteForward, true);
+                return true;
+            }
             EditIntent intent = EditIntent::Atomic;
             if (s->selectedRange.IsEmpty()) {
                 InputSelectTo(s, app, win,
@@ -31757,14 +33052,22 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             if (InputAcceptInlineCompletion(s, app, win)) {
                 return true;
             }
-            return DoIndent(s, app, win, false);
+            return ApplyIndent(s, app, win, IndentDirection::Indent, false);
         case InputAction::Indent:
-            return DoIndent(s, app, win, true);
+            return ApplyIndent(s, app, win, IndentDirection::Indent, true);
         case InputAction::OutdentInline:
+            return ApplyIndent(s, app, win, IndentDirection::Outdent, false);
         case InputAction::Outdent:
-            return DoOutdent(s, app, win);
+            return ApplyIndent(s, app, win, IndentDirection::Outdent, true);
 
         case InputAction::Escape:
+
+            if (s->extraCursors.len > 0) {
+                UndoBreakCoalescing(&s->undo);
+                InputRemoveExtraCursors(s);
+                Notify(app, win);
+                return true;
+            }
 
             if (InputHasInlineCompletion(s)) {
                 InputClearInlineCompletion(s);
@@ -31798,8 +33101,13 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             if (text.len == 0) {
                 return true;
             }
+
             s->undo.hasPendingIntent = true;
             s->undo.pendingIntent = EditIntent::Atomic;
+            if (InputIsMultiLine(s) && s->extraCursors.len > 0 &&
+                PasteLinesToCursors(s, app, win, text)) {
+                return true;
+            }
             InputReplaceTextInRange(s, app, win, nullptr, text);
             return true;
         }
@@ -31890,20 +33198,25 @@ void InputOpenSearch(InputState* s, App* app, Window* win, bool replaceMode) {
     if (!s || !s->searchable) {
         return;
     }
+    s->searchActivationRevision++;
     s->search.open = true;
     s->search.replaceMode = replaceMode && InputIsReplaceable(s);
 
     Str selected = InputSelectedValue(s);
-    if (selected.len > 0) {
-        StrFree(s->search.query);
-        s->search.query = StrDup(selected);
-    }
-    s->search.anchorOffset = FirstVisibleOffset(s);
-    SearchMatcherUpdateQuery(&s->search.matcher, s->search.query,
-                             s->search.caseInsensitive);
+    Str query = selected.len > 0 ? selected : s->search.query;
+    bool queryChanged = !StrEq(query, s->search.query);
+
+    s->search.anchorOffset = queryChanged ? FirstVisibleOffset(s) : -1;
+    SearchSessionSetQuery(&s->search, query, s->search.caseInsensitive);
     SearchMatcherUpdate(&s->search.matcher, InputValue(s));
-    SearchMatcherCursorByOffset(&s->search.matcher, s->search.anchorOffset);
+    if (queryChanged && s->search.anchorOffset >= 0) {
+        SearchMatcherCursorByOffset(&s->search.matcher, s->search.anchorOffset);
+    }
     Notify(app, win);
+}
+
+uint64_t InputSearchActivationRevision(const InputState* s) {
+    return s ? s->searchActivationRevision : 0;
 }
 
 void InputCloseSearch(InputState* s, App* app, Window* win) {
@@ -31936,16 +33249,13 @@ bool InputSearchNext(InputState* s, App* app, Window* win, Selection* out) {
     if (!s) {
         return false;
     }
-    int was = SearchMatcherIndex(&s->search.matcher);
     Selection r = {};
     if (!SearchMatcherNext(&s->search.matcher, &r)) {
         return false;
     }
 
-    InputMoveDir dir = SearchMatcherIndex(&s->search.matcher) > was
-                           ? InputMoveDir::Down
-                           : InputMoveDir::None;
-    InputScrollToOffset(s, r.end, dir);
+    InputScrollToOffsetWithPadding(s, r.end, InputMoveDir::None,
+                                   InputScrollPadding::SurroundingLines);
     Notify(app, win);
     if (out) {
         *out = r;
@@ -31957,15 +33267,13 @@ bool InputSearchPrev(InputState* s, App* app, Window* win, Selection* out) {
     if (!s) {
         return false;
     }
-    int was = SearchMatcherIndex(&s->search.matcher);
     Selection r = {};
     if (!SearchMatcherPrev(&s->search.matcher, &r)) {
         return false;
     }
-    InputMoveDir dir = SearchMatcherIndex(&s->search.matcher) < was
-                           ? InputMoveDir::Up
-                           : InputMoveDir::None;
-    InputScrollToOffset(s, r.start, dir);
+
+    InputScrollToOffsetWithPadding(s, r.start, InputMoveDir::None,
+                                   InputScrollPadding::SurroundingLines);
     Notify(app, win);
     if (out) {
         *out = r;
@@ -32317,6 +33625,10 @@ bool SearchMatcherPrev(SearchMatcher* m, Selection* out) {
 }
 
 void SearchSessionSetQuery(SearchSession* s, Str query, bool insensitive) {
+
+    if (StrEq(s->query, query) && s->caseInsensitive == insensitive) {
+        return;
+    }
     StrFree(s->query);
     s->query = query.len > 0 ? StrDup(query) : Str{};
     s->caseInsensitive = insensitive;
@@ -32902,9 +34214,9 @@ static void TransactionFree(UndoTransaction* t) {
         ChangeFree(&t->changes[i]);
     }
     free(t->changes);
-    t->changes = nullptr;
-    t->len = 0;
-    t->cap = 0;
+    free(t->selsBefore);
+    free(t->selsAfter);
+    *t = {};
 }
 
 static void TransactionPush(UndoTransaction* t, Change c) {
@@ -32921,6 +34233,17 @@ static void TransactionPush(UndoTransaction* t, Change c) {
     t->changes[t->len++] = c;
 }
 
+static CursorSelection* SelsDup(const CursorSelection* sels, int n) {
+    if (!sels || n <= 0) {
+        return nullptr;
+    }
+    auto* p = (CursorSelection*)malloc((size_t)n * sizeof(CursorSelection));
+    if (p) {
+        memcpy(p, sels, (size_t)n * sizeof(CursorSelection));
+    }
+    return p;
+}
+
 static void StackClear(Vec<UndoTransaction>& v) {
     for (int i = 0; i < v.len; i++) {
         TransactionFree(&v[i]);
@@ -32931,9 +34254,7 @@ static void StackClear(Vec<UndoTransaction>& v) {
 UndoManager::~UndoManager() {
     StackClear(undos);
     StackClear(redos);
-    if (hasPending) {
-        ChangeFree(&pending);
-    }
+    TransactionFree(&pending);
 }
 
 static bool IsAdjacent(EditIntent intent, const Change& prev,
@@ -32963,22 +34284,88 @@ static bool IsAdjacent(EditIntent intent, const Change& prev,
     return false;
 }
 
+static Change Shifted(Change c, int by) {
+    auto shift = [by](int off) {
+        int v = off + by;
+        return v < 0 ? 0 : v;
+    };
+    c.oldRange = Selection{shift(c.oldRange.start), shift(c.oldRange.end)};
+    c.newRange = Selection{shift(c.newRange.start), shift(c.newRange.end)};
+    return c;
+}
+
+static bool IsAdjacentBatch(EditIntent intent, const Change* prev,
+                            const Change* cur, int n) {
+    int shift = 0;
+    for (int i = n - 1; i >= 0; i--) {
+        if (!IsAdjacent(intent, Shifted(prev[i], shift), cur[i])) {
+            return false;
+        }
+        shift += prev[i].newText.len - prev[i].oldText.len;
+    }
+    return true;
+}
+
 static bool RangeSame(Selection a, Selection b) {
     return a.start == b.start && a.end == b.end;
 }
 
-static void PushTransaction(UndoManager* m, Change change, EditIntent intent) {
+static bool IsNoopBatch(const UndoTransaction* t) {
+    if (t->len == 0) {
+        return true;
+    }
+    const Change* last = &t->changes[0];
+    for (int i = 1; i < t->len; i++) {
+        const Change* c = &t->changes[i];
+        if (!RangeSame(last->newRange, c->oldRange)) {
+            return false;
+        }
+        last = c;
+    }
+    return RangeSame(t->changes[0].oldRange, last->newRange) &&
+           base::StrEq(t->changes[0].oldText, last->newText);
+}
+
+static void PushBatch(UndoManager* m, UndoTransaction batch,
+                      EditIntent intent) {
+    if (batch.len == 0) {
+        TransactionFree(&batch);
+        return;
+    }
     StackClear(m->redos);
     bool canCoalesce = false;
     if (!m->coalescingBoundary && intent != EditIntent::Atomic &&
         m->undos.len > 0) {
         UndoTransaction& prev = m->undos[m->undos.len - 1];
-        canCoalesce = prev.intent == intent &&
-                      prev.len < kMaxChangesPerTransaction && prev.len > 0 &&
-                      IsAdjacent(intent, prev.changes[prev.len - 1], change);
+        canCoalesce =
+            prev.intent == intent && prev.lastBatchLen == batch.len &&
+            prev.len + batch.len <= kMaxChangesPerTransaction &&
+            IsAdjacentBatch(intent, prev.changes + prev.len - prev.lastBatchLen,
+                            batch.changes, batch.len);
     }
     if (canCoalesce) {
-        TransactionPush(&m->undos[m->undos.len - 1], change);
+        UndoTransaction& prev = m->undos[m->undos.len - 1];
+        for (int i = 0; i < batch.len; i++) {
+            TransactionPush(&prev, batch.changes[i]);
+        }
+        prev.lastBatchLen = batch.len;
+
+        if (batch.selsBefore && !prev.selsBefore) {
+            prev.selsBefore = batch.selsBefore;
+            prev.nSelsBefore = batch.nSelsBefore;
+            batch.selsBefore = nullptr;
+            batch.nSelsBefore = 0;
+        }
+        if (batch.selsAfter) {
+            free(prev.selsAfter);
+            prev.selsAfter = batch.selsAfter;
+            prev.nSelsAfter = batch.nSelsAfter;
+            batch.selsAfter = nullptr;
+            batch.nSelsAfter = 0;
+        }
+
+        batch.len = 0;
+        TransactionFree(&batch);
         return;
     }
     if (m->undos.len >= kMaxUndoTransactions) {
@@ -32987,10 +34374,9 @@ static void PushTransaction(UndoManager* m, Change change, EditIntent intent) {
                 (size_t)(m->undos.len - 1) * sizeof(UndoTransaction));
         m->undos.len--;
     }
-    UndoTransaction t = {};
-    t.intent = intent;
-    TransactionPush(&t, change);
-    VecAppend(m->undos, t);
+    batch.intent = intent;
+    batch.lastBatchLen = batch.len;
+    VecAppend(m->undos, batch);
     m->coalescingBoundary = intent == EditIntent::Atomic;
 }
 
@@ -33006,55 +34392,80 @@ void UndoRecordTransaction(UndoManager* m, Change change, EditIntent intent) {
         UndoBreakCoalescing(m);
         return;
     }
-    if (m->transactionOpen) {
-        if (m->hasPending) {
-
-            StrFree(m->pending.newText);
-            m->pending.newRange = change.newRange;
-            m->pending.newText = change.newText;
-            m->pending.selAfter = change.selAfter;
-            StrFree(change.oldText);
-        } else {
-            m->pending = change;
-            m->hasPending = true;
-        }
+    if (m->transactionDepth > 0) {
+        TransactionPush(&m->pending, change);
         return;
     }
-    PushTransaction(m, change, intent);
+    UndoTransaction t = {};
+    TransactionPush(&t, change);
+    PushBatch(m, t, intent);
+}
+
+void UndoBeginTransactionWith(UndoManager* m, EditIntent intent) {
+    m->transactionDepth++;
+    if (m->transactionDepth == 1) {
+        TransactionFree(&m->pending);
+        m->pending.intent = intent;
+    }
 }
 
 void UndoBeginTransaction(UndoManager* m) {
-    if (m->transactionOpen) {
-        return;
-    }
-    m->transactionOpen = true;
-    if (m->hasPending) {
-        ChangeFree(&m->pending);
-        m->hasPending = false;
-    }
+    UndoBeginTransactionWith(m, EditIntent::Atomic);
 }
 
 void UndoCommitTransaction(UndoManager* m) {
-    if (!m->transactionOpen) {
+    if (m->transactionDepth == 0) {
         return;
     }
-    m->transactionOpen = false;
-    if (!m->hasPending) {
+    m->transactionDepth--;
+    if (m->transactionDepth > 0) {
         return;
     }
-    Change c = m->pending;
-    m->hasPending = false;
+    UndoTransaction t = m->pending;
     m->pending = {};
-    if (!RangeSame(c.oldRange, c.newRange) ||
-        !base::StrEq(c.oldText, c.newText)) {
-        PushTransaction(m, c, EditIntent::Atomic);
-    } else {
-        ChangeFree(&c);
+    if (t.len == 0 || IsNoopBatch(&t)) {
+        TransactionFree(&t);
+        return;
+    }
+    PushBatch(m, t, t.intent);
+}
+
+static void CommitAllTransactions(UndoManager* m) {
+    if (m->transactionDepth == 0) {
+        return;
+    }
+    m->transactionDepth = 1;
+    UndoCommitTransaction(m);
+}
+
+void UndoRecordSelections(UndoManager* m, const CursorSelection* before,
+                          int nBefore, const CursorSelection* after,
+                          int nAfter) {
+    if (m->ignoring) {
+        return;
+    }
+    UndoTransaction* t = nullptr;
+    if (m->transactionDepth > 0) {
+        t = &m->pending;
+    } else if (m->undos.len > 0) {
+        t = &m->undos[m->undos.len - 1];
+    }
+    if (!t) {
+        return;
+    }
+    if (before && nBefore > 0 && !t->selsBefore) {
+        t->selsBefore = SelsDup(before, nBefore);
+        t->nSelsBefore = nBefore;
+    }
+    if (after && nAfter > 0) {
+        free(t->selsAfter);
+        t->selsAfter = SelsDup(after, nAfter);
+        t->nSelsAfter = nAfter;
     }
 }
 
 void UndoBreakCoalescing(UndoManager* m) {
-    UndoCommitTransaction(m);
+
     m->coalescingBoundary = true;
 }
 
@@ -33065,24 +34476,21 @@ bool UndoIsIgnoring(const UndoManager* m) {
 void UndoSetIgnoring(UndoManager* m, bool ignoring) {
     m->ignoring = ignoring;
     if (ignoring) {
-        UndoCommitTransaction(m);
+        CommitAllTransactions(m);
     }
 }
 
 void UndoClear(UndoManager* m) {
     StackClear(m->undos);
     StackClear(m->redos);
-    m->transactionOpen = false;
-    if (m->hasPending) {
-        ChangeFree(&m->pending);
-        m->hasPending = false;
-    }
+    m->transactionDepth = 0;
+    TransactionFree(&m->pending);
     m->hasPendingIntent = false;
     m->coalescingBoundary = false;
 }
 
 const UndoTransaction* UndoPopUndo(UndoManager* m) {
-    UndoCommitTransaction(m);
+    CommitAllTransactions(m);
     if (m->undos.len == 0) {
         return nullptr;
     }
@@ -33095,7 +34503,7 @@ const UndoTransaction* UndoPopUndo(UndoManager* m) {
 }
 
 const UndoTransaction* UndoPopRedo(UndoManager* m) {
-    UndoCommitTransaction(m);
+    CommitAllTransactions(m);
     if (m->redos.len == 0) {
         return nullptr;
     }
@@ -35010,13 +36418,9 @@ static bool NavTop(const NavStackState* s, EntityId* view, int* index) {
     return true;
 }
 
-static bool NavUndoOne(NavStackState* s, EntityId* view) {
-    Vec<NavEntry> undone = s->history.Undo();
-    if (undone.len <= 0) {
-        return false;
-    }
-    *view = undone[0].view;
-    return true;
+static bool NavBackOne(NavStackState* s, EntityId* view) {
+    *view = s->Current();
+    return s->history.Back();
 }
 
 static void NavEmit(NavStackState* s, Ctx* cx, NavStackEvent event) {
@@ -35063,7 +36467,7 @@ EntityId NavStackPop(NavStackState* s, Ctx* cx, NavMotion motion) {
     int index = 0;
     bool hasPopped = NavTop(s, &popped, &index);
     EntityId undone = {};
-    if (!NavUndoOne(s, &undone)) {
+    if (!NavBackOne(s, &undone)) {
         return {};
     }
     NavFinish(s, cx, hasPopped, popped, index, NavOperation::Pop, motion,
@@ -35078,7 +36482,7 @@ Vec<EntityId> NavStackPopToRoot(NavStackState* s, Ctx* cx, NavMotion motion) {
     Vec<EntityId> popped;
     while (s->Depth() > 1) {
         EntityId view = {};
-        if (!NavUndoOne(s, &view)) {
+        if (!NavBackOne(s, &view)) {
             break;
         }
         VecAppend(popped, view);
@@ -35101,11 +36505,11 @@ EntityId NavStackForward(NavStackState* s, Ctx* cx, NavMotion motion) {
     EntityId outgoing = {};
     int index = 0;
     bool hasOutgoing = NavTop(s, &outgoing, &index);
-    Vec<NavEntry> redone = s->history.Redo();
-    if (redone.len <= 0) {
+    NavEntry redone;
+    if (!s->history.Forward(&redone)) {
         return {};
     }
-    EntityId view = redone[0].view;
+    EntityId view = redone.view;
     NavFinish(s, cx, hasOutgoing, outgoing, index, NavOperation::Push, motion,
               NavStackEvent::Forwarded);
     return view;
@@ -37086,6 +38490,33 @@ ResizablePanelGroup* ResizablePanelGroup::Children(ResizablePanel** values,
     return this;
 }
 
+void ResizableState::OnSettled(ResizableState*, Ctx* cx, const void*) {
+    Notify(cx);
+}
+
+static void MeasureResizableGroup(PaintCtx* paint, El* root, void* data) {
+    Entity<ResizableState> entity = *(Entity<ResizableState>*)data;
+    ResizableState* state = entity.Get(paint->app);
+    if (!state) return;
+    bool horizontal = AxisIsHorizontal(state->axis);
+    float container = horizontal ? root->w : root->h;
+    state->bounds = {root->x, root->y, root->w, root->h};
+    if (container <= 0 || container == state->lastContainer) return;
+    if (state->lastContainer <= 0) {
+        El* panel = root->first;
+        for (int i = 0; i < state->sizes.len && panel; i++) {
+            if (!state->shown[i]) continue;
+            state->sizes[i] = horizontal ? panel->w : panel->h;
+            panel = panel->next;
+        }
+    } else {
+        ResizableAdjustToContainer(state->sizes.els, state->sizes.len,
+                                   container);
+    }
+    state->lastContainer = container;
+    WindowPost(paint->window, ListenTo(entity, &ResizableState::OnSettled));
+}
+
 El* ResizablePanelGroup::IntoEl() {
     ResizableState* s = state.Get(cx);
     if (s) {
@@ -37113,7 +38544,7 @@ El* ResizablePanelGroup::IntoEl() {
         VecClear(s->maxs);
         for (int i = 0; i < panels.len; i++) {
 
-            VecAppend(s->sizes, grows[i] ? 0 : sizes[i]);
+            VecAppend(s->sizes, sizes[i]);
             VecAppend(s->mins, mins[i]);
 
             VecAppend(s->maxs, maxs[i] > 0 ? maxs[i] : 1e9f);
@@ -37135,34 +38566,10 @@ El* ResizablePanelGroup::IntoEl() {
         VecAppend(s->laid, Bounds{});
     }
 
-    float container = horiz ? s->bounds.w : s->bounds.h;
-    bool resolved = true;
-    bool anyGrow = false;
-    for (int i = 0; i < panels.len; i++) {
-        if (shown[i] && grows[i]) {
-            anyGrow = true;
-        }
-
-        if (grows[i]) {
-            continue;
-        }
-        if (s->sizes[i] <= 0 && shown[i] && i < s->laid.len) {
-            float was = horiz ? s->laid[i].w : s->laid[i].h;
-            if (was > 0) {
-                s->sizes[i] = was;
-            }
-        }
-        resolved = resolved && (s->sizes[i] > 0 || !shown[i]);
-    }
-
-    if (!anyGrow && resolved && container > 0 && s->lastContainer > 0 &&
-        container != s->lastContainer) {
-        ResizableAdjustToContainer(s->sizes.els, s->sizes.len, container);
-    }
-    if (resolved && container > 0) {
-        s->lastContainer = container;
-    }
-    root->BoundsOut(&s->bounds);
+    auto* measuredState = ArenaNew<Entity<ResizableState>>(a);
+    *measuredState = state;
+    root->customUser = measuredState;
+    root->customPaint = &MeasureResizableGroup;
 
     Listener down = ListenTo(state, &ResizableState::OnHandleDown, 0);
     Listener drag = ListenTo(state, &ResizableState::OnHandleDrag);
@@ -38508,7 +39915,8 @@ SelectAction SelectActionOf(uint32_t id, bool open, bool disabled) {
 }
 
 El* Select::New(Ctx* cx, Str id, bool open, bool disabled,
-                Str accessibilityLabel, Listener onOpenChange) {
+                Str accessibilityLabel, Listener onOpenChange,
+                Str accessibilityValue) {
     Arena* a = cx->a;
     El* e = Div(a)
                 ->Id(id)
@@ -38517,6 +39925,9 @@ El* Select::New(Ctx* cx, Str id, bool open, bool disabled,
                 ->AriaDisabled(disabled);
     if (accessibilityLabel.s) {
         e->AriaLabel(accessibilityLabel);
+    }
+    if (accessibilityValue.s) {
+        e->AriaValue(accessibilityValue);
     }
     if (!disabled && onOpenChange.IsValid()) {
         e->OnAccessibilityDefault(ListenerFill(onOpenChange, !open));
@@ -41942,9 +43353,34 @@ static Str MdDefUrl(MdBuild* b, Str identifier) {
 
 static void MdInlineNode(MdBuild* b, const md::Node* n) {
     switch (n->kind) {
-        case md::NodeKind::Text:
-            base_text_AddText(b, V(b, n, md::NodeStrKind::Value));
+        case md::NodeKind::Text: {
+
+            Str value = V(b, n, md::NodeStrKind::Value);
+            int firstBreak = 0;
+            while (firstBreak < value.len && value.s[firstBreak] != '\r' &&
+                   value.s[firstBreak] != '\n') {
+                firstBreak++;
+            }
+            if (firstBreak == value.len) {
+                base_text_AddText(b, value);
+                break;
+            }
+            StrBuilder text(b->a);
+            text.Reserve(value.len);
+            for (int i = 0; i < value.len; i++) {
+                char c = value.s[i];
+                if (c == '\r' || c == '\n') {
+                    if (c == '\r' && i + 1 < value.len &&
+                        value.s[i + 1] == '\n') {
+                        i++;
+                    }
+                    c = ' ';
+                }
+                text.AppendChar(c);
+            }
+            base_text_AddText(b, text.TakeStr());
             break;
+        }
         case md::NodeKind::Emphasis:
             MdMarked(b, n, MdItalic);
             break;
@@ -44304,19 +45740,7 @@ Point TilesConstrainOrigin(const TilesState* s, Point origin) {
 }
 
 static void PushChange(TilesState* s, const TileChange& c) {
-    if (s->ignoring) {
-        return;
-    }
-    if (s->cursor >= kMaxTileChanges) {
-
-        for (int i = 1; i < kMaxTileChanges; i++) {
-            s->changes[i - 1] = s->changes[i];
-        }
-        s->cursor = kMaxTileChanges - 1;
-    }
-    s->changes[s->cursor] = c;
-    s->cursor++;
-    s->nChange = s->cursor;
+    s->history.Push(c);
 }
 
 void TilesBeginMove(TilesState* s, int ix, float x, float y) {
@@ -44506,10 +45930,10 @@ int TilesBringToFront(TilesState* s, int ix) {
 }
 
 bool TilesCanUndo(const TilesState* s) {
-    return s->cursor > 0;
+    return s->history.CanUndo();
 }
 bool TilesCanRedo(const TilesState* s) {
-    return s->cursor < s->nChange;
+    return s->history.CanRedo();
 }
 
 static void MoveItem(TilesState* s, int from, int to) {
@@ -44534,30 +45958,34 @@ void TilesUndo(TilesState* s) {
     if (!TilesCanUndo(s)) {
         return;
     }
-    s->ignoring = true;
-    const TileChange& c = s->changes[--s->cursor];
-    if (c.hasBounds && c.tile >= 0 && c.tile < s->items.len) {
-        s->items[c.tile].bounds = c.oldBounds;
+    s->history.SetIgnoring(true);
+    Vec<TileChange> changes = s->history.Undo();
+    for (const TileChange& c : changes) {
+        if (c.hasBounds && c.tile >= 0 && c.tile < s->items.len) {
+            s->items[c.tile].bounds = c.oldBounds;
+        }
+        if (c.hasOrder) {
+            MoveItem(s, c.newOrder, c.oldOrder);
+        }
     }
-    if (c.hasOrder) {
-        MoveItem(s, c.newOrder, c.oldOrder);
-    }
-    s->ignoring = false;
+    s->history.SetIgnoring(false);
 }
 
 void TilesRedo(TilesState* s) {
     if (!TilesCanRedo(s)) {
         return;
     }
-    s->ignoring = true;
-    const TileChange& c = s->changes[s->cursor++];
-    if (c.hasBounds && c.tile >= 0 && c.tile < s->items.len) {
-        s->items[c.tile].bounds = c.newBounds;
+    s->history.SetIgnoring(true);
+    Vec<TileChange> changes = s->history.Redo();
+    for (const TileChange& c : changes) {
+        if (c.hasBounds && c.tile >= 0 && c.tile < s->items.len) {
+            s->items[c.tile].bounds = c.newBounds;
+        }
+        if (c.hasOrder) {
+            MoveItem(s, c.oldOrder, c.newOrder);
+        }
     }
-    if (c.hasOrder) {
-        MoveItem(s, c.oldOrder, c.newOrder);
-    }
-    s->ignoring = false;
+    s->history.SetIgnoring(false);
 }
 
 void TilesState::OnMoveDown(TilesState* self, Ctx* cx, const MouseDownEvent* ev,
@@ -45424,7 +46852,8 @@ static Ctx TooltipContext(Window* win) {
     return cx;
 }
 
-void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds) {
+void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds,
+                        int placement) {
     TooltipOverlay* overlay = TooltipGet(win);
     if (!overlay) {
         return;
@@ -45441,6 +46870,11 @@ void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds) {
     }
     Ctx cx = TooltipContext(win);
     TooltipRequest request = TooltipRequest::Text(triggerBounds, text);
+
+    if (placement >= (int)gpui::Placement::Top &&
+        placement <= (int)gpui::Placement::Right) {
+        request.Placement((gpui::Placement)placement);
+    }
     overlay->RequestShow(request, win, &cx);
 }
 
@@ -45964,6 +47398,8 @@ void TreeBindKeys(Ctx* cx, El* root, Entity<TreeState> state) {
 }
 
 }
+
+#line 1 "src/base/undo_history.cpp"
 
 #line 1 "src/base/virtual_list.cpp"
 
@@ -48132,8 +49568,11 @@ El* ButtonIcon::IntoEl() {
     if (loading && variant == ButtonIconVariant::Icon) {
         Spinner* wait = Spinner::New(cx)->Size(px);
         if (loadingIcon) {
-            if (loadingIcon->name != IconName::None)
+            if (loadingIcon->source == component::IconSource::Data) {
+                wait->IconData(loadingIcon->data);
+            } else if (loadingIcon->name != IconName::None) {
                 wait->Icon(loadingIcon->name);
+            }
             if (loadingIcon->hasColor) wait->Color(loadingIcon->color);
         } else if (loadingIconName != IconName::None) {
             wait->Icon(loadingIconName);
@@ -48357,6 +49796,10 @@ Button* Button::Tooltip(Str s) {
     tooltip = s;
     return this;
 }
+Button* Button::TooltipPlacement(gpui::Placement placement) {
+    tooltipPlacement = (int8_t)placement;
+    return this;
+}
 Button* Button::AccessibilityLabel(Str s) {
     accessibilityLabel = s;
     return this;
@@ -48535,6 +49978,9 @@ El* Button::IntoEl() {
     if (selected) {
 
         switch (variant) {
+            case ButtonVariant::Ghost:
+                bg = th.tokens.secondaryActive;
+                break;
             case ButtonVariant::Link:
             case ButtonVariant::Text:
                 bg = clear;
@@ -48728,6 +50174,10 @@ El* Button::IntoEl() {
         e->OnClickAction(clickAction, clickActionArg);
     }
 
+    if (loading) {
+        e->StopClick();
+    }
+
     e->Fg(fg);
 
     if (interactive && !selected) {
@@ -48753,6 +50203,9 @@ El* Button::IntoEl() {
     }
     if (tooltip.s) {
         e->Tip(tooltip);
+        if (tooltipPlacement >= 0) {
+            e->TipPlacement(tooltipPlacement);
+        }
     }
 
     if (loading && !disabled) {
@@ -50184,20 +51637,16 @@ static void SankeyLabelLine(PaintCtx* ctx, Str text, float x, float y,
     if (!text.s || text.len <= 0 || maxW <= 0) {
         return;
     }
-    Size size = {};
-    TextLayout* tl =
-        TextLayoutNew(ctx, text, fontSize, maxW, false, 0, 0, &size);
-    if (!tl) {
-        return;
-    }
+
+    text = plot::TruncateTextToWidth(ctx, GetTempArena(), text, fontSize, maxW);
+    Size size = MeasureText(ctx, text, fontSize, 0);
     float left = x;
     if (align < 0) {
         left = x - size.w;
     } else if (align == 0) {
         left = x - size.w / 2.f;
     }
-    TextLayoutDraw(ctx, tl, left, y, color, true);
-    TextLayoutRelease(tl);
+    DrawTextAt(ctx, text, left, y, size.w, size.h, fontSize, color, false);
 }
 
 static void PaintSankey(PaintCtx* ctx, El* e, void* user) {
@@ -52887,12 +54336,32 @@ El* DialogFooter::IntoEl() {
 
 DialogClose* DialogClose::New(Ctx* cx) {
     DialogClose* part = ArenaNew<DialogClose>(cx->a);
+    part->cx = cx;
     part->slot = gpui::DialogClose::New(cx);
     part->root = Div(cx->a)->W(kFill)->H(kFill)->Child(part->slot);
     return part;
 }
 DialogClose* DialogClose::Child(El* child) {
     slot->Child(child);
+    return this;
+}
+DialogClose* DialogClose::Trigger(Button* button) {
+    if (!button) {
+        return this;
+    }
+
+    button->AccessibilityLabel(StrL("Close"))->OnClickAction(action::Cancel());
+    El* trigger = button->IntoEl();
+    El* was = slot;
+    slot = gpui::DialogClose::WithTrigger(cx, trigger);
+
+    for (El* child = was ? was->first : nullptr; child;) {
+        El* next = child->next;
+        child->next = nullptr;
+        slot->Child(child);
+        child = next;
+    }
+    root = Div(cx->a)->W(kFill)->H(kFill)->Child(slot);
     return this;
 }
 El* DialogClose::IntoEl() {
@@ -53174,19 +54643,14 @@ El* Dialog::IntoEl(WinSize size) {
         panel->Child(Actions());
     }
     if (closeButton) {
-        El* x = Div(a)
-                    ->Absolute()
-                    ->Top(8)
-                    ->Right(8)
-                    ->W(24)
-                    ->H(24)
-                    ->ItemsCenter()
-                    ->JustifyCenter()
-                    ->Radius(th.radius)
-                    ->HoverBg(th.secondaryHover)
-                    ->Child(IconEl(a, IconName::X, 14)->Fg(th.mutedFg));
-        x->PathClick(LayerId(StrL("dialog-close-x")))
-            ->OnClickAction(action::Cancel());
+
+        El* x = DialogClose::New(cx)
+                    ->Trigger(Button::New(cx, LayerId(StrL("dialog-close-x")))
+                                  ->WithSize(UiSize::Small)
+                                  ->Ghost()
+                                  ->Icon(IconName::Close))
+                    ->IntoEl();
+        x->Absolute()->Top(8)->Right(8)->W(kAuto)->H(kAuto);
         panel->Child(x);
     }
 
@@ -55204,7 +56668,7 @@ static int SemanticSpans(Ctx* cx, InputState* state, Str text, TextSpan* out,
     if (!state || state->semanticTokens.len == 0 || !text.s) {
         return 0;
     }
-    const int kWindow = 1024;
+    const int kWindow = std::min(1024, state->semanticTokens.len);
     auto* window =
         (SemanticRange*)Alloc(cx->a, (int)sizeof(SemanticRange) * kWindow);
     if (!window) {
@@ -55354,13 +56818,17 @@ El* Highlighter::IntoEl() {
     }
 
     const int kMaxSpans = 4096;
-    auto* spans = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * kMaxSpans);
-    int n = spans ? SemanticSpans(cx, state, text, spans, kMaxSpans) : 0;
+    int semanticCap = state ? std::min(1024, state->semanticTokens.len) : 0;
+    int cap = std::min(kMaxSpans,
+                       semanticCap + 2 * std::min(kMaxSpans, nDecorations));
+    auto* spans =
+        cap > 0 ? (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * cap) : nullptr;
+    int n = spans ? SemanticSpans(cx, state, text, spans, semanticCap) : 0;
     if (nDecorations > 0 && spans) {
-        auto* tmp = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * kMaxSpans);
+        auto* tmp = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * cap);
         if (tmp) {
-            n = InputComposeSpans(spans, n, decorations, nDecorations,
-                                  kMaxSpans, tmp);
+            n = InputComposeSpans(spans, n, decorations, nDecorations, cap,
+                                  tmp);
         }
     }
     style.spans = n > 0 ? spans : nullptr;
@@ -55657,6 +57125,13 @@ Icon* Icon::Empty(Ctx* cx) {
 
 Icon* Icon::Path(Str assetPath) {
     path = assetPath;
+    source = IconSource::Path;
+    return this;
+}
+
+Icon* Icon::Data(Str svg) {
+    data = svg.len > 0 ? StrDup(a, svg) : Str{};
+    source = IconSource::Data;
     return this;
 }
 
@@ -55689,7 +57164,9 @@ Icon* Icon::Rotate(float turns) {
 
 El* Icon::IntoEl() {
     El* e = hasSize ? IconEl(a, name, size) : IconEl(a, name);
-    if (path.s) {
+    if (source == IconSource::Data) {
+        e->iconSvg = data;
+    } else if (path.s) {
         e->iconPath = path;
     }
     if (hasColor) {
@@ -56790,6 +58267,7 @@ struct SearchPanelState {
     bool seeded = false;
 
     bool wasOpen = false;
+    uint64_t activationRevision = 0;
 
     static void OnQueryEvent(SearchPanelState* self, Ctx* cx,
                              const InputEvent* ev);
@@ -56961,8 +58439,10 @@ El* SearchPanel::IntoEl() {
         return Div(a);
     }
 
-    if (!st->wasOpen) {
+    if (!st->wasOpen ||
+        st->activationRevision != target->searchActivationRevision) {
         st->wasOpen = true;
+        st->activationRevision = target->searchActivationRevision;
         InputSetValue(&st->query, ss->query);
         InputFocus(&st->query, cx->app, cx->win);
         InputSelectAll(&st->query, cx->app, cx->win);
@@ -58468,11 +59948,12 @@ El* List::IntoEl() {
     }
 
     float itemH = s->rowH;
-    if (delegate.renderItem) {
-        int measureEntry = ListEntryOf(s, s->itemToMeasure);
-        if (measureEntry < 0) {
-            measureEntry = 0;
-        }
+
+    int measureEntry = ListEntryOf(s, s->itemToMeasure);
+    if (measureEntry < 0 && s->count > 0) {
+        measureEntry = 0;
+    }
+    if (delegate.renderItem && measureEntry >= 0) {
         ListRow m = ListRowAt(s, ListRowOfEntry(s, measureEntry));
         ListItem* probe =
             delegate.renderItem(cx, delegate.data, m.section, m.row, m.entry);
@@ -59137,6 +60618,21 @@ PopupMenu* PopupMenu::Menu(Str label, IconName icon) {
     }
     return this;
 }
+PopupMenu* PopupMenu::Menu(Str label, component::Icon* icon) {
+    MenuItem* it = MenuAdd(this, MenuItemKind::Item);
+    if (it) {
+        it->label = label;
+        if (icon) {
+            it->icon = icon->name;
+            if (icon->source == component::IconSource::Data) {
+                it->iconSvg = icon->data;
+            } else {
+                it->iconPath = icon->path;
+            }
+        }
+    }
+    return this;
+}
 PopupMenu* PopupMenu::MenuWithCheck(Str label, bool checked) {
     MenuItem* it = MenuAdd(this, MenuItemKind::Item);
     if (it) {
@@ -59165,8 +60661,8 @@ PopupMenu* PopupMenu::Link(Str label, Str href, IconName icon) {
 }
 PopupMenu* PopupMenu::Separator() {
 
-    if (items.len == 0 ||
-        items[items.len - 1].kind == MenuItemKind::Separator) {
+    if (items.len == 0 || items[items.len - 1]
+                                  .kind == MenuItemKind::Separator) {
         return this;
     }
     MenuAdd(this, MenuItemKind::Separator);
@@ -59411,8 +60907,14 @@ El* PopupMenu::IntoEl() {
         El* left = Div(a)->FlexRow()->Flex1()->Gap(4)->ItemsCenter();
         if (leftGutter) {
 
-            if (it.icon != IconName::None) {
-                left->Child(IconEl(a, it.icon, 14)->Fg(fg));
+            if (it.icon != IconName::None || it.iconSvg.s || it.iconPath.s) {
+                El* ic = IconEl(a, it.icon, 14)->Fg(fg);
+                if (it.iconSvg.s) {
+                    ic->iconSvg = it.iconSvg;
+                } else if (it.iconPath.s) {
+                    ic->iconPath = it.iconPath;
+                }
+                left->Child(ic);
             } else if (SideIsLeft(checkSide) && it.checked) {
                 left->Child(IconEl(a, IconName::Check, 14)->Fg(fg));
             } else {
@@ -59528,9 +61030,9 @@ El* DropdownMenu::IntoEl() {
                 trigger->PathClick(StrL("trigger"));
             }
 
-            trigger->OnClick(ListenTo(menu->state,
-                                      &PopupMenuState::OnTriggerClick,
-                                      (intptr_t)st->open));
+            trigger
+                ->OnClick(ListenTo(menu->state, &PopupMenuState::OnTriggerClick,
+                                   (intptr_t)st->open));
         }
         wrap->Child(trigger);
     }
@@ -59618,8 +61120,8 @@ El* ContextMenu::IntoEl() {
     context->open = st->open;
     context->position = {st->x, st->y};
 
-    box->PathClick(id)->OnMouseDown(
-        ListenTo(state, &ContextMenuState::OnMouseDown));
+    box->PathClick(id)
+        ->OnMouseDown(ListenTo(state, &ContextMenuState::OnMouseDown));
     if (st->open) {
         box->Child(
             menu->IntoEl()->Absolute()->Left(st->x)->Top(st->y)->Deferred());
@@ -60609,6 +62111,24 @@ NativeMenu* NativeMenu::MenuWithIcon(Str label, IconName icon, intptr_t id) {
     }
     return this;
 }
+NativeMenu* NativeMenu::MenuWithIcon(Str label, component::Icon* icon,
+                                     intptr_t id) {
+    NativeMenuItem* it = PushItem(this);
+    if (it) {
+        it->kind = NativeMenuItemKind::Item;
+        it->label = label;
+        it->id = id;
+        if (icon) {
+            it->icon = icon->name;
+            if (icon->source == component::IconSource::Data) {
+                it->iconSvg = icon->data;
+            } else {
+                it->iconPath = icon->path;
+            }
+        }
+    }
+    return this;
+}
 NativeMenu* NativeMenu::Separator() {
     NativeMenuItem* it = PushItem(this);
     if (it) {
@@ -60680,7 +62200,13 @@ static PlatMenuItem* ToPlat(Arena* a, const NativeMenu* m, int* nextId) {
             p.submenuN = it.submenu ? it.submenu->items.len : 0;
             continue;
         }
-        if (it.icon != IconName::None) {
+
+        if (it.iconSvg.s) {
+            p.iconSvg = StrDup(a, it.iconSvg).s;
+            p.iconSvgLen = it.iconSvg.len;
+        } else if (it.iconPath.s) {
+            p.iconPath = StrDup(a, it.iconPath).s;
+        } else if (it.icon != IconName::None) {
             p.iconPath = StrDup(a, IconNamePath(it.icon)).s;
         }
         if (!it.disabled) {
@@ -60749,6 +62275,14 @@ PopupMenu* NativeMenu::IntoPopupMenu(Str id) const {
         }
         if (it.checked) {
             menu->MenuWithCheck(it.label, it.checked);
+        } else if (it.iconSvg.s || it.iconPath.s) {
+            component::Icon* icon = component::Icon::New(cx, it.icon);
+            if (it.iconSvg.s) {
+                icon->Data(it.iconSvg);
+            } else {
+                icon->Path(it.iconPath);
+            }
+            menu->Menu(it.label, icon);
         } else {
             menu->Menu(it.label, it.icon);
         }
@@ -62270,13 +63804,9 @@ float MeasureTextWidth(PaintCtx* ctx, Str text, float fontSize) {
     if (!ctx || !ctx->pa || !text.s || text.len <= 0) {
         return 0;
     }
-    Size measured = {};
-    TextLayout* layout = TextLayoutNew(ctx, text, fontSize, 0, false,
-                                       kFontWeightExplicitNormal, 0, &measured);
-    if (layout) {
-        TextLayoutRelease(layout);
-    }
-    return measured.w;
+    return MeasureText(ctx, text, fontSize, 0, false, kFontWeightExplicitNormal,
+                       0)
+        .w;
 }
 
 static Str PrefixEllipsis(Arena* arena, Str text, int prefix) {
@@ -62354,22 +63884,19 @@ void PlotLabel::Paint(PaintCtx* ctx, Bounds bounds) const {
         if (!item.text.s || item.text.len <= 0) {
             continue;
         }
-        Size measured = {};
-        TextLayout* layout =
-            TextLayoutNew(ctx, item.text, item.fontSize, 0, false,
-                          PlotFontWeight(item.fontWeight), 0, &measured);
-        if (!layout) {
-            continue;
-        }
+
+        int weight = PlotFontWeight(item.fontWeight);
+        Size measured =
+            MeasureText(ctx, item.text, item.fontSize, 0, false, weight, 0);
         float x = bounds.x + item.origin.x;
         if (item.align == PlotTextAlign::Right) {
             x -= measured.w;
         } else if (item.align == PlotTextAlign::Center) {
             x -= measured.w * 0.5f;
         }
-        TextLayoutDraw(ctx, layout, x, bounds.y + item.origin.y, item.color,
-                       false);
-        TextLayoutRelease(layout);
+        DrawTextAt(ctx, item.text, x, bounds.y + item.origin.y, measured.w,
+                   measured.h, item.fontSize, item.color, false, false, 0,
+                   weight, 0);
     }
 }
 
@@ -65935,10 +67462,12 @@ El* Select::IntoEl() {
         SearchableListSearch(s, items, nItems,
                              query ? InputValue(query) : Str{});
     }
-    El* root =
-        gpui::Select::New(cx, id, open, disabled, accessibilityLabel, onToggle)
-            ->W(width)
-            ->Child(box);
+
+    Str accessibilityValue = SelectTriggerTitle(s, placeholder, titlePrefix, a);
+    El* root = gpui::Select::New(cx, id, open, disabled, accessibilityLabel,
+                                 onToggle, accessibilityValue)
+                   ->W(width)
+                   ->Child(box);
 
     El* wrap = Popup::New(cx, StrDup(a, fmt("%s-popup", id)), root)
                    ->Content(DropdownPlaceContent(menu))
@@ -67459,6 +68988,16 @@ SidebarMenuItem* SidebarMenuItem::Icon(IconName v) {
     icon = v;
     return this;
 }
+SidebarMenuItem* SidebarMenuItem::Refine(const Style& v, uint32_t fields) {
+    StyleApplyFields(&style, v, fields);
+    styleSet |= fields;
+    return this;
+}
+SidebarMenuItem* SidebarMenuItem::LabelStyle(const Style& v, uint32_t fields) {
+    StyleApplyFields(&labelStyle, v, fields);
+    labelStyleSet |= fields;
+    return this;
+}
 SidebarMenuItem* SidebarMenuItem::Active(bool v) {
     active = v;
     return this;
@@ -67526,6 +69065,8 @@ El* SidebarMenuItem::IntoEl(Str id) {
                   ->Radius(th.radius)
                   ->Font(14)
                   ->PathId(StrL("item"));
+
+    StyleApplyFields(&row->style, style, styleSet);
     bool hoverable = !active && !disabled;
     if (hoverable) {
         row->HoverBg(BackgroundOpacity(th.tokens.sidebarAccent, 0.8f))
@@ -67549,8 +69090,12 @@ El* SidebarMenuItem::IntoEl(Str id) {
     } else {
         row->H(28);
         El* mid = Div(a)->FlexRow()->Flex1()->Gap(8)->JustifyBetween();
-        mid->Child(Div(a)->FlexRow()->Flex1()->Child(
-            TextEl(a, label)->Font(14)->Fg(fg)));
+
+        El* labelBox = Div(a)->FlexRow()->Flex1();
+        StyleApplyFields(&labelBox->style, labelStyle, labelStyleSet);
+        Rgba labelFg =
+            (labelStyleSet & StyleFieldColor) ? labelStyle.color : fg;
+        mid->Child(labelBox->Child(TextEl(a, label)->Font(14)->Fg(labelFg)));
         if (suffix) {
             mid->Child(suffix);
         }
@@ -68360,6 +69905,10 @@ Spinner* Spinner::Icon(IconName n) {
     icon = n;
     return this;
 }
+Spinner* Spinner::IconData(Str svg) {
+    iconSvg = svg;
+    return this;
+}
 
 Spinner* Spinner::Color(Rgba c) {
     color = c;
@@ -68390,6 +69939,9 @@ El* Spinner::IntoEl() {
                             speed > 0 ? speed : kSpinnerPeriodMs, ease);
     }
     El* ic = IconEl(a, icon, dim)->Rotate(turn);
+    if (iconSvg.s) {
+        ic->iconSvg = iconSvg;
+    }
     if (hasColor) {
         ic->Fg(color);
     } else {
@@ -77893,6 +79445,10 @@ void FrameSamplerIngestDraws(FrameSampler* s, const FrameSample* samples,
         s->capacity = kFpsCapacity;
     }
     for (int i = 0; i < n; i++) {
+        if (s->warmup > 0) {
+            s->warmup--;
+            continue;
+        }
         if (s->n == s->capacity) {
             memmove(s->samples, s->samples + 1,
                     sizeof(FrameSample) * (size_t)(s->n - 1));
@@ -77946,6 +79502,10 @@ void FrameSamplerIngest(FrameSampler* s, const FrameTiming* frames, int n,
             presents[nPresents++] = frames[i].presentAt;
         }
     }
+    if (!s->drainedBacklog) {
+        s->drainedBacklog = true;
+        s->warmup += (uint32_t)n;
+    }
     FrameSamplerIngestDraws(s, draws, n);
     FrameSamplerIngestPresents(s, presents, nPresents, now);
 }
@@ -77976,6 +79536,18 @@ float FrameSamplerPresentInterval(const FrameSampler* s) {
         return 0;
     }
     return 1.f / fps;
+}
+
+float FpsSustainableRate(float meanDrawSecs, double displayPeriod) {
+    if (meanDrawSecs <= 0) {
+        return 0;
+    }
+    float rate = 1.f / meanDrawSecs;
+    if (displayPeriod > 0) {
+        float display = (float)(1.0 / displayPeriod);
+        return rate < display ? rate : display;
+    }
+    return rate;
 }
 
 float FrameSamplerMeanDraw(const FrameSampler* s) {
@@ -78162,27 +79734,11 @@ static const float kHeadlineHeight = 35.f;
 static const float kFigureSize = 28.f;
 static const float kFigureWidth = 70.f;
 
-static const float kUnitWidth = 22.f;
+static const float kUnitWidth = 28.f;
 
 static const double kReadoutInterval = 0.5;
 
-static const float kFpsTolerance = 0.95f;
-
 static const float kOverlayMargin = 12.f;
-
-Rgba FpsRateColor(float fps, float budgetSecs, const FpsStyle& style) {
-    if (fps <= 0) {
-        return style.muted;
-    }
-    float target = 1.f / budgetSecs;
-    if (fps >= target * kFpsTolerance) {
-        return style.good;
-    }
-    if (fps >= target * 0.5f) {
-        return style.warn;
-    }
-    return style.bad;
-}
 
 TempStr FpsFormatCpuTemp(float percent) {
     if (percent < 10.f) {
@@ -78209,9 +79765,15 @@ void FpsMonitorSetFrameBudget(FpsMonitor* self, float budgetSecs) {
     self->axisMax = budgetSecs * 2.f;
 }
 
-void FpsMonitorSetContinuous(FpsMonitor* self, bool continuous) {
-    if (self) {
-        self->continuous = continuous;
+static void UpdateDisplay(FpsMonitor* self, Ctx* cx) {
+    uint64_t display = cx->win ? PlatWindowDisplay(cx->win) : 0;
+    if (!display) {
+        return;
+    }
+    if (!self->displayAsked || self->display != display) {
+        self->displayAsked = true;
+        self->display = display;
+        self->displayPeriod = PlatDisplayRefreshPeriod(display);
     }
 }
 
@@ -78221,6 +79783,8 @@ static void UpdateReadout(FpsMonitor* self) {
         return;
     }
     const FrameSampler* s = &self->sampler;
+    self->readout.maxFps =
+        FpsSustainableRate(FrameSamplerMeanDraw(s), self->displayPeriod);
     self->readout.fps = FrameSamplerFps(s);
     self->readout.intervalMillis = FrameSamplerPresentInterval(s) * 1000.f;
 
@@ -78276,8 +79840,13 @@ static void FpsResourceDone(FpsResourceJob* job) {
     delete job;
 }
 
-void FpsMonitor::OnResourceTick(FpsMonitor* self, Ctx* cx, const TickEvent*) {
-    if (!self || !cx || self->resourceTask || self->resourceJob) {
+void FpsMonitor::OnClockTick(FpsMonitor* self, Ctx* cx, const TickEvent*) {
+    if (!self || !cx) {
+        return;
+    }
+
+    Notify(cx);
+    if (!self->showResources || self->resourceTask || self->resourceJob) {
         return;
     }
     FpsResourceJob* job = new FpsResourceJob();
@@ -78294,29 +79863,34 @@ void FpsMonitor::OnResourceTick(FpsMonitor* self, Ctx* cx, const TickEvent*) {
     self->resourceTask = task;
 }
 
-static void StartResourceSampling(FpsMonitor* self, Ctx* cx) {
-    if (!self->showResources || self->resourceTimer || !cx->win) {
+static void StartClock(FpsMonitor* self, Ctx* cx) {
+    if (self->clockTimer || !cx->win) {
         return;
     }
-    int ms = (int)lroundf(self->resourceInterval * 1000.f);
+    int ms = (int)lround(kReadoutInterval * 1000.0);
+    if (self->showResources) {
+        ms = (int)lroundf(self->resourceInterval * 1000.f);
 
-    if (ms < 200) {
-        ms = 200;
+        if (ms < 200) {
+            ms = 200;
+        }
     }
-    self->resourceWindow = cx->win;
-    self->resourceTimer =
-        WindowSetInterval(cx->win, ms, Listen(cx, &FpsMonitor::OnResourceTick));
-    if (!self->resourceTimer) {
-        self->resourceWindow = nullptr;
+    self->clockWindow = cx->win;
+    self->clockTimer =
+        WindowSetInterval(cx->win, ms, Listen(cx, &FpsMonitor::OnClockTick));
+    if (!self->clockTimer) {
+        self->clockWindow = nullptr;
         return;
     }
 
-    FpsMonitor::OnResourceTick(self, cx, nullptr);
+    if (self->showResources) {
+        FpsMonitor::OnClockTick(self, cx, nullptr);
+    }
 }
 
 FpsMonitor::~FpsMonitor() {
-    if (resourceWindow && resourceTimer) {
-        WindowCancelTimer(resourceWindow, resourceTimer);
+    if (clockWindow && clockTimer) {
+        WindowCancelTimer(clockWindow, clockTimer);
     }
     if (resourceTask && ExecCancel(resourceTask)) {
         delete resourceJob;
@@ -78324,8 +79898,8 @@ FpsMonitor::~FpsMonitor() {
 
         resourceJob->app = nullptr;
     }
-    resourceWindow = nullptr;
-    resourceTimer = 0;
+    clockWindow = nullptr;
+    clockTimer = 0;
     resourceTask = 0;
     resourceJob = nullptr;
 }
@@ -78402,7 +79976,7 @@ static El* FpsReading(Ctx* cx, Str label, Str value, Rgba valueColor,
         ->Child(TextEl(cx->a, value)->Fg(valueColor));
 }
 
-static El* FpsHeadline(Ctx* cx, FpsMonitor* self, float fps, Rgba color,
+static El* FpsHeadline(Ctx* cx, FpsMonitor* self, float rate, Rgba color,
                        const FpsStyle& style) {
     El* trace = Div(cx->a)->Absolute()->Top(0)->Left(0)->SizeFull();
     trace->customPaint = PaintFpsTrace;
@@ -78414,7 +79988,7 @@ static El* FpsHeadline(Ctx* cx, FpsMonitor* self, float fps, Rgba color,
                      ->FlexRow()
                      ->ItemsCenter()
                      ->JustifyCenter()
-                     ->Child(TextEl(cx->a, fmt("%.0f", fps))
+                     ->Child(TextEl(cx->a, fmt("%.0f", rate))
                                  ->Font(kFigureSize)
                                  ->LineHeight(1.f)
                                  ->Fg(color));
@@ -78431,7 +80005,16 @@ static El* FpsHeadline(Ctx* cx, FpsMonitor* self, float fps, Rgba color,
                     ->JustifyCenter()
                     ->Gap(4)
 
-                    ->Child(Div(cx->a)->W(kUnitWidth)->H(kTextSize))
+                    ->Child(Div(cx->a)
+                                ->W(kUnitWidth)
+                                ->H(kTextSize)
+                                ->FlexRow()
+                                ->JustifyEnd()
+                                ->Child(TextEl(cx->a, self->headline ==
+                                                              FpsHeadline::Max
+                                                          ? StrL("MAX")
+                                                          : Str{})
+                                            ->Fg(style.muted)))
                     ->Child(figure)
                     ->Child(Div(cx->a)
                                 ->W(kUnitWidth)
@@ -78444,22 +80027,31 @@ void FpsMonitor::OnToggleCompact(FpsMonitor* self, Ctx* cx, const ClickEvent*) {
     Notify(cx);
 }
 
+void FpsMonitor::OnToggleHeadline(FpsMonitor* self, Ctx* cx,
+                                  const MouseDownEvent* event) {
+    if (!self || !event || event->button != MouseButton::Right) {
+        return;
+    }
+    self->headline = self->headline == FpsHeadline::Max ? FpsHeadline::Observed
+                                                        : FpsHeadline::Max;
+    WindowStopPropagation(cx);
+    Notify(cx);
+}
+
 El* FpsMonitor::Render(FpsMonitor* self, Ctx* cx) {
     FrameSamplerTick(&self->sampler, cx->win);
+    UpdateDisplay(self, cx);
     UpdateReadout(self);
     UpdateAxis(self);
-    StartResourceSampling(self, cx);
-
-    if (self->continuous && cx->win) {
-        WindowRequestAnimationFrame(cx->win);
-    }
+    StartClock(self, cx);
 
     const FpsStyle& style = FpsStyleDark();
     FpsReadout r = self->readout;
     float budget = self->frameBudget;
 
-    Rgba fpsColor = self->continuous ? FpsRateColor(r.fps, budget, style)
-                                     : style.foreground;
+    Rgba fpsColor = style.foreground;
+    bool max = self->headline == FpsHeadline::Max;
+    float rate = max ? r.maxFps : r.fps;
 
     El* hud = Div(cx->a)
                   ->Click(HashClickId(StrL("gpui-fps-hud")))
@@ -78468,21 +80060,22 @@ El* FpsMonitor::Render(FpsMonitor* self, Ctx* cx) {
                   ->Mono()
                   ->Font(kTextSize)
                   ->SuppressTextSelection()
-                  ->OnClick(Listen(cx, &FpsMonitor::OnToggleCompact));
+                  ->OnClick(Listen(cx, &FpsMonitor::OnToggleCompact))
+
+                  ->OnMouseDown(Listen(cx, &FpsMonitor::OnToggleHeadline));
 
     if (self->compact) {
 
-        return hud->ItemsCenter()
-            ->Gap(4)
-            ->PadX(6)
-            ->PadY(2)
-            ->Radius(3)
-            ->Child(
-                Div(cx->a)
-                    ->W(kCompactFigureWidth)
-                    ->FlexRow()
-                    ->JustifyEnd()
-                    ->Child(TextEl(cx->a, fmt("%.0f", r.fps))->Fg(fpsColor)))
+        hud->ItemsCenter()->Gap(4)->PadX(6)->PadY(2)->Radius(3);
+        if (max) {
+            hud->Child(TextEl(cx->a, StrL("MAX"))->Fg(style.muted));
+        }
+        return hud
+            ->Child(Div(cx->a)
+                        ->W(kCompactFigureWidth)
+                        ->FlexRow()
+                        ->JustifyEnd()
+                        ->Child(TextEl(cx->a, fmt("%.0f", rate))->Fg(fpsColor)))
             ->Child(TextEl(cx->a, StrL("FPS"))->Fg(style.muted));
     }
 
@@ -78491,7 +80084,7 @@ El* FpsMonitor::Render(FpsMonitor* self, Ctx* cx) {
         ->PadX(8)
         ->PadY(6)
         ->Radius(4)
-        ->Child(FpsHeadline(cx, self, r.fps, fpsColor, style))
+        ->Child(FpsHeadline(cx, self, rate, fpsColor, style))
 
         ->Child(FpsReading(cx, StrL("INTERVAL"),
                            fmt("%.1f ms", r.intervalMillis), style.foreground,
@@ -78537,15 +80130,10 @@ El* FpsMonitor::Render(FpsMonitor* self, Ctx* cx) {
 
 El* FpsOverlayEl(Ctx* cx, Entity<FpsMonitor> monitor, FpsOverlayOpts opts) {
 
-    if (opts.frameBudget > 0 || opts.continuous >= 0) {
+    if (opts.frameBudget > 0) {
         FpsMonitor* self = monitor.Get(cx->app);
         if (self) {
-            if (opts.frameBudget > 0) {
-                FpsMonitorSetFrameBudget(self, opts.frameBudget);
-            }
-            if (opts.continuous >= 0) {
-                FpsMonitorSetContinuous(self, opts.continuous != 0);
-            }
+            FpsMonitorSetFrameBudget(self, opts.frameBudget);
         }
     }
     El* hud = EntityRender(cx->app, cx->win, cx->a, monitor.id);
@@ -97963,9 +99551,9 @@ bool HostModule::IsAsync(Str function) const {
 }
 
 static const char* const kReserved[] = {
-    "gpui",    "gpui-base", "gpui-shell",  "gpui-fps",  "buffer",
-    "console", "crypto",    "fs/promises", "net",       "os",
-    "path",    "process",   "url",         "websocket", "zlib",
+    "gpui-kit", "gpui",   "gpui-base",   "gpui-shell", "gpui-fps", "buffer",
+    "console",  "crypto", "fs/promises", "net",        "os",       "path",
+    "process",  "url",    "websocket",   "zlib",
 };
 
 bool HostIsReservedSpecifier(Str value) {
@@ -98347,6 +99935,7 @@ struct MaterialBehavior {
     bool hasItemToMeasure = false;
     PopupAnchor anchor = PopupAnchor::TopLeft;
     bool hasAnchor = false;
+    float fpsFrameBudget = 0;
     MouseButton mouseButton = MouseButton::Left;
     int openDelayMs = 600;
     int closeDelayMs = 300;
@@ -98618,6 +100207,8 @@ static void ResolveBehavior(const shell::SpecNode* node,
             out->hasPosition = true;
         } else if (StrEq(op.name, StrL("anchor"))) {
             out->anchor = AnchorOf(AsString(op, 0), &out->hasAnchor);
+        } else if (StrEq(op.name, StrL("frame_budget"))) {
+            out->fpsFrameBudget = AsNumber(op, 0) / 1000.f;
         } else if (StrEq(op.name, StrL("mouse_button"))) {
             Str button = AsString(op, 0);
             out->mouseButton =
@@ -99473,6 +101064,10 @@ static Str MotionIdentity(Ctx* cx, const shell::SpecNode* node,
             if (component.virtualList && component.virtualList->id)
                 return component.virtualList->id;
             break;
+        case shell::ComponentKind::List:
+        case shell::ComponentKind::UniformList:
+            if (component.list && component.list->id) return component.list->id;
+            break;
         case shell::ComponentKind::Slider:
             return StrDup(cx->a,
                           fmt("gpui-shell-slider:%llu", component.handle));
@@ -99640,6 +101235,188 @@ static void MaterialVirtualRange(void* user, Ctx* cx, int first, int end,
             values->render, values->getKey, values->onItemClick,
             values->onItemSecondaryClick, first, end, cx, out);
     }
+}
+
+static const float kListOverdraw = 160;
+
+struct LazyListState {
+
+    float offset = 0;
+
+    int itemCount = 0;
+
+    Vec<float> measured;
+
+    float rowH = 0;
+
+    ~LazyListState() { VecReset(measured); }
+};
+
+static uint32_t LazyListKey(Str id) {
+    return KeyedKey((uint32_t)HashClickId(id),
+                    (uint32_t)HashClickId(StrL("gpui-shell-lazy-list")));
+}
+
+static void OnLazyListScroll(ScriptView*, Ctx* cx, const ScrollEvent* event,
+                             intptr_t key) {
+    LazyListState* state = KeyedState<LazyListState>(cx, (uint32_t)key);
+    if (!state || !event) return;
+    state->offset = event->offsetY;
+}
+
+static float LazyListViewport(Ctx* cx, int scrollId) {
+    const ScrollRect* last =
+        cx->win ? WindowLastScrollRect(cx->win, scrollId) : nullptr;
+    if (last && last->bounds.h > 0) return last->bounds.h;
+    if (cx->win && cx->win->paint.viewH > 0) return cx->win->paint.viewH;
+    return VirtualListOpts{}.viewH;
+}
+
+static float LazyListExtent(const LazyListState* state, int ix,
+                            float estimate) {
+    float measured = ix < state->measured.len ? state->measured[ix] : 0;
+    return measured > 0 ? measured : estimate;
+}
+
+static float LazyListEstimate(const LazyListState* state) {
+    float sum = 0;
+    int n = 0;
+    for (int i = 0; i < state->measured.len; i++) {
+        if (state->measured[i] > 0) {
+            sum += state->measured[i];
+            n++;
+        }
+    }
+    return n > 0 ? sum / (float)n : 0;
+}
+
+static El* LazyListElement(Ctx* cx, ShellRuntime* runtime,
+                           const shell::Component& component,
+                           const MaterialBehavior& behavior) {
+    const shell::ListSpec* spec = component.list;
+    bool uniform = component.kind == shell::ComponentKind::UniformList;
+    Str name = uniform ? StrL("uniform_list") : StrL("list");
+    if (!spec || !runtime) return Div(cx->a);
+    if (behavior.virtualScroll) {
+        logf(
+            "shell: track_scroll is ignored on a %s: its scroll position is "
+            "GPUI's own, filed under the id it was built with, which is where "
+            "a Scrollbar of that name finds it\n",
+            name);
+    }
+    if (!uniform && behavior.hasItemToMeasure) {
+        logf(
+            "shell: with_item_to_measure_index is ignored on a list: it "
+            "measures every item it draws, so there is no one item the rest "
+            "are sized from. It is uniform_list that takes one\n");
+    }
+
+    uint32_t key = LazyListKey(spec->id);
+    LazyListState* state = KeyedState<LazyListState>(cx, key);
+    if (!state) return Div(cx->a);
+    int count = spec->itemCount;
+    int scrollId = HashClickId(spec->id);
+    float viewport = LazyListViewport(cx, scrollId);
+    PaintCtx* paint = cx->win ? &cx->win->paint : nullptr;
+    Listener onScroll = Listen(cx, &OnLazyListScroll, (intptr_t)key);
+
+    MaterialVirtualUser* user = ArenaNew<MaterialVirtualUser>(cx->a);
+    user->runtime = runtime;
+    user->render = spec->renderItems;
+    user->getKey = spec->getKey;
+    user->onItemClick = behavior.onItemClick;
+    user->onItemSecondaryClick = behavior.onItemSecondaryClick;
+
+    if (uniform) {
+
+        if (count > 0) {
+            int measureIx =
+                behavior.hasItemToMeasure ? behavior.itemToMeasure : 0;
+            if (measureIx < 0) measureIx = 0;
+            if (measureIx >= count) measureIx = count - 1;
+            El* probe = nullptr;
+            runtime->RenderVirtualItems(spec->renderItems, spec->getKey, 0, 0,
+                                        measureIx, measureIx + 1, cx, &probe);
+            if (probe) {
+                float got = MeasureEl(paint, probe).h;
+                if (got > 0) state->rowH = got;
+            }
+        }
+        float content = state->rowH * (float)count;
+        float most = content > viewport ? content - viewport : 0;
+        if (state->offset > most) state->offset = most;
+        if (state->offset < 0) state->offset = 0;
+        VirtualListOpts opts;
+        opts.count = count;
+        opts.rowH = state->rowH;
+        opts.viewH = viewport;
+        opts.scrollY = state->offset;
+        opts.range = MaterialVirtualRange;
+        opts.user = user;
+        opts.scrollId = scrollId;
+        opts.onScroll = onScroll;
+
+        return VirtualList::New(cx, spec->id, opts)->SizeFull();
+    }
+
+    if (state->itemCount != count) {
+
+        VecClear(state->measured);
+        for (int i = 0; i < count; i++) VecAppend(state->measured, 0.f);
+        state->itemCount = count;
+    }
+    float estimate = LazyListEstimate(state);
+    float content = 0;
+    for (int i = 0; i < count; i++) {
+        content += LazyListExtent(state, i, estimate);
+    }
+    float most = content > viewport ? content - viewport : 0;
+    if (state->offset > most) state->offset = most;
+    if (state->offset < 0) state->offset = 0;
+    float offset = state->offset;
+
+    float origin = 0;
+    int first = 0;
+    while (first < count) {
+        float extent = LazyListExtent(state, first, estimate);
+        if (extent <= 0 || origin + extent > offset) break;
+        origin += extent;
+        first++;
+    }
+    El* column = Div(cx->a)->FlexCol();
+    if (first > 0) column->Child(Div(cx->a)->H(origin));
+
+    float filled = 0;
+    int end = first;
+    while (end < count && filled < viewport + kListOverdraw) {
+        El* item = nullptr;
+        runtime->RenderVirtualItems(
+            spec->renderItems, spec->getKey, behavior.onItemClick,
+            behavior.onItemSecondaryClick, end, end + 1, cx, &item);
+
+        if (!item) item = Div(cx->a);
+        float got = MeasureEl(paint, item).h;
+        if (got > 0) state->measured[end] = got;
+        filled += LazyListExtent(state, end, estimate);
+        column->Child(item);
+        end++;
+    }
+
+    estimate = LazyListEstimate(state);
+    float after = 0;
+    for (int ix = end; ix < count; ix++) {
+        after += LazyListExtent(state, ix, estimate);
+    }
+    if (after > 0) column->Child(Div(cx->a)->H(after));
+
+    return VirtualList::New(cx, spec->id)
+        ->ClipX()
+        ->ClipY()
+        ->ScrollY(offset)
+        ->ScrollId(scrollId)
+        ->OnScroll(onScroll)
+        ->SizeFull()
+        ->Child(column);
 }
 
 static El* DockAreaElement(Ctx* cx, ShellRuntime* runtime,
@@ -99850,8 +101627,11 @@ static El* Construct(Ctx* cx, ShellRuntime* runtime,
             return ProgressTrack::New(cx);
         case shell::ComponentKind::ProgressIndicator:
             return ProgressIndicator::New(cx);
-        case shell::ComponentKind::FpsMonitor:
-            return FpsMonitorEl(cx);
+        case shell::ComponentKind::FpsMonitor: {
+            FpsOverlayOpts opts;
+            opts.frameBudget = behavior.fpsFrameBudget;
+            return FpsMonitorEl(cx, opts);
+        }
         case shell::ComponentKind::Radio: {
             El* e =
                 Radio::New(cx, id, behavior.checked, behavior.disabled,
@@ -99914,9 +101694,10 @@ static El* Construct(Ctx* cx, ShellRuntime* runtime,
                 ->OnAction(action::SelectDown(), action)
                 ->OnAction(action::Confirm(), action)
                 ->OnAction(action::Cancel(), action);
-            if (!open && !behavior.disabled && behavior.onOpenChange)
-                root->OnAccessibilityDefault(
-                    Listen(cx, &ScriptView::OnSelectOpen, (intptr_t)binding));
+
+            if (!behavior.disabled && behavior.onOpenChange)
+                root->OnAccessibilityDefault(Listen(
+                    cx, &ScriptView::OnSelectActivate, (intptr_t)binding));
             return root;
         }
         case shell::ComponentKind::DatePicker: {
@@ -100065,6 +101846,9 @@ static El* Construct(Ctx* cx, ShellRuntime* runtime,
             }
             return VirtualList::New(cx, list->id, opts);
         }
+        case shell::ComponentKind::List:
+        case shell::ComponentKind::UniformList:
+            return LazyListElement(cx, runtime, component, behavior);
         case shell::ComponentKind::ChildView: {
             EntityId child =
                 runtime ? runtime->NestedView(component.handle, cx->app)
@@ -100564,9 +102348,18 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
                                                 (intptr_t)bound));
     }
     element = WireDockCommands(cx, element, behavior);
-    if (!childrenConsumed &&
-        node->component.kind != shell::ComponentKind::VVirtualList &&
-        node->component.kind != shell::ComponentKind::HVirtualList) {
+    bool lazyList =
+        node->component.kind == shell::ComponentKind::VVirtualList ||
+        node->component.kind == shell::ComponentKind::HVirtualList ||
+        node->component.kind == shell::ComponentKind::List ||
+        node->component.kind == shell::ComponentKind::UniformList;
+    if (lazyList && node->children.len > 0) {
+        logf(
+            "shell: children are dropped on a %s: its contents are whatever "
+            "the item renderer returns\n",
+            Str(shell::ComponentName(node->component)));
+    }
+    if (!childrenConsumed && !lazyList) {
         for (shell::SpecId child : node->children) {
             element->Child(MaterializeNode(cx, runtime, specs, child, error));
         }
@@ -101446,15 +103239,12 @@ bool PluginManifestParse(Str source, PluginManifest* out, ShellError* error) {
     }
     ParseSemver(Str(kShellVersion), &runtimeMajor, &runtimeMinor,
                 &runtimePatch);
-    bool line = requiredMajor == 0
-                    ? runtimeMajor == 0 && runtimeMinor == requiredMinor
-                    : runtimeMajor == requiredMajor;
     bool oldEnough =
         runtimeMajor > requiredMajor ||
         (runtimeMajor == requiredMajor &&
          (runtimeMinor > requiredMinor ||
           (runtimeMinor == requiredMinor && runtimePatch >= requiredPatch)));
-    if (!line || !oldEnough) {
+    if (!oldEnough) {
         shell_plugin_SetError(error, fmt("this application requires gpui-shell %s, but this "
                             "runtime is %s and is not compatible",
                             required, Str(kShellVersion)));
@@ -102510,7 +104300,6 @@ El* ShellRoot::Render(ShellRoot* self, Ctx* cx) {
 
             FpsOverlayOpts opts;
             opts.anchor = self->fpsHud.anchor;
-            opts.continuous = self->fpsHud.continuous ? 1 : 0;
             if (self->fpsHud.hasFrameBudget) {
                 opts.frameBudget = self->fpsHud.frameBudget;
             }
@@ -103974,17 +105763,19 @@ static TempStr ReadModuleFileTemp(Str path, ShellError* error) {
 }
 
 static bool IsBuiltin(Str name) {
-    return StrEq(name, StrL("gpui")) || StrEq(name, StrL("gpui-base")) ||
-           StrEq(name, StrL("gpui-shell")) || StrEq(name, StrL("gpui-fps")) ||
-           StrEq(name, StrL("buffer")) || StrEq(name, StrL("console")) ||
-           StrEq(name, StrL("crypto")) || StrEq(name, StrL("fs/promises")) ||
-           StrEq(name, StrL("os")) || StrEq(name, StrL("path")) ||
-           StrEq(name, StrL("process")) || StrEq(name, StrL("url")) ||
-           StrEq(name, StrL("zlib"));
+    return (StrEq(name, StrL("gpui")) || StrEq(name, StrL("gpui-kit"))) ||
+           StrEq(name, StrL("gpui-base")) || StrEq(name, StrL("gpui-shell")) ||
+           StrEq(name, StrL("gpui-fps")) || StrEq(name, StrL("buffer")) ||
+           StrEq(name, StrL("console")) || StrEq(name, StrL("crypto")) ||
+           StrEq(name, StrL("fs/promises")) || StrEq(name, StrL("os")) ||
+           StrEq(name, StrL("path")) || StrEq(name, StrL("process")) ||
+           StrEq(name, StrL("url")) || StrEq(name, StrL("zlib"));
 }
 
 static const char* const kGpuiExports[] = {
-    "View", "div", "svg", "image", "PathBuilder", "Background", "with_cx"};
+    "View", "div", "svg", "image",
+
+    "list", "uniform_list", "PathBuilder", "Background", "with_cx"};
 static const char* const kBaseExports[] = {
     "h_flex", "v_flex", "Button", "Link", "Checkbox", "Switch", "Tabs", "Tab",
     "Progress", "ProgressTrack", "ProgressIndicator", "Radio", "Toggle",
@@ -104026,7 +105817,7 @@ static const char* const kZlibExports[] = {
 static void ModuleExports(Str name, const char* const** values, int* count) {
     *values = nullptr;
     *count = 0;
-    if (StrEq(name, StrL("gpui"))) {
+    if ((StrEq(name, StrL("gpui")) || StrEq(name, StrL("gpui-kit")))) {
         *values = kGpuiExports;
         *count = (int)(sizeof(kGpuiExports) / sizeof(kGpuiExports[0]));
     } else if (StrEq(name, StrL("gpui-base"))) {
@@ -104066,8 +105857,9 @@ static void ModuleExports(Str name, const char* const** values, int* count) {
 }
 
 static const char* BuiltinObject(Str name) {
-    if (StrEq(name, StrL("gpui")) || StrEq(name, StrL("gpui-base")) ||
-        StrEq(name, StrL("gpui-shell")) || StrEq(name, StrL("gpui-fps")))
+    if ((StrEq(name, StrL("gpui")) || StrEq(name, StrL("gpui-kit"))) ||
+        StrEq(name, StrL("gpui-base")) || StrEq(name, StrL("gpui-shell")) ||
+        StrEq(name, StrL("gpui-fps")))
         return "__gpui";
     if (StrEq(name, StrL("buffer"))) return "__shell_buffer";
     if (StrEq(name, StrL("console"))) return "console";
@@ -105962,9 +107754,8 @@ static JSValue NativeShowFpsMonitor(JSContext* ctx, JSValueConst, int argc,
                 "%s expects an object, such as { anchor: \"bottom_left\" }",
                 kApi);
         }
-        static const char* const kKeys[] = {"anchor", "continuous",
-                                            "frame_budget"};
-        if (!KnownOptions(ctx, argv[0], kKeys, 3, kApi)) return JS_EXCEPTION;
+        static const char* const kKeys[] = {"anchor", "frame_budget"};
+        if (!KnownOptions(ctx, argv[0], kKeys, 2, kApi)) return JS_EXCEPTION;
         Arena* arena = ArenaNew();
         Str anchor;
         bool present = false;
@@ -105990,10 +107781,6 @@ static JSValue NativeShowFpsMonitor(JSContext* ctx, JSValueConst, int argc,
         }
         ArenaDelete(arena);
         if (!ok) return JS_EXCEPTION;
-        if (!OptionalBoolProperty(ctx, argv[0], "continuous",
-                                  &request.continuous)) {
-            return JS_EXCEPTION;
-        }
         JSValue budget = JS_GetPropertyStr(ctx, argv[0], "frame_budget");
         if (JS_IsException(budget)) return JS_EXCEPTION;
         if (!JS_IsUndefined(budget) && !JS_IsNull(budget)) {
@@ -106846,21 +108633,68 @@ static JSValue NativeVirtualScrollOp(JSContext* ctx, JSValueConst, int argc,
     return JS_UNDEFINED;
 }
 
+static const uint64_t kMaxVirtualItemsPerRender = 1000000;
+
+static bool GuardLazyList(JSContext* ctx, ShellRuntimeImpl* impl, int argc,
+                          int wanted, JSValueConst count, int64_t* countOut) {
+    if (!impl || argc < wanted ||
+        shell::ScopeCurrentPhase() == ScopePhase::Layout) {
+        JS_ThrowTypeError(ctx,
+                          "a list cannot be built from inside another list's "
+                          "item renderer: its own renderer would belong to no "
+                          "render pass and would never be called. Describe the "
+                          "nested list from the view's render() instead");
+        return false;
+    }
+    int64_t count64 = 0;
+    if (JS_ToInt64(ctx, &count64, count) != 0 || count64 < 0 ||
+        count64 > (int64_t)kMaxVirtualItemsPerRender) {
+        JS_ThrowTypeError(ctx, "a list needs a whole item count up to 1000000");
+        return false;
+    }
+    if (!impl->scratch->ClaimVirtualItems((uint64_t)count64,
+                                          kMaxVirtualItemsPerRender)) {
+        JS_ThrowRangeError(ctx,
+                           "the lists in one render may describe at most "
+                           "1000000 items in total");
+        return false;
+    }
+    *countOut = count64;
+    return true;
+}
+
+static bool RegisterItemCallbacks(JSContext* ctx, ShellRuntimeImpl* impl,
+                                  JSValueConst getKeyFn, JSValueConst renderFn,
+                                  shell::CallbackId* getKey,
+                                  shell::CallbackId* render) {
+    *getKey = impl->callbacks.Push(
+        ctx, getKeyFn, shell::ScopeCurrentView(), shell::ScopeCurrentPolicy(),
+        shell::ScopeCurrentGeneration(),
+        (AppModule*)shell::ScopeCurrentApplication());
+    *render = impl->callbacks.Push(
+        ctx, renderFn, shell::ScopeCurrentView(), shell::ScopeCurrentPolicy(),
+        shell::ScopeCurrentGeneration(),
+        (AppModule*)shell::ScopeCurrentApplication());
+    if (*getKey == UINT64_MAX || *render == UINT64_MAX) {
+        JS_ThrowInternalError(
+            ctx, "list callbacks were registered outside a snapshot build");
+        return false;
+    }
+    return true;
+}
+
 static JSValue NativeVirtualList(JSContext* ctx, JSValueConst, int argc,
                                  JSValueConst* argv, int magic) {
     ShellRuntimeImpl* impl = (ShellRuntimeImpl*)JS_GetContextOpaque(ctx);
-    if (!impl || argc < 5 || shell::ScopeCurrentPhase() == ScopePhase::Layout) {
-        return JS_ThrowTypeError(ctx,
-                                 "a virtual list cannot be built from inside "
-                                 "another list's item renderer");
+    int64_t count64 = 0;
+    if (!GuardLazyList(ctx, impl, argc, 5, argc > 1 ? argv[1] : JS_UNDEFINED,
+                       &count64)) {
+        return JS_EXCEPTION;
     }
     Arena* arena = ArenaNew();
     Str id;
-    int64_t count64 = 0;
     bool ok = JsString(ctx, argv[0], arena, &id) &&
-              JS_ToInt64(ctx, &count64, argv[1]) == 0 && count64 >= 0 &&
-              count64 <= 1000000 && JS_IsFunction(ctx, argv[3]) &&
-              JS_IsFunction(ctx, argv[4]);
+              JS_IsFunction(ctx, argv[3]) && JS_IsFunction(ctx, argv[4]);
     if (!ok) {
         ArenaDelete(arena);
         return JS_ThrowTypeError(
@@ -106869,12 +108703,6 @@ static JSValue NativeVirtualList(JSContext* ctx, JSValueConst, int argc,
             "get_key and render functions");
     }
     int count = (int)count64;
-    if (!impl->scratch->ClaimVirtualItems((uint64_t)count, 1000000)) {
-        ArenaDelete(arena);
-        return JS_ThrowRangeError(ctx,
-                                  "the virtual lists in one render may "
-                                  "describe at most 1000000 items in total");
-    }
     Size* sizes = count > 0
                       ? (Size*)Alloc(arena, (int)(sizeof(Size) * (size_t)count))
                       : nullptr;
@@ -106912,19 +108740,11 @@ static JSValue NativeVirtualList(JSContext* ctx, JSValueConst, int argc,
                                  "virtual-list item sizes must be one finite "
                                  "non-negative number or one per item");
     }
-    shell::CallbackId getKey = impl->callbacks.Push(
-        ctx, argv[3], shell::ScopeCurrentView(), shell::ScopeCurrentPolicy(),
-        shell::ScopeCurrentGeneration(),
-        (AppModule*)shell::ScopeCurrentApplication());
-    shell::CallbackId render = impl->callbacks.Push(
-        ctx, argv[4], shell::ScopeCurrentView(), shell::ScopeCurrentPolicy(),
-        shell::ScopeCurrentGeneration(),
-        (AppModule*)shell::ScopeCurrentApplication());
-    if (getKey == UINT64_MAX || render == UINT64_MAX) {
+    shell::CallbackId getKey = 0;
+    shell::CallbackId render = 0;
+    if (!RegisterItemCallbacks(ctx, impl, argv[3], argv[4], &getKey, &render)) {
         ArenaDelete(arena);
-        return JS_ThrowInternalError(
-            ctx,
-            "virtual-list callbacks were registered outside a snapshot build");
+        return JS_EXCEPTION;
     }
     shell::VirtualListSpec list = {};
     list.id = id;
@@ -106937,6 +108757,44 @@ static JSValue NativeVirtualList(JSContext* ctx, JSValueConst, int argc,
     component.kind = horizontal ? shell::ComponentKind::HVirtualList
                                 : shell::ComponentKind::VVirtualList;
     component.virtualList = &list;
+    shell::SpecId result = impl->scratch->Push(component);
+    ArenaDelete(arena);
+    return JS_NewUint32(ctx, result);
+}
+
+static JSValue NativeLazyList(JSContext* ctx, JSValueConst, int argc,
+                              JSValueConst* argv, int magic) {
+    ShellRuntimeImpl* impl = (ShellRuntimeImpl*)JS_GetContextOpaque(ctx);
+    int64_t count64 = 0;
+    if (!GuardLazyList(ctx, impl, argc, 4, argc > 1 ? argv[1] : JS_UNDEFINED,
+                       &count64)) {
+        return JS_EXCEPTION;
+    }
+    Arena* arena = ArenaNew();
+    Str id;
+    bool ok = JsString(ctx, argv[0], arena, &id) &&
+              JS_IsFunction(ctx, argv[2]) && JS_IsFunction(ctx, argv[3]);
+    if (!ok) {
+        ArenaDelete(arena);
+        return JS_ThrowTypeError(ctx,
+                                 "list needs an id, a count up to 1000000, "
+                                 "get_key and render functions");
+    }
+    shell::CallbackId getKey = 0;
+    shell::CallbackId render = 0;
+    if (!RegisterItemCallbacks(ctx, impl, argv[2], argv[3], &getKey, &render)) {
+        ArenaDelete(arena);
+        return JS_EXCEPTION;
+    }
+    shell::ListSpec list = {};
+    list.id = id;
+    list.itemCount = (int)count64;
+    list.getKey = getKey;
+    list.renderItems = render;
+    shell::Component component = {};
+    component.kind = magic != 0 ? shell::ComponentKind::UniformList
+                                : shell::ComponentKind::List;
+    component.list = &list;
     shell::SpecId result = impl->scratch->Push(component);
     ArenaDelete(arena);
     return JS_NewUint32(ctx, result);
@@ -110118,11 +111976,38 @@ globalThis.__gpui = (() => {
     scroll_to_bottom: () => __virtual_scroll_to_bottom(handle),
     release: () => __virtual_scroll_release(handle),
   });
+  // The three checks every lazy list makes. Only the render hint differs:
+  // `list` is called per item, the other two per visible range.
+  const checkListArgs = (shape, count, getKey, render, renderHint) => {
+    if (!Number.isInteger(count) || count < 0) throw new TypeError(shape + " needs a whole, non-negative item_count");
+    if (typeof getKey !== "function") throw new TypeError(shape + " needs get_key(index) to return each item's stable string key");
+    if (typeof render !== "function") throw new TypeError(shape + " needs a render function; it is called " + renderHint);
+  };
+  const RANGE_HINT = "once per visible range, not once per item";
   const virtualList = (build, name) => (id, count, sizes, getKey, render) => {
-    if (!Number.isInteger(count) || count < 0) throw new TypeError(name + " item_count must be a non-negative whole number");
-    if (typeof getKey !== "function" || typeof render !== "function") throw new TypeError(name + " needs get_key and render functions");
-    if (Array.isArray(sizes) && sizes.length !== count) throw new TypeError(name + " needs one size per item");
+    const shape = name + "(id, item_count, item_sizes, get_key, render)";
+    checkListArgs(shape, count, getKey, render, RANGE_HINT);
+    if (Array.isArray(sizes) && sizes.length !== count) {
+      throw new TypeError(shape + " was given " + sizes.length + " item sizes for " + count + " items; pass one number, or exactly one per item");
+    }
     return element(build(String(id), count, sizes, getKey, render));
+  };
+  // `list` and `uniform_list`: GPUI's own lazy lists. Both cross the boundary
+  // the way a virtual list does -- one renderer per visible range -- so a
+  // `list` renderer written per item is folded into a range here, once, rather
+  // than teaching the host a second calling convention.
+  const lazyList = (build, name, perItem) => (id, count, getKey, render) => {
+    const shape = name + "(id, item_count, get_key, render)";
+    checkListArgs(shape, count, getKey, render,
+      perItem ? "once per item on screen, with the item's index" : RANGE_HINT);
+    const describe = perItem
+      ? (range, cx) => {
+          const items = [];
+          for (let index = range.start; index < range.end; index++) items.push(render(index, cx));
+          return items;
+        }
+      : render;
+    return element(build(String(id), count, getKey, describe));
   };
   // A description recorded once and filled per call.
   //
@@ -110230,6 +112115,8 @@ globalThis.__gpui = (() => {
     Scrollbar: named("Scrollbar"),
     v_virtual_list: virtualList(__v_virtual_list, "v_virtual_list"),
     h_virtual_list: virtualList(__h_virtual_list, "h_virtual_list"),
+    list: lazyList(__list, "list", true),
+    uniform_list: lazyList(__uniform_list, "uniform_list", false),
     VirtualListScrollHandle: { new: () => virtualScrollHandle(__virtual_scroll_new()) },
     InputState: { new: (options = {}) => inputState(__input_state_new(options.placeholder ?? null, options.value ?? null)) }, Input: retained("Input"),
     NumberInput: retained("NumberInput"),
@@ -111971,6 +113858,10 @@ static bool InstallRuntime(ShellRuntimeImpl* impl, ShellError* error) {
                            NativeVirtualList, 5, 0);
     SetGlobalMagicFunction(impl->context, global, "__h_virtual_list",
                            NativeVirtualList, 5, 1);
+    SetGlobalMagicFunction(impl->context, global, "__list", NativeLazyList, 4,
+                           0);
+    SetGlobalMagicFunction(impl->context, global, "__uniform_list",
+                           NativeLazyList, 4, 1);
     JS_FreeValue(impl->context, global);
     BeginExecution(impl);
     JSValue result = JS_Eval(impl->context, kPrelude, sizeof(kPrelude) - 1,
@@ -113123,7 +115014,8 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
 
     double started = TimeNow();
     shell::SpecArena* outer = impl->scratch;
-    shell::SpecArena* batch = new shell::SpecArena();
+
+    shell::SpecArena* batch = new shell::SpecArena(cx->a);
     impl->scratch = batch;
     Vec<shell::SpecId> roots;
     Vec<Str> itemKeys;
@@ -113823,6 +115715,10 @@ const char* ComponentName(const Component& component) {
             return "v_virtual_list";
         case ComponentKind::HVirtualList:
             return "h_virtual_list";
+        case ComponentKind::List:
+            return "list";
+        case ComponentKind::UniformList:
+            return "uniform_list";
     }
     return "element";
 }
@@ -113866,10 +115762,16 @@ Str SpecErrorMessage(Arena* arena, const SpecError& error) {
 
 SpecArena::SpecArena() {
     arena = ArenaNew();
+    ownsArena = true;
+}
+
+SpecArena::SpecArena(Arena* borrowed) {
+    arena = borrowed;
+    ownsArena = false;
 }
 
 SpecArena::~SpecArena() {
-    ArenaDelete(arena);
+    if (ownsArena) ArenaDelete(arena);
 }
 
 void SpecArena::Reset() {
@@ -113879,7 +115781,7 @@ void SpecArena::Reset() {
     VecClear(mountedViews);
     virtualItems = 0;
     structure = 0;
-    arena->Reset();
+    if (ownsArena) arena->Reset();
 }
 
 Component SpecArena::CopyComponent(const Component& source) {
@@ -113900,6 +115802,11 @@ Component SpecArena::CopyComponent(const Component& source) {
             memcpy(out.virtualList->sizes, source.virtualList->sizes,
                    sizeof(Size) * (size_t)source.virtualList->sizeCount);
         }
+    }
+    if (source.list) {
+        out.list = ArenaNew<ListSpec>(arena);
+        *out.list = *source.list;
+        out.list->id = StrDup(arena, source.list->id);
     }
     return out;
 }
@@ -114205,6 +116112,13 @@ void SpecArena::WriteTree(StrBuilder* out, SpecId id, int depth) const {
             if (component.virtualList) {
                 out->Append(fmt(" \"%s\" ×%d", component.virtualList->id,
                                 component.virtualList->sizeCount));
+            }
+            break;
+        case ComponentKind::List:
+        case ComponentKind::UniformList:
+            if (component.list) {
+                out->Append(fmt(" \"%s\" ×%d", component.list->id,
+                                component.list->itemCount));
             }
             break;
         default:
@@ -115368,24 +117282,24 @@ SeqStrings ThemeRadiusTokenNames() {
 
 namespace gpui::shell {
 
-static const char kShellTypes0[] = R"GPUI_DTS(// Auto-generated — add `gpui.d.ts` to your .gitignore.
+static const char kShellTypes0[] = R"GPUI_DTS(// Auto-generated — add `gpui-kit.d.ts` to your .gitignore.
 //
-// The built-in modules, as TypeScript declarations, for gpui-shell 0.1.0.
+// The built-in modules, as TypeScript declarations, for gpui-shell 0.6.0.
 // Do not edit: gpui-shell rewrites this on every run, in every directory that
 // imports one of them, from the runtime that is about to execute the script. A
 // committed copy could only ever be the stale one.
 //
 // Each built-in module names the public Rust layer it exposes, so an import
-// says which layer a script depends on. "gpui" also carries the shell bridge:
+// says which layer a script depends on. "gpui-kit" also carries the shell bridge:
 //
-//   "gpui"       GPUI's own elements, plus what this runtime adds: views,
+//   "gpui-kit"   GPUI's own elements, plus what this runtime adds: views,
 //                the style surface, the window, storage, scheduling.
+//   "gpui"       Compatibility alias for "gpui-kit".
 //   "gpui-base"  gpui-base's layout helpers, components and theme.
 //   "gpui-fps"   gpui-fps's performance overlay.
 //
-// A name belongs to exactly one of them. Nothing is re-exported for
-// convenience: a name reachable from two specifiers stops saying where it came
-// from.
+// Except for the explicit "gpui" compatibility alias, a name belongs to
+// exactly one module and is not re-exported for convenience.
 //
 // The style surface here is generated from the same tables the runtime
 // dispatches through, so a style method that type-checks exists at run time,
@@ -115396,7 +117310,7 @@ static const char kShellTypes0[] = R"GPUI_DTS(// Auto-generated — add `gpui.d.
 // type-checks), element and `cx` lifetimes (both belong to one call), and
 // which component a method suits (all elements share one prototype).
 
-declare module "gpui" {
+declare module "gpui-kit" {
   /**
    * A length. A bare number is pixels; a string carries its unit.
    *
@@ -115763,9 +117677,9 @@ declare module "gpui" {
   /**
    * A context that may be held across an `await`.
    *
-   * The mirror of GPUI's `AsyncApp`. An ordinary [`Context`] speaks for one
 )GPUI_DTS";
-static const char kShellTypes1[] = R"GPUI_DTS(   * host call and reports clearly once that call has returned — which is what
+static const char kShellTypes1[] = R"GPUI_DTS(   * The mirror of GPUI's `AsyncApp`. An ordinary [`Context`] speaks for one
+   * host call and reports clearly once that call has returned — which is what
    * catches a `cx` stashed in a closure. This one names no call at all: it
    * resolves whichever is running when a member is used, and refuses only when
    * none is.
@@ -116039,9 +117953,9 @@ static const char kShellTypes1[] = R"GPUI_DTS(   * host call and reports clearly
     /**
      * Supplies the look of a `NumberInput`'s decrement button.
      *
-     * Not optional in practice. The step button is built by the base layer and
 )GPUI_DTS";
-static const char kShellTypes2[] = R"GPUI_DTS(     * is completely unstyled — no size, no content — so a number input that
+static const char kShellTypes2[] = R"GPUI_DTS(     * Not optional in practice. The step button is built by the base layer and
+     * is completely unstyled — no size, no content — so a number input that
      * leaves this empty has a decrement control that cannot be seen and cannot
      * be pressed.
      *
@@ -116272,10 +118186,10 @@ static const char kShellTypes2[] = R"GPUI_DTS(     * is completely unstyled — 
     /**
      * `handler(_, cx)` on Escape in an open `Select` or `Combobox`, before
      * `on_open_change(false)` — which is what lets a script commit a pending
-     * value on the way out.
-     */
 )GPUI_DTS";
-static const char kShellTypes3[] = R"GPUI_DTS(    on_dismiss(handler: (event: {}, cx: Context) => void): Element;
+static const char kShellTypes3[] = R"GPUI_DTS(     * value on the way out.
+     */
+    on_dismiss(handler: (event: {}, cx: Context) => void): Element;
     /**
      * The label a hover shows over this element, once the pointer has rested
      * on it for half a second.
@@ -116524,10 +118438,10 @@ static const char kShellTypes3[] = R"GPUI_DTS(    on_dismiss(handler: (event: {}
     /**
      * Whether pressing outside an open `Popover` closes it. Default `true`.
      */
-    overlay_closable(value: boolean): Element;
-    /**
 )GPUI_DTS";
-static const char kShellTypes4[] = R"GPUI_DTS(     * Which corner of a `Popover` or `HoverCard` is pinned to its trigger, or
+static const char kShellTypes4[] = R"GPUI_DTS(    overlay_closable(value: boolean): Element;
+    /**
+     * Which corner of a `Popover` or `HoverCard` is pinned to its trigger, or
      * where an `fps_monitor()` is pinned inside its relative parent. Omitted,
      * each keeps its own default: `Popover` is `top_left`, `HoverCard` is
      * `top_center`, and `fps_monitor()` is `top_right`.
@@ -116536,8 +118450,6 @@ static const char kShellTypes4[] = R"GPUI_DTS(     * Which corner of a `Popover`
      * edge is a preference rather than a promise.
      */
     anchor(value: Anchor): Element;
-    /** Whether an fps_monitor requests continuous whole-window redraws. Default false. */
-    continuous(value: boolean): Element;
     /** Frame budget, in milliseconds, used by an fps_monitor's FRAME grading. */
     frame_budget(milliseconds: number): Element;
     /** Which pointer button opens a `Popover`. Default `left`. */
@@ -116768,10 +118680,10 @@ static const char kShellTypes4[] = R"GPUI_DTS(     * Which corner of a `Popover`
     /** Sets the corner radius on the two right corners. */
     rounded_r(value: AbsoluteLength): Element;
     /** Sets the corner radius on the two top corners. */
-)GPUI_DTS";
-static const char kShellTypes5[] = R"GPUI_DTS(    rounded_t(value: AbsoluteLength): Element;
+    rounded_t(value: AbsoluteLength): Element;
     /** Sets the corner radius on the top-left corner. */
-    rounded_tl(value: AbsoluteLength): Element;
+)GPUI_DTS";
+static const char kShellTypes5[] = R"GPUI_DTS(    rounded_tl(value: AbsoluteLength): Element;
     /** Sets the corner radius on the top-right corner. */
     rounded_tr(value: AbsoluteLength): Element;
     /** Sets the width and the height together. */
@@ -117157,10 +119069,10 @@ static const char kShellTypes5[] = R"GPUI_DTS(    rounded_t(value: AbsoluteLengt
      *
      * 2px
      */
-)GPUI_DTS";
-static const char kShellTypes6[] = R"GPUI_DTS(    border_r_2(): Element;
+    border_r_2(): Element;
     /**
-     * Sets the border width of the right side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)
+)GPUI_DTS";
+static const char kShellTypes6[] = R"GPUI_DTS(     * Sets the border width of the right side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)
      *
      * 20px
      */
@@ -135690,6 +137602,81 @@ static const char kShellTypes50[] = R"GPUI_DTS(     * Sets the width of the elem
    */
   export function image(path: string): Element;
 
+  /** The visible items, as a half-open `[start, end)` interval. */
+  export interface ItemRange {
+    start: number;
+    end: number;
+  }
+
+  /**
+   * GPUI's own lazy list: rows of any height, measured as they are drawn.
+   *
+   * Where `v_virtual_list` places rows by the sizes the script states, `list`
+   * asks nothing about size. `render(index, cx)` is called for each item that
+   * is on screen, from inside layout as a virtual list's renderer is, and the
+   * element it returns is measured; the list keeps those measurements and
+   * estimates the rest, so a collection of panels that size to their own
+   * content scrolls as one and costs the script only what is visible. The
+   * rules of a virtual list's renderer apply unchanged: no handlers and no
+   * retained state inside it, and `cx.notify()` is refused there.
+   *
+   * The list scrolls itself and paints no scrollbar; pair one with it by name,
+   * as with a scroll area:
+   *
+   * ```js
+   * v_flex().relative().flex_1().min_h(0)
+   *   .child(list("panels", this.panels.length,
+   *     (index) => this.panels[index].id,
+   *     (index) => this.panel(this.panels[index])))
+   *   .child(Scrollbar.vertical("panels").absolute().inset_0());
+   * ```
+   *
+)GPUI_DTS";
+static const char kShellTypes51[] = R"GPUI_DTS(   * The measuring is what it costs: the host is entered once per visible item
+   * per frame, where `v_virtual_list` and `uniform_list` are entered once per
+   * frame however many rows are on screen. Reach for this when heights are
+   * genuinely unequal and unknown — a column of panels, a feed of mixed
+   * cards — and for a long run of same-height rows reach for one of the
+   * others.
+   *
+   * One consequence of the per-item call: `get_key`'s uniqueness is checked
+   * within a call, so a `list` cannot see that two items share a key, where
+   * the other two throw. A duplicate key there quietly gives both items one
+   * identity, and `on_item_click` reports it for either.
+   *
+   * @param id      Identity, and the name a `Scrollbar` pairs with.
+   * @param item_count How many items the collection has, visible or not.
+   * @param get_key An item's stable domain key, from its current index; the
+   *   row's element identity and what `on_item_click` reports.
+   * @param render  Called with one index; returns that item's element.
+   */
+  export function list(
+    id: string | number,
+    item_count: number,
+    get_key: (index: number) => string,
+    render: (index: number, cx: Context) => Element,
+  ): Element;
+
+  /**
+   * GPUI's own uniform list: one row is measured and every row takes its
+   * height.
+   *
+   * The same contract as `v_virtual_list` with a single size, without the
+   * size: the first row (or the one `with_item_to_measure_index` names) is
+   * measured and the rest are placed by it, so a row's height may come from
+   * its content rather than a number in the script. `render(range, cx)` is
+   * called with the visible interval and returns one element per item in it,
+   * so one frame is one call however many rows are on screen — the same
+   * bargain `v_virtual_list` makes, and the reason to prefer this over `list`
+   * whenever the rows really are the same height.
+   */
+  export function uniform_list(
+    id: string | number,
+    item_count: number,
+    get_key: (index: number) => string,
+    render: (range: ItemRange, cx: Context) => Element[],
+  ): Element;
+
   /** Immutable native GPUI geometry produced by `PathBuilder.build()`. */
   export interface Path {}
   export interface PathBuilder {
@@ -135699,8 +137686,7 @@ static const char kShellTypes50[] = R"GPUI_DTS(     * Sets the width of the elem
     cubic_bezier_to(to_x: import("gpui-shell").PathCoordinate, to_y: import("gpui-shell").PathCoordinate, control_a_x: import("gpui-shell").PathCoordinate, control_a_y: import("gpui-shell").PathCoordinate, control_b_x: import("gpui-shell").PathCoordinate, control_b_y: import("gpui-shell").PathCoordinate): PathBuilder;
     arc_to(radius_x: import("gpui-shell").PathCoordinate, radius_y: import("gpui-shell").PathCoordinate, rotation: number, large_arc: boolean, sweep: boolean, to_x: import("gpui-shell").PathCoordinate, to_y: import("gpui-shell").PathCoordinate): PathBuilder;
     add_polygon(points: ReadonlyArray<readonly [import("gpui-shell").PathCoordinate, import("gpui-shell").PathCoordinate]>, closed?: boolean): PathBuilder;
-)GPUI_DTS";
-static const char kShellTypes51[] = R"GPUI_DTS(    close(): PathBuilder;
+    close(): PathBuilder;
     dash_array(values: readonly number[]): PathBuilder;
     build(): Path;
   }
@@ -135899,7 +137885,8 @@ static const char kShellTypes51[] = R"GPUI_DTS(    close(): PathBuilder;
    * you `JSON.stringify` it — and reading it back is `JSON.parse`. That is not
    * an omission; it is the API this mirrors.
    *
-   * Storage is per application. The host places the file, because an
+)GPUI_DTS";
+static const char kShellTypes52[] = R"GPUI_DTS(   * Storage is per application. The host places the file, because an
    * application that could name its own storage location could name another
    * application's.
    */
@@ -135945,13 +137932,17 @@ static const char kShellTypes51[] = R"GPUI_DTS(    close(): PathBuilder;
   }
 }
 
+declare module "gpui" {
+  export * from "gpui-kit";
+}
+
 declare module "gpui-base" {
   import {
     Color,
     Context,
     Element,
     FocusHandle,
-  } from "gpui";
+  } from "gpui-kit";
 
   /** Every semantic color token the installed Base palette defines. */
   export type ColorToken =
@@ -136003,8 +137994,7 @@ declare module "gpui-base" {
   /** A controlled switch. No styling. */
   export const Switch: ComponentType;
   /** Rich HTML or Markdown text. CSS in HTML is not supported. */
-)GPUI_DTS";
-static const char kShellTypes52[] = R"GPUI_DTS(  export interface TextViewElement extends Element {
+  export interface TextViewElement extends Element {
     /** Overrides TextView's default URL opening and reports the resolved URL. */
     on_link_click(handler: (url: string, cx: Context) => void): TextViewElement;
     selectable(value?: boolean): TextViewElement;
@@ -136207,7 +138197,8 @@ static const char kShellTypes52[] = R"GPUI_DTS(  export interface TextViewElemen
     value(): CalendarDate;
     /** Selects a day, a range, or nothing. */
     set_value(next: CalendarDate): void;
-    /** Moves the grid forward one month. Illegal from `render`. */
+)GPUI_DTS";
+static const char kShellTypes53[] = R"GPUI_DTS(    /** Moves the grid forward one month. Illegal from `render`. */
     next_month(): void;
     /** And back one. Illegal from `render`. */
     prev_month(): void;
@@ -136289,8 +138280,7 @@ static const char kShellTypes52[] = R"GPUI_DTS(  export interface TextViewElemen
   /** The body row group of a `Table`. */
   export const TableBody: ComponentType;
   /** One row. `TableRow.new(id, row_index)`, one-based. */
-)GPUI_DTS";
-static const char kShellTypes53[] = R"GPUI_DTS(  export const TableRow: { new: (id: string | number, row_index: number) => Element };
+  export const TableRow: { new: (id: string | number, row_index: number) => Element };
   /** One column header. `TableHead.new(id, column_index)`, one-based. */
   export const TableHead: { new: (id: string | number, column_index: number) => Element };
   /** One data cell. `TableCell.new(id, column_index)`, one-based. */
@@ -136467,7 +138457,8 @@ static const char kShellTypes53[] = R"GPUI_DTS(  export const TableRow: { new: (
   /**
    * A date-picker root: the combobox role, the announced open state, and the
    * trigger's place in the Tab order. **It holds no date** — the date lives
-   * wherever you keep it, and the calendar you draw inside it is your own.
+)GPUI_DTS";
+static const char kShellTypes54[] = R"GPUI_DTS(   * wherever you keep it, and the calendar you draw inside it is your own.
    *
    * The focus handle is a constructor argument because base requires it: the
    * picker takes the keyboard through that handle, and there is no builder to
@@ -136524,10 +138515,7 @@ static const char kShellTypes53[] = R"GPUI_DTS(  export const TableRow: { new: (
   };
 
   /** The visible items, as a half-open `[start, end)` interval. */
-  export interface ItemRange {
-    start: number;
-    end: number;
-  }
+  export type ItemRange = import("gpui-kit").ItemRange;
 
   /**
    * A list that describes only what is on screen.
@@ -136545,8 +138533,7 @@ static const char kShellTypes53[] = R"GPUI_DTS(  export const TableRow: { new: (
    *
    * * **No handlers inside the renderer.** `on_click` and the rest throw if
    *   called there. Use `on_item_click` on the list — see its note for why.
-)GPUI_DTS";
-static const char kShellTypes54[] = R"GPUI_DTS(   * * **No state inside the renderer.** `InputState.new()`, `cx.focus_handle()`
+   * * **No state inside the renderer.** `InputState.new()`, `cx.focus_handle()`
    *   and the rest throw there as they do in `render()`, and `cx.notify()` is
    *   refused: asking for a re-render from inside layout is a loop.
    *
@@ -136744,7 +138731,8 @@ static const char kShellTypes54[] = R"GPUI_DTS(   * * **No state inside the rend
     /**
      * `change` arrives on every pixel of a drag; `release` arrives once, when
      * the pointer is let go. Take the first for a live readout and the second
-     * for anything that costs something — a request, a write, an undo entry.
+)GPUI_DTS";
+static const char kShellTypes55[] = R"GPUI_DTS(     * for anything that costs something — a request, a write, an undo entry.
      */
     on(event: "change" | "release", handler: (value: SliderValue, cx: Context) => void): boolean;
     release(): boolean;
@@ -136826,8 +138814,7 @@ static const char kShellTypes54[] = R"GPUI_DTS(   * * **No state inside the rend
    * state is: the base layer has no setter for it.
    */
   export interface OtpState {
-)GPUI_DTS";
-static const char kShellTypes55[] = R"GPUI_DTS(    /** The digits entered so far — shorter than `len()` until the code is complete. */
+    /** The digits entered so far — shorter than `len()` until the code is complete. */
     value(): string;
     /**
      * Sets the code from the script. Deliberately unfiltered, as in the base
@@ -137032,14 +139019,15 @@ static const char kShellTypes55[] = R"GPUI_DTS(    /** The digits entered so far
    */
   export interface DockArea {
     /** Docks `view` — a view from `cx.new(Class)`, not an element. */
-    add_panel(view: import("gpui").Entity, options: DockPanelOptions): void;
+    add_panel(view: import("gpui-kit").Entity, options: DockPanelOptions): void;
     /** Removes the panel with this id, wherever it sits. */
     remove_panel(id: number): void;
     /** Every panel in the area, in tree order. */
     panels(): DockPanel[];
     /**
      * The whole layout as plain data: the tree, the docks, and each panel's own
-     * `serialize()` payload. Hand it back to `load` after a restart.
+)GPUI_DTS";
+static const char kShellTypes56[] = R"GPUI_DTS(     * `serialize()` payload. Hand it back to `load` after a restart.
      */
     dump(): any;
     /**
@@ -137091,7 +139079,7 @@ static const char kShellTypes55[] = R"GPUI_DTS(    /** The digits entered so far
      * Registering the same name twice replaces the class, which is what a hot
      * reload does.
      */
-    register_panel: (name: string, Class: import("gpui").ViewClass) => string;
+    register_panel: (name: string, Class: import("gpui-kit").ViewClass) => string;
   };
 
   /**
@@ -137115,8 +139103,7 @@ static const char kShellTypes55[] = R"GPUI_DTS(    /** The digits entered so far
 
   export interface DockAreaElement extends Element {
     /** The tab bar above a group's displayed panel. */
-)GPUI_DTS";
-static const char kShellTypes56[] = R"GPUI_DTS(    tab_bar(handler: (group: DockGroup, cx: Context) => Element): DockAreaElement;
+    tab_bar(handler: (group: DockGroup, cx: Context) => Element): DockAreaElement;
     /** What a group with no displayed panel shows. */
     empty_group(handler: (group: DockGroup, cx: Context) => Element | null): DockAreaElement;
     /** The hint showing where a dragged panel would land. */
@@ -137223,7 +139210,7 @@ static const char kShellTypes56[] = R"GPUI_DTS(    tab_bar(handler: (group: Dock
 }
 
 declare module "gpui-component" {
-  import { ClickEvent, Context, Element } from "gpui";
+  import { ClickEvent, Context, Element } from "gpui-kit";
 }
 
 declare module "gpui-shell" {
@@ -137246,7 +139233,7 @@ declare module "gpui-shell" {
   export type Props = Record<string, any>;
 
   /** Element-local event bounds assembled by the shell. */
-  export interface ElementBounds extends import("gpui").Point {
+  export interface ElementBounds extends import("gpui-kit").Point {
     width: number;
     height: number;
   }
@@ -137266,7 +139253,7 @@ declare module "gpui-shell" {
 
   export interface TaskOptions {
     /** Defaults to the running view; `null` outlives every view. */
-    owner?: import("gpui").View | null;
+    owner?: import("gpui-kit").View | null;
   }
 
   export type MotionProperty = "opacity" | "width" | "height" | "left" | "top";
@@ -137290,7 +139277,7 @@ declare module "gpui-shell" {
 }
 
 declare module "gpui-fps" {
-  import { Anchor, Element } from "gpui";
+  import { Anchor, Element } from "gpui-kit";
 
   /**
    * The native `gpui-fps` performance HUD, shared once per window and pinned
@@ -137305,12 +139292,6 @@ declare module "gpui-fps" {
   export interface FpsMonitorOptions {
     /** Corner or edge of the window. Default `top_right`. */
     anchor?: Anchor;
-    /**
-     * Whether the HUD requests a redraw after every frame, so the rate it
-     * shows is the rate the window *can* sustain. Default `false`: the HUD
-     * observes the application's own frames and reads zero while it idles.
-     */
-    continuous?: boolean;
     /** Frame budget in milliseconds, for the FRAME grading and the chart's scale. */
     frame_budget?: number;
   }
@@ -137340,7 +139321,8 @@ declare module "buffer" {
 declare module "path" {
   export function join(...parts: string[]): string;
   export function resolve(...parts: string[]): string;
-  export function dirname(path: string): string;
+)GPUI_DTS";
+static const char kShellTypes57[] = R"GPUI_DTS(  export function dirname(path: string): string;
   export function basename(path: string, suffix?: string): string;
   const path: { join: typeof join; resolve: typeof resolve; dirname: typeof dirname; basename: typeof basename };
   export default path;
@@ -137410,8 +139392,7 @@ declare module "fs/promises" {
   export function exists(path: string): Promise<boolean>;
   export function unlink(path: string): Promise<void>;
   export function rmdir(path: string): Promise<void>;
-)GPUI_DTS";
-static const char kShellTypes57[] = R"GPUI_DTS(  export function mkdir(path: string, options?: MakeDirectoryOptions): Promise<void>;
+  export function mkdir(path: string, options?: MakeDirectoryOptions): Promise<void>;
 }
 declare module "net" {
   export interface Socket {
@@ -137476,7 +139457,7 @@ declare const process: typeof import("process").default;
  * `cx.notify()` re-renders this view, `window.open_dialog()` changes what the
  * user is looking at — which is why these are here and not on `Context`.
  */
-type GpuiShellWindow = import("gpui").Window;
+type GpuiShellWindow = import("gpui-kit").Window;
 interface Window extends GpuiShellWindow {}
 declare var window: Window & typeof globalThis;
 
@@ -137485,9 +139466,9 @@ declare var window: Window & typeof globalThis;
  * *is* the global object. Here `window` is an ordinary object, so both
  * spellings are installed rather than one falling out of the other.
  */
-declare const localStorage: import("gpui").Storage;
+declare const localStorage: import("gpui-kit").Storage;
 /** `window.sessionStorage`, bare, for the same reason. */
-declare const sessionStorage: import("gpui").Storage;
+declare const sessionStorage: import("gpui-kit").Storage;
 )GPUI_DTS";
 
 void AppendBuiltinTypeDeclarations(StrBuilder* out) {
@@ -137577,9 +139558,10 @@ static TempStr shell_typings_JoinPathTemp(Str directory, Str name) {
 }
 
 static bool SourceImportsBuiltins(Str source) {
-    static const char* specifiers[] = {"gpui", "gpui-base", "gpui-shell",
-                                       "gpui-fps"};
-    for (int i = 0; i < 4; i++) {
+    static const char* specifiers[] = {"gpui-kit", "gpui", "gpui-base",
+                                       "gpui-shell", "gpui-fps"};
+    for (int i = 0; i < (int)(sizeof(specifiers) / sizeof(specifiers[0]));
+         i++) {
         TempStr quoted = fmt("\"%s\"", Str(specifiers[i]));
         if (StrContains(source, quoted)) return true;
         quoted = fmt("'%s'", Str(specifiers[i]));
@@ -137660,6 +139642,9 @@ static void AppendReindented(StrBuilder* out, Str declarations) {
 void ShellTypeDeclarations(StrBuilder* out, const HostModules* modules) {
     if (!out) return;
     AppendBuiltinTypeDeclarations(out);
+
+    out->Append(StrL(
+        "\ndeclare module \"gpui-kit\" {\n  export * from \"gpui\";\n}\n"));
     for (int i = 0; i < HostModulesCount(modules); i++) {
         HostModule* module = HostModulesAt(modules, i);
         if (!module) continue;
@@ -137700,7 +139685,7 @@ static const char* const kEditorConfig =
     "",
     "`lib` decides which globals exist. The default hands a script the",
     "browser's — a `console`, a `localStorage`, a `Window` this runtime does",
-    "not have — and their declarations collide with the ones gpui.d.ts makes,",
+    "not have — and their declarations collide with the ones gpui-kit.d.ts makes,",
     "so the file describing the API is itself reported as the error.",
     "",
     "`strictNullChecks` is off, and this one is the runtime's shape rather than",
@@ -138252,17 +140237,33 @@ void ScriptView::OnItemSecondaryPress(ScriptView* self, Ctx* cx,
                                               *event, cx->win, cx->app);
 }
 
+static void ShellSelectClose(ScriptView* self, Ctx* cx,
+                             ShellSelectBinding* value) {
+    if (value->onDismiss)
+        self->runtime->DispatchSignal(value->onDismiss, cx->win, cx->app);
+    if (value->onOpenChange)
+        self->runtime
+            ->DispatchChange(value->onOpenChange, false, cx->win, cx->app);
+    if (value->triggerFocus.IsValid())
+        FocusHandleFocus(cx->win, value->triggerFocus);
+}
+
+static void ShellSelectOpen(ScriptView* self, Ctx* cx,
+                            ShellSelectBinding* value) {
+    if (value->onOpenChange)
+        self->runtime
+            ->DispatchChange(value->onOpenChange, true, cx->win, cx->app);
+    if (value->contentFocus.IsValid())
+        FocusHandleFocus(cx->win, value->contentFocus);
+}
+
 void ScriptView::OnSelectAction(ScriptView* self, Ctx* cx,
                                 const ActionEvent* event, intptr_t binding) {
     ShellSelectBinding* value = (ShellSelectBinding*)binding;
     if (!self || !self->runtime || !event || !value) return;
     switch (SelectActionOf(event->action, value->open, value->disabled)) {
         case SelectAction::Open:
-            if (value->contentFocus.IsValid())
-                FocusHandleFocus(cx->win, value->contentFocus);
-            if (value->onOpenChange)
-                self->runtime->DispatchChange(value->onOpenChange, true,
-                                              cx->win, cx->app);
+            ShellSelectOpen(self, cx, value);
             break;
         case SelectAction::Confirm:
             if (value->onConfirm)
@@ -138270,14 +140271,7 @@ void ScriptView::OnSelectAction(ScriptView* self, Ctx* cx,
                     ->DispatchSignal(value->onConfirm, cx->win, cx->app);
             break;
         case SelectAction::Dismiss:
-            if (value->onDismiss)
-                self->runtime
-                    ->DispatchSignal(value->onDismiss, cx->win, cx->app);
-            if (value->triggerFocus.IsValid())
-                FocusHandleFocus(cx->win, value->triggerFocus);
-            if (value->onOpenChange)
-                self->runtime->DispatchChange(value->onOpenChange, false,
-                                              cx->win, cx->app);
+            ShellSelectClose(self, cx, value);
             break;
         case SelectAction::None:
             const_cast<ActionEvent*>(event)->propagate = true;
@@ -138285,16 +140279,15 @@ void ScriptView::OnSelectAction(ScriptView* self, Ctx* cx,
     }
 }
 
-void ScriptView::OnSelectOpen(ScriptView* self, Ctx* cx, const ClickEvent*,
-                              intptr_t binding) {
+void ScriptView::OnSelectActivate(ScriptView* self, Ctx* cx, const ClickEvent*,
+                                  intptr_t binding) {
     ShellSelectBinding* value = (ShellSelectBinding*)binding;
-    if (!self || !self->runtime || !value || value->disabled || value->open)
+    if (!self || !self->runtime || !value || value->disabled) return;
+    if (value->open) {
+        ShellSelectClose(self, cx, value);
         return;
-    if (value->contentFocus.IsValid())
-        FocusHandleFocus(cx->win, value->contentFocus);
-    if (value->onOpenChange)
-        self->runtime
-            ->DispatchChange(value->onOpenChange, true, cx->win, cx->app);
+    }
+    ShellSelectOpen(self, cx, value);
 }
 
 void ScriptView::OnNumberStep(ScriptView* self, Ctx* cx,
@@ -154019,6 +156012,11 @@ static float BoxPad(TextLayout* tl) {
     return (tl->box - tl->natural) * 0.5f;
 }
 
+bool PaintTextLayoutSpans(PaintCtx*, TextLayout*, Str, float, float, Rgba,
+                          const TextSpan*, int) {
+    return false;
+}
+
 void TextLayoutDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
                     bool clip, float clipW) {
     cairo_t* cr = Cr(ctx);
@@ -155105,6 +157103,11 @@ void TextLayoutRelease(TextLayout* tl) {
 
 uint64_t TextLayoutGeneration(const TextLayout* tl) {
     return tl ? tl->generation : 0;
+}
+
+bool PaintTextLayoutSpans(PaintCtx*, TextLayout*, Str, float, float, Rgba,
+                          const TextSpan*, int) {
+    return false;
 }
 
 void TextLayoutDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
@@ -156471,6 +158474,11 @@ void TextLayoutRelease(TextLayout* tl) {
 
 uint64_t TextLayoutGeneration(const TextLayout* tl) {
     return tl ? tl->generation : 0;
+}
+
+bool PaintTextLayoutSpans(PaintCtx*, TextLayout*, Str, float, float, Rgba,
+                          const TextSpan*, int) {
+    return false;
 }
 
 void TextLayoutDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
@@ -158183,6 +160191,40 @@ uint64_t TextLayoutGeneration(const TextLayout* tl) {
 
 void* PaintTextLayoutNative(TextLayout* tl) {
     return Dw(tl);
+}
+
+bool PaintTextLayoutSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x,
+                          float y, Rgba base, const TextSpan* spans, int n) {
+    if (PaintGpuOn() || !tl || n <= 0) return false;
+    if (scene::Recording()) {
+        return scene::RecTextDrawSpans(ctx, tl, text, x, y, base, spans, n);
+    }
+    if (!ctx || !ctx->rt || !ctx->rt->rt) return false;
+
+    IDWriteTextLayout* layout = Dw(tl);
+    bool ok = true;
+    for (int i = 0; i < n; i++) {
+        int lo = Utf8OffToWide(text, spans[i].lo);
+        int hi = Utf8OffToWide(text, spans[i].hi);
+        if (hi <= lo) continue;
+        ID2D1SolidColorBrush* brush = nullptr;
+        HRESULT hr = ctx->rt->rt->CreateSolidColorBrush(
+            ToD2D(PaintFade(ctx, spans[i].color)), &brush);
+        if (SUCCEEDED(hr)) {
+            hr = layout
+                     ->SetDrawingEffect(brush, {(UINT32)lo, (UINT32)(hi - lo)});
+        }
+        gpui_paint_win_Rel(&brush);
+        if (FAILED(hr)) {
+            ok = false;
+            break;
+        }
+    }
+    if (ok) {
+        TextLayoutDraw(ctx, tl, x, y, base, false);
+    }
+    layout->SetDrawingEffect(nullptr, {0, UINT32_MAX});
+    return ok;
 }
 
 void TextLayoutDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
@@ -162596,6 +164638,14 @@ int PlatDoubleClickMs() {
     return 400;
 }
 
+uint64_t PlatWindowDisplay(Window*) {
+    return 0;
+}
+
+double PlatDisplayRefreshPeriod(uint64_t) {
+    return 0;
+}
+
 void* PlatWindowHandle(Window* win) {
 
     if (!win || !win->plat) {
@@ -164688,6 +166738,34 @@ int PlatDoubleClickMs() {
     return (int)([NSEvent doubleClickInterval] * 1000);
 }
 
+uint64_t PlatWindowDisplay(Window* win) {
+    NSScreen* screen = win && win->plat && win->plat->window
+                           ? [win->plat->window screen]
+                           : nil;
+    if (!screen) {
+        return 0;
+    }
+
+    NSNumber* number =
+        [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+    return number ? (uint64_t)[number unsignedIntValue] : 0;
+}
+
+double PlatDisplayRefreshPeriod(uint64_t display) {
+    if (!display) {
+        return 0;
+    }
+    CGDisplayModeRef mode =
+        CGDisplayCopyDisplayMode((CGDirectDisplayID)display);
+    if (!mode) {
+        return 0;
+    }
+    double hertz = CGDisplayModeGetRefreshRate(mode);
+    CGDisplayModeRelease(mode);
+
+    return hertz > 1. ? 1. / hertz : 0;
+}
+
 static id GpuiAccessibilityHitTest(id self, SEL cmd, NSPoint point) {
     (void)cmd;
     NSView* view = [(NSWindow*)self contentView];
@@ -164780,8 +166858,9 @@ namespace gpui {
 
 static const int kMenuImageSize = 16;
 
-static NSImage* MenuIconImage(Window* win, const char* path) {
-    if (!win || !path || !path[0]) {
+static NSImage* MenuIconImage(Window* win, const PlatMenuItem& it) {
+    bool fromSvg = it.iconSvg && it.iconSvgLen > 0;
+    if (!win || (!fromSvg && (!it.iconPath || !it.iconPath[0]))) {
         return nil;
     }
 
@@ -164789,7 +166868,12 @@ static NSImage* MenuIconImage(Window* win, const char* path) {
     Vec<uint8_t> buf;
     VecAppendBlanks(buf, px * px * 4);
 
-    if (!SvgRasterize(win->paint.pa, Str(path), px, Rgb(0, 0, 0), buf.els)) {
+    bool drew =
+        fromSvg ? SvgRasterizeXml(win->paint.pa, Str(it.iconSvg, it.iconSvgLen),
+                                  px, Rgb(0, 0, 0), buf.els)
+                : SvgRasterize(win->paint.pa, Str(it.iconPath), px,
+                               Rgb(0, 0, 0), buf.els);
+    if (!drew) {
         return nil;
     }
     CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
@@ -164906,8 +166990,8 @@ static NSMenu* BuildMenu(Window* win, const PlatMenuItem* items, int n,
                                                       action:nil
                                                keyEquivalent:@""];
         [item setEnabled:(it.disabled ? NO : YES)];
-        if (it.iconPath) {
-            NSImage* image = MenuIconImage(win, it.iconPath);
+        if (it.iconPath || it.iconSvg) {
+            NSImage* image = MenuIconImage(win, it);
             if (image) {
                 [item setImage:image];
             }
@@ -165868,6 +167952,14 @@ int PlatDoubleClickMs() {
     return 500;
 }
 
+uint64_t PlatWindowDisplay(Window*) {
+    return 0;
+}
+
+double PlatDisplayRefreshPeriod(uint64_t) {
+    return 0;
+}
+
 void* PlatWindowHandle(Window*) {
 
     return nullptr;
@@ -166791,6 +168883,37 @@ void* PlatWindowHandle(Window* win) {
     return (void*)Hwnd(win);
 }
 
+uint64_t PlatWindowDisplay(Window* win) {
+    HWND hwnd = Hwnd(win);
+    if (!hwnd) {
+        return 0;
+    }
+    return (uint64_t)(uintptr_t)MonitorFromWindow(hwnd,
+                                                  MONITOR_DEFAULTTONEAREST);
+}
+
+double PlatDisplayRefreshPeriod(uint64_t display) {
+    HMONITOR monitor = (HMONITOR)(uintptr_t)display;
+    if (!monitor) {
+        return 0;
+    }
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) {
+        return 0;
+    }
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) {
+        return 0;
+    }
+
+    if (mode.dmDisplayFrequency <= 1) {
+        return 0;
+    }
+    return 1.0 / (double)mode.dmDisplayFrequency;
+}
+
 void PlatInstallAccessibilityHitTest(Window* win) {
 
     if (win && win->plat && !win->plat->accessibility) {
@@ -166824,7 +168947,9 @@ static void ApplyMenuTheme(HWND hwnd, bool dark) {
     static bool tried = false;
     if (!tried) {
         tried = true;
-        uxtheme = LoadLibraryW(L"uxtheme.dll");
+
+        uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr,
+                                 LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if (!uxtheme) {
         return;
@@ -166851,9 +168976,10 @@ static void ApplyMenuTheme(HWND hwnd, bool dark) {
 
 static const int kMenuImageSize = 16;
 
-static HBITMAP MenuIconBitmap(Window* win, const char* path, int px,
+static HBITMAP MenuIconBitmap(Window* win, const PlatMenuItem& it, int px,
                               Rgba color) {
-    if (!win || !path || !path[0] || px <= 0) {
+    bool fromSvg = it.iconSvg && it.iconSvgLen > 0;
+    if (!win || px <= 0 || (!fromSvg && (!it.iconPath || !it.iconPath[0]))) {
         return nullptr;
     }
     BITMAPINFO bi = {};
@@ -166872,7 +168998,13 @@ static HBITMAP MenuIconBitmap(Window* win, const char* path, int px,
         }
         return nullptr;
     }
-    if (!SvgRasterize(win->paint.pa, Str(path), px, color, (uint8_t*)bits)) {
+
+    bool drew =
+        fromSvg ? SvgRasterizeXml(win->paint.pa, Str(it.iconSvg, it.iconSvgLen),
+                                  px, color, (uint8_t*)bits)
+                : SvgRasterize(win->paint.pa, Str(it.iconPath), px, color,
+                               (uint8_t*)bits);
+    if (!drew) {
         DeleteObject(bmp);
         return nullptr;
     }
@@ -166911,8 +169043,8 @@ static HMENU BuildMenu(Window* win, const PlatMenuItem* items, int n,
         UINT flags = MF_STRING | (it.disabled ? MF_GRAYED : 0u) |
                      (it.checked ? MF_CHECKED : 0u);
         AppendMenuW(menu, flags, (UINT_PTR)it.id, label);
-        if (it.iconPath) {
-            HBITMAP bmp = MenuIconBitmap(win, it.iconPath, iconPx, iconColor);
+        if (it.iconPath || it.iconSvg) {
+            HBITMAP bmp = MenuIconBitmap(win, it, iconPx, iconColor);
             if (bmp) {
 
                 MENUITEMINFOW info = {};

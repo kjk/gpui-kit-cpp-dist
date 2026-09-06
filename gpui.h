@@ -3990,8 +3990,6 @@ struct RuntimeStyle {
 const RuntimeStyle& RuntimeStyleNow(const App* app);
 void RuntimeStyleInstall(App* app, const RuntimeStyle& style);
 
-const double kInactiveFrameInterval = 0.5;
-
 const float kRadiusFull = 9999.f;
 
 const int kPaintLayerTree = 0;
@@ -4457,9 +4455,11 @@ struct Style {
     bool focusOnPress = false;
 
     bool focusRing = false;
+
+    int8_t tooltipPlacement = -1;
 };
 
-static_assert(sizeof(Style) <= 408, "keep Style members packed by alignment");
+static_assert(sizeof(Style) <= 416, "keep Style members packed by alignment");
 
 struct ActionSlot {
     uint32_t action = 0;
@@ -4777,6 +4777,8 @@ struct ElStyleStates {
     ArenaStr dragOverKind = kArenaStrNone;
 };
 
+struct Selection;
+
 struct El {
 
     Arena* arena = nullptr;
@@ -4784,6 +4786,8 @@ struct El {
     Str id;
     Str text;
     Str iconPath;
+
+    Str iconSvg;
     AccessibilityInfo accessibility = {};
 
     ImageSource imageSource;
@@ -4848,6 +4852,11 @@ struct El {
     gpui::Bounds* rangeOut = nullptr;
     float* caretOutX = nullptr;
     float* caretOutY = nullptr;
+
+    const Selection* extraSels = nullptr;
+    int nExtraSels = 0;
+    const int* extraCarets = nullptr;
+    int nExtraCarets = 0;
 
     const SelSource* selSrc = nullptr;
 
@@ -5136,6 +5145,9 @@ struct El {
 
     El* SelRange(int lo, int hi, Rgba color);
 
+    El* ExtraSelRanges(const Selection* ranges, int n);
+    El* ExtraCarets(const int* offsets, int n, Rgba color);
+
     El* CaretOut(float* outX, float* outY);
 
     El* RangeOut(int lo, int hi, gpui::Bounds* out);
@@ -5210,6 +5222,8 @@ struct El {
     El* FocusRing(bool v = true);
     El* TrapId(int v);
     El* Tip(Str s);
+
+    El* TipPlacement(int placement);
     El* Id(Str s);
 };
 
@@ -5265,6 +5279,7 @@ struct HitRect {
     CursorKind cursor = CursorKind::Arrow;
 
     Str tooltip = {};
+    int8_t tooltipPlacement = -1;
     SliderState* slider = nullptr;
     Axis sliderAxis = Axis::Horizontal;
     InputState* input = nullptr;
@@ -5603,6 +5618,17 @@ inline Selection SelectionAt(int offset) {
     return Selection{offset, offset};
 }
 
+struct CursorSelection {
+    Selection range = {};
+    bool reversed = false;
+
+    int preferredColumn = -1;
+    float preferredX = -1;
+
+    int Cursor() const { return reversed ? range.start : range.end; }
+    bool IsEmpty() const { return range.IsEmpty(); }
+};
+
 enum class EditIntent : uint8_t {
     Typing,
     Backspace,
@@ -5624,15 +5650,23 @@ struct UndoTransaction {
     Change* changes = nullptr;
     int len = 0;
     int cap = 0;
+
+    int lastBatchLen = 0;
+
+    CursorSelection* selsBefore = nullptr;
+    int nSelsBefore = 0;
+    CursorSelection* selsAfter = nullptr;
+    int nSelsAfter = 0;
 };
 
 struct UndoManager {
     Vec<UndoTransaction> undos;
     Vec<UndoTransaction> redos;
     bool ignoring = false;
-    bool transactionOpen = false;
-    bool hasPending = false;
-    Change pending = {};
+
+    int transactionDepth = 0;
+
+    UndoTransaction pending = {};
 
     bool hasPendingIntent = false;
     EditIntent pendingIntent = EditIntent::Atomic;
@@ -5643,6 +5677,12 @@ struct UndoManager {
 
 void UndoRecordTransaction(UndoManager* m, Change change, EditIntent intent);
 void UndoBeginTransaction(UndoManager* m);
+
+void UndoBeginTransactionWith(UndoManager* m, EditIntent intent);
+
+void UndoRecordSelections(UndoManager* m, const CursorSelection* before,
+                          int nBefore, const CursorSelection* after,
+                          int nAfter);
 void UndoCommitTransaction(UndoManager* m);
 void UndoBreakCoalescing(UndoManager* m);
 void UndoSetIgnoring(UndoManager* m, bool ignoring);
@@ -6177,6 +6217,10 @@ struct InputState {
 
     bool hasSelectedWordRange = false;
     Selection selectedWordRange = {};
+
+    Vec<CursorSelection> extraCursors;
+
+    int columnSelectStart = -1;
     UndoManager undo;
     MaskPattern maskPattern = {};
     bool maskPatternSet = false;
@@ -6195,6 +6239,7 @@ struct InputState {
     bool searchable = false;
     bool replaceable = true;
     SearchSession search;
+    uint64_t searchActivationRevision = 0;
 
     FoldMap folds;
     Vec<FoldIconBox> foldIcons;
@@ -6333,12 +6378,23 @@ enum class InputMoveDir : uint8_t {
 void InputScrollToCaret(InputState* s, float caretX, float caretY,
                         InputMoveDir dir);
 
+enum class InputScrollPadding : uint8_t {
+    Minimal,
+    SurroundingLines
+};
+
+void InputScrollToCaretWithPadding(InputState* s, float caretX, float caretY,
+                                   InputMoveDir dir,
+                                   InputScrollPadding padding);
+
 float InputEmptyBottomHeight(bool isCodeEditor, int overrideRows,
                              float viewportH, float lineH);
 float InputCursorSurroundingPadding(bool isAutoGrow, int overrideLines,
                                     int visibleLines, float lineH);
 
 void InputScrollToOffset(InputState* s, int offset, InputMoveDir dir);
+void InputScrollToOffsetWithPadding(InputState* s, int offset, InputMoveDir dir,
+                                    InputScrollPadding padding);
 
 void InputScrollToCursor(InputState* s, InputMoveDir dir);
 
@@ -6396,6 +6452,20 @@ void InputSetSelectedRange(InputState* s, App* app, Window* win, int a, int b);
 void InputSelectWord(InputState* s, App* app, Window* win, int offset);
 void InputSelectLine(InputState* s, App* app, Window* win, int offset);
 
+int InputCursorCount(const InputState* s);
+
+void InputRemoveExtraCursors(InputState* s);
+
+void InputMergeOverlappingCursors(InputState* s);
+
+void InputAddCursorAt(InputState* s, App* app, Window* win, int offset);
+
+void InputBuildColumnarSelection(InputState* s, App* app, Window* win,
+                                 int startOffset, int endOffset);
+
+bool InputReplaceTextInRanges(InputState* s, App* app, Window* win,
+                              const Selection* ranges, const Str* texts, int n);
+
 enum class InputAction : uint8_t {
     None,
     MoveLeft,
@@ -6421,6 +6491,9 @@ enum class InputAction : uint8_t {
     SelectToEndOfLine,
     SelectToPreviousWordStart,
     SelectToNextWordEnd,
+
+    AddCursorAbove,
+    AddCursorBelow,
     Backspace,
     Delete,
     DeleteToBeginningOfLine,
@@ -6545,6 +6618,7 @@ void InputUnmarkText(InputState* s, App* app, Window* win);
 void InputTypeChar(InputState* s, App* app, Window* win, uint32_t ch);
 
 void InputOpenSearch(InputState* s, App* app, Window* win, bool replaceMode);
+uint64_t InputSearchActivationRevision(const InputState* s);
 void InputCloseSearch(InputState* s, App* app, Window* win);
 
 bool InputIsReplaceable(const InputState* s);
@@ -6749,6 +6823,8 @@ void PaintEl(PaintCtx* ctx, El* e);
 int HitTest(PaintCtx* ctx, float x, float y);
 const HitRect* HitTestRect(PaintCtx* ctx, float x, float y);
 
+const ScrollRect* WindowLastScrollRect(const Window* win, int id);
+
 const HitRect* HitTestDrop(PaintCtx* ctx, float x, float y, Str kind);
 const ScrollRect* HitScrollRect(PaintCtx* ctx, float x, float y);
 int TextHitOffsetAt(PaintCtx* ctx, float x, float y, bool nearest);
@@ -6911,6 +6987,8 @@ struct Window {
     EntityId root = {};
 
     Vec<EntityId> rendered;
+
+    Vec<ScrollRect> prevScrolls;
 
     Vec<AccessibilityNode> accessibility;
 
@@ -7660,16 +7738,23 @@ bool SvgViewBox(Str assetPath, Size* out);
 bool SvgDraw(PaintCtx* ctx, Str assetPath, float x, float y, float size,
              Rgba color, float turns = 0);
 
+bool SvgDrawXml(PaintCtx* ctx, Str xml, float x, float y, float size,
+                Rgba color, float turns = 0);
+
 bool SvgDrawOps(PaintCtx* ctx, const uint8_t* ops, int len, float x, float y,
                 float w, float h, Rgba color, float turns = 0,
                 bool grayscale = false);
 
 bool SvgRasterize(PaintApp* pa, Str assetPath, int px, Rgba color,
                   uint8_t* outBgra);
+bool SvgRasterizeXml(PaintApp* pa, Str xml, int px, Rgba color,
+                     uint8_t* outBgra);
 
 bool SvgToDrawOps(Str xml, DrawOpsBuilder* out);
 
 const uint8_t* SvgDrawOpsFor(Str assetPath, int* lenOut);
+
+const uint8_t* SvgDrawOpsForXml(Str xml, int* lenOut);
 
 void SvgCacheClear();
 
@@ -7837,7 +7922,11 @@ struct DialogDescription {
 };
 struct DialogClose {
     static El* New(Ctx* cx, int clickId = 0);
+
+    static El* WithTrigger(Ctx* cx, El* trigger, int clickId = 0);
 };
+
+El* DialogCloseActivation(El* button);
 
 struct DialogTrigger {
     static El* New(Ctx* cx, Listener onOpen = {}, DialogHandle handle = {},
@@ -9345,8 +9434,10 @@ Str SelectContext();
 SelectAction SelectActionOf(uint32_t id, bool open, bool disabled);
 
 struct Select {
+
     static El* New(Ctx* cx, Str id, bool open = false, bool disabled = false,
-                   Str accessibilityLabel = {}, Listener onOpenChange = {});
+                   Str accessibilityLabel = {}, Listener onOpenChange = {},
+                   Str accessibilityValue = {});
 };
 }
 
@@ -10097,6 +10188,8 @@ struct EditResult {
 };
 
 struct DockLayout;
+struct PanelSource;
+struct DockAreaState;
 
 struct PaneTree {
     PaneNode* root = nullptr;
@@ -10137,6 +10230,8 @@ struct PaneTree {
     EditResult BringToFront(PanelId panel);
     void Normalize();
     bool IsNormalized() const;
+
+    int ToState(const PanelSource& source, DockAreaState* out) const;
 
     static PaneTree* FromLayout(DockLayout* layout, RootKind kind,
                                 Vec<DockPanelDef>* panels = nullptr);
@@ -10232,6 +10327,99 @@ struct JsonWriter {
 
 }
 
+#line 1 "src/base/undo_history.h"
+
+namespace gpui {
+template <typename T>
+struct UndoHistory {
+    Vec<Vec<T>*> undos;
+    Vec<Vec<T>*> redos;
+    double lastChangedAt = 0;
+    bool hasLastChangedAt = false;
+    int maxUndos = 1000;
+    double groupInterval = 0;
+    bool hasGroupInterval = false;
+    bool grouping = false;
+    bool ignoring = false;
+
+    UndoHistory() = default;
+    UndoHistory(const UndoHistory&) = delete;
+    UndoHistory& operator=(const UndoHistory&) = delete;
+    ~UndoHistory() { Clear(); }
+    UndoHistory& MaxUndos(int n) {
+        maxUndos = std::max(0, n);
+        EnforceMaxUndos();
+        return *this;
+    }
+    UndoHistory& GroupInterval(double seconds) {
+        groupInterval = std::max(0.0, seconds);
+        hasGroupInterval = true;
+        return *this;
+    }
+    UndoHistory& GroupIntervalMs(int64_t ms) {
+        return GroupInterval((double)ms / 1000);
+    }
+    void StartGrouping() { grouping = true; }
+    void EndGrouping() { grouping = false; }
+    bool IsIgnoring() const { return ignoring; }
+    void SetIgnoring(bool value) { ignoring = value; }
+    bool CanUndo() const { return undos.len > 0; }
+    bool CanRedo() const { return redos.len > 0; }
+    void Push(T item) {
+        if (ignoring || maxUndos == 0) return;
+        double now = TimeNow();
+        bool group = grouping || (hasLastChangedAt && hasGroupInterval &&
+                                  now - lastChangedAt <= groupInterval);
+        if (!group || !undos.len) {
+            VecAppend(undos, new Vec<T>());
+            EnforceMaxUndos();
+        }
+        VecAppend(*undos[undos.len - 1], item);
+        lastChangedAt = now;
+        hasLastChangedAt = true;
+        ClearStack(redos);
+    }
+    Vec<T> Undo() { return Move(undos, redos, true); }
+    Vec<T> Redo() {
+        if (maxUndos == 0) return Vec<T>();
+        Vec<T> result = Move(redos, undos, false);
+        EnforceMaxUndos();
+        return result;
+    }
+    void Clear() {
+        ClearStack(undos);
+        ClearStack(redos);
+        hasLastChangedAt = false;
+    }
+
+  private:
+    static void ClearStack(Vec<Vec<T>*>& stack) {
+        for (auto* transaction : stack) delete transaction;
+        VecClear(stack);
+    }
+    void EnforceMaxUndos() {
+        int excess = undos.len - maxUndos;
+        if (excess <= 0) return;
+        for (int i = 0; i < excess; i++) delete undos[i];
+        for (int i = excess; i < undos.len; i++) undos[i - excess] = undos[i];
+        undos.len -= excess;
+    }
+    Vec<T> Move(Vec<Vec<T>*>& from, Vec<Vec<T>*>& to, bool reverse) {
+        Vec<T> result;
+        if (!from.len) return result;
+        Vec<T>* transaction = from[from.len - 1];
+        from.len--;
+        for (int i = 0; i < transaction->len; i++) {
+            VecAppend(result,
+                      (*transaction)[reverse ? transaction->len - 1 - i : i]);
+        }
+        VecAppend(to, transaction);
+        hasLastChangedAt = false;
+        return result;
+    }
+};
+}
+
 #line 1 "src/base/tiles.h"
 
 namespace gpui {
@@ -10292,8 +10480,6 @@ enum class TilesEvent : uint8_t {
     ZoomOut
 };
 
-const int kMaxTileChanges = 64;
-
 struct TileItem {
 
     int panel = 0;
@@ -10334,10 +10520,8 @@ struct TilesState {
 
     ScrollbarMode scrollbarMode = ScrollbarMode::Always;
 
-    TileChange changes[kMaxTileChanges] = {};
-    int nChange = 0;
-    int cursor = 0;
-    bool ignoring = false;
+    UndoHistory<TileChange> history;
+    TilesState() { history.GroupIntervalMs(100); }
 
     int zoomedPanel = -1;
 
@@ -10673,180 +10857,90 @@ bool BaseIsInDeferredContext(App* app);
 #line 1 "src/base/history.h"
 
 namespace gpui {
-
-template <typename I>
+template <typename T>
+struct HistoryForwardEntries {
+    const T* items = nullptr;
+    int len = 0;
+    const T& operator[](int i) const { return items[len - 1 - i]; }
+};
+template <typename T>
 struct History {
-    Vec<I> undos;
-    Vec<I> redos;
-    double lastChangedAt = TimeNow();
-    uint64_t version = 0;
-    bool ignore = false;
-    int maxUndos = 1000;
-    double groupInterval = 0;
-    bool hasGroupInterval = false;
-    bool grouping = false;
-    bool unique = false;
-
-    History& MaxUndos(int n) {
-        maxUndos = n;
+    Vec<T> entries;
+    Vec<T> forwardEntries;
+    int maxEntries = 1000;
+    History& MaxEntries(int n) {
+        maxEntries = std::max(0, n);
+        EnforceMaxEntries();
         return *this;
     }
-
-    History& Unique(bool on = true) {
-        unique = on;
-        return *this;
+    void Push(T entry) {
+        VecClear(forwardEntries);
+        if (maxEntries == 0) return;
+        VecAppend(entries, entry);
+        EnforceMaxEntries();
     }
-
-    History& GroupInterval(double seconds) {
-        groupInterval = seconds >= 0 ? seconds : 0;
-        hasGroupInterval = true;
-        return *this;
+    const T* Current() const {
+        return entries.len ? &entries[entries.len - 1] : nullptr;
     }
-
-    History& GroupIntervalMs(int64_t ms) {
-        return GroupInterval(ms > 0 ? (double)ms / 1000.0 : 0);
+    void ReplaceCurrent(T entry) {
+        if (entries.len)
+            entries[entries.len - 1] = entry;
+        else
+            Push(entry);
     }
-
-    void StartGrouping() { grouping = true; }
-    void EndGrouping() { grouping = false; }
-
-    uint64_t Version() const { return version; }
-    bool IsIgnoring() const { return ignore; }
-    void SetIgnoring(bool on) { ignore = on; }
-
-    const Vec<I>& Undos() const { return undos; }
-    const Vec<I>& Redos() const { return redos; }
-    bool CanUndo() const { return undos.len > 0; }
-    bool CanRedo() const { return redos.len > 0; }
-
+    bool RemoveCurrent(T* out = nullptr) {
+        if (!entries.len) return false;
+        if (out) *out = entries[entries.len - 1];
+        entries.len--;
+        return true;
+    }
+    bool CanBack() const { return entries.len > 1; }
+    bool CanForward() const { return forwardEntries.len > 0; }
+    bool Back(T* out = nullptr) {
+        if (!CanBack()) return false;
+        VecAppend(forwardEntries, entries[entries.len - 1]);
+        entries.len--;
+        if (out) *out = *Current();
+        return true;
+    }
+    bool Forward(T* out = nullptr) {
+        if (maxEntries == 0 || !CanForward()) return false;
+        VecAppend(entries, forwardEntries[forwardEntries.len - 1]);
+        forwardEntries.len--;
+        EnforceMaxEntries();
+        if (out) *out = *Current();
+        return true;
+    }
+    const Vec<T>& Entries() const { return entries; }
+    HistoryForwardEntries<T> ForwardEntries() const {
+        return {forwardEntries.els, forwardEntries.len};
+    }
+    void Retain(bool (*keep)(const T&, void*), void* user = nullptr) {
+        RetainIf(entries, keep, user);
+        RetainIf(forwardEntries, keep, user);
+    }
     void Clear() {
-        VecClear(undos);
-        VecClear(redos);
+        VecClear(entries);
+        VecClear(forwardEntries);
     }
-
-    void Push(I item) {
-        uint64_t nextVersion = IncVersion();
-        VecClear(redos);
-        if (maxUndos <= 0) {
-            return;
-        }
-        if (undos.len >= maxUndos) {
-            RemoveAt(&undos, 0);
-        }
-        if (unique) {
-            RetainDifferent(&undos, item);
-        }
-        item.SetVersion(nextVersion);
-        VecAppend(undos, item);
-    }
-
-    const I* Current() const {
-        return undos.len > 0 ? &undos[undos.len - 1] : nullptr;
-    }
-    I* Current() { return undos.len > 0 ? &undos[undos.len - 1] : nullptr; }
-
-    void ReplaceCurrent(I item) {
-        if (undos.len <= 0) {
-            Push(item);
-            return;
-        }
-        I& current = undos[undos.len - 1];
-        item.SetVersion(current.Version());
-        current = item;
-    }
-
-    void Retain(bool (*keep)(const I&, void*), void* user = nullptr) {
-        RetainIf(&undos, keep, user);
-        RetainIf(&redos, keep, user);
-    }
-
-    Vec<I> Undo() { return MoveVersion(&undos, &redos); }
-    Vec<I> Redo() { return MoveVersion(&redos, &undos); }
 
   private:
-    uint64_t IncVersion() {
-        double now = TimeNow();
-        if (!grouping &&
-            (!hasGroupInterval || now - lastChangedAt > groupInterval)) {
-            version++;
-        }
-        lastChangedAt = now;
-        return version;
+    void EnforceMaxEntries() {
+        int excess = entries.len - maxEntries;
+        if (excess <= 0) return;
+        for (int i = excess; i < entries.len; i++)
+            entries[i - excess] = entries[i];
+        entries.len -= excess;
     }
-
-    static void RemoveAt(Vec<I>* values, int at) {
-        if (!values || at < 0 || at >= values->len) {
-            return;
-        }
-        for (int i = at + 1; i < values->len; i++) {
-            (*values)[i - 1] = (*values)[i];
-        }
-        values->len--;
-    }
-
-    static void RetainDifferent(Vec<I>* values, const I& item) {
-        int out = 0;
-        for (int i = 0; i < values->len; i++) {
-            if ((*values)[i] == item) {
-                continue;
-            }
-            if (out != i) {
-                (*values)[out] = (*values)[i];
-            }
-            out++;
-        }
-        values->len = out;
-    }
-
-    static void RetainIf(Vec<I>* values, bool (*keep)(const I&, void*),
+    static void RetainIf(Vec<T>& values, bool (*keep)(const T&, void*),
                          void* user) {
-        if (!values || !keep) {
-            return;
-        }
-        int out = 0;
-        for (int i = 0; i < values->len; i++) {
-            if (!keep((*values)[i], user)) {
-                continue;
-            }
-            if (out != i) {
-                (*values)[out] = (*values)[i];
-            }
-            out++;
-        }
-        values->len = out;
-    }
-
-    static bool ContainsVersion(const Vec<I>& values, uint64_t version) {
-        for (int i = 0; i < values.len; i++) {
-            if (values[i].Version() == version) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    static Vec<I> MoveVersion(Vec<I>* from, Vec<I>* to) {
-        Vec<I> changes;
-        if (!from || from->len <= 0) {
-            return changes;
-        }
-        I first = (*from)[from->len - 1];
-        from->len--;
-        VecAppend(changes, first);
-        uint64_t pickedVersion = first.Version();
-
-        while (ContainsVersion(*from, pickedVersion)) {
-            I change = (*from)[from->len - 1];
-            from->len--;
-            VecAppend(changes, change);
-        }
-        for (int i = 0; i < changes.len; i++) {
-            VecAppend(*to, changes[i]);
-        }
-        return changes;
+        if (!keep) return;
+        int n = 0;
+        for (const T& value : values)
+            if (keep(value, user)) values[n++] = value;
+        values.len = n;
     }
 };
-
 }
 
 #line 1 "src/base/hover_card.h"
@@ -11606,6 +11700,8 @@ uint32_t SelectRight();
 uint32_t SelectToEnd();
 uint32_t SelectToEndOfLine();
 uint32_t SelectToNextWordEnd();
+uint32_t AddCursorAbove();
+uint32_t AddCursorBelow();
 uint32_t SelectToPreviousWordStart();
 uint32_t SelectToStart();
 uint32_t SelectToStartOfLine();
@@ -11713,11 +11809,6 @@ enum class NavStackEvent : uint8_t {
 
 struct NavEntry {
     EntityId view = {};
-    uint64_t version = 0;
-
-    uint64_t Version() const { return version; }
-    void SetVersion(uint64_t value) { version = value; }
-    bool operator==(const NavEntry& other) const { return view == other.view; }
 };
 
 struct NavTransit {
@@ -11735,8 +11826,8 @@ struct NavStackState {
 
     Entity<NavStackState> self = {};
 
-    int Depth() const { return history.Undos().len; }
-    bool IsEmpty() const { return history.Undos().len == 0; }
+    int Depth() const { return history.Entries().len; }
+    bool IsEmpty() const { return history.Entries().len == 0; }
 
     EntityId Current() const {
         const NavEntry* entry = history.Current();
@@ -11744,15 +11835,15 @@ struct NavStackState {
     }
 
     EntityId ViewAt(int index) const {
-        const Vec<NavEntry>& undos = history.Undos();
+        const Vec<NavEntry>& undos = history.Entries();
         return index >= 0 && index < undos.len ? undos[index].view : EntityId{};
     }
 
-    int ForwardCount() const { return history.Redos().len; }
+    int ForwardCount() const { return history.ForwardEntries().len; }
     EntityId ForwardViewAt(int index) const {
-        const Vec<NavEntry>& redos = history.Redos();
-        int at = redos.len - 1 - index;
-        return at >= 0 && at < redos.len ? redos[at].view : EntityId{};
+        auto entries = history.ForwardEntries();
+        return index >= 0 && index < entries.len ? entries[index].view
+                                                 : EntityId{};
     }
 };
 
@@ -12278,6 +12369,7 @@ struct ResizableState {
                              const DragMoveEvent* ev);
     static void OnHandleUp(ResizableState* self, Ctx* cx,
                            const MouseUpEvent* ev);
+    static void OnSettled(ResizableState* self, Ctx* cx, const void*);
 
     const Vec<float>& Sizes() const { return sizes; }
     float ContainerSize() const {
@@ -14904,7 +14996,8 @@ struct TooltipPositioner {
     El* IntoEl();
 };
 
-void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds);
+void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds,
+                        int placement = -1);
 void TooltipRequestHide(Window* win);
 void TooltipHide(Window* win);
 const TooltipOverlay* TooltipShowing(Window* win);
@@ -17170,6 +17263,8 @@ struct Button {
     bool hasCustom = false;
     Rgba custom = {};
     Str tooltip = {};
+
+    int8_t tooltipPlacement = -1;
     Str accessibilityLabel = {};
     Str accessibilityId = {};
     AccessibilityRole accessibilityRole = AccessibilityRole::None;
@@ -17239,6 +17334,8 @@ struct Button {
     Button* TabStop(bool v);
     Button* FocusRing(bool v);
     Button* Tooltip(Str s);
+
+    Button* TooltipPlacement(gpui::Placement placement);
     Button* AccessibilityLabel(Str s);
     Button* AccessibilityId(Str s);
     Button* Role(AccessibilityRole role);
@@ -19510,11 +19607,14 @@ struct DialogFooter {
 };
 
 struct DialogClose {
+    Ctx* cx = nullptr;
     El* root = nullptr;
     El* slot = nullptr;
     DialogFooterButton semantic = {true, false};
     static DialogClose* New(Ctx* cx);
     DialogClose* Child(El* child);
+
+    DialogClose* Trigger(Button* button);
     El* IntoEl();
 };
 
@@ -20194,11 +20294,21 @@ struct IconNamed {
     static IconNamed From(IconName name);
 };
 
+enum class IconSource : uint8_t {
+
+    Path,
+
+    Data,
+};
+
 struct Icon {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     IconName name = IconName::None;
     Str path = {};
+
+    Str data = {};
+    IconSource source = IconSource::Path;
     float size = 0;
     float rotation = 0;
     Rgba color = {};
@@ -20208,7 +20318,10 @@ struct Icon {
     static Icon* New(Ctx* cx, IconName name);
     static Icon* New(Ctx* cx, IconNamed named);
     static Icon* Empty(Ctx* cx);
+
     Icon* Path(Str assetPath);
+
+    Icon* Data(Str svg);
     Icon* Size(float v);
     Icon* Size(UiSize v);
     Icon* Color(Rgba c);
@@ -20913,6 +21026,9 @@ struct MenuItem {
     Str label = {};
     IconName icon = IconName::None;
 
+    Str iconPath = {};
+    Str iconSvg = {};
+
     Str kbd = {};
 
     uint32_t action = 0;
@@ -20947,6 +21063,8 @@ struct PopupMenu {
     static PopupMenu* New(Ctx* cx, Str id);
     static PopupMenu* New(Ctx* cx, Str id, Entity<PopupMenuState> state);
     PopupMenu* Menu(Str label, IconName icon = IconName::None);
+
+    PopupMenu* Menu(Str label, component::Icon* icon);
     PopupMenu* MenuWithCheck(Str label, bool checked);
     PopupMenu* MenuWithKbd(Str label, Str kbd);
 
@@ -21264,6 +21382,8 @@ struct NativeMenuItem {
     bool checked = false;
 
     IconName icon = IconName::None;
+    Str iconPath = {};
+    Str iconSvg = {};
 
     intptr_t id = 0;
     NativeMenu* submenu = nullptr;
@@ -21282,6 +21402,8 @@ struct NativeMenu {
     NativeMenu* MenuWithDisabled(Str label, bool disabled, intptr_t id);
     NativeMenu* MenuWithCheck(Str label, bool checked, intptr_t id);
     NativeMenu* MenuWithIcon(Str label, IconName icon, intptr_t id);
+
+    NativeMenu* MenuWithIcon(Str label, component::Icon* icon, intptr_t id);
     NativeMenu* Separator();
     NativeMenu* Submenu(Str label, NativeMenu* menu);
     NativeMenu* OnSelect(Listener l);
@@ -22990,10 +23112,18 @@ struct SidebarMenuItem {
     ArenaVec<SidebarMenuItem*> children;
     PopupMenu* contextMenu = nullptr;
 
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    Style labelStyle = {};
+    uint32_t labelStyleSet = 0;
+
     bool collapsed = false;
 
     static SidebarMenuItem* New(Ctx* cx, Str label);
     SidebarMenuItem* Icon(IconName v);
+    SidebarMenuItem* Refine(const Style& v, uint32_t fields);
+    SidebarMenuItem* LabelStyle(const Style& v, uint32_t fields);
     SidebarMenuItem* Active(bool v);
     SidebarMenuItem* Disabled(bool v);
     SidebarMenuItem* DefaultOpen(bool v);
@@ -23205,6 +23335,8 @@ struct Spinner {
     UiSize size = UiSize::Medium;
     float px = 0;
     IconName icon = IconName::Loader;
+
+    Str iconSvg = {};
     Rgba color = {};
     bool hasColor = false;
 
@@ -23220,6 +23352,7 @@ struct Spinner {
     Spinner* WithSize(UiSize s);
     Spinner* Size(float v);
     Spinner* Icon(IconName n);
+    Spinner* IconData(Str svg);
     Spinner* Color(Rgba c);
     El* IntoEl();
 };
@@ -24403,6 +24536,8 @@ enum : uint16_t {
     kFpsPresents = 512,
 
     kResourceHistoryCap = 32,
+
+    kFpsWarmupFrames = 8,
 };
 
 struct FrameSample {
@@ -24420,6 +24555,10 @@ struct FrameSampler {
     double presents[kFpsPresents] = {};
     int nPresents = 0;
     uint64_t cursor = 0;
+
+    uint32_t warmup = kFpsWarmupFrames;
+
+    bool drainedBacklog = false;
 };
 
 void FrameSamplerTick(FrameSampler* s, Window* win);
@@ -24437,6 +24576,8 @@ void FrameSamplerSetCapacity(FrameSampler* s, int capacity);
 float FrameSamplerFps(const FrameSampler* s);
 
 float FrameSamplerPresentInterval(const FrameSampler* s);
+
+float FpsSustainableRate(float meanDrawSecs, double displayPeriod);
 float FrameSamplerMeanDraw(const FrameSampler* s);
 
 float FrameSamplerPercentileDraw(const FrameSampler* s, float percentile);
@@ -24479,6 +24620,8 @@ bool ResourceProbeSample(ResourceProbe* probe, ResourceSample* out);
 
 struct FpsReadout {
 
+    float maxFps = 0;
+
     float fps = 0;
 
     float intervalMillis = 0;
@@ -24493,21 +24636,32 @@ struct FpsReadout {
 
 struct FpsResourceJob;
 
+enum class FpsHeadline : uint8_t {
+
+    Max,
+
+    Observed,
+};
+
 struct FpsMonitor {
     FrameSampler sampler;
     FpsReadout readout;
     double readoutAt = -1;
 
     float frameBudget = 1.f / 60.f;
+    FpsHeadline headline = FpsHeadline::Max;
 
-    bool continuous = true;
+    bool displayAsked = false;
+    uint64_t display = 0;
+    double displayPeriod = 0;
     bool showResources = true;
     float resourceInterval = 0.5f;
     ResourceProbe probe;
     ResourceSample resources;
     bool hasResources = false;
-    Window* resourceWindow = nullptr;
-    int resourceTimer = 0;
+
+    Window* clockWindow = nullptr;
+    int clockTimer = 0;
     int resourceTask = 0;
     FpsResourceJob* resourceJob = nullptr;
     bool compact = false;
@@ -24517,13 +24671,13 @@ struct FpsMonitor {
     ~FpsMonitor();
     static El* Render(FpsMonitor* self, Ctx* cx);
     static void OnToggleCompact(FpsMonitor* self, Ctx* cx, const ClickEvent*);
-    static void OnResourceTick(FpsMonitor* self, Ctx* cx, const TickEvent*);
+
+    static void OnToggleHeadline(FpsMonitor* self, Ctx* cx,
+                                 const MouseDownEvent* event);
+    static void OnClockTick(FpsMonitor* self, Ctx* cx, const TickEvent*);
 };
 
 void FpsMonitorSetFrameBudget(FpsMonitor* self, float budgetSecs);
-void FpsMonitorSetContinuous(FpsMonitor* self, bool continuous);
-
-Rgba FpsRateColor(float fps, float budgetSecs, const FpsStyle& style);
 
 TempStr FpsFormatCpuTemp(float percent);
 
@@ -24545,8 +24699,6 @@ struct FpsOverlayOpts {
     FpsAnchor anchor = FpsAnchor::TopRight;
 
     float frameBudget = 0;
-
-    int8_t continuous = -1;
 };
 
 El* FpsOverlayEl(Ctx* cx, Entity<FpsMonitor> monitor,
@@ -24861,6 +25013,12 @@ uint64_t TextLayoutGeneration(const TextLayout* tl);
 
 void TextLayoutDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
                     bool clip, float clipW = 0);
+
+bool PaintTextLayoutSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x,
+                          float y, Rgba base, const TextSpan* spans, int n);
+
+void TextLayoutDrawSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x,
+                         float y, Rgba base, const TextSpan* spans, int n);
 void DrawTextAt(PaintCtx* ctx, Str s, float x, float y, float w, float h,
                 float fontSize, Rgba c, bool truncate, bool wrap = false,
                 float measMaxW = -1.f, int weight = 0, float lineH = 0);
@@ -25026,6 +25184,10 @@ void PlatSetMouseCapture(Window* win, bool capture);
 
 int PlatDoubleClickMs();
 
+uint64_t PlatWindowDisplay(Window* win);
+
+double PlatDisplayRefreshPeriod(uint64_t display);
+
 void* PlatWindowHandle(Window* win);
 
 void PlatInstallAccessibilityHitTest(Window* win);
@@ -25042,6 +25204,9 @@ struct PlatMenuItem {
     bool checked = false;
 
     const char* iconPath = nullptr;
+
+    const char* iconSvg = nullptr;
+    int iconSvgLen = 0;
     const PlatMenuItem* submenu = nullptr;
     int submenuN = 0;
 
@@ -25102,6 +25267,8 @@ void Invalidate(PaintCtx* ctx);
 
 void Reset(PaintCtx* ctx);
 
+bool RecTextDrawSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x, float y,
+                      Rgba base, const TextSpan* spans, int n);
 void RecClear(PaintCtx* ctx, Rgba c);
 void RecFillRect(PaintCtx* ctx, float x, float y, float w, float h, Rgba c);
 void RecFillRound(PaintCtx* ctx, float x, float y, float w, float h, float r,
@@ -27345,6 +27512,9 @@ enum class ComponentKind : uint8_t {
     DockContent,
     VVirtualList,
     HVirtualList,
+
+    List,
+    UniformList,
 };
 
 struct VirtualListSpec {
@@ -27356,6 +27526,17 @@ struct VirtualListSpec {
     CallbackId renderItems = 0;
 };
 
+struct ListSpec {
+
+    Str id;
+
+    int itemCount = 0;
+
+    CallbackId getKey = 0;
+
+    CallbackId renderItems = 0;
+};
+
 struct Component {
     ComponentKind kind = ComponentKind::Div;
     Str text;
@@ -27364,6 +27545,7 @@ struct Component {
     BackgroundSpec background;
     float strokeWidth = 0;
     VirtualListSpec* virtualList = nullptr;
+    ListSpec* list = nullptr;
 };
 
 const char* ComponentName(const Component& component);
@@ -27467,6 +27649,8 @@ struct Template {
 class SpecArena {
   public:
     SpecArena();
+
+    explicit SpecArena(Arena* borrowed);
     SpecArena(const SpecArena&) = delete;
     SpecArena& operator=(const SpecArena&) = delete;
     ~SpecArena();
@@ -27497,6 +27681,7 @@ class SpecArena {
 
   private:
     Arena* arena = nullptr;
+    bool ownsArena = true;
     Vec<SpecNode*> nodes;
     Vec<uint8_t> parented;
     Vec<uint8_t> claimed;
@@ -27944,8 +28129,9 @@ struct ScriptView {
                                      intptr_t binding);
     static void OnSelectAction(ScriptView* self, Ctx* cx,
                                const ActionEvent* event, intptr_t binding);
-    static void OnSelectOpen(ScriptView* self, Ctx* cx, const ClickEvent* event,
-                             intptr_t binding);
+
+    static void OnSelectActivate(ScriptView* self, Ctx* cx,
+                                 const ClickEvent* event, intptr_t binding);
     static void OnNumberStep(ScriptView* self, Ctx* cx,
                              const NumberInputEvent* event, intptr_t callback);
     static void OnNumberKey(ScriptView* self, Ctx* cx, const KeyEvent* event,
@@ -27989,8 +28175,6 @@ namespace gpui {
 struct FpsHudRequest {
 
     FpsAnchor anchor = FpsAnchor::TopRight;
-
-    bool continuous = false;
 
     bool hasFrameBudget = false;
     float frameBudget = 0;
@@ -28054,9 +28238,9 @@ bool ShellRootCloseDialog(Ctx* cx);
 int ShellRootCloseAllDialogs(Ctx* cx);
 bool ShellRootHasDialog(Ctx* cx);
 
-bool ShellRootOpenSheet(Ctx* cx, Entity<ScriptView> content,
-                        component::SheetPlacement placement =
-                            component::SheetPlacement::Right);
+bool ShellRootOpenSheet(
+    Ctx* cx, Entity<ScriptView> content,
+    component::SheetPlacement placement = component::SheetPlacement::Right);
 bool ShellRootCloseSheet(Ctx* cx);
 bool ShellRootHasSheet(Ctx* cx);
 
@@ -28076,7 +28260,7 @@ int ShellRootToastCount(Ctx* cx);
 
 namespace gpui::shell {
 
-constexpr const char* kShellVersion = "0.1.0";
+constexpr const char* kShellVersion = "0.6.0";
 constexpr const char* kShellManifestFile = "gpui-shell.json";
 constexpr int kShellMaxManifestBytes = 1024 * 1024;
 
@@ -28747,7 +28931,7 @@ SeqStrings ThemeRadiusTokenNames();
 
 namespace gpui::shell {
 
-constexpr const char* kShellTypesFile = "gpui.d.ts";
+constexpr const char* kShellTypesFile = "gpui-kit.d.ts";
 
 constexpr const char* kShellConfigFile = "jsconfig.json";
 constexpr const char* kShellTypeScriptConfigFile = "tsconfig.json";
