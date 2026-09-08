@@ -17640,6 +17640,7 @@ static void SetMouseDown(Window* win, bool down) {
 
 static bool SliderKeyStep(Window* win, int key, bool ctrl, bool alt);
 static bool SemanticKeyStep(Window* win, int key, bool ctrl, bool alt);
+static bool PageScrollBy(Window* win, int dir);
 
 bool WindowKeyDown(Window* win, int key, bool shift, bool ctrl, bool alt,
                    bool platform, bool function) {
@@ -17734,6 +17735,15 @@ bool WindowKeyDown(Window* win, int key, bool shift, bool ctrl, bool alt,
         ev.function = function;
         ListenerCall(win->app, win, win->onKey, &ev);
         windowHandled = !ev.propagate;
+    }
+
+    if (!eaten && !windowHandled && !shift && !ctrl && !alt && !platform &&
+        (key == KeyPageUp || key == KeyPageDown)) {
+        if (PageScrollBy(win, key == KeyPageUp ? -1 : 1)) {
+            win->eatChar = true;
+            AppInvalidate(win);
+            return true;
+        }
     }
 
     bool activates = (key == KeyReturn && !win->eatReturn) ||
@@ -18098,6 +18108,44 @@ static void ScrollbarEmit(Window* win, ScrollRect* s, float offsetX,
     ScrollEvent ev = {s->id, offsetY, offsetX};
     ListenerCall(win->app, win, s->onScroll, &ev);
     AppInvalidate(win);
+}
+
+static bool PageScrollBy(Window* win, int dir) {
+    if (!win || dir == 0) {
+        return false;
+    }
+    const HitRect* focused = HitRectById(win, win->focusId);
+    Point pointer = {win->mouseX, win->mouseY};
+    ScrollRect* underPointer = nullptr;
+    ScrollRect* underFocus = nullptr;
+    for (int i = win->paint.scrolls.len - 1; i >= 0; i--) {
+        ScrollRect& s = win->paint.scrolls[i];
+        if (s.input || !s.onScroll.IsValid() || !ScrollsY(s)) {
+            continue;
+        }
+        if (!underPointer && s.bounds.Contains(pointer)) {
+            underPointer = &s;
+        }
+        if (!underFocus && focused) {
+            const Bounds& a = focused->bounds;
+            const Bounds& b = s.bounds;
+            bool overlap = a.x < b.Right() && b.x < a.Right() &&
+                           a.y < b.Bottom() && b.y < a.Bottom();
+            if (overlap) {
+                underFocus = &s;
+            }
+        }
+        if (underPointer && underFocus) {
+            break;
+        }
+    }
+    ScrollRect* found = underPointer ? underPointer : underFocus;
+    if (!found) {
+        return false;
+    }
+    float next = found->scrollY + (float)dir * found->bounds.h;
+    ScrollbarEmit(win, found, found->scrollX, next);
+    return true;
 }
 
 static void ScrollbarPress(Window* win, ScrollRect* s, float x, float y,
@@ -28652,7 +28700,12 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     }
     float numW = 0;
     if (lineNumbers) {
-        numW = 12.f + 7.f * (float)(rows >= 100 ? 3 : (rows >= 10 ? 2 : 1));
+
+        int digits = 1;
+        for (int n = rows < 1 ? 1 : rows; n >= 10; n /= 10) {
+            digits++;
+        }
+        numW = 12.f + 7.f * (float)digits;
     }
 
     bool folding = lineNumbers && LayoutModeIsFolding(state->mode);
@@ -32345,6 +32398,16 @@ static void SelectAllCursorsTo(InputState* s, App* app, Window* win, F f) {
     InputMergeOverlappingCursors(s);
 }
 
+static int InputPageLines(const InputState* s) {
+    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
+    float h = s->inputBounds.h > 0 ? s->inputBounds.h : s->viewH;
+    if (lineH <= 0) {
+        return 1;
+    }
+    int lines = (int)(h / lineH);
+    return lines > 1 ? lines : 1;
+}
+
 static void MoveVertical(InputState* s, App* app, Window* win, int lines,
                          bool collapse) {
     if (InputIsSingleLine(s)) {
@@ -32829,11 +32892,17 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             MoveVertical(s, app, win, 1, true);
             return true;
         case InputAction::MovePageUp:
-            MoveVertical(s, app, win, -LayoutModeRows(s->mode), false);
-            return InputIsMultiLine(s);
+            if (InputIsSingleLine(s)) {
+                return false;
+            }
+            MoveVertical(s, app, win, -InputPageLines(s), false);
+            return true;
         case InputAction::MovePageDown:
-            MoveVertical(s, app, win, LayoutModeRows(s->mode), false);
-            return InputIsMultiLine(s);
+            if (InputIsSingleLine(s)) {
+                return false;
+            }
+            MoveVertical(s, app, win, InputPageLines(s), false);
+            return true;
         case InputAction::MoveHome:
             PauseBlink(s, app, win);
             MoveAllCursors(s, app, win,
