@@ -2186,7 +2186,7 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
 
 #endif
 
-#if GPUI_OS_LINUX || GPUI_OS_MAC
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/base_mem_posix.cpp"
 
 #include <sys/mman.h>
@@ -2257,7 +2257,7 @@ uint64_t PlatArenaReserveSize() {
 
 #endif
 
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_WASM
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
 #line 1 "src/base_posix.cpp"
 
 #include <dirent.h>
@@ -2381,7 +2381,7 @@ int PlatListDir(const char* dir, DirEntry* out, int max) {
         e.isDir = S_ISDIR(st.st_mode);
         e.isFile = S_ISREG(st.st_mode);
         e.size = e.isFile && st.st_size > 0 ? (uint64_t)st.st_size : 0;
-#if GPUI_OS_MAC
+#if GPUI_OS_MAC || GPUI_OS_IOS
         e.modified = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull +
                      (uint64_t)st.st_mtimespec.tv_nsec;
 #else

@@ -36,24 +36,47 @@
 #define GPUI_OS_WINDOWS 0
 #define GPUI_OS_LINUX 0
 #define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 1
 #elif defined(_WIN32)
 #define GPUI_OS_WINDOWS 1
 #define GPUI_OS_LINUX 0
 #define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
+#define GPUI_OS_WASM 0
+#elif defined(__ANDROID__)
+#define GPUI_OS_WINDOWS 0
+#define GPUI_OS_LINUX 0
+#define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 1
+#define GPUI_OS_WASM 0
+#elif defined(__APPLE__) && \
+    defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)
+#define GPUI_OS_WINDOWS 0
+#define GPUI_OS_LINUX 0
+#define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 1
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 0
 #elif defined(__APPLE__)
 #define GPUI_OS_WINDOWS 0
 #define GPUI_OS_LINUX 0
 #define GPUI_OS_MAC 1
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 0
 #elif defined(__linux__)
 #define GPUI_OS_WINDOWS 0
 #define GPUI_OS_LINUX 1
 #define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 0
 #else
-#error "unsupported platform: gpui builds on Windows, Linux, macOS and wasm"
+#error "unsupported platform"
 #endif
 
 #define GPUI_OS_POSIX (!GPUI_OS_WINDOWS)
@@ -3354,6 +3377,24 @@ int StrToIntUnchecked(Str s);
 namespace gpui {
 
 struct App;
+struct Window;
+struct KeyChord;
+
+struct ClipboardItem {
+    Str text = {};
+    const uint8_t* imageBytes = nullptr;
+    int imageBytesLen = 0;
+    Str externalPaths = {};
+
+    bool HasImage() const { return imageBytes && imageBytesLen > 0; }
+    bool HasExternalPaths() const { return externalPaths.len > 0; }
+    bool IsEmpty() const {
+        return text.len <= 0 && !HasImage() && !HasExternalPaths();
+    }
+};
+
+using InputPasteFn = bool (*)(void* data, const ClipboardItem& item, App* app,
+                              Window* win);
 
 struct Rgba {
     uint8_t r = 0;
@@ -3459,6 +3500,8 @@ Rgba RgbaDarken(Rgba c, float amount);
 Str RgbaToHex(Arena* a, Rgba c, bool upper = true);
 
 Rgba RgbaMixOklab(Rgba a, Rgba b, float factor);
+
+Rgba RgbaOklch(float lightness, float chroma, float hueDegrees);
 
 enum class Axis : uint8_t {
     Horizontal,
@@ -3683,12 +3726,26 @@ struct ScrollWheelEvent {
     bool propagate = true;
 };
 
+struct TouchDragEvent {
+    TouchPhase phase = TouchPhase::Moved;
+    Point startPosition = {};
+    Point position = {};
+};
+
+struct LongPressEvent {
+    TouchPhase phase = TouchPhase::Moved;
+    Point startPosition = {};
+    Point position = {};
+};
+
 enum class PlatformInputKind : uint8_t {
     MouseDown,
     MouseUp,
     MouseMove,
     MouseExited,
-    ScrollWheel
+    ScrollWheel,
+    TouchDrag,
+    LongPress
 };
 
 struct PlatformInput {
@@ -3699,6 +3756,8 @@ struct PlatformInput {
         MouseMoveEvent mouseMove;
         MouseExitEvent mouseExited;
         ScrollWheelEvent scrollWheel;
+        TouchDragEvent touchDrag;
+        LongPressEvent longPress;
     };
 };
 
@@ -4872,6 +4931,8 @@ struct El {
 
     uint32_t clickAction = 0;
 
+    int clickActionFocusId = 0;
+
     ArenaPtr<ElStyleStates> styleStates = {};
     float lineSpanHeight = 0;
     float lineClampCap = 0;
@@ -5210,6 +5271,7 @@ struct El {
     El* OnAction(uint32_t action, Listener fn);
 
     El* OnClickAction(uint32_t action, intptr_t arg = 0);
+    El* OnClickActionAt(uint32_t action, FocusHandle focus, intptr_t arg = 0);
 
     El* OnKeyDown(Listener fn);
 
@@ -5286,6 +5348,7 @@ struct HitRect {
 
     uint32_t clickAction = 0;
     intptr_t clickActionArg = 0;
+    int clickActionFocusId = 0;
 
     bool stopClick = false;
     bool stopMouseDown = false;
@@ -5311,6 +5374,7 @@ struct AccessibilityNode {
     Func0 accessibilityDecrementDirect = {};
     uint32_t clickAction = 0;
     intptr_t clickActionArg = 0;
+    int clickActionFocusId = 0;
     SliderState* slider = nullptr;
     InputState* input = nullptr;
 };
@@ -6220,7 +6284,12 @@ struct InputState {
 
     Vec<CursorSelection> extraCursors;
 
-    int columnSelectStart = -1;
+    struct ColumnarPoint {
+        int offset = -1;
+        int columnsPastLineEnd = 0;
+
+        bool IsValid() const { return offset >= 0; }
+    } columnSelectStart;
     UndoManager undo;
     MaskPattern maskPattern = {};
     bool maskPatternSet = false;
@@ -6232,9 +6301,20 @@ struct InputState {
     bool readonly = false;
     bool loading = false;
 
+    bool numberHasMin = false;
+    bool numberHasMax = false;
+    double numberMin = 0;
+    double numberMax = 0;
+
     bool masked = false;
     bool cleanOnEscape = false;
     bool submitOnEnter = false;
+
+    InputPasteFn pasteHandler = nullptr;
+    void* pasteHandlerData = nullptr;
+
+    bool autoClose = true;
+    bool smartIndent = true;
 
     bool searchable = false;
     bool replaceable = true;
@@ -6461,7 +6541,12 @@ void InputMergeOverlappingCursors(InputState* s);
 void InputAddCursorAt(InputState* s, App* app, Window* win, int offset);
 
 void InputBuildColumnarSelection(InputState* s, App* app, Window* win,
-                                 int startOffset, int endOffset);
+                                 InputState::ColumnarPoint start,
+                                 InputState::ColumnarPoint end);
+inline void InputBuildColumnarSelection(InputState* s, App* app, Window* win,
+                                        int startOffset, int endOffset) {
+    InputBuildColumnarSelection(s, app, win, {startOffset, 0}, {endOffset, 0});
+}
 
 bool InputReplaceTextInRanges(InputState* s, App* app, Window* win,
                               const Selection* ranges, const Str* texts, int n);
@@ -6603,6 +6688,10 @@ bool InputCodeActionAction(InputState* s, App* app, Window* win,
 
 bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
                              const Selection* range, Str newText);
+void InputSetAutoClose(InputState* s, bool enabled, App* app,
+                       Window* win = nullptr);
+void InputSetSmartIndent(InputState* s, bool enabled, App* app,
+                         Window* win = nullptr);
 
 int Utf8OffsetToUtf16(Str s, int u8);
 int Utf16OffsetToUtf8(Str s, int u16);
@@ -6639,7 +6728,8 @@ void InputFocus(InputState* s, App* app, Window* win);
 void InputBlur(InputState* s, App* app, Window* win);
 
 int InputIndexForPosition(const InputState* s, PaintCtx* ctx, float x, float y,
-                          bool* lineEndAffinity = nullptr);
+                          bool* lineEndAffinity = nullptr,
+                          int* columnsPastLineEnd = nullptr);
 
 int InputFoldIconAt(const InputState* s, float x, float y);
 
@@ -6888,6 +6978,8 @@ struct WinOpts {
 };
 
 struct FrameTiming {
+
+    double drawAt = 0;
     float drawSecs = 0;
 
     uint64_t invalidations = 0;
@@ -7066,6 +7158,17 @@ struct Window {
     bool scrollDragHorizontal = false;
 
     InputState* scrollDragInput = nullptr;
+    bool touchScrollbarDrag = false;
+
+    bool touchPressPending = false;
+    bool touchPress = false;
+
+    bool scrollDragNotifyPending = false;
+    double scrollDragLastNotify = 0;
+    double scrollDragNotifyDue = 0;
+    Listener scrollDragNotifyListener = {};
+    ScrollEvent scrollDragNotifyEvent = {};
+    bool longPressSelection = false;
     InputState* input = nullptr;
 
     EntityId tooltip = {};
@@ -7397,6 +7500,8 @@ const DragPayload* WindowActiveDrag(Ctx* cx);
 
 bool WindowIsActive(Ctx* cx);
 
+bool WindowIsTouchPress(Ctx* cx);
+
 void WindowSetActive(Window* win, bool active);
 
 int WindowDragOverId(Ctx* cx);
@@ -7496,6 +7601,8 @@ void AppFree(App* app);
 
 void ClipboardSetText(Window* win, Str text);
 
+ClipboardItem ClipboardGetItem(Arena* a, Window* win);
+
 Str ClipboardGetText(Arena* a, Window* win);
 
 void WindowSetTextContentType(Window* win, Str value);
@@ -7550,6 +7657,9 @@ bool WindowFocusWithin(const Window* win, int id);
 
 bool WindowRestoreFocus(Window* win, int id);
 
+bool WindowBindingForActionAtFocus(Window* win, uint32_t action,
+                                   FocusHandle focus, KeyChord* out);
+
 bool WindowDispatchKeyAction(Window* win, int vk, bool shift, bool ctrl,
                              bool alt, bool platform = false,
                              bool function = false);
@@ -7569,6 +7679,9 @@ constexpr bool KeySecondary(bool ctrl, bool platform) {
 }
 
 bool WindowDispatchAction(Window* win, uint32_t action, intptr_t arg = 0);
+
+bool WindowDispatchActionAtFocus(Window* win, FocusHandle focus,
+                                 uint32_t action, intptr_t arg = 0);
 
 bool WindowDispatchKeyEvent(Window* win, KeyEvent* ev);
 
@@ -8852,6 +8965,151 @@ inline bool MotionEq(const MotionTransform& a, const MotionTransform& b) {
            a.rotationRadians == b.rotationRadians && a.opacity == b.opacity;
 }
 
+double MotionNow(Ctx* cx);
+void* MotionSlot(Ctx* cx, uint32_t key, int size);
+void MotionWantsFrame(Ctx* cx);
+
+template <typename T>
+struct SequenceStep {
+    T target = {};
+    motion::Transition transition = motion::Transition::New(0);
+
+    static SequenceStep New(T value, const motion::Transition& policy) {
+        SequenceStep step;
+        step.target = value;
+        step.transition = policy;
+        return step;
+    }
+    const T& Target() const { return target; }
+    const motion::Transition& Transition() const { return transition; }
+};
+
+template <typename T>
+struct SequenceSample {
+    T value = {};
+    int32_t step = 0;
+    MotionStatus status = MotionStatus::Idle;
+
+    const T& Value() const { return value; }
+    T IntoValue() const { return value; }
+    int32_t Step() const { return step; }
+    MotionStatus Status() const { return status; }
+    bool IsFinished() const { return status == MotionStatus::Finished; }
+    bool IsActive() const {
+        return status == MotionStatus::Delayed ||
+               status == MotionStatus::Running;
+    }
+};
+
+template <typename T>
+struct SequenceState {
+    int32_t step = 0;
+    T from = {};
+    T target = {};
+    motion::Transition transition = motion::Transition::New(0);
+    double startedAt = 0;
+    bool init = false;
+};
+
+template <typename T>
+struct Sequence {
+    Arena* arena = nullptr;
+    motion::TransitionId id = {};
+    T from = {};
+    ArenaVec<SequenceStep<T>> steps;
+
+    static Sequence New(Arena* a, motion::TransitionId valueId, T value) {
+        Sequence out;
+        out.arena = a;
+        out.id = valueId;
+        out.from = value;
+        return out;
+    }
+    static Sequence New(Ctx* cx, motion::TransitionId valueId, T value) {
+        return New(cx ? cx->a : nullptr, valueId, value);
+    }
+    Sequence& WithStep(T target, const motion::Transition& policy) {
+        steps.Append(arena, SequenceStep<T>::New(target, policy));
+        return *this;
+    }
+    Sequence& WithSteps(const SequenceStep<T>* values, int32_t count) {
+        for (int32_t i = 0; i < count; i++) steps.Append(arena, values[i]);
+        return *this;
+    }
+    const T& From() const { return from; }
+    const ArenaVec<SequenceStep<T>>& Steps() const { return steps; }
+
+    SequenceSample<T> Sample(Ctx* cx) const {
+        SequenceSample<T> out;
+        out.value = from;
+        if (!cx || steps.len == 0) return out;
+
+        const int32_t last = steps.len - 1;
+        uint32_t stateKey = id.key ^ 0x9e3779b9u;
+        auto* state = (SequenceState<T>*)MotionSlot(
+            cx, stateKey, (int)sizeof(SequenceState<T>));
+        if (!state) {
+            out.value = steps[last].target;
+            out.step = last;
+            out.status = MotionStatus::Finished;
+            return out;
+        }
+        const double now = MotionNow(cx);
+        auto start = [&](int32_t at, T startValue, double startedAt) {
+            state->step = at;
+            state->from = startValue;
+            state->target = steps[at].target;
+            state->transition = steps[at].transition;
+            state->startedAt = startedAt;
+            state->init = true;
+        };
+        if (!state->init) start(0, from, now);
+
+        if (MotionReduced()) {
+            start(last, steps[last].target, now);
+            out.value = steps[last].target;
+            out.step = last;
+            out.status = MotionStatus::Finished;
+            return out;
+        }
+
+        auto sample = [&](MotionStatus* status) {
+            float elapsed =
+                (float)(std::max(0.0, now - state->startedAt) * 1000.0);
+            float progress =
+                MotionProgress(state->transition, elapsed,
+                               state->transition.durationMs, status);
+            return motion::Interpolate<T>::Between(
+                state->from, state->target,
+                MotionSample(state->transition, progress));
+        };
+
+        MotionStatus status;
+        T value = sample(&status);
+        bool retargeted = state->step > last ||
+                          !MotionEq(state->target, steps[state->step].target);
+        if (retargeted) {
+            start(0, value, now);
+            value = sample(&status);
+        } else {
+            while (status == MotionStatus::Finished && state->step < last) {
+                float finishMs =
+                    state->transition.durationMs + state->transition.delayMs;
+                if (finishMs < 0) finishMs = 0;
+                double nextStart = state->startedAt + finishMs / 1000.0;
+                T previousTarget = state->target;
+                start(state->step + 1, previousTarget, nextStart);
+                value = sample(&status);
+            }
+        }
+        out.value = value;
+        out.step = state->step;
+        out.status = status;
+        if (out.IsActive()) MotionWantsFrame(cx);
+        return out;
+    }
+};
+
 template <typename T>
 MotionStep<T> MotionAdvance(MotionState<T>* st, T target, const Motion& m,
                             double now, bool reduced) {
@@ -8910,11 +9168,6 @@ MotionStep<T> MotionAdvance(MotionState<T>* st, T target, const Motion& m,
                   out.status == MotionStatus::Running;
     return out;
 }
-
-double MotionNow(Ctx* cx);
-
-void* MotionSlot(Ctx* cx, uint32_t key, int size);
-void MotionWantsFrame(Ctx* cx);
 
 float MotionRepeat(Ctx* cx, uint32_t key, float periodMs,
                    EaseFn ease = nullptr);
@@ -9737,6 +9990,8 @@ struct DockPanelDef {
     bool canZoom = true;
     DockPanelControl zoomable = DockPanelControl::Menu;
 
+    bool titleBar = true;
+
     bool innerPadding = true;
 };
 
@@ -9919,6 +10174,8 @@ void DockTabsInsert(DockState* s, int node, int panelIx, int at);
 void DockSplitAdd(DockState* s, int node, int childNode, float size);
 
 void DockSetActive(DockState* s, Ctx* cx, int node, int ix);
+
+void DockSelectPanel(DockState* s, Ctx* cx, PanelId panel);
 
 void DockClosePanel(DockState* s, Ctx* cx, int node, int ix);
 
@@ -10960,6 +11217,10 @@ struct HoverCardState {
 
     static void OnOpen(HoverCardState* self, Ctx* cx, const TickEvent* ev);
     static void OnClose(HoverCardState* self, Ctx* cx, const TickEvent* ev);
+    static void OnTap(HoverCardState* self, Ctx* cx, const ClickEvent* ev,
+                      intptr_t open);
+    static void OnDismiss(HoverCardState* self, Ctx* cx,
+                          const MouseUpEvent* ev);
 };
 
 struct HoverCardOpenChangeEvent {
@@ -10983,6 +11244,8 @@ struct HoverCard {
     El* root = nullptr;
     Str id = {};
     Entity<HoverCardState> state = {};
+
+    bool tapToOpen = GPUI_OS_IOS || GPUI_OS_ANDROID;
 
     static HoverCard* New(Ctx* cx, Str id, Entity<HoverCardState> state = {});
 
@@ -11368,6 +11631,72 @@ struct InputHighlighterFactory {
 
     bool Create(Str language, InputHighlighter* out) const;
 };
+
+enum class SyntaxContext : uint8_t {
+    Code,
+    String,
+    Comment,
+};
+
+struct SyntaxContextProvider {
+    void* data = nullptr;
+    SyntaxContext (*contextAt)(void* data, Str text, int offset) = nullptr;
+
+    SyntaxContext ContextAt(Str text, int offset) const {
+        return contextAt ? contextAt(data, text, offset) : SyntaxContext::Code;
+    }
+};
+
+struct BracketPair {
+    Str open = {};
+    Str close = {};
+
+    static BracketPair New(Str open, Str close) { return {open, close}; }
+};
+
+struct AutoClosingPair {
+    Str open = {};
+    Str close = {};
+    const SyntaxContext* notIn = nullptr;
+    int nNotIn = 0;
+
+    static AutoClosingPair New(Str open, Str close) { return {open, close}; }
+};
+
+struct IndentationRules {
+    void* data = nullptr;
+    bool (*increaseIndent)(void* data, Str text) = nullptr;
+    bool (*decreaseIndent)(void* data, Str text) = nullptr;
+};
+
+struct LanguageConfig {
+    const BracketPair* brackets = nullptr;
+    int nBrackets = 0;
+    const AutoClosingPair* autoClosingPairs = nullptr;
+    int nAutoClosingPairs = 0;
+
+    bool hasAutoClosingPairs = false;
+    Str autoCloseBefore = {};
+    IndentationRules indentation = {};
+    bool hasIndentationRules = false;
+
+    static LanguageConfig Default();
+};
+
+struct LanguageProvider {
+    void* data = nullptr;
+    Str (*languageName)(void* data, Arena* a, Str name) = nullptr;
+    bool (*config)(void* data, Str canonicalName,
+                   LanguageConfig* out) = nullptr;
+    bool (*syntaxContextProvider)(void* data, Str canonicalName,
+                                  SyntaxContextProvider* out) = nullptr;
+};
+
+void InputSetLanguageProvider(App* app, const LanguageProvider& provider);
+void InputSetLanguageConfig(App* app, Str language,
+                            const LanguageConfig& config);
+LanguageConfig InputLanguageConfig(App* app, Str language);
+SyntaxContextProvider InputSyntaxContextProvider(App* app, Str language);
 
 struct FoldIconRenderer {
     void* data = nullptr;
@@ -12641,6 +12970,21 @@ struct ScrollbarStyles {
     }
 };
 
+struct ScrollbarThumbGeometry {
+    float origin = 0;
+    float inset = 0;
+    float length = 0;
+    float travel = 0;
+    float extent = 0;
+
+    float Start(float offset) const;
+    float DragOffset(float position, float grab, float current) const;
+};
+
+ScrollbarThumbGeometry ScrollbarGeometry(float origin, float container,
+                                         float content, float marginEnd,
+                                         float inset, float minLength);
+
 float ScrollbarThumbSize(float track, float container, float content);
 float ScrollbarThumbSize(float track, float container, float content,
                          float minLength);
@@ -12723,9 +13067,136 @@ struct Scrollbar {
 };
 }
 
+#line 1 "src/base/scroll_bounce.h"
+
+namespace gpui {
+
+struct ScrollBounceMotion {
+    float tracking = 0.55f;
+    float responseMs = 524.f;
+
+    ScrollBounceMotion WithTracking(float value) const {
+        ScrollBounceMotion out = *this;
+        if (value > 0 && value == value) out.tracking = value;
+        return out;
+    }
+    ScrollBounceMotion WithResponse(float ms) const {
+        ScrollBounceMotion out = *this;
+        out.responseMs = std::max(0.f, ms);
+        return out;
+    }
+};
+
+struct ScrollBouncePrepaintState {
+    float offset = 0;
+    float velocity = 0;
+};
+
+struct ScrollBouncePhysics {
+    float position = 0;
+    float velocity = 0;
+    bool dragging = false;
+    bool suppressMomentum = false;
+    float extent = 0;
+    ScrollBounceMotion motion = {};
+
+    float Offset() const;
+    void Begin(float viewportExtent);
+    float Pull(float delta);
+    void Release();
+    bool Step(float seconds);
+};
+
+struct ScrollBounce {
+    Ctx* cx = nullptr;
+    Str id = {};
+    El* child = nullptr;
+    ScrollBounceMotion motion = {};
+    bool enabled = false;
+    Listener onScroll = {};
+
+    static ScrollBounce* New(Ctx* cx, Str id, El* child);
+    ScrollBounce* Enabled(bool value = true);
+    ScrollBounce* Motion(ScrollBounceMotion value);
+    ScrollBounce* OnScroll(Listener listener);
+    El* IntoEl();
+};
+
+}
+
+#line 1 "src/base/touch_selection.h"
+
+namespace gpui {
+
+enum class SelectionEdge : uint8_t {
+    Start,
+    End,
+};
+
+inline SelectionEdge SelectionEdgeOpposite(SelectionEdge edge) {
+    return edge == SelectionEdge::Start ? SelectionEdge::End
+                                        : SelectionEdge::Start;
+}
+
+struct TouchSelectionSnapshot {
+    Bounds start = {};
+    Bounds end = {};
+    SelectionEdge dragging = SelectionEdge::Start;
+    bool startVisible = true;
+    bool endVisible = true;
+    bool menuOpen = false;
+    bool hasDragging = false;
+
+    static TouchSelectionSnapshot New(Bounds start, Bounds end);
+    TouchSelectionSnapshot WithEdgeVisible(SelectionEdge edge,
+                                           bool visible) const;
+    TouchSelectionSnapshot WithMenuOpen(bool open) const;
+    TouchSelectionSnapshot WithDragging(SelectionEdge edge) const;
+    TouchSelectionSnapshot WithoutDragging() const;
+    Bounds Edge(SelectionEdge edge) const;
+    bool IsEdgeVisible(SelectionEdge edge) const;
+    bool IsEmpty() const;
+    bool BoundsOfVisible(Bounds* out) const;
+};
+
+struct TouchHandle {
+    static constexpr float kHitSize = 44.f;
+    static constexpr float kKnobSize = 10.f;
+    static constexpr float kBarWidth = 2.f;
+    static constexpr float kExtent = 12.f;
+
+    static Bounds HitBounds(SelectionEdge edge, Bounds caret);
+    static Bounds BarBounds(Bounds caret);
+    static Bounds KnobBounds(SelectionEdge edge, Bounds caret);
+};
+
+Bounds TouchCaretLineBox(Point position, float lineHeight);
+bool TouchCaretInView(Bounds caret, Bounds viewport);
+
+struct TouchEdgeDrag {
+    SelectionEdge edge = SelectionEdge::Start;
+    Point offset = {};
+
+    static TouchEdgeDrag Begin(SelectionEdge edge, Bounds caret, Point finger);
+    TouchEdgeDrag WithEdge(SelectionEdge value) const;
+    Point TextPosition(Point finger) const;
+};
+
+}
+
 #line 1 "src/base/text_selection.h"
 
 namespace gpui {
+
+struct TouchHandleHitbox {
+    SelectionEdge edge = SelectionEdge::Start;
+    Bounds bounds = {};
+};
+
+struct TouchHandleLayout {
+    Vec<TouchHandleHitbox> hitboxes;
+    ~TouchHandleLayout() { VecReset(hitboxes); }
+};
 
 struct TextSelectionScopeId {
     uint64_t raw = 0;
@@ -12965,6 +13436,8 @@ void WindowSelectionFree(Window* win);
 
 void WindowSelectionPress(Window* win, float x, float y, int clickCount,
                           bool extend);
+
+bool WindowSelectionLongPressStart(Window* win, float x, float y);
 
 void WindowSelectionDrag(Window* win, float x, float y);
 
@@ -14012,18 +14485,42 @@ struct MarkdownNode {
     Str ToMarkdown() const;
 };
 
+struct InlineElement {
+    El* element = nullptr;
+    float baseline = 0;
+    bool hasBaseline = false;
+
+    static InlineElement New(El* element) { return {element, 0, false}; }
+    InlineElement& WithBaseline(float px) {
+        baseline = px;
+        hasBaseline = true;
+        return *this;
+    }
+};
+
+struct InlineRenderContext {
+    gpui::Style textStyle = {};
+    float fontSize = 0;
+    float lineHeight = 0;
+    float remSize = 16;
+};
+
 using MarkdownBlockParserFn = bool (*)(const markdown::Node* node,
                                        const MarkdownParseContext* context,
                                        void* data, MarkdownNode* out);
 using MarkdownBlockRenderFn = El* (*)(Ctx * cx, const MarkdownNode* node,
                                       void* data);
+using MarkdownInlineRenderFn =
+    InlineElement (*)(Ctx* cx, const MarkdownNode* node,
+                      const InlineRenderContext* context, void* data);
 
 struct MarkdownPlugin {
     Str name = {};
     MarkdownBlockParserFn parse = nullptr;
     MarkdownBlockRenderFn render = nullptr;
+    MarkdownInlineRenderFn renderInline = nullptr;
     void* data = nullptr;
-    bool isBlock = true;
+    bool isBlock = false;
 };
 
 struct MarkdownBlockParser {
@@ -14037,13 +14534,24 @@ struct MarkdownBlockRenderer {
     void* data = nullptr;
 };
 
+struct MarkdownInlineRenderer {
+    Str name = {};
+    MarkdownBlockRenderFn render = nullptr;
+    MarkdownInlineRenderFn renderInline = nullptr;
+    void* data = nullptr;
+};
+
 struct MarkdownExtensions {
     ArenaVec<MarkdownBlockParser> blockParsers{};
     ArenaVec<MarkdownBlockRenderer> blockRenderers{};
+    ArenaVec<MarkdownBlockParser> inlineParsers{};
+    ArenaVec<MarkdownInlineRenderer> inlineRenderers{};
     uint64_t revision = 0;
     bool enableMdx = false;
+    bool enableFrontmatter = false;
 
     MarkdownExtensions& Mdx();
+    MarkdownExtensions& Frontmatter();
     MarkdownExtensions& BlockParser(Arena* a, MarkdownBlockParserFn fn,
                                     void* data = nullptr);
     MarkdownExtensions& BlockRenderer(Arena* a, Str name,
@@ -14051,6 +14559,7 @@ struct MarkdownExtensions {
                                       void* data = nullptr);
     MarkdownExtensions& Plugin(Arena* a, const MarkdownPlugin& plugin);
     const MarkdownBlockRenderer* Renderer(Str name) const;
+    const MarkdownInlineRenderer* InlineRenderer(Str name) const;
 
     bool HasSameParserConfiguration(const MarkdownExtensions& other) const;
 
@@ -14085,6 +14594,8 @@ struct MdRun {
 
     float imgW = 0;
     float imgH = 0;
+    MarkdownNode custom = {};
+    bool hasCustom = false;
     MdRun* next = nullptr;
     uint8_t marks = 0;
 };
@@ -14276,10 +14787,35 @@ enum class TextViewFormat : uint8_t {
     Html
 };
 
+struct TextViewMotion {
+    float streamFadeMs = 0;
+    float streamFadeStaggerMs = 0;
+    Easing streamFadeEasing = Easing::EaseOut();
+
+    TextViewMotion WithStreamFade(float ms) const {
+        TextViewMotion out = *this;
+        out.streamFadeMs = std::max(0.f, ms);
+        return out;
+    }
+    TextViewMotion WithStreamFadeStagger(float ms) const {
+        TextViewMotion out = *this;
+        out.streamFadeStaggerMs = std::max(0.f, ms);
+        return out;
+    }
+    TextViewMotion WithStreamFadeEasing(Easing easing) const {
+        TextViewMotion out = *this;
+        out.streamFadeEasing = easing;
+        return out;
+    }
+};
+
 struct TextViewState {
     EntityId self = {};
     Str text = {};
     TextViewFormat format = TextViewFormat::Markdown;
+
+    const char* elementTextPtr = nullptr;
+    int elementTextLen = 0;
     TextViewStyle textViewStyle = {};
     uint64_t revision = 0;
     uint64_t selectionRevision = 0;
@@ -14291,6 +14827,13 @@ struct TextViewState {
 
     bool clamped = false;
     gpui::SelectionFormat selectionFormat = gpui::SelectionFormat::Plain;
+    TextViewMotion motion = {};
+
+    Str streamRenderedText = {};
+    bool streamFadePending = false;
+    bool streamFadeReplace = false;
+    int streamFadeFrom = -1;
+    double streamFadeStartedAt = 0;
 
     ~TextViewState();
     static Entity<TextViewState> Markdown(App* app, Str text);
@@ -14300,6 +14843,11 @@ struct TextViewState {
     void PushStr(Str value, App* app, Window* window = nullptr);
     void SetSelectable(bool value, App* app, Window* window = nullptr);
     void SetScrollable(bool value, App* app, Window* window = nullptr);
+    TextViewState& Motion(TextViewMotion value) {
+        motion = value;
+        return *this;
+    }
+    void SetMotion(TextViewMotion value, App* app, Window* window = nullptr);
     bool IsClamped() const { return clamped; }
     void SetSelectionFormat(gpui::SelectionFormat value, App* app,
                             Window* window = nullptr);
@@ -14325,6 +14873,11 @@ struct TextViewLayoutState {
 
 Str MdTableToMarkdown(Arena* a, MdNode* table);
 
+struct TextViewLinkBinding {
+    intptr_t context = 0;
+    const char* href = nullptr;
+};
+
 struct TextView {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
@@ -14344,6 +14897,8 @@ struct TextView {
     bool html = false;
 
     Listener onLink;
+    intptr_t onLinkContext = 0;
+    bool onLinkHasContext = false;
     CodeBlockActionsFn codeActions = nullptr;
 
     CodeBlockHighlighterFn codeHighlighter = nullptr;
@@ -14371,6 +14926,12 @@ struct TextView {
     MarkdownExtensions markdownExtensions = {};
     gpui::Style outerStyle = {};
     uint32_t outerStyleFields = 0;
+    TextViewMotion motion = {};
+    bool motionSet = false;
+    int streamBlockDepth = 0;
+    int streamRenderedOffset = 0;
+    int streamFadeFrom = -1;
+    float streamFadeOpacity = 1;
 
     static TextView* New(Ctx* cx, Str source);
     static TextView* NewHtml(Ctx* cx, Str source);
@@ -14389,8 +14950,13 @@ struct TextView {
 
     TextView* MaxLines(int count);
     TextView* ParagraphGap(float px);
+    TextView* Motion(TextViewMotion value);
+
+    TextView* StreamFade(bool value = true);
 
     TextView* OnLink(Listener fn);
+
+    TextView* OnLinkWithContext(Listener fn, intptr_t context);
 
     TextView* CodeBlockActions(CodeBlockActionsFn fn, void* data = nullptr);
 
@@ -14442,6 +15008,7 @@ struct TextView {
     void SrcBreak();
 
     El* SrcImage(El* e, MdRun* r);
+    Listener LinkListener(Str href);
 
     Str BlockText(MdNode* n);
     El* PluginBlock(MdNode* n);
@@ -14960,6 +15527,8 @@ struct TooltipRequest {
 };
 
 struct TooltipOverlay {
+
+    bool enabled = !(GPUI_OS_IOS || GPUI_OS_ANDROID);
     TooltipRequest content = {};
     TooltipRequest pending = {};
     Bounds previousBounds = {};
@@ -15015,6 +15584,10 @@ struct VirtualRange {
 
 VirtualRange VirtualListVisibleRange(const float* sizes, int count,
                                      float offset, float viewport);
+
+VirtualRange VirtualListVisibleRangeFromLayout(const float* origins,
+                                               const float* sizes, int count,
+                                               float offset, float viewport);
 
 VirtualRange VirtualListVisibleRows(int count, float rowSize, float offset,
                                     float viewport);
@@ -15292,6 +15865,12 @@ struct EventEmitter<TreeState, TreeEvent> {};
 #line 1 "src/base/lib.h"
 
 namespace gpui {
+
+constexpr bool IsMobile() {
+    return GPUI_OS_IOS || GPUI_OS_ANDROID;
+}
+
+void ApplySystemReduceMotion();
 
 void BaseInit(App* app);
 
@@ -15761,6 +16340,10 @@ bool ColorNameParse(Str value, ColorName* out);
 Rgba ColorNameScale(ColorName name, int scale = 500);
 Rgba ThemeHsl(float hueDegrees, float saturationPercent,
               float lightnessPercent);
+Rgba ThemeOklch(float lightness, float chroma, float hueDegrees);
+inline Rgba Oklch(float lightness, float chroma, float hueDegrees) {
+    return ThemeOklch(lightness, chroma, hueDegrees);
+}
 Rgba ThemeBlack();
 Rgba ThemeWhite();
 
@@ -17528,6 +18111,177 @@ struct ButtonGroup {
 }
 }
 
+#line 1 "src/ui/carousel.h"
+
+namespace gpui {
+namespace component {
+
+struct CarouselEvent {
+    int index = 0;
+};
+
+struct CarouselState {
+    Entity<CarouselState> self = {};
+    int itemCount = 0;
+    int selectedIndex = -1;
+    Axis axis = Axis::Horizontal;
+    bool looping = false;
+
+    static CarouselState New(int itemCount);
+    CarouselState& WithSelectedIndex(int index);
+    CarouselState& WithAxis(Axis value);
+    CarouselState& WithLooping(bool value = true);
+    int ItemCount() const { return itemCount; }
+    int SelectedIndex() const { return selectedIndex; }
+    Axis GetAxis() const { return axis; }
+    bool IsLooping() const { return looping; }
+    bool HasPrevious() const;
+    bool HasNext() const;
+    void SetSelectedIndex(int index, Ctx* cx);
+    void SetItemCount(int count, Ctx* cx);
+    void SetAxis(Axis value, Ctx* cx);
+    void SetLooping(bool value, Ctx* cx);
+    bool SelectIndex(int index, Ctx* cx);
+    bool SelectPrevious(Ctx* cx);
+    bool SelectNext(Ctx* cx);
+    bool SelectFirst(Ctx* cx);
+    bool SelectLast(Ctx* cx);
+
+    static void OnAction(CarouselState* self, Ctx* cx,
+                         const ActionEvent* event);
+    static void OnPrevious(CarouselState* self, Ctx* cx,
+                           const ClickEvent* event);
+    static void OnNext(CarouselState* self, Ctx* cx, const ClickEvent* event);
+    static void OnSelect(CarouselState* self, Ctx* cx, const ClickEvent* event,
+                         intptr_t index);
+};
+
+Entity<CarouselState> CarouselStateNew(App* app, int itemCount);
+void CarouselInitKeys();
+
+struct Carousel {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    Entity<CarouselState> state = {};
+    Str accessibilityLabel = StrL("Carousel");
+    bool focusRingEnabled = true;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static Carousel* New(Ctx* cx, Str id, Entity<CarouselState> state);
+    Carousel* AccessibilityLabel(Str value);
+    Carousel* FocusRing(bool enabled);
+    Carousel* Child(El* child);
+    Carousel* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct CarouselContent {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Entity<CarouselState> state = {};
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+    Style trackStyle = {};
+    uint32_t trackStyleSet = 0;
+
+    static CarouselContent* New(Ctx* cx, Entity<CarouselState> state);
+    CarouselContent* Child(El* child);
+    CarouselContent* Refine(const Style& value, uint32_t fields);
+    CarouselContent* TrackStyle(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct CarouselItem {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    int index = 0;
+    Entity<CarouselState> state = {};
+    Str accessibilityLabel = {};
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static CarouselItem* New(Ctx* cx, Str id, int index,
+                             Entity<CarouselState> state);
+    CarouselItem* AccessibilityLabel(Str value);
+    CarouselItem* Child(El* child);
+    CarouselItem* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct CarouselControl {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Entity<CarouselState> state = {};
+    UiSize size = UiSize::Medium;
+    Str accessibilityLabel = {};
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+    bool next = false;
+
+    CarouselControl* WithSize(UiSize value);
+    CarouselControl* AccessibilityLabel(Str value);
+    CarouselControl* Child(El* child);
+    CarouselControl* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct CarouselPrevious : CarouselControl {
+    static CarouselPrevious* New(Ctx* cx, Entity<CarouselState> state);
+};
+
+struct CarouselNext : CarouselControl {
+    static CarouselNext* New(Ctx* cx, Entity<CarouselState> state);
+};
+
+struct CarouselPagination {
+    Arena* a = nullptr;
+    Str accessibilityLabel = StrL("Carousel pagination");
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static CarouselPagination* New(Ctx* cx);
+    CarouselPagination* AccessibilityLabel(Str value);
+    CarouselPagination* Child(El* child);
+    CarouselPagination* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct CarouselPaginationItem {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    int index = 0;
+    Entity<CarouselState> state = {};
+    UiSize size = UiSize::XSmall;
+    Str accessibilityLabel = {};
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static CarouselPaginationItem* New(Ctx* cx, Str id, int index,
+                                       Entity<CarouselState> state);
+    CarouselPaginationItem* WithSize(UiSize value);
+    CarouselPaginationItem* AccessibilityLabel(Str value);
+    CarouselPaginationItem* Child(El* child);
+    CarouselPaginationItem* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+}
+
+template <>
+struct EventEmitter<component::CarouselState, component::CarouselEvent> {};
+
+}
+
 #line 1 "src/base/sankey.h"
 
 namespace gpui {
@@ -17988,6 +18742,8 @@ struct Checkbox {
     Checkbox* TabStop(bool v);
     Checkbox* Tooltip(Str s);
     Checkbox* OnClick(Listener fn);
+
+    Checkbox* OnChange(Listener fn);
     El* IntoEl();
 };
 
@@ -18022,11 +18778,13 @@ struct Clipboard {
     Str value = {};
     Str tooltipText = {};
     Listener onCopied;
+    UiSize size = UiSize::XSmall;
 
     static Clipboard* New(Ctx* cx, Str id);
     Clipboard* Value(Str v);
     Clipboard* Tooltip(Str t);
     Clipboard* OnCopied(Listener fn);
+    Clipboard* WithSize(UiSize sizeValue);
     El* IntoEl();
 };
 
@@ -18550,6 +19308,8 @@ struct SearchableListState {
 
     Listener onChange = {};
 
+    Listener onClose = {};
+
     FocusHandle triggerFocus = {};
     FocusHandle contentFocus = {};
     FocusHandle previousFocus = {};
@@ -18699,8 +19459,10 @@ struct SelectState {
     void Focus(Window* win) const;
     void SetOpen(bool open, Ctx* cx);
     void ToggleMenu(Ctx* cx);
+    void ClearQueryAndRestore(Ctx* cx);
     void Clean(Ctx* cx);
 
+    static void OnListClose(SelectState* self, Ctx* cx, const TickEvent* event);
     static void OnListChange(SelectState* self, Ctx* cx,
                              const ListEvent* event);
     static void OnMouseDownOut(SelectState* self, Ctx* cx,
@@ -18997,6 +19759,9 @@ Str KbdFormatStr(Ctx* cx, Keystroke stroke);
 
 bool KeystrokeForAction(uint32_t action, const char* context, Keystroke* out);
 
+bool KeystrokeForActionAtFocus(Ctx* cx, uint32_t action, FocusHandle focus,
+                               Keystroke* out);
+
 struct Kbd {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
@@ -19010,6 +19775,7 @@ struct Kbd {
 
     static Kbd* ForAction(Ctx* cx, uint32_t action,
                           const char* context = nullptr);
+    static Kbd* ForActionAtFocus(Ctx* cx, uint32_t action, FocusHandle focus);
     Kbd* Appearance(bool v);
     Kbd* Outline();
     El* IntoEl();
@@ -19825,6 +20591,104 @@ struct DockArea {
 }
 }
 
+#line 1 "src/ui/empty.h"
+
+namespace gpui {
+namespace component {
+
+enum class EmptyMediaVariant : uint8_t {
+    Default,
+    Icon,
+};
+
+struct EmptyMedia {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    EmptyMediaVariant variant = EmptyMediaVariant::Default;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static EmptyMedia* New(Ctx* cx);
+    EmptyMedia* WithVariant(EmptyMediaVariant value);
+    EmptyMedia* Child(El* child);
+    EmptyMedia* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct EmptyTitle {
+    Arena* a = nullptr;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static EmptyTitle* New(Ctx* cx);
+    EmptyTitle* Child(El* child);
+    EmptyTitle* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct EmptyDescription {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static EmptyDescription* New(Ctx* cx);
+    EmptyDescription* Child(El* child);
+    EmptyDescription* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct EmptyContent {
+    Arena* a = nullptr;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static EmptyContent* New(Ctx* cx);
+    EmptyContent* Child(El* child);
+    EmptyContent* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct EmptyHeader {
+    Arena* a = nullptr;
+    EmptyMedia* media = nullptr;
+    EmptyTitle* title = nullptr;
+    EmptyDescription* description = nullptr;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static EmptyHeader* New(Ctx* cx);
+    EmptyHeader* Media(EmptyMedia* value);
+    EmptyHeader* Title(EmptyTitle* value);
+    EmptyHeader* Description(EmptyDescription* value);
+    EmptyHeader* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct Empty {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    EmptyHeader* header = nullptr;
+    EmptyContent* content = nullptr;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static Empty* New(Ctx* cx);
+    Empty* Header(EmptyHeader* value);
+    Empty* Content(EmptyContent* value);
+    Empty* Child(El* child);
+    Empty* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+}
+}
+
 #line 1 "src/ui/tiles.h"
 
 namespace gpui {
@@ -19982,6 +20846,7 @@ struct Form {
     UiSize size = UiSize::Medium;
 
     float labelTextSize = 0;
+    El* footer = nullptr;
 
     static Form* New(Ctx* cx);
     Form* Child(const component::Field& field);
@@ -19996,8 +20861,12 @@ struct Form {
     Form* Visible(bool v);
     Form* LabelIndent(bool v);
     Form* Align(FieldAlign v);
+
+    Form* LabelLayout(Axis axis);
     Form* Horizontal(bool v = true);
     Form* Columns(int n);
+
+    Form* Footer(El* content);
     Form* LabelWidth(float w);
     Form* WithSize(UiSize v);
     Form* LabelTextSize(float px);
@@ -20288,10 +21157,16 @@ namespace gpui {
 
 namespace component {
 
+struct Icon;
+
 struct IconNamed {
     Str path = {};
 
     static IconNamed From(IconName name);
+};
+
+struct IconNameExt {
+    static Icon* View(Ctx* cx, IconName name);
 };
 
 enum class IconSource : uint8_t {
@@ -20461,6 +21336,8 @@ struct Input {
     Listener onFocus;
     Listener onClear;
     Listener onToggleMask;
+    InputPasteFn onPaste = nullptr;
+    void* onPasteData = nullptr;
 
     static Input* New(Ctx* cx, Str id, InputState* state);
     Input* Label(Str s);
@@ -20489,6 +21366,7 @@ struct Input {
     Input* W(float v);
     Input* OnChange(Listener fn);
     Input* OnFocus(Listener fn);
+    Input* OnPaste(InputPasteFn fn, void* data = nullptr);
     El* IntoEl();
 };
 
@@ -20522,6 +21400,8 @@ struct Editor {
     Str ariaLabel = {};
     EditorContextMenuFn contextMenu = nullptr;
     void* contextMenuData = nullptr;
+    InputPasteFn onPaste = nullptr;
+    void* onPasteData = nullptr;
 
     Str language = {};
     const TextSpan* decorations = nullptr;
@@ -20547,6 +21427,7 @@ struct Editor {
     Editor* Role(AccessibilityRole value);
     Editor* AriaLabel(Str value);
     Editor* ContextMenu(EditorContextMenuFn fn, void* data = nullptr);
+    Editor* OnPaste(InputPasteFn fn, void* data = nullptr);
     Editor* Language(Str value);
     Editor* Decorations(const TextSpan* runs, int n);
     Editor* ActiveLine(bool value = true);
@@ -20619,6 +21500,8 @@ struct Textarea {
     AccessibilityRole accessibilityRole = AccessibilityRole::MultilineTextInput;
     Str ariaLabel = {};
     Listener onFocus;
+    InputPasteFn onPaste = nullptr;
+    void* onPasteData = nullptr;
 
     static Textarea* New(Ctx* cx, Str id, InputState* state);
 
@@ -20628,6 +21511,7 @@ struct Textarea {
     Textarea* Role(AccessibilityRole role);
     Textarea* AriaLabel(Str label);
     Textarea* OnFocus(Listener fn);
+    Textarea* OnPaste(InputPasteFn fn, void* data = nullptr);
     El* IntoEl();
 };
 
@@ -20954,6 +21838,8 @@ struct PopupMenuState {
     FocusHandle focus = {};
     FocusHandle previousFocus = {};
 
+    FocusHandle triggerFocus = {};
+
     Entity<PopupMenuState> parent = {};
 
     Bounds bounds = {};
@@ -21120,6 +22006,7 @@ struct ContextMenuState {
     bool open = false;
     Point position = {};
     FocusHandle previousFocus = {};
+    FocusHandle triggerFocus = {};
 
     static void OnMouseDown(ContextMenuState* self, Ctx* cx,
                             const MouseDownEvent* ev);
@@ -21681,6 +22568,41 @@ namespace gpui {
 struct Path;
 
 namespace component {
+
+struct PathCache {
+    uint64_t key = 0;
+    bool hasKey = false;
+
+    bool Touch(uint64_t value) {
+        bool warm = hasKey && key == value;
+        key = value;
+        hasKey = true;
+        return warm;
+    }
+    bool IsWarm() const { return hasKey; }
+};
+
+struct PathCaches {
+    Vec<PathCache> slots;
+
+    ~PathCaches() { VecReset(slots); }
+    PathCache* Slot(int index);
+    void SlotPair(int index, PathCache** first, PathCache** second);
+};
+
+struct ShapeKey {
+    uint64_t value = 1469598103934665603ull;
+
+    static ShapeKey New(uint64_t extra = 0) {
+        ShapeKey key;
+        key.U64(extra);
+        return key;
+    }
+    ShapeKey& U64(uint64_t v);
+    ShapeKey& PointValue(Point point);
+    ShapeKey& Float(float v);
+    uint64_t Finish() const { return value; }
+};
 
 struct ScaleLinear {
     int domainLen = 0;
@@ -22311,6 +23233,8 @@ struct Radio {
     Radio* TabIndex(int v);
     Radio* TabStop(bool v);
     Radio* OnClick(Listener fn);
+
+    Radio* OnChange(Listener fn);
     El* IntoEl();
 };
 
@@ -22325,6 +23249,7 @@ struct RadioGroup {
     UiSize size = UiSize::Medium;
     Listener onClick;
 
+    static RadioGroup* New(Ctx* cx, Str id);
     static RadioGroup* Vertical(Ctx* cx, Str id);
     static RadioGroup* Horizontal(Ctx* cx, Str id);
     RadioGroup* Child(Radio* r);
@@ -22334,6 +23259,7 @@ struct RadioGroup {
     RadioGroup* Disabled(bool v);
     RadioGroup* WithSize(UiSize s);
     RadioGroup* OnClick(Listener fn);
+    RadioGroup* OnChange(Listener fn);
     El* IntoEl();
 };
 
@@ -22961,11 +23887,6 @@ struct SettingsState {
     static void OnFieldReset(SettingsState* self, Ctx* cx, const ClickEvent* ev,
                              intptr_t ix);
 
-    static void OnFieldInc(SettingsState* self, Ctx* cx, const ClickEvent* ev,
-                           intptr_t ix);
-    static void OnFieldDec(SettingsState* self, Ctx* cx, const ClickEvent* ev,
-                           intptr_t ix);
-
     static void OnResetPage(SettingsState* self, Ctx* cx, const ClickEvent* ev,
                             intptr_t unused);
 
@@ -23496,6 +24417,8 @@ struct Switch {
     Switch* WithSize(UiSize s);
     Switch* Color(Rgba c);
     Switch* OnClick(Listener fn);
+
+    Switch* OnChange(Listener fn);
     El* IntoEl();
 };
 
@@ -24272,6 +25195,7 @@ using HeadingFontSizeFn = gpui::HeadingFontSizeFn;
 using TextViewStyle = gpui::TextViewStyle;
 using TextViewDefaults = gpui::TextViewDefaults;
 using TextViewFormat = gpui::TextViewFormat;
+using TextViewMotion = gpui::TextViewMotion;
 using TextViewState = gpui::TextViewState;
 using TextViewLayoutState = gpui::TextViewLayoutState;
 using TextView = gpui::TextView;
@@ -24302,6 +25226,10 @@ void UiCodeBlockHighlighter(void* data, const CodeBlock* block, Arena* a,
                             ArenaVec<CodeHighlight>* out);
 
 void TextViewInstallDefaults(App* app);
+
+struct FrontmatterPlugin {
+    static MarkdownPlugin New();
+};
 
 }
 }
@@ -24559,9 +25487,15 @@ struct FrameSampler {
     uint32_t warmup = kFpsWarmupFrames;
 
     bool drainedBacklog = false;
+
+    double ownFrameAt = -1;
+    uint64_t ownFrameNotifies = 0;
 };
 
 void FrameSamplerTick(FrameSampler* s, Window* win);
+void FrameSamplerExpectOwnFrame(FrameSampler* s, double at);
+
+void FrameSamplerReset(FrameSampler* s);
 
 void FrameSamplerIngest(FrameSampler* s, const FrameTiming* frames, int n,
                         double now);
@@ -24649,6 +25583,7 @@ struct FpsMonitor {
     double readoutAt = -1;
 
     float frameBudget = 1.f / 60.f;
+    bool budgetExplicit = false;
     FpsHeadline headline = FpsHeadline::Max;
 
     bool displayAsked = false;
@@ -24662,7 +25597,12 @@ struct FpsMonitor {
 
     Window* clockWindow = nullptr;
     int clockTimer = 0;
+    uint64_t framesRendered = 0;
+    uint64_t clockSeenFrames = 0;
+    uint32_t clockStillTicks = 0;
+    bool sleeping = false;
     int resourceTask = 0;
+    uint64_t resourceGeneration = 0;
     FpsResourceJob* resourceJob = nullptr;
     bool compact = false;
 
@@ -24678,6 +25618,11 @@ struct FpsMonitor {
 };
 
 void FpsMonitorSetFrameBudget(FpsMonitor* self, float budgetSecs);
+
+void FpsMonitorAdoptDisplayPeriod(FpsMonitor* self, double periodSecs);
+
+bool FpsRenderWatchTick(uint64_t framesRendered, uint64_t* seen,
+                        uint32_t* stillTicks);
 
 TempStr FpsFormatCpuTemp(float percent);
 
@@ -25149,6 +26094,8 @@ PlatformInput InputMouseExited(float x, float y, bool pressed,
 PlatformInput InputScrollWheel(float x, float y, float deltaX, float deltaY,
                                bool precise, Modifiers modifiers,
                                TouchPhase phase);
+PlatformInput InputTouchDrag(TouchPhase phase, Point start, Point position);
+PlatformInput InputLongPress(TouchPhase phase, Point start, Point position);
 
 int WindowClickCount(Window* win, float x, float y, MouseButton button);
 
@@ -26984,6 +27931,8 @@ struct CapabilityError {
 void CapabilityErrorFree(CapabilityError* error);
 Str CapabilityErrorMessage(Arena* arena, const CapabilityError& error);
 
+bool IsOpenableUrl(Str url);
+
 struct CapabilityPath {
     Str root;
     Str relative;
@@ -27447,6 +28396,7 @@ enum class ComponentKind : uint8_t {
     VFlex,
     ChildView,
     Text,
+    TextView,
     Button,
     Link,
     Checkbox,
@@ -27517,6 +28467,11 @@ enum class ComponentKind : uint8_t {
     UniformList,
 };
 
+enum class TextViewFormat : uint8_t {
+    Html,
+    Markdown,
+};
+
 struct VirtualListSpec {
     Str id;
     Axis axis = Axis::Vertical;
@@ -27540,6 +28495,9 @@ struct ListSpec {
 struct Component {
     ComponentKind kind = ComponentKind::Div;
     Str text;
+
+    Str value;
+    TextViewFormat textViewFormat = TextViewFormat::Markdown;
     uint64_t handle = 0;
     uint32_t index = 0;
     BackgroundSpec background;
@@ -28109,6 +29067,8 @@ struct ScriptView {
 
     static void OnClick(ScriptView* self, Ctx* cx, const ClickEvent* event,
                         intptr_t callback);
+    static void OnTextLink(ScriptView* self, Ctx* cx, const ClickEvent* event,
+                           intptr_t binding);
     static void OnChange(ScriptView* self, Ctx* cx, const ClickEvent* event,
                          intptr_t value);
     static void OnHover(ScriptView* self, Ctx* cx, const HoverEvent* event,

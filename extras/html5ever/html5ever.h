@@ -28,24 +28,47 @@
 #define GPUI_OS_WINDOWS 0
 #define GPUI_OS_LINUX 0
 #define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 1
 #elif defined(_WIN32)
 #define GPUI_OS_WINDOWS 1
 #define GPUI_OS_LINUX 0
 #define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
+#define GPUI_OS_WASM 0
+#elif defined(__ANDROID__)
+#define GPUI_OS_WINDOWS 0
+#define GPUI_OS_LINUX 0
+#define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 1
+#define GPUI_OS_WASM 0
+#elif defined(__APPLE__) && \
+    defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)
+#define GPUI_OS_WINDOWS 0
+#define GPUI_OS_LINUX 0
+#define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 1
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 0
 #elif defined(__APPLE__)
 #define GPUI_OS_WINDOWS 0
 #define GPUI_OS_LINUX 0
 #define GPUI_OS_MAC 1
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 0
 #elif defined(__linux__)
 #define GPUI_OS_WINDOWS 0
 #define GPUI_OS_LINUX 1
 #define GPUI_OS_MAC 0
+#define GPUI_OS_IOS 0
+#define GPUI_OS_ANDROID 0
 #define GPUI_OS_WASM 0
 #else
-#error "unsupported platform: gpui builds on Windows, Linux, macOS and wasm"
+#error "unsupported platform"
 #endif
 
 #define GPUI_OS_POSIX (!GPUI_OS_WINDOWS)

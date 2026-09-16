@@ -78,6 +78,8 @@ static const StoryInfo kMeta[StoryCount] = {
      "A styleable chat surface for text, rich content, and reactions."},
     {"button", "Button",
      "Displays a button or a component that looks like a button."},
+    {"carousel", "Carousel",
+     "A composable carousel with keyboard navigation and pagination."},
     {"calendar", "Calendar", "A calendar to select a date or date range."},
     {"chart", "Chart", "Beautiful Charts & Graphs."},
     {"checkbox", "Checkbox", "Select one or more independent options."},
@@ -106,6 +108,8 @@ static const StoryInfo kMeta[StoryCount] = {
     {"editor", "Editor",
      "Code editor with theme-aware syntax highlighting and "
      "folding."},
+    {"empty", "Empty",
+     "Present an empty state with media, description, and actions."},
     {"form", "Form", "Form to collect multiple inputs."},
     {"group-box", "GroupBox",
      "A styled container element that with an optional title to groups "
@@ -194,9 +198,6 @@ static const StoryInfo kMeta[StoryCount] = {
     {"theme-colors", "Theme Colors",
      "A color theme viewer to explore colors organized by "
      "categories."},
-    {"tiles", "Tiles",
-     "Panels that float over an area, each moved by its bar and resized by "
-     "its edges."},
     {"toggle", "Toggle", "Turn an option on or off, alone or in a group."},
     {"tooltip", "Tooltip", "Describe a control on hover."},
     // TreeStory has no description() in Rust, so its page has no line under
