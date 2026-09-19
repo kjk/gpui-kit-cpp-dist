@@ -42,7 +42,7 @@ static void MsSetBody(DemoMessage* m, Str body, bool own) {
 }
 
 static void MsFreeList(Vec<DemoMessage>& list) {
-    for (int i = 0; i < list.len; i++) {
+    for (int i = 0; i < len(list); i++) {
         if (list[i].owned) {
             StrFree(list[i].body);
         }
@@ -282,7 +282,7 @@ static void MsScrollToUnread(MessageScrollerStory* self, Ctx* cx,
 static void MsSend(MessageScrollerStory* self, Ctx* cx, const ClickEvent*) {
     Str body = InputValue(&self->composer);
     bool blank = true;
-    for (int i = 0; i < body.len; i++) {
+    for (int i = 0; i < len(body); i++) {
         if (body.s[i] != ' ' && body.s[i] != '\t' && body.s[i] != '\n') {
             blank = false;
             break;

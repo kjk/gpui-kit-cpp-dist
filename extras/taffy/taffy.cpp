@@ -17,7 +17,7 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 static int VscprintfUtf8(const char* fmt, va_list args);
 
 float StrToFloatUnchecked(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return 0;
     }
     TempStr text = StrDupTemp(s);
@@ -25,21 +25,21 @@ float StrToFloatUnchecked(Str s) {
 }
 
 int StrToIntUnchecked(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return 0;
     }
     int i = 0;
-    while (i < s.len && s.s[i] <= ' ') {
+    while (i < len(s) && s.s[i] <= ' ') {
         i++;
     }
     bool negative = false;
-    Str rest = Str(s.s + i, s.len - i);
+    Str rest = Str(s.s + i, len(s) - i);
     if (StrStartsWithAny(rest, "+-")) {
         negative = rest.s[0] == '-';
         i++;
     }
     uint64_t value = 0;
-    while (i < s.len && s.s[i] >= '0' && s.s[i] <= '9') {
+    while (i < len(s) && s.s[i] >= '0' && s.s[i] <= '9') {
         value = value * 10 + (uint64_t)(s.s[i] - '0');
         i++;
     }
@@ -87,20 +87,11 @@ static uint64_t ArenaAlignPow2(uint64_t value, uint64_t align) {
     return (value + align - 1) & ~(align - 1);
 }
 
-static uint64_t ArenaMin(uint64_t a, uint64_t b) {
-    return (a < b) ? a : b;
-}
-
-static uint64_t ArenaMax(uint64_t a, uint64_t b) {
-    return (a > b) ? a : b;
-}
-
-static uint64_t ArenaClampTop(uint64_t value, uint64_t maxValue) {
-    return (value < maxValue) ? value : maxValue;
-}
-
-static uint64_t ArenaClampBot(uint64_t minValue, uint64_t value) {
-    return (value > minValue) ? value : minValue;
+static uint64_t ArenaPosAfter(Arena* current, uint64_t size, uint64_t align) {
+    if (align == 0) {
+        align = 1;
+    }
+    return ArenaAlignPow2(current->pos, align) + size;
 }
 
 static Arena* ArenaAlloc(const ArenaParams& params);
@@ -112,15 +103,10 @@ static void ArenaRelease(Arena* arena) {
 static bool ArenaPushWouldChainLocked(Arena* arena, uint64_t size,
                                       uint64_t align) {
     if (!arena || (arena->flags & ArenaFlagNoChain)) {
-
         return false;
     }
-    if (align == 0) {
-        align = 1;
-    }
-    Arena* current = arena->current;
-    uint64_t posPost = ArenaAlignPow2(current->pos, align) + size;
-    return current->reserved < posPost;
+    return arena->current
+               ->reserved < ArenaPosAfter(arena->current, size, align);
 }
 
 static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
@@ -128,17 +114,13 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
     if (!arena) {
         return nullptr;
     }
-    if (align == 0) {
-        align = 1;
-    }
-
     Arena* current = arena->current;
-    uint64_t posPre = ArenaAlignPow2(current->pos, align);
-    uint64_t posPost = posPre + size;
+    uint64_t posPost = ArenaPosAfter(current, size, align);
+    uint64_t posPre = posPost - size;
 
     uint64_t sizeToZero = 0;
     if (zero && current->committed > posPre) {
-        sizeToZero = ArenaMin(current->committed, posPost) - posPre;
+        sizeToZero = std::min(current->committed, posPost) - posPre;
     }
 
     if (current->reserved < posPost && !(arena->flags & ArenaFlagNoChain)) {
@@ -147,7 +129,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         uint64_t commitChunkSize = arena->commitChunkSize;
         if (size + kArenaHeaderSize > reserveChunkSize) {
             reserveChunkSize = ArenaAlignPow2(size + kArenaHeaderSize,
-                                              ArenaMax(align, PlatPageSize()));
+                                              std::max(align, PlatPageSize()));
             commitChunkSize = reserveChunkSize;
         }
 
@@ -168,8 +150,8 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         newBlock->prev = current;
         arena->current = newBlock;
         current = newBlock;
-        posPre = ArenaAlignPow2(current->pos, align);
-        posPost = posPre + size;
+        posPost = ArenaPosAfter(current, size, align);
+        posPre = posPost - size;
         sizeToZero = 0;
     }
 
@@ -179,7 +161,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         }
 
         uint64_t commitEnd = ArenaAlignPow2(posPost, current->commitChunkSize);
-        uint64_t commitClamped = ArenaClampTop(commitEnd, current->reserved);
+        uint64_t commitClamped = std::min(commitEnd, current->reserved);
         uint64_t commitSize = commitClamped - current->committed;
         void* commitPtr = (char*)current + current->committed;
         if (!PlatMemCommit(commitPtr, commitSize, false)) {
@@ -194,12 +176,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
 
     void* result = (char*)current + posPre;
     current->pos = posPost;
-
-    arena->nAllocsLifetime++;
     arena->nAllocsSinceReset++;
-    uint64_t used = current->basePos + posPost;
-    arena->peakBytesLifetime = std::max(used, arena->peakBytesLifetime);
-    arena->peakBytesSinceReset = std::max(used, arena->peakBytesSinceReset);
 
     if (sizeToZero) {
         memset(result, 0, (size_t)sizeToZero);
@@ -232,10 +209,10 @@ static Arena* ArenaAlloc(const ArenaParams& srcParams) {
     const uint64_t pageSize =
         useLargePages ? PlatLargePageSize() : PlatPageSize();
     uint64_t reserveSize = ArenaAlignPow2(
-        ArenaMax(params.reserveSize, kArenaHeaderSize), pageSize);
+        std::max(params.reserveSize, kArenaHeaderSize), pageSize);
     uint64_t commitSize =
-        ArenaAlignPow2(ArenaMax(params.commitSize, kArenaHeaderSize), pageSize);
-    commitSize = ArenaClampTop(commitSize, reserveSize);
+        ArenaAlignPow2(std::max(params.commitSize, kArenaHeaderSize), pageSize);
+    commitSize = std::min(commitSize, reserveSize);
 
     void* base = params.optionalBackingBuffer;
     bool usesExternalBuffer = (base != nullptr);
@@ -284,10 +261,7 @@ static Arena* ArenaAlloc(const ArenaParams& srcParams) {
     arena->allocationSiteLine = params.allocationSiteLine;
     arena->name = params.name;
     arena->usesExternalBuffer = usesExternalBuffer;
-    arena->nAllocsLifetime = 0;
-    arena->peakBytesLifetime = 0;
     arena->nAllocsSinceReset = 0;
-    arena->peakBytesSinceReset = 0;
     return arena;
 }
 
@@ -317,7 +291,7 @@ void Arena::PopTo(uint64_t popPos) {
     Arena* arena = this;
     lock.Lock();
 
-    uint64_t bigPos = ArenaClampBot(kArenaHeaderSize, popPos);
+    uint64_t bigPos = std::max(kArenaHeaderSize, popPos);
     Arena* node = arena->current;
     while (node && node->basePos >= bigPos) {
         Arena* prevNode = node->prev;
@@ -346,14 +320,6 @@ uint64_t ArenaUsed(Arena* arena) {
     }
     Arena* cur = arena->current;
     return cur ? cur->basePos + cur->pos : 0;
-}
-
-static Arena* ArenaBlockAt(Arena* arena, uint64_t pos) {
-    Arena* node = arena ? arena->current : nullptr;
-    while (node && node->basePos > pos) {
-        node = node->prev;
-    }
-    return node;
 }
 
 int VarintSize(uint32_t v) {
@@ -392,33 +358,30 @@ int VarintGet(const char* src, uint32_t* out) {
 }
 
 static char* ArenaStrAt(Arena* a, ArenaStr s) {
-    Arena* node = ArenaBlockAt(a, s);
-    if (!node) {
-        return nullptr;
-    }
-    return (char*)node + ((uint64_t)s - node->basePos);
+    return (char*)ArenaAtOffset(a, s);
+}
+
+static uint64_t ArenaBlockOff(Arena* block, const void* p) {
+    return block->basePos + (uint64_t)((const char*)p - (const char*)block);
 }
 
 ArenaStr ArenaStrDup(Arena* a, Str src) {
-    if (!a || !src.s || src.len <= 0) {
+    if (!a || !src.s || len(src) <= 0) {
         return kArenaStrNone;
     }
-    uint32_t len = (uint32_t)src.len;
-    int vlen = VarintSize(len);
+    uint32_t n = (uint32_t)len(src);
+    int vlen = VarintSize(n);
     a->lock.Lock();
-
-    char* dst = (char*)ArenaPushLocked(a, (uint64_t)vlen + len + 1, 1, false);
-    Arena* cur = a->current;
-    uint64_t at = dst ? cur->basePos + (uint64_t)((char*)dst - (char*)cur) : 0;
+    char* dst = (char*)ArenaPushLocked(a, (uint64_t)vlen + n + 1, 1, false);
+    uint64_t at = dst ? ArenaBlockOff(a->current, dst) : 0;
     a->lock.Unlock();
     if (!dst) {
         return kArenaStrNone;
     }
-    VarintPut(dst, len);
-    memcpy(dst + vlen, src.s, (size_t)len);
-    dst[vlen + len] = 0;
+    VarintPut(dst, n);
+    memcpy(dst + vlen, src.s, (size_t)n);
+    dst[vlen + n] = 0;
     if (at > UINT32_MAX) {
-
         return kArenaStrNone;
     }
     return (ArenaStr)at;
@@ -438,7 +401,7 @@ uint32_t ArenaStrLen(Arena* a, ArenaStr s) {
 }
 
 ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
-    if (!a || !more.s || more.len <= 0) {
+    if (!a || !more.s || len(more) <= 0) {
         return s;
     }
     if (!ArenaStrIsSet(s)) {
@@ -455,9 +418,7 @@ ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
     bool newest = p && (uint64_t)s + vlen + len + 1 == used;
     uint32_t nlen = len + (uint32_t)more.len;
     int nvlen = VarintSize(nlen);
-
     uint64_t want = (uint64_t)nvlen + nlen + 1;
-
     if (newest && !ArenaPushWouldChainLocked(
                       a, (uint64_t)(nvlen - vlen) + (uint64_t)more.len, 1)) {
         want = (uint64_t)(nvlen - vlen) + (uint64_t)more.len;
@@ -465,11 +426,7 @@ ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
         newest = false;
     }
     char* dst = (char*)ArenaPushLocked(a, want, 1, false);
-    uint64_t at = 0;
-    if (dst) {
-        Arena* after = a->current;
-        at = after->basePos + (uint64_t)((char*)dst - (char*)after);
-    }
+    uint64_t at = dst ? ArenaBlockOff(a->current, dst) : 0;
     a->lock.Unlock();
     if (!dst) {
         return s;
@@ -521,7 +478,7 @@ uint32_t ArenaOffsetOf(Arena* a, const void* p) {
         if (at < lo || at >= lo + node->pos) {
             continue;
         }
-        uint64_t off = node->basePos + (uint64_t)(at - lo);
+        uint64_t off = ArenaBlockOff(node, at);
         if (off > UINT32_MAX) {
 
             return kArenaPtrNone;
@@ -531,43 +488,37 @@ uint32_t ArenaOffsetOf(Arena* a, const void* p) {
     return kArenaPtrNone;
 }
 
-void* Arena::Alloc(int size) {
-    if (size <= 0) {
+static void* AllocBytes(Arena* arena, uint64_t size) {
+    if (size == 0) {
         return nullptr;
     }
-    return Push((uint64_t)size, 8, false);
+    if (!arena) {
+        return malloc((size_t)size);
+    }
+    return arena->Push(size, 8, false);
+}
+
+void* Arena::Alloc(int size) {
+    return AllocBytes(this, size <= 0 ? 0 : (uint64_t)size);
 }
 
 void Arena::Reset() {
     PopTo(0);
     nAllocsSinceReset = 0;
-    peakBytesSinceReset = 0;
 }
 
 void* Alloc(Arena* arena, int size) {
-    if (size <= 0) {
-        return nullptr;
-    }
-    if (!arena) {
-        return malloc(size);
-    }
-    return arena->Alloc(size);
+    return AllocBytes(arena, size <= 0 ? 0 : (uint64_t)size);
 }
 
 void Free(Arena* arena, void* mem) {
-
-    if (arena) return;
-    free(mem);
+    if (!arena) {
+        free(mem);
+    }
 }
 
 static void* Alloc(Arena* arena, size_t size) {
-    if (size == 0) {
-        return nullptr;
-    }
-    if (!arena) {
-        return malloc(size);
-    }
-    return arena->Push((uint64_t)size, 8, false);
+    return AllocBytes(arena, (uint64_t)size);
 }
 
 static void* Realloc(Arena* arena, void* mem, size_t newSize, size_t copySize) {
@@ -708,18 +659,10 @@ GPUI_NOINLINE bool VecRealloc(Arena* a, void** els, int len, int* cap,
     return true;
 }
 
-static int VecNextCap(int cap, int wanted, int elSize) {
-    if (cap == 0) {
-        int floorCap = elSize == 1 ? 8 : elSize <= 1024 ? 4 : 1;
-        return std::max(floorCap, wanted);
-    }
-    return std::max(cap * 2, wanted);
-}
-
 GPUI_NOINLINE bool VecReserveNT(Arena* arena, VecNonTemplated* v, int elSize,
                                 int wantedSize) {
     int cap = v->cap;
-    int curCap = cap < 0 ? -cap : cap;
+    int curCap = VecAbsCap(cap);
     if (wantedSize <= curCap) {
         return true;
     }
@@ -761,12 +704,12 @@ GPUI_NOINLINE bool VecResizeNT(VecNonTemplated* v, int elSize, int newSize) {
     if (newSize < 0) {
         return false;
     }
-    int curCap = v->cap < 0 ? -v->cap : v->cap;
+    int curCap = VecAbsCap(v->cap);
     if (newSize > curCap) {
         if (!VecReserveNT(nullptr, v, elSize, newSize)) {
             return false;
         }
-        curCap = v->cap < 0 ? -v->cap : v->cap;
+        curCap = VecAbsCap(v->cap);
     }
     v->len = newSize;
     if (v->els && curCap > newSize) {
@@ -821,7 +764,7 @@ GPUI_NOINLINE void VecFreeElementsNT(VecNonTemplated* v) {
 
 GPUI_NOINLINE void VecClearNT(VecNonTemplated* v, int elSize) {
     v->len = 0;
-    int curCap = v->cap < 0 ? -v->cap : v->cap;
+    int curCap = VecAbsCap(v->cap);
     if (v->els && curCap > 0) {
         memset(v->els, 0, (size_t)curCap * (size_t)elSize);
     }
@@ -860,7 +803,7 @@ GPUI_NOINLINE void VecCopyFromNT(VecNonTemplated* v, int elSize, int srcLen,
         memcpy(v->els, srcEls, (size_t)srcLen * (size_t)elSize);
     }
     if (zeroTail && v->els) {
-        int curCap = v->cap < 0 ? -v->cap : v->cap;
+        int curCap = VecAbsCap(v->cap);
         if (curCap > srcLen) {
             char* tail = (char*)v->els + (size_t)srcLen * (size_t)elSize;
             memset(tail, 0, (size_t)(curCap - srcLen) * (size_t)elSize);
@@ -869,7 +812,6 @@ GPUI_NOINLINE void VecCopyFromNT(VecNonTemplated* v, int elSize, int srcLen,
 }
 
 #if defined(DEBUG)
-
 static FILE* gVecDbgFile = nullptr;
 static bool gVecDbgOpened = false;
 static int gVecDbgNextId = 1;
@@ -937,27 +879,13 @@ void VecDbgArenaDeath(int id, int len, int totalCap, int segCount) noexcept {
 }
 #endif
 
-static bool StrIsNull(const Str& s) {
-    return !s.s;
-}
-
-static Str WrapAllocated(char* s, int cch = -1) {
-    if (!s) {
-        return {};
-    }
-    if (cch < 0) {
-        return Str(s);
-    }
-    return Str(s, cch);
-}
-
 Str StrDup(Arena* a, Str s) {
-    if (StrIsNull(s) || s.len < 0) {
+    if (!s.s || len(s) < 0) {
         return {};
     }
-    int cch = s.len;
-    return WrapAllocated(
-        (char*)MemDup(a, s.s, (size_t)cch * sizeof(char), sizeof(char)), cch);
+    char* p =
+        (char*)MemDup(a, s.s, (size_t)len(s) * sizeof(char), sizeof(char));
+    return p ? Str(p, len(s)) : Str{};
 }
 
 Str StrDup(Str s) {
@@ -967,8 +895,8 @@ Str StrDup(Str s) {
 void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out) {
     s1Out = {};
     s2Out = {};
-    int n1 = (!s1.s || s1.len < 0) ? 0 : s1.len;
-    int n2 = (!s2.s || s2.len < 0) ? 0 : s2.len;
+    int n1 = (!s1.s || len(s1) < 0) ? 0 : len(s1);
+    int n2 = (!s2.s || len(s2) < 0) ? 0 : len(s2);
     if (n2 > INT_MAX - 2 - n1) {
         return;
     }
@@ -991,10 +919,6 @@ void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out) {
 
 void StrFree(Str s) {
     free(s.s);
-}
-
-void StrFree2(Str s) {
-    StrFree(s);
 }
 
 static bool DateParseIso(const char* s, LocalDate* out) {
@@ -1087,55 +1011,50 @@ void StrLowerAscii(char* s) {
     }
 }
 
-GPUI_NOINLINE bool StrEqRest(Str s1, Str s2) {
-    if (s1.s == s2.s || s1.len == 0) {
+static bool StrEqRestCommon(Str s1, Str s2, bool ignoreCase) {
+    if (s1.s == s2.s || len(s1) == 0) {
         return true;
     }
     if (!s1.s || !s2.s) {
         return false;
     }
-    return memcmp(s1.s, s2.s, (size_t)s1.len) == 0;
+    return ignoreCase ? StrCmpNI(s1.s, s2.s, len(s1)) == 0
+                      : memcmp(s1.s, s2.s, (size_t)len(s1)) == 0;
 }
 
-bool StrEq(Str s1, const char* s2) {
-    return StrEq(s1, Str(s2));
+GPUI_NOINLINE bool StrEqRest(Str s1, Str s2) {
+    return StrEqRestCommon(s1, s2, false);
 }
 
 int StrCmp(Str s1, Str s2) {
-    int common = std::min(s1.len, s2.len);
+    int common = std::min(len(s1), len(s2));
     int cmp = common > 0 ? memcmp(s1.s, s2.s, (size_t)common) : 0;
     if (cmp != 0) {
         return cmp;
     }
-    return s1.len < s2.len ? -1 : s1.len > s2.len ? 1 : 0;
+    return len(s1) < len(s2) ? -1 : len(s1) > len(s2) ? 1 : 0;
 }
 
 GPUI_NOINLINE bool StrEqIRest(Str s1, Str s2) {
-    if (s1.s == s2.s || s1.len == 0) {
-        return true;
-    }
-    if (StrIsNull(s1) || StrIsNull(s2)) {
-        return false;
-    }
-    return 0 == StrCmpNI(s1.s, s2.s, s1.len);
+    return StrEqRestCommon(s1, s2, true);
 }
 
-bool StrEqI(Str s1, const char* s2) {
-    return StrEqI(s1, Str(s2));
+static bool StrHasAffix(Str s, Str affix, bool fromEnd, bool ignoreCase) {
+    if (len(affix) > len(s)) {
+        return false;
+    }
+    if (len(affix) == 0) {
+        return true;
+    }
+    if (!s.s || !affix.s) {
+        return false;
+    }
+    Str slice(s.s + (fromEnd ? len(s) - len(affix) : 0), len(affix));
+    return ignoreCase ? StrEqI(slice, affix) : StrEq(slice, affix);
 }
 
 bool StrStartsWith(Str s, Str prefix) {
-    if (prefix.len > s.len) {
-        return false;
-    }
-    if (prefix.len == 0) {
-        return true;
-    }
-    return s.s && prefix.s && StrEq(Str(s.s, prefix.len), prefix);
-}
-
-bool StrStartsWith(Str s, const char* prefix) {
-    return StrStartsWith(s, Str(prefix));
+    return StrHasAffix(s, prefix, false, false);
 }
 
 bool StrStartsWithAny(Str s, const char* chars) {
@@ -1150,78 +1069,37 @@ bool StrStartsWithAny(Str s, const char* chars) {
     return false;
 }
 
-bool StrStartsWithI(Str s, const char* prefix) {
-    return StrStartsWithI(s, Str(prefix));
+bool StrStartsWithI(Str s, Str prefix) {
+    return StrHasAffix(s, prefix, false, true);
 }
 
 bool StrEndsWith(Str s, Str suffix) {
-    if (suffix.len > s.len) {
-        return false;
-    }
-    if (suffix.len == 0) {
-        return true;
-    }
-    return s.s && suffix.s &&
-           StrEq(Str(s.s + s.len - suffix.len, suffix.len), suffix);
-}
-
-bool StrEndsWith(Str s, const char* suffix) {
-    return StrEndsWith(s, Str(suffix));
+    return StrHasAffix(s, suffix, true, false);
 }
 
 bool StrEndsWithI(Str s, Str suffix) {
-    if (suffix.len > s.len) {
-        return false;
-    }
-    if (suffix.len == 0) {
-        return true;
-    }
-    return s.s && suffix.s &&
-           StrEqI(Str(s.s + s.len - suffix.len, suffix.len), suffix);
+    return StrHasAffix(s, suffix, true, true);
 }
 
-bool StrEndsWithI(Str s, const char* suffix) {
-    return StrEndsWithI(s, Str(suffix));
+static int StrFindCommon(Str s, Str sub, bool ignoreCase) {
+    if (!s.s || !sub.s || len(sub) <= 0 || len(sub) > len(s)) {
+        return -1;
+    }
+    for (int off = 0; off + len(sub) <= len(s); off++) {
+        Str slice(s.s + off, len(sub));
+        if (ignoreCase ? StrEqI(slice, sub) : StrEq(slice, sub)) {
+            return off;
+        }
+    }
+    return -1;
 }
 
 int StrFind(Str s, Str sub) {
-    if (!s.s || !sub.s || sub.len <= 0 || sub.len > s.len) {
-        return -1;
-    }
-    for (int off = 0; off + sub.len <= s.len; off++) {
-        if (StrEq(Str(s.s + off, sub.len), sub)) {
-            return off;
-        }
-    }
-    return -1;
-}
-
-int StrFind(Str s, const char* sub) {
-    return StrFind(s, Str(sub));
+    return StrFindCommon(s, sub, false);
 }
 
 int StrFindI(Str s, Str sub) {
-    if (!s.s || !sub.s || sub.len <= 0 || sub.len > s.len) {
-        return -1;
-    }
-    for (int off = 0; off + sub.len <= s.len; off++) {
-        if (StrEqI(Str(s.s + off, sub.len), sub)) {
-            return off;
-        }
-    }
-    return -1;
-}
-
-int StrFindI(Str s, const char* sub) {
-    return StrFindI(s, Str(sub));
-}
-
-bool StrContains(Str s, Str sub) {
-    return StrFind(s, sub) >= 0;
-}
-
-bool StrContainsI(Str s, Str sub) {
-    return StrFindI(s, sub) >= 0;
+    return StrFindCommon(s, sub, true);
 }
 
 static bool IsStrTrimAscii(char c) {
@@ -1229,11 +1107,11 @@ static bool IsStrTrimAscii(char c) {
 }
 
 Str StrTrimAscii(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return s;
     }
     int start = 0;
-    int end = s.len;
+    int end = len(s);
     while (start < end && IsStrTrimAscii(s.s[start])) {
         start++;
     }
@@ -1244,24 +1122,24 @@ Str StrTrimAscii(Str s) {
 }
 
 Str StrReplaceAll(Str value, Str from, Str to) {
-    if (from.len == 0 || from.len > value.len) {
+    if (len(from) == 0 || len(from) > len(value)) {
         return value;
     }
     int count = 0;
-    for (int i = 0; i <= value.len - from.len;) {
-        if (StrEq(Str(value.s + i, from.len), from)) {
-            count++;
-            i += from.len;
-        } else {
-            i++;
+    for (int i = 0; i <= len(value) - len(from);) {
+        int at = StrFind(Str(value.s + i, len(value) - i), from);
+        if (at < 0) {
+            break;
         }
+        count++;
+        i += at + len(from);
     }
     if (count == 0) {
         return value;
     }
 
-    int64_t grown = (int64_t)value.len +
-                    (int64_t)count * ((int64_t)to.len - (int64_t)from.len);
+    int64_t grown = (int64_t)len(value) +
+                    (int64_t)count * ((int64_t)len(to) - (int64_t)len(from));
     if (grown < 0 || grown > (int64_t)INT_MAX - 1) {
         return value;
     }
@@ -1272,15 +1150,25 @@ Str StrReplaceAll(Str value, Str from, Str to) {
     }
     int src = 0;
     int dst = 0;
-    while (src < value.len) {
-        if (src <= value.len - from.len &&
-            StrEq(Str(value.s + src, from.len), from)) {
-            memcpy(result.s + dst, to.s, (size_t)to.len);
-            src += from.len;
-            dst += to.len;
-        } else {
-            result.s[dst++] = value.s[src++];
+    while (src < len(value)) {
+        int remain = len(value) - src;
+        int at = remain >= len(from) ? StrFind(Str(value.s + src, remain), from)
+                                     : -1;
+        if (at < 0) {
+            memcpy(result.s + dst, value.s + src, (size_t)remain);
+            dst += remain;
+            break;
         }
+        if (at > 0) {
+            memcpy(result.s + dst, value.s + src, (size_t)at);
+            dst += at;
+            src += at;
+        }
+        if (len(to) > 0) {
+            memcpy(result.s + dst, to.s, (size_t)len(to));
+            dst += len(to);
+        }
+        src += len(from);
     }
     result.s[dst] = 0;
     result.len = dst;
@@ -1295,33 +1183,23 @@ Str SeqStrFirst(SeqStrings strs) {
 }
 
 Str SeqStrNext(Str s) {
-    if (s.len == 0) {
+    if (len(s) == 0) {
         return {};
     }
-    const char* next = s.s + s.len + 1;
+    const char* next = s.s + len(s) + 1;
     return next[0] ? Str(next) : Str{};
 }
 
 static int SeqStrIndexCmp(SeqStrings strs, Str toFind, bool ignoreCase) {
-    if (!strs || !toFind) return -1;
-    const char* candidate = strs;
+    if (!strs || !toFind) {
+        return -1;
+    }
     int idx = 0;
-    while (*candidate) {
-        int i = 0;
-        while (i < toFind.len && candidate[i]) {
-            char a = candidate[i];
-            char b = toFind.s[i];
-            if (ignoreCase) {
-                if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
-                if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
-            }
-            if (a != b) break;
-            i++;
+    for (Str cand = SeqStrFirst(strs); len(cand) > 0;
+         cand = SeqStrNext(cand), idx++) {
+        if (ignoreCase ? StrEqI(cand, toFind) : StrEq(cand, toFind)) {
+            return idx;
         }
-        if (i == toFind.len && !candidate[i]) return idx;
-        while (*candidate) candidate++;
-        candidate++;
-        idx++;
     }
     return -1;
 }
@@ -1343,7 +1221,7 @@ Str SeqStrByIndex(SeqStrings strs, int idx) {
         return {};
     }
     Str s = SeqStrFirst(strs);
-    while (idx > 0 && s.len > 0) {
+    while (idx > 0 && len(s) > 0) {
         s = SeqStrNext(s);
         idx--;
     }
@@ -1352,7 +1230,7 @@ Str SeqStrByIndex(SeqStrings strs, int idx) {
 
 int SeqStrCount(SeqStrings strs) {
     int n = 0;
-    for (Str s = SeqStrFirst(strs); s.len > 0; s = SeqStrNext(s)) {
+    for (Str s = SeqStrFirst(strs); len(s) > 0; s = SeqStrNext(s)) {
         n++;
     }
     return n;
@@ -1398,9 +1276,9 @@ void StrBuilderUseExternalBuffer(StrBuilder& b, Str buf) {
     if (b.els || b.len != 0) {
         return;
     }
-    if (buf.s && buf.len > kPadding) {
+    if (buf.s && len(buf) > kPadding) {
         b.els = buf.s;
-        b.cap = -(buf.len - kPadding);
+        b.cap = -(len(buf) - kPadding);
         b.els[0] = 0;
     }
 }
@@ -1423,7 +1301,7 @@ bool StrBuilder::AppendChar(char c) {
 }
 
 bool StrBuilder::Append(Str src) {
-    if (StrIsNull(src) || 0 == src.len) {
+    if (!src.s || src.len == 0) {
         return true;
     }
     if (!StrBuilderEnsureCap(*this, len + src.len)) {
@@ -1505,6 +1383,15 @@ struct Fmt {
     char buf[256] = {};
 };
 
+static int parseUintAt(Str f, int* off) {
+    int n = 0;
+    while (*off < len(f) && IsDigit(f.s[*off])) {
+        n = (n * 10) + (f.s[*off] - '0');
+        (*off)++;
+    }
+    return n;
+}
+
 static void addRawStr(Fmt& fmt, int off, size_t n) {
     if (n == 0) {
         return;
@@ -1524,17 +1411,18 @@ static int parseArgDefBrace(Fmt& fmt, int off) {
     off++;
     int n = 0;
     bool positional = false;
-
-    while (off < fmt.format.len && fmt.format.s[off] != '}') {
+    if (off < len(fmt.format) && IsDigit(fmt.format.s[off])) {
+        n = parseUintAt(fmt.format, &off);
+        positional = true;
+    }
+    while (off < len(fmt.format) && fmt.format.s[off] != '}') {
         if (!IsDigit(fmt.format.s[off])) {
             fmt.isOk = false;
             return off;
         }
-        n = (n * 10) + (fmt.format.s[off] - '0');
-        positional = true;
         off++;
     }
-    if (off >= fmt.format.len) {
+    if (off >= len(fmt.format)) {
         fmt.isOk = false;
         return off;
     }
@@ -1585,7 +1473,7 @@ static FmtArg::Kind typeFromConv(char c) {
 static bool startsWith(Str s, int off, const char* prefix) {
     int i = 0;
     while (prefix[i]) {
-        if (off + i >= s.len || s.s[off + i] != prefix[i]) {
+        if (off + i >= len(s) || s.s[off + i] != prefix[i]) {
             return false;
         }
         i++;
@@ -1593,13 +1481,42 @@ static bool startsWith(Str s, int off, const char* prefix) {
     return true;
 }
 
+static int parseLenMod(Str f, int off, int* bits) {
+    *bits = 32;
+    struct Mod {
+        const char* s;
+        int n;
+        int wide;
+    };
+    static const Mod kMods[] = {
+        {"I64", 3, 64},
+        {"I32", 3, 32},
+        {"ll", 2, 64},
+        {"hh", 2, 32},
+    };
+    for (const Mod& m : kMods) {
+        if (startsWith(f, off, m.s)) {
+            *bits = m.wide;
+            return off + m.n;
+        }
+    }
+    char c = off < len(f) ? f.s[off] : 0;
+    if (c == 'l' || c == 'h' || c == 'L' || c == 'w') {
+        return off + 1;
+    }
+    if (c == 'z' || c == 'j' || c == 't' || c == 'I') {
+        *bits = 64;
+        return off + 1;
+    }
+    return off;
+}
+
 static int parseArgDefPerc(Fmt& fmt, int off) {
     Str f = fmt.format;
     off++;
     int fwpStart = off;
     bool leftJust = false;
-
-    while (off < f.len &&
+    while (off < len(f) &&
            (f.s[off] == '-' || f.s[off] == '+' || f.s[off] == ' ' ||
             f.s[off] == '0' || f.s[off] == '#')) {
         if (f.s[off] == '-') {
@@ -1607,48 +1524,16 @@ static int parseArgDefPerc(Fmt& fmt, int off) {
         }
         off++;
     }
-
-    int width = 0;
-    while (off < f.len && IsDigit(f.s[off])) {
-        width = (width * 10) + (f.s[off] - '0');
-        off++;
-    }
-
+    int width = parseUintAt(f, &off);
     int prec = -1;
-    if (off < f.len && f.s[off] == '.') {
+    if (off < len(f) && f.s[off] == '.') {
         off++;
-        prec = 0;
-        while (off < f.len && IsDigit(f.s[off])) {
-            prec = (prec * 10) + (f.s[off] - '0');
-            off++;
-        }
+        prec = parseUintAt(f, &off);
     }
     int fwpEnd = off;
-
     int bits = 32;
-    char lenMod = (off < f.len) ? f.s[off] : 0;
-    bool is32BitLenMod =
-        lenMod == 'l' || lenMod == 'h' || lenMod == 'L' || lenMod == 'w';
-
-    bool is64BitLenMod =
-        lenMod == 'z' || lenMod == 'j' || lenMod == 't' || lenMod == 'I';
-    if (startsWith(f, off, "I64")) {
-        bits = 64;
-        off += 3;
-    } else if (startsWith(f, off, "I32")) {
-        off += 3;
-    } else if (startsWith(f, off, "ll")) {
-        bits = 64;
-        off += 2;
-    } else if (startsWith(f, off, "hh")) {
-        off += 2;
-    } else if (is32BitLenMod) {
-        off++;
-    } else if (is64BitLenMod) {
-        bits = 64;
-        off++;
-    }
-    char conv = (off < f.len) ? f.s[off] : 0;
+    off = parseLenMod(f, off, &bits);
+    char conv = (off < len(f)) ? f.s[off] : 0;
     off++;
 
     if (fmt.nInst >= (int)dimof(fmt.instructions)) {
@@ -1710,18 +1595,18 @@ static bool ParseFormat(Fmt& o, Str fmtStr) {
 
     int start = 0;
     int off = 0;
-    while (off < fmtStr.len && fmtStr.s[off]) {
+    while (off < len(fmtStr) && fmtStr.s[off]) {
         char c = fmtStr.s[off];
         if ('%' == c) {
 
-            if (off + 1 < fmtStr.len && '%' == fmtStr.s[off + 1]) {
+            if (off + 1 < len(fmtStr) && '%' == fmtStr.s[off + 1]) {
                 addRawStr(o, start, off - start);
                 start = off + 1;
                 off += 2;
                 continue;
             }
             addRawStr(o, start, off - start);
-            if (off + 1 < fmtStr.len && '{' == fmtStr.s[off + 1]) {
+            if (off + 1 < len(fmtStr) && '{' == fmtStr.s[off + 1]) {
                 off = parseArgDefBrace(o, off + 1);
             } else {
                 off = parseArgDefPerc(o, off);
@@ -1760,7 +1645,7 @@ static bool appendConv(Fmt& fmt, const char* spec, ...) {
     int n = VsnprintfUtf8(bufS, spec, args);
     va_end(args);
     fmt.buf[dimof(fmt.buf) - 1] = 0;
-    if (n >= 0 && n < bufS.len) {
+    if (n >= 0 && n < len(bufS)) {
         va_end(retry);
         return fmt.res.Append(Str(fmt.buf, n));
     }
@@ -1815,33 +1700,44 @@ static int64_t argToI64(const FmtArg& arg) {
     }
 }
 
+static bool appendSpaces(Fmt& fmt, int n) {
+    for (int j = 0; j < n; j++) {
+        if (!fmt.res.AppendChar(' ')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool isFloatConv(char c) {
+    return c == 'f' || c == 'F' || c == 'e' || c == 'E' || c == 'g' ||
+           c == 'G' || c == 'a' || c == 'A';
+}
+
+static bool isUnsignedConv(char c) {
+    return c == 'u' || c == 'o' || c == 'x' || c == 'X';
+}
+
 static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     if (inst.conv == 's' || inst.conv == 'S') {
-        Str sv = arg.str;
-        int slen = sv.len;
+        int slen = arg.str.len;
         if (inst.prec >= 0 && inst.prec < slen) {
             slen = inst.prec;
         }
-        int pad = inst.width - slen;
-        pad = std::max(pad, 0);
-        if (!inst.leftJust) {
-            for (int j = 0; j < pad; j++) {
-                if (!fmt.res.AppendChar(' ')) {
-                    return false;
-                }
-            }
-        }
-        if (!fmt.res.Append(Str(sv.s, slen))) {
+        int pad = std::max(inst.width - slen, 0);
+        if (!inst.leftJust && !appendSpaces(fmt, pad)) {
             return false;
         }
-        if (inst.leftJust) {
-            for (int j = 0; j < pad; j++) {
-                if (!fmt.res.AppendChar(' ')) {
-                    return false;
-                }
-            }
+        if (!fmt.res.Append(Str(arg.str.s, slen))) {
+            return false;
         }
-        return true;
+        return inst.leftJust ? appendSpaces(fmt, pad) : true;
+    }
+    if (inst.conv == 'p') {
+        const void* pv = arg.t == FmtArg::Kind::Ptr
+                             ? arg.ptr
+                             : (const void*)(intptr_t)argToI64(arg);
+        return appendConv(fmt, "%p", pv);
     }
 
     char fbuf[64];
@@ -1850,70 +1746,31 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     for (int j = 0; j < inst.fwpLen && k < (int)dimof(fbuf) - 5; j++) {
         fbuf[k++] = fmt.format.s[inst.fwpOff + j];
     }
-    char conv = inst.conv;
-    int64_t ival = argToI64(arg);
-    bool ok = true;
-    switch (conv) {
-        case 'd':
-        case 'i':
-            if (inst.intBits == 64) {
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'd';
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (long long)ival);
-            } else {
-                fbuf[k++] = 'd';
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (int)ival);
-            }
-            break;
-        case 'u':
-        case 'o':
-        case 'x':
-        case 'X':
-            if (inst.intBits == 64) {
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'l';
-                fbuf[k++] = conv;
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (unsigned long long)ival);
-            } else {
-                fbuf[k++] = conv;
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf,
-                                (unsigned int)(unsigned long long)ival);
-            }
-            break;
-        case 'c':
-            fbuf[k++] = 'c';
-            fbuf[k] = 0;
-            ok = appendConv(fmt, fbuf, (int)ival);
-            break;
-        case 'f':
-        case 'F':
-        case 'e':
-        case 'E':
-        case 'g':
-        case 'G':
-        case 'a':
-        case 'A': {
-            fbuf[k++] = conv;
-            fbuf[k] = 0;
-            double dv = (arg.t == FmtArg::Kind::Double) ? arg.d : (double)arg.f;
-            ok = appendConv(fmt, fbuf, dv);
-        } break;
-        case 'p': {
-
-            const void* pv = (arg.t == FmtArg::Kind::Ptr)
-                                 ? arg.ptr
-                                 : (const void*)(intptr_t)ival;
-            ok = appendConv(fmt, "%p", pv);
-        } break;
-        default:
-            break;
+    bool wideInt =
+        inst.intBits == 64 &&
+        (inst.conv == 'd' || inst.conv == 'i' || isUnsignedConv(inst.conv));
+    if (wideInt) {
+        fbuf[k++] = 'l';
+        fbuf[k++] = 'l';
     }
-    return ok;
+    fbuf[k++] = inst.conv == 'i' ? 'd' : inst.conv;
+    fbuf[k] = 0;
+
+    if (isFloatConv(inst.conv)) {
+        double dv = arg.t == FmtArg::Kind::Double ? arg.d : (double)arg.f;
+        return appendConv(fmt, fbuf, dv);
+    }
+    int64_t ival = argToI64(arg);
+    if (isUnsignedConv(inst.conv)) {
+        if (wideInt) {
+            return appendConv(fmt, fbuf, (unsigned long long)ival);
+        }
+        return appendConv(fmt, fbuf, (unsigned int)(unsigned long long)ival);
+    }
+    if (wideInt) {
+        return appendConv(fmt, fbuf, (long long)ival);
+    }
+    return appendConv(fmt, fbuf, (int)ival);
 }
 
 bool Fmt::Eval(const FmtArg** args, int nArgs) {
@@ -2027,10 +1884,10 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args) {
 #if defined(_MSC_VER)
     _locale_t loc = GetUtf8FormatLocale();
     if (loc) {
-        return _vsnprintf_l(buf.s, (size_t)buf.len, fmt, loc, args);
+        return _vsnprintf_l(buf.s, (size_t)len(buf), fmt, loc, args);
     }
 #endif
-    return vsnprintf(buf.s, (size_t)buf.len, fmt, args);
+    return vsnprintf(buf.s, (size_t)len(buf), fmt, args);
 }
 }
 
@@ -2087,8 +1944,8 @@ struct Segment {
 
     bool FitsFloatWidth(SizeF floatedBox, FloatDirection direction,
                         float bfcWidth, const float cbInsets[2]) const {
-        return FloatFitsHorizontally(floatedBox.w, direction, bfcWidth,
-                                     insets, cbInsets);
+        return FloatFitsHorizontally(floatedBox.w, direction, bfcWidth, insets,
+                                     cbInsets);
     }
     bool Contains(float y) const { return y >= yStart && y < yEnd; }
 };
@@ -2143,7 +2000,7 @@ struct FloatContext {
     Optf floatCeiling = None();
 
     float LastSegmentEnd() const {
-        return segments.len > 0 ? segments[segments.len - 1].yEnd : 0.0f;
+        return len(segments) > 0 ? segments[len(segments) - 1].yEnd : 0.0f;
     }
 
     bool HasActiveFloats(float minY) const {
@@ -2185,12 +2042,10 @@ struct FloatContext {
         int slot = (int)direction;
         float bottom = placed.y + placed.height;
         clearBottoms[slot] =
-            Some(IsSome(clearBottoms[slot])
-                     ? F32Max(clearBottoms[slot], bottom)
-                     : bottom);
-        floatCeiling = Some(IsSome(floatCeiling)
-                                ? F32Max(floatCeiling, placed.y)
-                                : placed.y);
+            Some(IsSome(clearBottoms[slot]) ? F32Max(clearBottoms[slot], bottom)
+                                            : bottom);
+        floatCeiling = Some(
+            IsSome(floatCeiling) ? F32Max(floatCeiling, placed.y) : placed.y);
         float xInset = placed.xInset;
         float y = placed.y;
         if (direction == FloatDirection::Left) {
@@ -2210,9 +2065,8 @@ struct FloatContext {
             case Clear::Right:
                 return right > 0 ? right : -1;
             case Clear::Both: {
-                return left > 0 || right > 0
-                           ? (left > right ? left : right)
-                           : -1;
+                return left > 0 || right > 0 ? (left > right ? left : right)
+                                             : -1;
             }
             default:
                 return -1;
@@ -2304,9 +2158,8 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
         }
 
         const Segment& startSegment = segments[startIdx];
-        if (!startSegment
-                 .FitsFloatWidth(floatedBox, direction, availableWidth,
-                                 containingBlockInsets)) {
+        if (!startSegment.FitsFloatWidth(floatedBox, direction, availableWidth,
+                                         containingBlockInsets)) {
             startIdx++;
             if (endIdx < startIdx) {
                 endIdx = startIdx;
@@ -2542,8 +2395,7 @@ BfcSlot FloatContext::FindBfcSlot(float minY,
     slot.x = fitInsets[0];
     slot.y = F32Max(segment.yStart, minY);
     slot.borderWidth = availableWidth - fitInsets[0] - fitInsets[1];
-    slot.stretchWidth =
-        availableWidth - stretchInsets[0] - stretchInsets[1];
+    slot.stretchWidth = availableWidth - stretchInsets[0] - stretchInsets[1];
     return slot;
 }
 
@@ -2641,8 +2493,8 @@ struct BlockContext {
         slot.x -= insets[0];
         return slot;
     }
-    BfcSlot FindBfcSlot(float minY, const float margins[2],
-                        Direction direction, Clear clear, int after) const {
+    BfcSlot FindBfcSlot(float minY, const float margins[2], Direction direction,
+                        Clear clear, int after) const {
         BfcSlot slot = bfc->floatContext.FindBfcSlot(
             minY + yOffset, contentBoxInsets, margins, direction, clear, after);
         slot.y -= yOffset;
@@ -2682,10 +2534,10 @@ struct BlockContext {
         adjoiningFloats[1] = false;
     }
     void GetTopAdjoiningFloats(bool out[2]) const {
-        out[0] = hasTopAdjoiningFloats ? topAdjoiningFloats[0]
-                                      : adjoiningFloats[0];
-        out[1] = hasTopAdjoiningFloats ? topAdjoiningFloats[1]
-                                      : adjoiningFloats[1];
+        out[0] =
+            hasTopAdjoiningFloats ? topAdjoiningFloats[0] : adjoiningFloats[0];
+        out[1] =
+            hasTopAdjoiningFloats ? topAdjoiningFloats[1] : adjoiningFloats[1];
     }
     void AddChildFloatedContentHeightContribution(float childContribution) {
         floatContentContribution =
@@ -2803,7 +2655,7 @@ float DetermineContentBasedContainerWidth(TaffyTree* tree,
     FloatIntrinsicWidthCalculator floatContribution;
     floatContribution.availableWidth = availableWidth;
 
-    for (int i = 0; i < items.len; i++) {
+    for (int i = 0; i < len(items); i++) {
         const BlockItem& item = items[i];
         if (item.position == Position::Absolute) {
             continue;
@@ -2847,8 +2699,8 @@ struct InFlowResult {
 InFlowResult PerformFinalLayoutOnInFlowChildren(
     TaffyTree* tree, RunMode runMode, Vec<BlockItem>* items,
     float containerOuterWidth, Optf containerPercentageResolutionHeight,
-    RectF contentBoxInset, RectF resolvedContentBoxInset,
-    RectF resolvedBorder, TextAlign textAlign, Direction direction,
+    RectF contentBoxInset, RectF resolvedContentBoxInset, RectF resolvedBorder,
+    TextAlign textAlign, Direction direction,
     LineBool ownMarginsCollapseWithChildren, BlockContext* blockCtx) {
     CalcResolver calc = tree->calc;
     float containerInnerWidth = containerOuterWidth - resolvedContentBoxInset
@@ -2906,8 +2758,7 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         if (floatDirection.IsSome()) {
             hasActiveFloats = true;
 
-            float availableWidth =
-                containerInnerWidth - itemNonAutoXMarginSum;
+            float availableWidth = containerInnerWidth - itemNonAutoXMarginSum;
             LayoutOutput itemLayout = tree->PerformChildLayout(
                 item.nodeId, SizeFOptNone(), parentSize,
                 {AvailableSpace::Definite(availableWidth),
@@ -2915,9 +2766,8 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
                 SizingMode::InherentSize, LineBool::False());
             SizeF marginBox = itemLayout.size + itemNonAutoMargin.SumAxes();
 
-            bool adjoinsUnresolvedStrut =
-                isCollapsingWithFirstMarginSet &&
-                ownMarginsCollapseWithChildren.start;
+            bool adjoinsUnresolvedStrut = isCollapsingWithFirstMarginSet &&
+                                          ownMarginsCollapseWithChildren.start;
             float yOffsetForFloat =
                 adjoinsUnresolvedStrut
                     ? committedYOffset
@@ -2940,16 +2790,15 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             layout.margin = itemNonAutoMargin;
             tree->SetUnroundedLayout(item.nodeId, layout);
 
-            res.inflowContentSize =
-                Max(res.inflowContentSize, ComputeContentSizeContribution(
-                    {IsRtl(direction)
-                         ? containerOuterWidth -
-                               (location.x + itemLayout.size.w) -
-                               resolvedBorder.right
-                         : location.x - resolvedBorder.left,
+            res.inflowContentSize = Max(
+                res.inflowContentSize,
+                ComputeContentSizeContribution(
+                    {IsRtl(direction) ? containerOuterWidth -
+                                            (location.x + itemLayout.size.w) -
+                                            resolvedBorder.right
+                                      : location.x - resolvedBorder.left,
                      location.y - resolvedBorder.top},
-                    itemLayout.size, itemLayout.contentSize,
-                    item.overflow));
+                    itemLayout.size, itemLayout.contentSize, item.overflow));
             continue;
         }
 
@@ -2973,8 +2822,8 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             }
             float minY = committedYOffset + yMarginOffset;
             if (hasActiveFloats || blockCtx->HasActiveFloats(minY)) {
-                float xMargins[2] = {itemNonAutoMargin.left,
-                                     itemNonAutoMargin.right};
+                float xMargins[2] = {itemNonAutoMargin.left, itemNonAutoMargin
+                                                                 .right};
                 float minAutoWidth = -itemNonAutoXMarginSum;
                 int after = -1;
                 BfcSlot slot;
@@ -3095,17 +2944,17 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         bool hasClearance = false;
         if (item.isInSameBfc && IsSome(clearThreshold)) {
             float hypotheticalY =
-                committedYOffset +
-                activeCollapsibleMarginSet.CollapseWithSet(topMarginSet)
-                    .Resolve();
+                committedYOffset + activeCollapsibleMarginSet
+                                       .CollapseWithSet(topMarginSet)
+                                       .Resolve();
             bool forcedClearance = blockCtx->HasAdjoiningFloat(item.clear);
             if (forcedClearance || hypotheticalY < clearThreshold) {
                 hasClearance = true;
-                float escapedMargin =
-                    isCollapsingWithFirstMarginSet &&
-                            ownMarginsCollapseWithChildren.start
-                        ? activeCollapsibleMarginSet.Resolve()
-                        : 0.0f;
+                float escapedMargin = isCollapsingWithFirstMarginSet &&
+                                              ownMarginsCollapseWithChildren
+                                                  .start
+                                          ? activeCollapsibleMarginSet.Resolve()
+                                          : 0.0f;
                 yMarginOffset =
                     clearThreshold - committedYOffset - escapedMargin;
             }
@@ -3128,8 +2977,7 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             item.staticPosition = {direction == Direction::Ltr
                                        ? floatAvoidingPosition.x
                                        : floatAvoidingPosition.x +
-                                             floatAvoidingWidth -
-                                             finalSize.w,
+                                             floatAvoidingWidth - finalSize.w,
                                    floatAvoidingPosition.y};
         }
 
@@ -3139,30 +2987,26 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
                             ? resolvedContentBoxInset.left + insetOffset.x +
                                   resolvedMargin.left
                             : containerOuterWidth -
-                                  resolvedContentBoxInset.right -
-                                  finalSize.w - resolvedMargin.right +
-                                  insetOffset.x,
+                                  resolvedContentBoxInset.right - finalSize.w -
+                                  resolvedMargin.right + insetOffset.x,
                         committedYOffset + yMarginOffset + insetOffset.y};
         } else {
             float extraLeft = itemAvoidsFloats
-                                  ? resolvedMargin.left -
-                                        itemNonAutoMargin.left
+                                  ? resolvedMargin.left - itemNonAutoMargin.left
                                   : resolvedMargin.left;
-            float extraRight = itemAvoidsFloats
-                                   ? resolvedMargin.right -
-                                         itemNonAutoMargin.right
-                                   : resolvedMargin.right;
-            location = {direction == Direction::Ltr
-                            ? floatAvoidingPosition.x + extraLeft +
-                                  insetOffset.x
-                            : floatAvoidingPosition.x + floatAvoidingWidth -
-                                  finalSize.w - extraRight +
-                                  insetOffset.x,
-                        floatAvoidingPosition.y + insetOffset.y};
+            float extraRight = itemAvoidsFloats ? resolvedMargin.right -
+                                                      itemNonAutoMargin.right
+                                                : resolvedMargin.right;
+            location = {
+                direction == Direction::Ltr
+                    ? floatAvoidingPosition.x + extraLeft + insetOffset.x
+                    : floatAvoidingPosition.x + floatAvoidingWidth -
+                          finalSize.w - extraRight + insetOffset.x,
+                floatAvoidingPosition.y + insetOffset.y};
         }
 
         float itemOuterWidth = itemLayout.size.w + resolvedMargin
-                                                           .HorizontalAxisSum();
+                                                       .HorizontalAxisSum();
         if (itemOuterWidth < containerInnerWidth) {
             float free = containerInnerWidth - itemOuterWidth;
             switch (textAlign) {
@@ -3184,8 +3028,7 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             }
         }
 
-        if (!IsSome(res.firstBaseline) &&
-            IsSome(itemLayout.firstBaselines.y)) {
+        if (!IsSome(res.firstBaseline) && IsSome(itemLayout.firstBaselines.y)) {
             res.firstBaseline = Some(location.y + itemLayout.firstBaselines.y);
         }
 
@@ -3200,13 +3043,14 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         item.finalLayout.margin = resolvedMargin;
 
         res.inflowContentSize =
-            Max(res.inflowContentSize, ComputeContentSizeContribution(
-                {IsRtl(direction)
-                     ? containerOuterWidth - (location.x + finalSize.w) -
-                           resolvedBorder.right
-                     : location.x - resolvedBorder.left,
-                 location.y - resolvedBorder.top},
-                finalSize, itemLayout.contentSize, item.overflow));
+            Max(res.inflowContentSize,
+                ComputeContentSizeContribution(
+                    {IsRtl(direction)
+                         ? containerOuterWidth - (location.x + finalSize.w) -
+                               resolvedBorder.right
+                         : location.x - resolvedBorder.left,
+                     location.y - resolvedBorder.top},
+                    finalSize, itemLayout.contentSize, item.overflow));
 
         if (isCollapsingWithFirstMarginSet && itemPushedBelowFloat) {
             isCollapsingWithFirstMarginSet = false;
@@ -3232,8 +3076,7 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             yOffsetForAbsolute =
                 committedYOffset + itemLayout.size.h + yMarginOffset;
         } else {
-            committedYOffset =
-                location.y - insetOffset.y + itemLayout.size.h;
+            committedYOffset = location.y - insetOffset.y + itemLayout.size.h;
             if (hasClearance && itemLayout.marginsCanCollapseThrough) {
                 committedYOffset -= topMarginSet.Resolve();
                 activeCollapsibleMarginSet =
@@ -3252,12 +3095,11 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
     res.lastChildBottomMarginSet = activeMarginSetHasClearance
                                        ? CollapsibleMarginSet{}
                                        : activeCollapsibleMarginSet;
-    float bottomYMarginOffset =
-        activeMarginSetHasClearance
-            ? activeCollapsibleMarginSet.Resolve()
-        : ownMarginsCollapseWithChildren.end
-            ? 0.0f
-            : res.lastChildBottomMarginSet.Resolve();
+    float bottomYMarginOffset = activeMarginSetHasClearance
+                                    ? activeCollapsibleMarginSet.Resolve()
+                                : ownMarginsCollapseWithChildren.end
+                                    ? 0.0f
+                                    : res.lastChildBottomMarginSet.Resolve();
     committedYOffset += resolvedContentBoxInset.bottom + bottomYMarginOffset;
     res.intrinsicOuterHeight = F32Max(0.0f, committedYOffset);
     return res;
@@ -3272,7 +3114,7 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree,
     float areaHeight = areaSize.h;
     SizeF absoluteContentSize = SizeF::Zero();
 
-    for (int i = 0; i < items.len; i++) {
+    for (int i = 0; i < len(items); i++) {
         const BlockItem& item = items[i];
         if (item.position != Position::Absolute) {
             continue;
@@ -3402,11 +3244,10 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree,
         } else if (IsSome(right)) {
             xOffset = areaSize.w - finalSize.w - right - resolvedMargin.right;
         } else {
-            xOffset = IsRtl(direction)
-                          ? item.staticPosition.x - finalSize.w -
-                                resolvedMargin.right - areaOffset.x
-                          : item.staticPosition.x + resolvedMargin.left -
-                                areaOffset.x;
+            xOffset = IsRtl(direction) ? item.staticPosition.x - finalSize.w -
+                                             resolvedMargin.right - areaOffset.x
+                                       : item.staticPosition.x +
+                                             resolvedMargin.left - areaOffset.x;
         }
 
         float yLocation;
@@ -3437,11 +3278,10 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree,
 
         PointF relativeLocation = {location.x - areaOffset.x,
                                    location.y - areaOffset.y};
-        absoluteContentSize =
-            Max(absoluteContentSize,
-                ComputeContentSizeContribution(relativeLocation, finalSize,
-                                               layoutOutput.contentSize,
-                                               item.overflow));
+        absoluteContentSize = Max(absoluteContentSize,
+                                  ComputeContentSizeContribution(
+                                      relativeLocation, finalSize,
+                                      layoutOutput.contentSize, item.overflow));
     }
 
     return absoluteContentSize;
@@ -3585,7 +3425,7 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
             intrinsicOuterHeight - resolvedContentBoxInset.VerticalAxisSum();
         float freeSpace = containerInnerHeight - inflowContentHeight;
         bool anyInFlow = false;
-        for (int i = 0; i < items.len; i++) {
+        for (int i = 0; i < len(items); i++) {
             if (items[i].hasFinalLayout) {
                 anyInFlow = true;
                 break;
@@ -3599,22 +3439,22 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
             if (IsSome(inFlow.firstBaseline)) {
                 inFlow.firstBaseline += groupOffset;
             }
-            for (int i = 0; i < items.len; i++) {
+            for (int i = 0; i < len(items); i++) {
                 if (items[i].hasFinalLayout) {
                     items[i].finalLayout.location.y += groupOffset;
                 }
             }
             inflowContentSize = SizeF::Zero();
-            for (int i = 0; i < items.len; i++) {
+            for (int i = 0; i < len(items); i++) {
                 if (!items[i].hasFinalLayout) {
                     continue;
                 }
                 const Layout& l = items[i].finalLayout;
-                inflowContentSize =
-                    Max(inflowContentSize, ComputeContentSizeContribution(
+                inflowContentSize = Max(
+                    inflowContentSize,
+                    ComputeContentSizeContribution(
                         {IsRtl(direction)
-                             ? containerOuterWidth -
-                                   (l.location.x + l.size.w) -
+                             ? containerOuterWidth - (l.location.x + l.size.w) -
                                    resolvedBorder.right
                              : l.location.x - resolvedBorder.left,
                          l.location.y - resolvedBorder.top},
@@ -3624,7 +3464,7 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
     }
 
     bool allInFlowChildrenCanBeCollapsedThrough = true;
-    for (int i = 0; i < items.len; i++) {
+    for (int i = 0; i < len(items); i++) {
         if (IsFloated(items[i].floatMode)) {
             continue;
         }
@@ -3656,7 +3496,7 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
         return output;
     }
 
-    for (int i = 0; i < items.len; i++) {
+    for (int i = 0; i < len(items); i++) {
         if (items[i].hasFinalLayout) {
             tree->SetUnroundedLayout(items[i].nodeId, items[i].finalLayout);
         }
@@ -3670,8 +3510,8 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
     SizeF absoluteContentSize = PerformAbsoluteLayoutOnAbsoluteChildren(
         tree, items, absolutePositionArea, absolutePositionOffset, direction);
 
-    inflowContentSize.w +=
-        IsRtl(direction) ? resolvedPadding.left : resolvedPadding.right;
+    inflowContentSize
+        .w += IsRtl(direction) ? resolvedPadding.left : resolvedPadding.right;
     inflowContentSize.h += resolvedPadding.bottom;
     output.contentSize = Max(inflowContentSize, absoluteContentSize);
 
@@ -3901,10 +3741,10 @@ AlgoConstants ComputeConstants(TaffyTree* tree, const Style& style,
                                     ? paddingBorderSum
                                     : SizeF::Zero();
 
-    c.alignItems =
-        style.alignItems.UnwrapOr(AlignItems{AlignItemsKeyword::Stretch});
-    c.alignContent =
-        style.alignContent.UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
+    c.alignItems = style.alignItems
+                       .UnwrapOr(AlignItems{AlignItemsKeyword::Stretch});
+    c.alignContent = style.alignContent
+                         .UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
     c.justifyContent = style.justifyContent;
     c.layoutDirection = style.direction;
 
@@ -3965,12 +3805,10 @@ void GenerateAnonymousFlexItems(TaffyTree* tree, NodeId node,
             MaybeApplyAspectRatio(cs.size.MaybeResolve(c.nodeInnerSize, calc),
                                   aspectRatio),
             boxSizingAdjustment);
-        item.minSize = MaybeAdd(
-            cs.minSize.MaybeResolve(c.nodeInnerSize, calc),
-            boxSizingAdjustment);
-        item.maxSize = MaybeAdd(
-            cs.maxSize.MaybeResolve(c.nodeInnerSize, calc),
-            boxSizingAdjustment);
+        item.minSize = MaybeAdd(cs.minSize.MaybeResolve(c.nodeInnerSize, calc),
+                                boxSizingAdjustment);
+        item.maxSize = MaybeAdd(cs.maxSize.MaybeResolve(c.nodeInnerSize, calc),
+                                boxSizingAdjustment);
         item.aspectRatio = aspectRatio;
 
         item.inset = cs.inset.MaybeResolveZip(c.nodeInnerSize, calc);
@@ -3979,9 +3817,9 @@ void GenerateAnonymousFlexItems(TaffyTree* tree, NodeId node,
                              cs.margin.top.IsAuto(), cs.margin.bottom.IsAuto()};
         item.padding = padding;
         item.border = border;
-        item.alignSelf = ResolveSelfRelative(
-            cs.alignSelf.UnwrapOr(c.alignItems), cs.direction,
-            c.layoutDirection, c.isColumn);
+        item.alignSelf =
+            ResolveSelfRelative(cs.alignSelf.UnwrapOr(c.alignItems),
+                                cs.direction, c.layoutDirection, c.isColumn);
         item.overflow = cs.overflow;
         item.scrollbarWidth = cs.scrollbarWidth;
         item.flexGrow = cs.flexGrow;
@@ -4136,10 +3974,10 @@ void DetermineFlexBaseSize(TaffyTree* tree, const AlgoConstants& c,
                 MaybeMax(clamped, Main(paddingBorderAxesSums, dir));
         }
 
-        float hypotheticalInnerMinMain = MaybeMax(
-            MaybeMax(child.resolvedMinimumMainSize,
-                     Main(transferredMinSize, dir)),
-            Main(paddingBorderAxesSums, dir));
+        float hypotheticalInnerMinMain =
+            MaybeMax(MaybeMax(child.resolvedMinimumMainSize,
+                              Main(transferredMinSize, dir)),
+                     Main(paddingBorderAxesSums, dir));
         float hypotheticalInnerSize =
             MaybeClamp(child.flexBasis, Some(hypotheticalInnerMinMain),
                        Main(transferredMaxSize, dir));
@@ -4566,15 +4404,15 @@ void DetermineHypotheticalCrossSize(TaffyTree* tree, FlexLine* line,
         Optf transferredMaxCross =
             Cross(MaybeApplyAspectRatio(child.maxSize, child.aspectRatio), dir);
 
-        Optf childCross = MaybeMax(
-            MaybeClamp(Cross(child.size, dir), transferredMinCross,
-                       transferredMaxCross),
-            paddingBorderSum);
+        Optf childCross =
+            MaybeMax(MaybeClamp(Cross(child.size, dir), transferredMinCross,
+                                transferredMaxCross),
+                     paddingBorderSum);
 
-        AvailableSpace childAvailableCross = MaybeMax(
-            MaybeClamp(availableSpace.Cross(dir), transferredMinCross,
-                       transferredMaxCross),
-            paddingBorderSum);
+        AvailableSpace childAvailableCross =
+            MaybeMax(MaybeClamp(availableSpace.Cross(dir), transferredMinCross,
+                                transferredMaxCross),
+                     paddingBorderSum);
 
         float childInnerCross;
         if (IsSome(childCross)) {
@@ -4587,10 +4425,9 @@ void DetermineHypotheticalCrossSize(TaffyTree* tree, FlexLine* line,
             float measured = tree->MeasureChildSize(
                 child.node, known, c.nodeInnerSize, avail,
                 SizingMode::ContentSize, CrossAxis(dir), LineBool::False());
-            childInnerCross =
-                F32Max(MaybeClamp(measured, transferredMinCross,
-                                  transferredMaxCross),
-                       paddingBorderSum);
+            childInnerCross = F32Max(
+                MaybeClamp(measured, transferredMinCross, transferredMaxCross),
+                paddingBorderSum);
         }
         float childOuterCross =
             childInnerCross + CrossAxisSum(child.margin, dir);
@@ -4818,8 +4655,9 @@ void DistributeRemainingFreeSpace(Vec<FlexLine>* lines,
         int numItems = line.count;
         bool layoutReverse = IsReverse(dir);
         float gap = Main(c.gap, dir);
-        JustifyContent rawMode = c.justifyContent.UnwrapOr(
-            AlignContent{AlignContentKeyword::FlexStart});
+        JustifyContent rawMode =
+            c.justifyContent
+                .UnwrapOr(AlignContent{AlignContentKeyword::FlexStart});
         AlignContentKeyword mode =
             ApplyAlignmentFallback(freeSpace, numItems, rawMode);
 
@@ -4887,12 +4725,12 @@ void ResolveCrossAxisAutoMargins(Vec<FlexLine>* lines, const AlgoConstants& c) {
         float maxBaselineToBottomDistance = 0.0f;
         for (int i = 0; i < line.count; i++) {
             maxBaseline = F32Max(maxBaseline, line.items[i].baseline);
-            if (line.items[i].alignSelf.keyword ==
-                AlignItemsKeyword::Baseline) {
-                maxBaselineToBottomDistance = F32Max(
-                    maxBaselineToBottomDistance,
-                    Cross(line.items[i].outerTargetSize, c.dir) -
-                        line.items[i].baseline);
+            if (line.items[i]
+                    .alignSelf.keyword == AlignItemsKeyword::Baseline) {
+                maxBaselineToBottomDistance =
+                    F32Max(maxBaselineToBottomDistance,
+                           Cross(line.items[i].outerTargetSize, c.dir) -
+                               line.items[i].baseline);
             }
         }
 
@@ -4924,8 +4762,8 @@ void ResolveCrossAxisAutoMargins(Vec<FlexLine>* lines, const AlgoConstants& c) {
             } else {
 
                 child.offsetCross = AlignFlexItemsAlongCrossAxis(
-                    child, freeSpace, maxBaseline,
-                    maxBaselineToBottomDistance, c);
+                    child, freeSpace, maxBaseline, maxBaselineToBottomDistance,
+                    c);
             }
         }
     }
@@ -5017,16 +4855,16 @@ void CalculateFlexItem(TaffyTree* tree, FlexItem* item, float* totalOffsetMain,
 
     float effectiveLineOffsetCross = isRtlColumn ? 0.0f : lineOffsetCross;
 
-    float offsetMain = isRtlRow ? *totalOffsetMain - item->offsetMain -
-                                      MainEnd(item->margin, direction) -
-                                      mainRelativeInset - size.w
-                                : *totalOffsetMain + item->offsetMain +
-                                      MainStart(item->margin, direction) +
-                                      mainRelativeInset;
+    float offsetMain =
+        isRtlRow
+            ? *totalOffsetMain - item->offsetMain -
+                  MainEnd(item->margin, direction) - mainRelativeInset - size.w
+            : *totalOffsetMain + item->offsetMain +
+                  MainStart(item->margin, direction) + mainRelativeInset;
 
-    float offsetCross = totalOffsetCross + item->offsetCross +
-                        effectiveLineOffsetCross +
-                        CrossStart(item->margin, direction) + crossRelativeInset;
+    float offsetCross =
+        totalOffsetCross + item->offsetCross + effectiveLineOffsetCross +
+        CrossStart(item->margin, direction) + crossRelativeInset;
 
     float innerBaseline = UnwrapOr(layoutOutput.firstBaselines.y, size.h);
     if (IsRow(direction) && IsScrollContainer(item->overflow.y)) {
@@ -5070,8 +4908,7 @@ void CalculateFlexItem(TaffyTree* tree, FlexItem* item, float* totalOffsetMain,
 
     PointF contributionLocation =
         IsRtl(layoutDirection)
-            ? PointF{containerSize.w - (location.x + size.w), location
-                                                                          .y}
+            ? PointF{containerSize.w - (location.x + size.w), location.y}
             : location;
     *totalContentSize =
         Max(*totalContentSize,
@@ -5130,8 +4967,8 @@ SizeF FinalLayoutPass(TaffyTree* tree, Vec<FlexLine>* lines,
         IsRtl(c.layoutDirection)
             ? c.contentBoxInset.left - c.border.left - c.scrollbarGutter.x
             : c.contentBoxInset.right - c.border.right - c.scrollbarGutter.x;
-    contentSize.h +=
-        c.contentBoxInset.bottom - c.border.bottom - c.scrollbarGutter.y;
+    contentSize
+        .h += c.contentBoxInset.bottom - c.border.bottom - c.scrollbarGutter.y;
 
     return contentSize;
 }
@@ -5159,9 +4996,9 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree, NodeId node,
         PointOverflow overflow = cs.overflow;
         float scrollbarWidth = cs.scrollbarWidth;
         Optf aspectRatio = cs.aspectRatio;
-        AlignSelf alignSelf = ResolveSelfRelative(
-            cs.alignSelf.UnwrapOr(c.alignItems), cs.direction,
-            c.layoutDirection, c.isColumn);
+        AlignSelf alignSelf =
+            ResolveSelfRelative(cs.alignSelf.UnwrapOr(c.alignItems),
+                                cs.direction, c.layoutDirection, c.isColumn);
         RectFOpt margin = cs.margin
                               .MaybeResolve(Some(insetRelativeSize.w), calc);
         RectF padding = cs.padding
@@ -5239,24 +5076,22 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree, NodeId node,
             UnwrapOr(margin.left, 0.0f), UnwrapOr(margin.right, 0.0f),
             UnwrapOr(margin.top, 0.0f), UnwrapOr(margin.bottom, 0.0f)};
 
-        SizeF freeSpace =
-            Max(SizeF{c.containerSize.w - finalSize.w -
-                          nonAutoMargin.HorizontalAxisSum(),
-                      c.containerSize.h - finalSize.h -
-                          nonAutoMargin.VerticalAxisSum()},
-                SizeF::Zero());
+        SizeF freeSpace = Max(SizeF{c.containerSize.w - finalSize.w -
+                                        nonAutoMargin.HorizontalAxisSum(),
+                                    c.containerSize.h - finalSize.h -
+                                        nonAutoMargin.VerticalAxisSum()},
+                              SizeF::Zero());
 
         int autoW =
             (IsSome(margin.left) ? 0 : 1) + (IsSome(margin.right) ? 0 : 1);
         int autoH =
             (IsSome(margin.top) ? 0 : 1) + (IsSome(margin.bottom) ? 0 : 1);
-        SizeF autoMarginSize = {
-            autoW > 0 && IsSome(left) && IsSome(right)
-                ? freeSpace.w / (float)autoW
-                : 0.0f,
-            autoH > 0 && IsSome(top) && IsSome(bottom)
-                ? freeSpace.h / (float)autoH
-                : 0.0f};
+        SizeF autoMarginSize = {autoW > 0 && IsSome(left) && IsSome(right)
+                                    ? freeSpace.w / (float)autoW
+                                    : 0.0f,
+                                autoH > 0 && IsSome(top) && IsSome(bottom)
+                                    ? freeSpace.h / (float)autoH
+                                    : 0.0f};
         RectF resolvedMargin = {UnwrapOr(margin.left, autoMarginSize.w),
                                 UnwrapOr(margin.right, autoMarginSize.w),
                                 UnwrapOr(margin.top, autoMarginSize.h),
@@ -5296,19 +5131,18 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree, NodeId node,
 
             float startPos = MainStart(c.contentBoxInset, c.dir) +
                              MainStart(resolvedMargin, c.dir);
-            float endPos =
-                Main(c.containerSize, c.dir) - MainEnd(c.contentBoxInset, c.dir) -
-                Main(finalSize, c.dir) - MainEnd(resolvedMargin, c.dir);
+            float endPos = Main(c.containerSize, c.dir) -
+                           MainEnd(c.contentBoxInset, c.dir) -
+                           Main(finalSize, c.dir) -
+                           MainEnd(resolvedMargin, c.dir);
             AlignContentKeyword jc =
                 c.justifyContent
                     .UnwrapOr(AlignContent{AlignContentKeyword::FlexStart})
                     .Keyword();
             bool rev = mainAxisFlexStartReversed;
-            bool startPosition =
-                jc == AlignContentKeyword::Start
-                    ? !mainIsRtl
-                : jc == AlignContentKeyword::End ? mainIsRtl
-                                                 : true;
+            bool startPosition = jc == AlignContentKeyword::Start ? !mainIsRtl
+                                 : jc == AlignContentKeyword::End ? mainIsRtl
+                                                                  : true;
             switch (jc) {
                 case AlignContentKeyword::SpaceBetween:
                 case AlignContentKeyword::Stretch:
@@ -5361,12 +5195,11 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree, NodeId node,
                            Cross(finalSize, c.dir) -
                            CrossEnd(resolvedMargin, c.dir);
             bool rev = crossAxisFlexStartReversed;
-            bool startPosition =
-                ck == AlignItemsKeyword::Start ||
-                        ck == AlignItemsKeyword::Baseline
-                    ? !crossIsRtl
-                : ck == AlignItemsKeyword::End ? crossIsRtl
-                                               : true;
+            bool startPosition = ck == AlignItemsKeyword::Start ||
+                                         ck == AlignItemsKeyword::Baseline
+                                     ? !crossIsRtl
+                                 : ck == AlignItemsKeyword::End ? crossIsRtl
+                                                                : true;
             switch (ck) {
                 case AlignItemsKeyword::Start:
                 case AlignItemsKeyword::End:
@@ -5431,8 +5264,7 @@ SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree, NodeId node,
                     F32Max(insetRelativeSize.w - relativeLocation.x, 0.0f) +
                     overflowExtraWidth;
             } else {
-                contribution.w = relativeLocation.x + sizeContribution
-                                                              .w;
+                contribution.w = relativeLocation.x + sizeContribution.w;
             }
             contribution.h = relativeLocation.y + sizeContribution.h;
             contentSize = Max(contentSize, contribution);
@@ -5463,7 +5295,7 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
         knownDimensions, inputs.availableSpace, constants);
 
     DetermineFlexBaseSize(tree, constants, availableSpace, flexItems.els,
-                          flexItems.len);
+                          len(flexItems));
 
     CollectFlexLines(constants, availableSpace, &flexItems, &flexLines);
 
@@ -5487,14 +5319,15 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
             Main(constants.innerContainerSize, constants.dir);
         SizeF resolvedGap =
             style.gap.ResolveOrZero(Some(innerContainerSize), tree->calc);
-        SetMain(&constants.gap, constants.dir, Main(resolvedGap, constants.dir));
+        SetMain(&constants.gap, constants.dir,
+                Main(resolvedGap, constants.dir));
     }
 
-    for (int i = 0; i < flexLines.len; i++) {
+    for (int i = 0; i < len(flexLines); i++) {
         ResolveFlexibleLengths(&flexLines[i], constants);
     }
 
-    for (int i = 0; i < flexLines.len; i++) {
+    for (int i = 0; i < len(flexLines); i++) {
         DetermineHypotheticalCrossSize(tree, &flexLines[i], constants,
                                        availableSpace);
     }
@@ -5528,8 +5361,8 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
     SizeF absoluteContentSize =
         PerformAbsoluteLayoutOnAbsoluteChildren(tree, node, constants);
 
-    int len = tree->ChildCount(node);
-    for (int order = 0; order < len; order++) {
+    int nChildren = tree->ChildCount(node);
+    for (int order = 0; order < nChildren; order++) {
         NodeId child = tree->GetChildId(node, order);
         if (tree->GetStyle(child).BoxGenMode() == BoxGenerationMode::None) {
             tree->SetUnroundedLayout(child, Layout::WithOrder((uint32_t)order));
@@ -5540,7 +5373,7 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
     }
 
     Optf firstVerticalBaseline = None();
-    int firstLineIdx = constants.isWrapReverse ? flexLines.len - 1 : 0;
+    int firstLineIdx = constants.isWrapReverse ? len(flexLines) - 1 : 0;
     if (firstLineIdx >= 0 && flexLines[firstLineIdx].count > 0) {
         FlexLine& firstLine = flexLines[firstLineIdx];
         const FlexItem* chosen = nullptr;
@@ -5925,9 +5758,9 @@ struct CellOccupancyMatrix {
     }
 
     OptOriginZeroLine LineAreaCollisionJump(AbsoluteAxis primaryAxis,
-                                             LineOzl primarySpan,
-                                             LineOzl secondarySpan,
-                                             bool reversed) const {
+                                            LineOzl primarySpan,
+                                            LineOzl secondarySpan,
+                                            bool reversed) const {
         const TrackCounts& pc = Counts(primaryAxis);
         const TrackCounts& sc = Counts(OtherAxis(primaryAxis));
         int primaryStart = pc.OzLineToNextTrack(primarySpan.start);
@@ -5939,20 +5772,18 @@ struct CellOccupancyMatrix {
         primaryStart = primaryStart < 0 ? 0 : primaryStart;
         primaryEnd = primaryEnd > primaryLen ? primaryLen : primaryEnd;
         secondaryStart = secondaryStart < 0 ? 0 : secondaryStart;
-        secondaryEnd = secondaryEnd > secondaryLen ? secondaryLen
-                                                     : secondaryEnd;
+        secondaryEnd =
+            secondaryEnd > secondaryLen ? secondaryLen : secondaryEnd;
 
         bool found = false;
         int best = 0;
         for (int secondary = secondaryStart; secondary < secondaryEnd;
              secondary++) {
             for (int primary = primaryStart; primary < primaryEnd; primary++) {
-                int row = primaryAxis == AbsoluteAxis::Horizontal
-                              ? secondary
-                              : primary;
-                int col = primaryAxis == AbsoluteAxis::Horizontal
-                              ? primary
-                              : secondary;
+                int row = primaryAxis == AbsoluteAxis::Horizontal ? secondary
+                                                                  : primary;
+                int col = primaryAxis == AbsoluteAxis::Horizontal ? primary
+                                                                  : secondary;
                 if (Get(row, col) == CellOccupancyState::Unoccupied) {
                     continue;
                 }
@@ -5995,7 +5826,7 @@ struct CellOccupancyMatrix {
         }
         OriginZeroLine line = pc.TrackToPrevOzLine((uint16_t)best);
         int32_t next = (int32_t)line.v + (reversed ? -1 : 1);
-        next = next < INT16_MIN ? INT16_MIN
+        next = next < INT16_MIN   ? INT16_MIN
                : next > INT16_MAX ? INT16_MAX
                                   : next;
         return OptOriginZeroLine(OriginZeroLine{(int16_t)next});
@@ -6239,10 +6070,10 @@ struct NamedLineResolver {
     uint16_t explicitRowCount = 0;
 
     void Free() {
-        for (int i = 0; i < rowLines.len; i++) {
+        for (int i = 0; i < len(rowLines); i++) {
             VecReset(rowLines[i].lines);
         }
-        for (int i = 0; i < columnLines.len; i++) {
+        for (int i = 0; i < len(columnLines); i++) {
             VecReset(columnLines[i].lines);
         }
         VecReset(rowLines);
@@ -6272,7 +6103,7 @@ struct NamedLineResolver {
 
     static const Vec<uint32_t>* Find(const Vec<LineNameEntry>& map, Str name,
                                      NameSuffix suffix) {
-        for (int i = 0; i < map.len; i++) {
+        for (int i = 0; i < len(map); i++) {
             const LineNameEntry& e = map[i];
             if (e.suffix == suffix && base::StrEq(e.name, name)) {
                 return &e.lines;
@@ -6326,8 +6157,7 @@ void NamedLineResolver::Init(const Style& style, uint16_t columnAutoRepetitions,
             currentLine += 1;
             const LineNameSet& set = ax.names[i];
             for (int k = 0; k < set.names.len; k++) {
-                Upsert(ax.map, set.names[k], NameSuffix::None,
-                       currentLine);
+                Upsert(ax.map, set.names[k], NameSuffix::None, currentLine);
             }
             if (trackIdx >= ax.tracks.len) {
                 continue;
@@ -6363,11 +6193,10 @@ void NamedLineResolver::Init(const Style& style, uint16_t columnAutoRepetitions,
 GridLine NamedLineResolver::FindLineIndex(Str name, int32_t idx,
                                           GridAreaAxis axis, GridAreaEnd end,
                                           int filterFrom, int filterTo) const {
-    int32_t explicitTrackCount = axis == GridAreaAxis::Row
-                                     ? explicitRowCount
-                                     : explicitColumnCount;
+    int32_t explicitTrackCount =
+        axis == GridAreaAxis::Row ? explicitRowCount : explicitColumnCount;
     auto gridLine = [](int64_t value) {
-        value = value < INT16_MIN ? INT16_MIN
+        value = value < INT16_MIN   ? INT16_MIN
                 : value > INT16_MAX ? INT16_MAX
                                     : value;
         return GridLine{(int16_t)value};
@@ -6393,8 +6222,7 @@ GridLine NamedLineResolver::FindLineIndex(Str name, int32_t idx,
         if (count < 0) {
             count = 0;
         }
-        uint32_t absIdx = idx < 0 ? (uint32_t)(-(int64_t)idx)
-                                  : (uint32_t)idx;
+        uint32_t absIdx = idx < 0 ? (uint32_t)(-(int64_t)idx) : (uint32_t)idx;
         if (absIdx <= (uint32_t)count) {
             if (idx > 0) {
                 return gridLine((*lines)[from + (int)absIdx - 1]);
@@ -6774,10 +6602,10 @@ ExplicitGridSize ComputeExplicitGridSizeInAxis(
                         ? floorf(numRepetitionThatFit)
                         : ceilf(numRepetitionThatFit);
 
-                numRepetitions =
-                    !isfinite(rounded) || rounded >= 4294967040.0f
-                        ? UINT32_MAX
-                        : rounded < 0.0f ? 1u : (uint32_t)rounded + 1u;
+                numRepetitions = !isfinite(rounded) || rounded >= 4294967040.0f
+                                     ? UINT32_MAX
+                                 : rounded < 0.0f ? 1u
+                                                  : (uint32_t)rounded + 1u;
             }
         }
     }
@@ -6789,12 +6617,10 @@ ExplicitGridSize ComputeExplicitGridSizeInAxis(
         numRepetitions = 0;
     } else {
         uint32_t maxRepetitions =
-            (remainingTracks + repetitionTrackCount - 1) /
-            repetitionTrackCount;
+            (remainingTracks + repetitionTrackCount - 1) / repetitionTrackCount;
         numRepetitions = numRepetitions < 1 ? 1 : numRepetitions;
-        numRepetitions = numRepetitions > maxRepetitions
-                             ? maxRepetitions
-                             : numRepetitions;
+        numRepetitions =
+            numRepetitions > maxRepetitions ? maxRepetitions : numRepetitions;
     }
     uint32_t gridTemplateTrackCount =
         nonAutoRepeatingTrackCount +
@@ -6869,8 +6695,8 @@ void InitializeGridTracks(Vec<GridTrack>* tracks, TrackCounts counts,
     }
 
     int currentTrackIndex = (int)counts.negativeImplicit;
-    int explicitTrackLimit =
-        (int)counts.negativeImplicit + (int)counts.explicitCount;
+    int explicitTrackLimit = (int)counts.negativeImplicit + (int)counts
+                                                                .explicitCount;
 
     if (counts.explicitCount > 0) {
         for (int i = 0; i < trackTemplate.len; i++) {
@@ -6890,8 +6716,7 @@ void InitializeGridTracks(Vec<GridTrack>* tracks, TrackCounts counts,
                 int total = (int)c.repeat.TrackCount() * (int)c.repeat.count
                                                              .count;
                 for (int k = 0;
-                     k < total && currentTrackIndex < explicitTrackLimit;
-                     k++) {
+                     k < total && currentTrackIndex < explicitTrackLimit; k++) {
                     TrackSizingFunction f =
                         c.repeat.tracks[k % c.repeat.tracks.len];
                     VecAppend(*tracks, GridTrack::New(f.MinSizingFunction(),
@@ -7299,7 +7124,7 @@ bool AxisIsReversed(Direction direction, AbsoluteAxis axis) {
 
 OriginZeroLine AdvancePosition(OriginZeroLine position, bool reversed) {
     int32_t value = (int32_t)position.v + (reversed ? -1 : 1);
-    value = value < INT16_MIN ? INT16_MIN
+    value = value < INT16_MIN   ? INT16_MIN
             : value > INT16_MAX ? INT16_MAX
                                 : value;
     return OriginZeroLine{(int16_t)value};
@@ -7313,7 +7138,7 @@ OriginZeroLine SearchStartLine(OriginZeroLine gridStartLine,
 LineOzl ResolveIndefiniteGridSpan(OriginZeroLine position, uint16_t span,
                                   bool reversed) {
     auto line = [](int32_t value) {
-        value = value < INT16_MIN ? INT16_MIN
+        value = value < INT16_MIN   ? INT16_MIN
                 : value > INT16_MAX ? INT16_MAX
                                     : value;
         return OriginZeroLine{(int16_t)value};
@@ -7325,16 +7150,13 @@ LineOzl ResolveIndefiniteGridSpan(OriginZeroLine position, uint16_t span,
     return {position, line((int32_t)position.v + span)};
 }
 
-LineOzl ClampSpanToLimitedGrid(LineOzl span, int16_t minLine,
-                               int16_t maxLine) {
+LineOzl ClampSpanToLimitedGrid(LineOzl span, int16_t minLine, int16_t maxLine) {
     int32_t start = span.start.v;
-    start = start < minLine ? minLine
-            : start > (int32_t)maxLine - 1 ? (int32_t)maxLine - 1
-                                          : start;
+    start = start<minLine ? minLine : start>(int32_t) maxLine - 1
+                ? (int32_t)maxLine - 1
+                : start;
     int32_t end = span.end.v;
-    end = end < start + 1 ? start + 1
-          : end > maxLine ? maxLine
-                          : end;
+    end = end < start + 1 ? start + 1 : end > maxLine ? maxLine : end;
     return {OriginZeroLine{(int16_t)start}, OriginZeroLine{(int16_t)end}};
 }
 
@@ -7354,13 +7176,12 @@ LineOzl MaybeMirrorSpan(LineOzl span, AbsoluteAxis axis, Direction direction,
     return span;
 }
 
-LineOzl ClampSpanForAxis(LineOzl span, AbsoluteAxis axis,
-                         Direction direction, uint16_t explicitColCount) {
+LineOzl ClampSpanForAxis(LineOzl span, AbsoluteAxis axis, Direction direction,
+                         uint16_t explicitColCount) {
     if (axis == AbsoluteAxis::Horizontal && IsRtl(direction)) {
         int16_t explicitEnd = (int16_t)explicitColCount;
-        return ClampSpanToLimitedGrid(
-            span, (int16_t)(explicitEnd - kMaxOzLine),
-            (int16_t)(explicitEnd - kMinOzLine));
+        return ClampSpanToLimitedGrid(span, (int16_t)(explicitEnd - kMaxOzLine),
+                                      (int16_t)(explicitEnd - kMinOzLine));
     }
     return ClampSpanToLimitedGrid(span, kMinOzLine, kMaxOzLine);
 }
@@ -7384,10 +7205,10 @@ void RecordGridPlacement(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
                          uint16_t explicitColCount, LineOzl primarySpan,
                          LineOzl secondarySpan,
                          CellOccupancyState placementType) {
-    primarySpan = ClampSpanForAxis(primarySpan, primaryAxis, direction,
-                                   explicitColCount);
-    secondarySpan = ClampSpanForAxis(
-        secondarySpan, OtherAxis(primaryAxis), direction, explicitColCount);
+    primarySpan =
+        ClampSpanForAxis(primarySpan, primaryAxis, direction, explicitColCount);
+    secondarySpan = ClampSpanForAxis(secondarySpan, OtherAxis(primaryAxis),
+                                     direction, explicitColCount);
     matrix->MarkAreaAs(primaryAxis, primarySpan, secondarySpan, placementType);
 
     LineOzl colSpan =
@@ -7467,8 +7288,7 @@ SpanPair PlaceDefiniteSecondaryAxisItem(const CellOccupancyMatrix& matrix,
         LineOzl primaryPlacement = ResolveIndefiniteGridSpan(
             position, primarySpanLen, primaryReversed);
         OptOriginZeroLine collision = matrix.LineAreaCollisionJump(
-            primaryAxis, primaryPlacement, secondaryPlacement,
-            primaryReversed);
+            primaryAxis, primaryPlacement, secondaryPlacement, primaryReversed);
         if (!collision.IsSome()) {
             return {primaryPlacement, secondaryPlacement};
         }
@@ -7528,8 +7348,7 @@ SpanPair PlaceIndefinitelyPositionedItem(const CellOccupancyMatrix& matrix,
             LineOzl secondarySpan = ResolveIndefiniteGridSpan(
                 secondaryIdx, secondarySpanLen, secondaryReversed);
             OptOriginZeroLine collision = matrix.LineAreaCollisionJump(
-                secondaryAxis, secondarySpan, primarySpan,
-                secondaryReversed);
+                secondaryAxis, secondarySpan, primarySpan, secondaryReversed);
             if (!collision.IsSome()) {
                 return {primarySpan, secondarySpan};
             }
@@ -7572,7 +7391,7 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
     uint16_t explicitColCount = matrix->Counts(AbsoluteAxis::Horizontal)
                                     .explicitCount;
 
-    for (int i = 0; i < children.len; i++) {
+    for (int i = 0; i < len(children); i++) {
         const PlacementChild& c = children[i];
         if (!c.horizontal.IsDefinite() || !c.vertical.IsDefinite()) {
             continue;
@@ -7583,12 +7402,11 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
             c, secondaryAxis, direction, explicitColCount);
         RecordGridPlacement(matrix, items, tree, c.node, c.index, alignItems,
                             justifyItems, primaryAxis, direction,
-                            explicitColCount, primarySpan,
-                            secondarySpan,
+                            explicitColCount, primarySpan, secondarySpan,
                             CellOccupancyState::DefinitelyPlaced);
     }
 
-    for (int i = 0; i < children.len; i++) {
+    for (int i = 0; i < len(children); i++) {
         const PlacementChild& c = children[i];
         if (!c.Get(secondaryAxis).IsDefinite() || c.Get(primaryAxis)
                                                       .IsDefinite()) {
@@ -7598,8 +7416,8 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
             *matrix, c, gridAutoFlow, direction, explicitColCount);
         RecordGridPlacement(matrix, items, tree, c.node, c.index, alignItems,
                             justifyItems, primaryAxis, direction,
-                            explicitColCount, spans.primary,
-                            spans.secondary, CellOccupancyState::AutoPlaced);
+                            explicitColCount, spans.primary, spans.secondary,
+                            CellOccupancyState::AutoPlaced);
     }
 
     bool primaryReversed = AxisIsReversed(direction, primaryAxis);
@@ -7613,7 +7431,7 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
     OriginZeroLine posPrimary = startPrimary;
     OriginZeroLine posSecondary = startSecondary;
 
-    for (int i = 0; i < children.len; i++) {
+    for (int i = 0; i < len(children); i++) {
         const PlacementChild& c = children[i];
         if (c.Get(secondaryAxis).IsDefinite()) {
             continue;
@@ -7623,8 +7441,8 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
             explicitColCount);
         RecordGridPlacement(matrix, items, tree, c.node, c.index, alignItems,
                             justifyItems, primaryAxis, direction,
-                            explicitColCount, spans.primary,
-                            spans.secondary, CellOccupancyState::AutoPlaced);
+                            explicitColCount, spans.primary, spans.secondary,
+                            CellOccupancyState::AutoPlaced);
 
         if (IsDense(gridAutoFlow)) {
             posPrimary = startPrimary;
@@ -8075,12 +7893,11 @@ void DistributeItemSpaceToBaseSizeInner(
                        ? minimumFilter(t)
                        : maximumFilter(t);
         };
-        DistributeSpaceUpToLimits(extraSpace, tracks, n, filter,
-                                  trackDistributionProportion, getBaseSize,
-                                  [&](const GridTrack& t) {
-                                      return t.FitContentLimit(
-                                          axisInnerNodeSize);
-                                  });
+        DistributeSpaceUpToLimits(
+            extraSpace, tracks, n, filter, trackDistributionProportion,
+            getBaseSize, [&](const GridTrack& t) {
+                return t.FitContentLimit(axisInnerNodeSize);
+            });
     }
 
     for (int i = 0; i < n; i++) {
@@ -8094,8 +7911,8 @@ void DistributeItemSpaceToBaseSizeInner(
 
 template <typename Affected, typename Limit>
 void DistributeItemSpaceToBaseSize(
-    bool isFlex, bool, float space,
-    GridTrack* tracks, int n, Affected trackIsAffected, Limit trackLimit,
+    bool isFlex, bool, float space, GridTrack* tracks, int n,
+    Affected trackIsAffected, Limit trackLimit,
     IntrinsicContributionType intrinsicContributionType,
     Optf axisInnerNodeSize) {
     auto one = [](const GridTrack&) { return 1.0f; };
@@ -8111,15 +7928,13 @@ void DistributeItemSpaceToBaseSize(
         }
         if (flexFactorSum > 0.0f) {
             auto flexFactor = [](const GridTrack& t) { return t.FlexFactor(); };
-            DistributeItemSpaceToBaseSizeInner(space, tracks, n, filter,
-                                               flexFactor, trackLimit,
-                                               intrinsicContributionType,
-                                               axisInnerNodeSize);
+            DistributeItemSpaceToBaseSizeInner(
+                space, tracks, n, filter, flexFactor, trackLimit,
+                intrinsicContributionType, axisInnerNodeSize);
         } else {
-            DistributeItemSpaceToBaseSizeInner(space, tracks, n, filter, one,
-                                               trackLimit,
-                                               intrinsicContributionType,
-                                               axisInnerNodeSize);
+            DistributeItemSpaceToBaseSizeInner(
+                space, tracks, n, filter, one, trackLimit,
+                intrinsicContributionType, axisInnerNodeSize);
         }
         return;
     }
@@ -8393,15 +8208,13 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                             return t.FitContentLimitedGrowthLimit(
                                 axisInnerNodeSize);
                         },
-                        IntrinsicContributionType::Minimum,
-                        axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
                 } else {
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasIntrinsicMin,
                         [](const GridTrack& t) { return t.growthLimit; },
-                        IntrinsicContributionType::Minimum,
-                        axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
                 }
             }
         }
@@ -8427,15 +8240,13 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                             return t.FitContentLimitedGrowthLimit(
                                 axisInnerNodeSize);
                         },
-                        IntrinsicContributionType::Minimum,
-                        axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
                 } else {
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasMinOrMaxContentMin,
                         [](const GridTrack& t) { return t.growthLimit; },
-                        IntrinsicContributionType::Minimum,
-                        axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
                 }
             }
         }
@@ -8475,8 +8286,7 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasMaxContentMin,
                         [](const GridTrack&) { return INFINITY; },
-                        IntrinsicContributionType::Maximum,
-                        axisInnerNodeSize);
+                        IntrinsicContributionType::Maximum, axisInnerNodeSize);
                 } else {
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
@@ -8485,8 +8295,7 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                             return t.FitContentLimitedGrowthLimit(
                                 axisInnerNodeSize);
                         },
-                        IntrinsicContributionType::Maximum,
-                        axisInnerNodeSize);
+                        IntrinsicContributionType::Maximum, axisInnerNodeSize);
                 }
             }
             FlushPlannedBaseSizeIncreases(axisTracks, nAxisTracks);
@@ -8505,8 +8314,7 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                     isFlex, useFlexFactorForDistribution, space,
                     axisTracks + from, count, hasMaxContentMinFn,
                     [](const GridTrack& t) { return t.growthLimit; },
-                    IntrinsicContributionType::Maximum,
-                    axisInnerNodeSize);
+                    IntrinsicContributionType::Maximum, axisInnerNodeSize);
             }
         }
         FlushPlannedBaseSizeIncreases(axisTracks, nAxisTracks);
@@ -8840,8 +8648,8 @@ void AlignTracks(float gridContainerContentBoxSize, LineF padding, LineF border,
 
     float emptyGridOffset =
         numTracks == 0
-            ? ComputeAlignmentOffset(freeSpace, numTracks, gap,
-                                     trackAlignment, layoutIsReversed, true)
+            ? ComputeAlignmentOffset(freeSpace, numTracks, gap, trackAlignment,
+                                     layoutIsReversed, true)
             : 0.0f;
     float totalOffset = origin + emptyGridOffset;
     bool seenNonCollapsedTrack = false;
@@ -9084,12 +8892,12 @@ AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
 
     AlignedAxis xr = AlignItemWithinArea(
         {gridArea.left, gridArea.right},
-        justifySelf.UnwrapOr(horizontalAlignment), finalSize.w, position,
-        inset, false, margin, 0.0f, direction);
-    AlignedAxis yr = AlignItemWithinArea(
-        {gridArea.top, gridArea.bottom}, alignSelf.UnwrapOr(verticalAlignment),
-        finalSize.h, position, inset, true, margin, baselineShim,
-        Direction::Ltr);
+        justifySelf.UnwrapOr(horizontalAlignment), finalSize.w, position, inset,
+        false, margin, 0.0f, direction);
+    AlignedAxis yr = AlignItemWithinArea({gridArea.top, gridArea.bottom},
+                                         alignSelf.UnwrapOr(verticalAlignment),
+                                         finalSize.h, position, inset, true,
+                                         margin, baselineShim, Direction::Ltr);
 
     SizeF scrollbarSize = {
         overflow.y == Overflow::Scroll ? scrollbarWidth : 0.0f,
@@ -9108,13 +8916,11 @@ AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
     tree->SetUnroundedLayout(node, layout);
 
     SizeF contribution = ComputeContentSizeContribution(
-        {IsRtl(direction)
-             ? containerBorderBoxWidth - (xr.start + finalSize.w) -
-                   containerBorder.right
-             : xr.start - containerBorder.left,
+        {IsRtl(direction) ? containerBorderBoxWidth - (xr.start + finalSize.w) -
+                                containerBorder.right
+                          : xr.start - containerBorder.left,
          yr.start - containerBorder.top},
-        finalSize,
-        layoutOutput.contentSize, overflow);
+        finalSize, layoutOutput.contentSize, overflow);
     return {contribution, yr.start, finalSize.h};
 }
 
@@ -9219,8 +9025,9 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
 
     AlignContent alignContent =
         style.alignContent.UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
-    AlignContent justifyContent = style.justifyContent.UnwrapOr(
-        AlignContent{AlignContentKeyword::Stretch});
+    AlignContent justifyContent =
+        style.justifyContent
+            .UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
     OptAlignItems alignItems = style.alignItems;
     OptAlignItems justifyItems = style.justifyItems;
 
@@ -9237,8 +9044,8 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     }
     constrainedAvailableSpace =
         MaybeClamp(constrainedAvailableSpace, minSize, maxSize);
-    constrainedAvailableSpace.width =
-        MaybeMax(constrainedAvailableSpace.width, paddingBorderSize.w);
+    constrainedAvailableSpace
+        .width = MaybeMax(constrainedAvailableSpace.width, paddingBorderSize.w);
     constrainedAvailableSpace.height =
         MaybeMax(constrainedAvailableSpace.height, paddingBorderSize.h);
 
@@ -9306,12 +9113,10 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     uint16_t explicitRowCount = rowSize.trackCount > nameResolver.areaRowCount
                                     ? rowSize.trackCount
                                     : nameResolver.areaRowCount;
-    explicitColCount = explicitColCount > kMaxGridTracks
-                           ? kMaxGridTracks
-                           : explicitColCount;
-    explicitRowCount = explicitRowCount > kMaxGridTracks
-                           ? kMaxGridTracks
-                           : explicitRowCount;
+    explicitColCount =
+        explicitColCount > kMaxGridTracks ? kMaxGridTracks : explicitColCount;
+    explicitRowCount =
+        explicitRowCount > kMaxGridTracks ? kMaxGridTracks : explicitRowCount;
     nameResolver.explicitColumnCount = explicitColCount;
     nameResolver.explicitRowCount = explicitRowCount;
 
@@ -9340,17 +9145,17 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     TrackCounts estColCounts;
     TrackCounts estRowCounts;
     ComputeGridSizeEstimate(explicitColCount, explicitRowCount, direction,
-                            childPlacements.els, childPlacements.len,
+                            childPlacements.els, len(childPlacements),
                             &estColCounts, &estRowCounts);
 
     Vec<GridItem> items;
     CellOccupancyMatrix cellOccupancyMatrix;
     cellOccupancyMatrix.Init(estColCounts, estRowCounts);
-    PlaceGridItems(
-        &cellOccupancyMatrix, &items, tree, children, direction,
-        style.gridAutoFlow,
-        alignItems.UnwrapOr(AlignItems{AlignItemsKeyword::Stretch}),
-        justifyItems.UnwrapOr(AlignItems{AlignItemsKeyword::Stretch}));
+    PlaceGridItems(&cellOccupancyMatrix, &items, tree, children, direction,
+                   style.gridAutoFlow,
+                   alignItems.UnwrapOr(AlignItems{AlignItemsKeyword::Stretch}),
+                   justifyItems
+                       .UnwrapOr(AlignItems{AlignItemsKeyword::Stretch}));
 
     TrackCounts finalColCounts = cellOccupancyMatrix
                                      .Counts(AbsoluteAxis::Horizontal);
@@ -9380,16 +9185,16 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                              return cellOccupancyMatrix.RowIsOccupied(rowIndex);
                          });
     if (IsRtl(direction)) {
-        ReverseNonGutterTracks(columns.els, columns.len, finalColCounts);
+        ReverseNonGutterTracks(columns.els, len(columns), finalColCounts);
     }
 
-    ResolveItemTrackIndexes(items.els, items.len, finalColCounts,
+    ResolveItemTrackIndexes(items.els, len(items), finalColCounts,
                             finalRowCounts);
-    DetermineIfItemCrossesFlexibleOrIntrinsicTracks(items.els, items.len,
+    DetermineIfItemCrossesFlexibleOrIntrinsicTracks(items.els, len(items),
                                                     columns.els, rows.els);
 
     bool hasBaselineAlignedItem = false;
-    for (int i = 0; i < items.len; i++) {
+    for (int i = 0; i < len(items); i++) {
         if (items[i].alignSelf.keyword == AlignItemsKeyword::Baseline) {
             hasBaselineAlignedItem = true;
             break;
@@ -9399,30 +9204,30 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     TrackSizingAlgorithm(
         tree, AbstractAxis::Inline, Get(innerMinSize, AbstractAxis::Inline),
         Get(innerMaxSize, AbstractAxis::Inline), justifyContent, alignContent,
-        availableGridSpace, innerNodeSize, columns.els, columns.len, rows.els,
-        rows.len, items.els, items.len,
+        availableGridSpace, innerNodeSize, columns.els, len(columns), rows.els,
+        len(rows), items.els, len(items),
         TrackSizeEstimate::MaxTrackSizingFunction, hasBaselineAlignedItem);
     float initialColumnSum = 0.0f;
-    for (int i = 0; i < columns.len; i++) {
+    for (int i = 0; i < len(columns); i++) {
         initialColumnSum += columns[i].baseSize;
     }
     if (!IsSome(innerNodeSize.w)) {
         innerNodeSize.w = Some(initialColumnSum);
     }
 
-    for (int i = 0; i < items.len; i++) {
+    for (int i = 0; i < len(items); i++) {
         items[i].hasGridAreaSizeCache = false;
     }
 
     TrackSizingAlgorithm(
         tree, AbstractAxis::Block, Get(innerMinSize, AbstractAxis::Block),
         Get(innerMaxSize, AbstractAxis::Block), alignContent, justifyContent,
-        availableGridSpace, innerNodeSize, rows.els, rows.len, columns.els,
-        columns.len, items.els, items.len, TrackSizeEstimate::BaseSize,
+        availableGridSpace, innerNodeSize, rows.els, len(rows), columns.els,
+        len(columns), items.els, len(items), TrackSizeEstimate::BaseSize,
 
         false);
     float initialRowSum = 0.0f;
-    for (int i = 0; i < rows.len; i++) {
+    for (int i = 0; i < len(rows); i++) {
         initialRowSum += rows[i].baseSize;
     }
     if (!IsSome(innerNodeSize.h)) {
@@ -9443,9 +9248,8 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                paddingBorderSize.h)};
     SizeF containerContentBox = {
         F32Max(0.0f, containerBorderBox.w - contentBoxInset
-                                                    .HorizontalAxisSum()),
-        F32Max(0.0f, containerBorderBox.h - contentBoxInset
-                                                     .VerticalAxisSum())};
+                                                .HorizontalAxisSum()),
+        F32Max(0.0f, containerBorderBox.h - contentBoxInset.VerticalAxisSum())};
 
     if (runMode == RunMode::ComputeSize) {
         VecReset(items);
@@ -9459,35 +9263,35 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     }
 
     if (!availableGridSpace.width.IsDefinite()) {
-        for (int i = 0; i < columns.len; i++) {
+        for (int i = 0; i < len(columns); i++) {
             GridTrack& c = columns[i];
-            Optf mn = c.minTrackSizingFunction.ResolvedPercentageSize(
-                containerContentBox.w, calc);
-            Optf mx = c.maxTrackSizingFunction.ResolvedPercentageSize(
-                containerContentBox.w, calc);
+            Optf mn = c.minTrackSizingFunction
+                          .ResolvedPercentageSize(containerContentBox.w, calc);
+            Optf mx = c.maxTrackSizingFunction
+                          .ResolvedPercentageSize(containerContentBox.w, calc);
             c.baseSize = MaybeClamp(c.baseSize, mn, mx);
         }
     }
     if (!availableGridSpace.height.IsDefinite()) {
-        for (int i = 0; i < rows.len; i++) {
+        for (int i = 0; i < len(rows); i++) {
             GridTrack& r = rows[i];
-            Optf mn = r.minTrackSizingFunction.ResolvedPercentageSize(
-                containerContentBox.h, calc);
-            Optf mx = r.maxTrackSizingFunction.ResolvedPercentageSize(
-                containerContentBox.h, calc);
+            Optf mn = r.minTrackSizingFunction
+                          .ResolvedPercentageSize(containerContentBox.h, calc);
+            Optf mx = r.maxTrackSizingFunction
+                          .ResolvedPercentageSize(containerContentBox.h, calc);
             r.baseSize = MaybeClamp(r.baseSize, mn, mx);
         }
     }
 
     bool hasPercentageColumn = false;
-    for (int i = 0; i < columns.len; i++) {
+    for (int i = 0; i < len(columns); i++) {
         if (columns[i].UsesPercentage()) {
             hasPercentageColumn = true;
             break;
         }
     }
     bool hasPercentageRow = false;
-    for (int i = 0; i < rows.len; i++) {
+    for (int i = 0; i < len(rows); i++) {
         if (rows[i].UsesPercentage()) {
             hasPercentageRow = true;
             break;
@@ -9498,7 +9302,7 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     bool intrinsicColumnContributionChanged = false;
 
     if (!rerunColumnSizing) {
-        for (int i = 0; i < items.len; i++) {
+        for (int i = 0; i < len(items); i++) {
             GridItem* item = &items[i];
             if (!item->crossesIntrinsicColumn) {
                 continue;
@@ -9524,7 +9328,7 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         }
         rerunColumnSizing = intrinsicColumnContributionChanged;
     } else {
-        for (int i = 0; i < items.len; i++) {
+        for (int i = 0; i < len(items); i++) {
             items[i].hasGridAreaSizeCache = false;
             items[i].minContentContributionCache.w = None();
             items[i].maxContentContributionCache.w = None();
@@ -9537,16 +9341,15 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         TrackSizingAlgorithm(
             tree, AbstractAxis::Inline, Get(innerMinSize, AbstractAxis::Inline),
             Get(innerMaxSize, AbstractAxis::Inline), justifyContent,
-            alignContent,
-            availableGridSpace, innerNodeSize, columns.els, columns.len,
-            rows.els, rows.len, items.els, items.len,
+            alignContent, availableGridSpace, innerNodeSize, columns.els,
+            len(columns), rows.els, len(rows), items.els, len(items),
             TrackSizeEstimate::BaseSize, hasBaselineAlignedItem);
 
         bool parentHeightIndefinite = !availableSpace.height.IsDefinite();
         bool rerunRowSizing = parentHeightIndefinite && hasPercentageRow;
 
         if (!rerunRowSizing) {
-            for (int i = 0; i < items.len; i++) {
+            for (int i = 0; i < len(items); i++) {
                 GridItem* item = &items[i];
                 if (!item->crossesIntrinsicColumn) {
                     continue;
@@ -9572,7 +9375,7 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
             }
             rerunRowSizing = intrinsicRowContributionChanged;
         } else {
-            for (int i = 0; i < items.len; i++) {
+            for (int i = 0; i < len(items); i++) {
                 items[i].hasGridAreaSizeCache = false;
                 items[i].minContentContributionCache.h = None();
                 items[i].maxContentContributionCache.h = None();
@@ -9585,9 +9388,8 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                 tree, AbstractAxis::Block,
                 Get(innerMinSize, AbstractAxis::Block),
                 Get(innerMaxSize, AbstractAxis::Block), alignContent,
-                justifyContent,
-                availableGridSpace, innerNodeSize, rows.els, rows.len,
-                columns.els, columns.len, items.els, items.len,
+                justifyContent, availableGridSpace, innerNodeSize, rows.els,
+                len(rows), columns.els, len(columns), items.els, len(items),
                 TrackSizeEstimate::BaseSize, false);
         }
     }
@@ -9595,11 +9397,11 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     if ((intrinsicColumnContributionChanged && !hasPercentageColumn) ||
         (intrinsicRowContributionChanged && !hasPercentageRow)) {
         float finalColumnSum = 0.0f;
-        for (int i = 0; i < columns.len; i++) {
+        for (int i = 0; i < len(columns); i++) {
             finalColumnSum += columns[i].baseSize;
         }
         float finalRowSum = 0.0f;
-        for (int i = 0; i < rows.len; i++) {
+        for (int i = 0; i < len(rows); i++) {
             finalRowSum += rows[i].baseSize;
         }
         if (intrinsicColumnContributionChanged && !hasPercentageColumn) {
@@ -9610,9 +9412,9 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                                                   .HorizontalAxisSum()),
                     minSize.w, maxSize.w),
                 paddingBorderSize.w);
-            containerContentBox
-                .w = F32Max(0.0f, containerBorderBox.w -
-                                          contentBoxInset.HorizontalAxisSum());
+            containerContentBox.w =
+                F32Max(0.0f, containerBorderBox.w - contentBoxInset
+                                                        .HorizontalAxisSum());
         }
         if (intrinsicRowContributionChanged && !hasPercentageRow) {
             containerBorderBox.h = F32Max(
@@ -9621,9 +9423,8 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                              finalRowSum + contentBoxInset.VerticalAxisSum()),
                     minSize.h, maxSize.h),
                 paddingBorderSize.h);
-            containerContentBox
-                .h = F32Max(0.0f, containerBorderBox.h -
-                                           contentBoxInset.VerticalAxisSum());
+            containerContentBox.h = F32Max(
+                0.0f, containerBorderBox.h - contentBoxInset.VerticalAxisSum());
         }
     }
 
@@ -9637,36 +9438,36 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
              (IsRtl(direction) ? inlineScrollbarGutterForAlignment : 0.0f),
          padding.right +
              (IsRtl(direction) ? 0.0f : inlineScrollbarGutterForAlignment)},
-        {border.left, border.right}, columns.els, columns.len, justifyContent,
+        {border.left, border.right}, columns.els, len(columns), justifyContent,
         IsRtl(direction));
     AlignTracks(Get(containerContentBox, AbstractAxis::Block),
                 {padding.top, padding.bottom}, {border.top, border.bottom},
-                rows.els, rows.len, alignContent, false);
+                rows.els, len(rows), alignContent, false);
 
     SizeF itemContentSizeContribution = SizeF::Zero();
     SizeF absoluteContentSize = SizeF::Zero();
 
-    StableSort(items.els, items.len, [](const GridItem& a, const GridItem& b) {
+    StableSort(items.els, len(items), [](const GridItem& a, const GridItem& b) {
         return a.sourceOrder < b.sourceOrder;
     });
 
-    for (int index = 0; index < items.len; index++) {
+    for (int index = 0; index < len(items); index++) {
         GridItem& item = items[index];
         RectF gridArea = {columns[(int)item.columnIndexes.start + 1].offset,
                           columns[(int)item.columnIndexes.end].offset,
                           rows[(int)item.rowIndexes.start + 1].offset,
                           rows[(int)item.rowIndexes.end].offset};
-        AlignedItem placed = AlignAndPositionItem(
-            tree, item.node, (uint32_t)index, gridArea, justifyItems,
-            alignItems, item.baselineShim, direction, containerBorderBox.w,
-            border);
+        AlignedItem placed =
+            AlignAndPositionItem(tree, item.node, (uint32_t)index, gridArea,
+                                 justifyItems, alignItems, item.baselineShim,
+                                 direction, containerBorderBox.w, border);
         item.yPosition = placed.yPosition;
         item.height = placed.height;
-        itemContentSizeContribution = Max(itemContentSizeContribution,
-                                          placed.contentSizeContribution);
+        itemContentSizeContribution =
+            Max(itemContentSizeContribution, placed.contentSizeContribution);
     }
 
-    uint32_t order = (uint32_t)items.len;
+    uint32_t order = (uint32_t)len(items);
     for (int index = 0; index < childCount; index++) {
         NodeId child = tree->GetChildId(node, index);
         const Style& cs = tree->GetStyle(child);
@@ -9724,20 +9525,19 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         }
 
         auto lineAsStartEdge = [](const Vec<GridTrack>& tracks, int index) {
-            return index + 1 < tracks.len ? tracks[index + 1].offset
-                                          : tracks[index].offset;
+            return index + 1 < len(tracks) ? tracks[index + 1].offset
+                                           : tracks[index].offset;
         };
         auto lineAsEndEdge = [](const Vec<GridTrack>& tracks, int index) {
             if (index == 0) {
-                return tracks.len > 1 ? tracks[1].offset : tracks[0].offset;
+                return len(tracks) > 1 ? tracks[1].offset : tracks[0].offset;
             }
             return tracks[index].offset;
         };
 
         RectF gridArea;
-        gridArea.top = rowStartIdx >= 0
-                           ? lineAsStartEdge(rows, rowStartIdx)
-                           : border.top;
+        gridArea.top =
+            rowStartIdx >= 0 ? lineAsStartEdge(rows, rowStartIdx) : border.top;
         gridArea.bottom =
             rowEndIdx >= 0
                 ? lineAsEndEdge(rows, rowEndIdx)
@@ -9754,33 +9554,32 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                                     : containerBorderBox.w - border.right -
                                           scrollbarGutter.x);
 
-        AlignedItem placed =
-            AlignAndPositionItem(tree, child, order, gridArea, justifyItems,
-                                 alignItems, 0.0f, direction,
-                                 containerBorderBox.w, border);
-        absoluteContentSize = Max(absoluteContentSize,
-                                  placed.contentSizeContribution);
+        AlignedItem placed = AlignAndPositionItem(
+            tree, child, order, gridArea, justifyItems, alignItems, 0.0f,
+            direction, containerBorderBox.w, border);
+        absoluteContentSize =
+            Max(absoluteContentSize, placed.contentSizeContribution);
         order += 1;
     }
 
-    itemContentSizeContribution.w +=
-        IsRtl(direction) ? padding.left : padding.right;
+    itemContentSizeContribution
+        .w += IsRtl(direction) ? padding.left : padding.right;
     itemContentSizeContribution.h += padding.bottom;
     SizeF finalContentSize =
         Max(itemContentSizeContribution, absoluteContentSize);
 
     LayoutOutput out;
-    if (items.len == 0) {
+    if (len(items) == 0) {
         out = LayoutOutput::FromOuterSize(containerBorderBox);
     } else {
 
-        StableSort(items.els, items.len,
+        StableSort(items.els, len(items),
                    [](const GridItem& a, const GridItem& b) {
                        return a.row.start < b.row.start;
                    });
         OriginZeroLine firstRow = items[0].row.start;
         int rowEnd = 0;
-        while (rowEnd < items.len && items[rowEnd].row.start == firstRow) {
+        while (rowEnd < len(items) && items[rowEnd].row.start == firstRow) {
             rowEnd++;
         }
         const GridItem* chosen = &items[0];
@@ -9841,7 +9640,7 @@ void GridSizeEstimateForTest(uint16_t explicitColCount,
     TrackCounts cols;
     TrackCounts rws;
     ComputeGridSizeEstimate(explicitColCount, explicitRowCount, direction,
-                            children.els, children.len, &cols, &rws);
+                            children.els, len(children), &cols, &rws);
     VecReset(children);
     outColCounts[0] = cols.negativeImplicit;
     outColCounts[1] = cols.explicitCount;
@@ -9860,7 +9659,7 @@ int GridInitTracksForTest(const Style& style, AbsoluteAxis axis,
         TrackCounts::FromRaw(negativeImplicit, explicitCount, positiveImplicit);
     InitializeGridTracks(&tracks, counts, style, axis,
                          [](int) { return false; });
-    int n = tracks.len;
+    int n = len(tracks);
     for (int i = 0; i < n && i < cap; i++) {
         out[i].isGutter = tracks[i].kind == GridTrackKind::Gutter;
         out[i].isCollapsed = tracks[i].isCollapsed;
@@ -9904,7 +9703,7 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
     TrackCounts estCols;
     TrackCounts estRows;
     ComputeGridSizeEstimate(explicitColCount, explicitRowCount, Direction::Ltr,
-                            childPlacements.els, childPlacements.len, &estCols,
+                            childPlacements.els, len(childPlacements), &estCols,
                             &estRows);
 
     Vec<GridItem> items;
@@ -9914,7 +9713,7 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
                    AlignItems{AlignItemsKeyword::Start},
                    AlignItems{AlignItemsKeyword::Start});
 
-    int n = items.len;
+    int n = len(items);
     for (int i = 0; i < n && i < cap; i++) {
         out[i].columnStart = items[i].column.start.v;
         out[i].columnEnd = items[i].column.end.v;
@@ -10051,10 +9850,10 @@ static void RoundLayoutInner(TaffyTree* tree, NodeId nodeId, float cumulativeX,
 
     layout.location.x = F32Round(unrounded.location.x);
     layout.location.y = F32Round(unrounded.location.y);
-    layout.size.w =
-        F32Round(cumulativeX + unrounded.size.w) - F32Round(cumulativeX);
-    layout.size.h =
-        F32Round(cumulativeY + unrounded.size.h) - F32Round(cumulativeY);
+    layout.size
+        .w = F32Round(cumulativeX + unrounded.size.w) - F32Round(cumulativeX);
+    layout.size
+        .h = F32Round(cumulativeY + unrounded.size.h) - F32Round(cumulativeY);
     layout.scrollbarSize.w = F32Round(unrounded.scrollbarSize.w);
     layout.scrollbarSize.h = F32Round(unrounded.scrollbarSize.h);
     layout.border.left =
@@ -10074,15 +9873,13 @@ static void RoundLayoutInner(TaffyTree* tree, NodeId nodeId, float cumulativeX,
         F32Round(cumulativeX + unrounded.size.w - unrounded.padding.right);
     layout.padding.top =
         F32Round(cumulativeY + unrounded.padding.top) - F32Round(cumulativeY);
-    layout.padding.bottom = F32Round(cumulativeY + unrounded.size.h) -
-                            F32Round(cumulativeY + unrounded.size.h -
-                                     unrounded.padding.bottom);
-    layout.contentSize
-        .w = F32Round(cumulativeX + unrounded.contentSize.w) -
-                 F32Round(cumulativeX);
-    layout.contentSize
-        .h = F32Round(cumulativeY + unrounded.contentSize.h) -
-                  F32Round(cumulativeY);
+    layout.padding.bottom =
+        F32Round(cumulativeY + unrounded.size.h) -
+        F32Round(cumulativeY + unrounded.size.h - unrounded.padding.bottom);
+    layout.contentSize.w =
+        F32Round(cumulativeX + unrounded.contentSize.w) - F32Round(cumulativeX);
+    layout.contentSize.h =
+        F32Round(cumulativeY + unrounded.contentSize.h) - F32Round(cumulativeY);
 
     tree->SetFinalLayout(nodeId, layout);
 
@@ -10209,8 +10006,7 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
     out.size = size;
     out.contentSize = measuredSize + padding.SumAxes();
     out.marginsCanCollapseThrough = !hasStylesPreventingBeingCollapsedThrough &&
-                                    size.h == 0.0f &&
-                                    measuredSize.h == 0.0f;
+                                    size.h == 0.0f && measuredSize.h == 0.0f;
     return out;
 }
 
@@ -10262,9 +10058,10 @@ float ComputeAlignmentOffset(float freeSpace, int numItems, float gap,
                 return 0.0f;
             case AlignContentKeyword::SpaceAround:
                 return freeSpace >= 0.0f
-                           ? (freeSpace / (float)(numItems > 0 ? numItems : 1)) /
+                           ? (freeSpace /
+                              (float)(numItems > 0 ? numItems : 1)) /
                                  2.0f
-                                          : freeSpace / 2.0f;
+                           : freeSpace / 2.0f;
             case AlignContentKeyword::SpaceEvenly:
                 return freeSpace >= 0.0f ? freeSpace / (float)(numItems + 1)
                                          : freeSpace / 2.0f;
@@ -10288,12 +10085,11 @@ float ComputeAlignmentOffset(float freeSpace, int numItems, float gap,
 SizeF ComputeContentSizeContribution(PointF location, SizeF size,
                                      SizeF contentSize,
                                      PointOverflow overflow) {
-    SizeF contribution = {overflow.x == Overflow::Visible
-                              ? F32Max(size.w, contentSize.w)
-                              : size.w,
-                          overflow.y == Overflow::Visible
-                              ? F32Max(size.h, contentSize.h)
-                              : size.h};
+    SizeF contribution = {
+        overflow.x == Overflow::Visible ? F32Max(size.w, contentSize.w)
+                                        : size.w,
+        overflow.y == Overflow::Visible ? F32Max(size.h, contentSize.h)
+                                        : size.h};
     if (contribution.w > 0.0f && contribution.h > 0.0f) {
         float maxX = F32Max(location.x + contribution.w, 0.0f);
         float minX = F32Min(location.x, 0.0f);
@@ -10416,7 +10212,7 @@ OriginZeroLine IntoOriginZeroLine(GridLine line, uint16_t explicitTrackCount) {
     } else if (line.v < 0) {
         value = (int32_t)line.v + explicitLineCount;
     }
-    value = value < kMinOzLine ? kMinOzLine
+    value = value < kMinOzLine   ? kMinOzLine
             : value > kMaxOzLine ? kMaxOzLine
                                  : value;
     return OriginZeroLine{(int16_t)value};
@@ -10650,8 +10446,7 @@ bool operator==(const Style& a, const Style& b) {
 
            SameSlice(a.gridTemplateAreas.areas, b.gridTemplateAreas.areas) &&
            a.gridTemplateAreas.rowCount == b.gridTemplateAreas.rowCount &&
-           a.gridTemplateAreas.columnCount ==
-               b.gridTemplateAreas.columnCount &&
+           a.gridTemplateAreas.columnCount == b.gridTemplateAreas.columnCount &&
            SameSlice(a.gridTemplateColumnNames, b.gridTemplateColumnNames) &&
            SameSlice(a.gridTemplateRowNames, b.gridTemplateRowNames) &&
 
@@ -10866,7 +10661,7 @@ void TaffyTree::EachUnreachable(NodeId root, void (*fn)(NodeId, void*),
         }
     }
     base::Free(nullptr, seen);
-    for (int i = 0; i < ids.len; i++) {
+    for (int i = 0; i < len(ids); i++) {
         fn(ids[i], user);
     }
     VecReset(ids);
@@ -11836,7 +11631,7 @@ int PlatListDir(const char* dir, DirEntry* out, int max) {
         StrCopyZ(e.name, (int)sizeof(e.name), ent->d_name);
         TempStr full = fmt("%s/%s", Str(dir), name);
         struct stat st = {};
-        if (full.len >= kMaxPath || lstat(full.s, &st) != 0) {
+        if (len(full) >= kMaxPath || lstat(full.s, &st) != 0) {
             continue;
         }
         e.isSymlink = S_ISLNK(st.st_mode);
@@ -12091,8 +11886,8 @@ void StrCopyZ(char* dst, int cap, const char* src) {
 WCHAR* ToCWstrTemp(Str s) {
     Arena* arena = GetTempArena();
     int n = 0;
-    if (s.s && s.len > 0) {
-        n = MultiByteToWideChar(CP_UTF8, 0, s.s, s.len, nullptr, 0);
+    if (s.s && len(s) > 0) {
+        n = MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), nullptr, 0);
         if (n < 0) {
             n = 0;
         }
@@ -12100,7 +11895,7 @@ WCHAR* ToCWstrTemp(Str s) {
     auto res = (WCHAR*)arena->Push((uint64_t)(n + 1) * sizeof(WCHAR),
                                    alignof(WCHAR), false);
     if (n > 0) {
-        MultiByteToWideChar(CP_UTF8, 0, s.s, s.len, res, n);
+        MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), res, n);
     }
     res[n] = 0;
     return res;

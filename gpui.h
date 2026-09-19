@@ -121,6 +121,10 @@ struct Str {
     explicit operator bool() const { return len > 0 && s; }
 };
 
+constexpr int len(Str s) noexcept {
+    return s.len;
+}
+
 float StrToFloatUnchecked(Str s);
 
 void log(Str s);
@@ -134,7 +138,6 @@ TempStr StrDupTemp(Str s);
 TempStr ReadBoundedFileTemp(Str path, int limit);
 
 #if GPUI_OS_WINDOWS
-
 WCHAR* ToCWstrTemp(Str s);
 #endif
 
@@ -142,7 +145,6 @@ uint64_t PlatPageSize();
 uint64_t PlatLargePageSize();
 
 uint64_t PlatArenaReserveSize();
-
 void* PlatMemReserve(uint64_t size);
 bool PlatMemCommit(void* base, uint64_t size, bool largePages);
 void* PlatMemReserveCommit(uint64_t size, bool largePages);
@@ -150,16 +152,12 @@ void PlatMemRelease(void* base, uint64_t size);
 
 int StrCmpI(const char* a, const char* b);
 int StrCmpNI(const char* a, const char* b, int n);
-
 void StrCopyZ(char* dst, int cap, const char* src);
 
 bool PlatDirExists(const char* path);
-
 bool PlatFileExists(const char* path);
 void PlatGetCwd(char* out, int cap);
-
 bool PlatCanonicalPath(const char* path, char* out, int cap);
-
 void PlatGetExeDir(char* out, int cap);
 
 struct DirEntry {
@@ -172,9 +170,7 @@ struct DirEntry {
 };
 
 int PlatListDir(const char* dir, DirEntry* out, int max);
-
 int PlatCoreCount();
-
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes);
 
 void* AllocZero(int count, int size);
@@ -230,7 +226,6 @@ inline Func0 MkFunc0Void(void (*fn)()) {
 
 template <typename T>
 struct Func1 {
-
     static constexpr uintptr_t kDropsArgBit = 1;
     static constexpr uintptr_t kFuncNoArg = Func0::kFuncNoArg;
 
@@ -238,7 +233,6 @@ struct Func1 {
     uintptr_t userData = 0;
 
     Func1() = default;
-
     Func1(const Func0& that) {
         this->fn = that.fn;
         this->SetData(that.userData, true);
@@ -323,7 +317,6 @@ struct CondVar {
 };
 
 bool PlatThreadRun(Func0 f);
-
 uint64_t PlatThreadId();
 void PlatSleepMs(int ms);
 
@@ -344,10 +337,7 @@ struct Arena {
     const char* name;
     bool usesExternalBuffer;
     Mutex lock;
-    uint64_t nAllocsLifetime;
-    uint64_t peakBytesLifetime;
     uint64_t nAllocsSinceReset;
-    uint64_t peakBytesSinceReset;
 
     void* Alloc(int size);
     void Reset();
@@ -364,9 +354,7 @@ void ArenaDelete(Arena* arena);
 uint64_t ArenaUsed(Arena* arena);
 
 int VarintSize(uint32_t v);
-
 int VarintPut(char* dst, uint32_t v);
-
 int VarintGet(const char* src, uint32_t* out);
 
 using ArenaStr = uint32_t;
@@ -378,11 +366,9 @@ constexpr bool ArenaStrIsSet(ArenaStr s) {
 }
 
 ArenaStr ArenaStrDup(Arena* a, Str src);
-
 uint32_t ArenaStrLen(Arena* a, ArenaStr s);
 
 ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more);
-
 Str ArenaStrGet(Arena* a, ArenaStr s);
 
 constexpr uint32_t kArenaPtrNone = 0;
@@ -394,7 +380,6 @@ inline void* ArenaAtOffset(Arena* a, uint32_t off) {
         return nullptr;
     }
     Arena* node = a->current;
-
     if (node && node->basePos <= (uint64_t)off) {
         return (char*)node + ((uint64_t)off - node->basePos);
     }
@@ -447,6 +432,18 @@ void* ArenaVecAlloc(struct Arena* a, int count, int elSize, int align,
 
 GPUI_NOINLINE bool VecRealloc(struct Arena* a, void** els, int len, int* cap,
                               int newCap, int elSize);
+
+inline int VecNextCap(int cap, int wanted, int elSize) {
+    if (cap == 0) {
+        int floorCap = elSize == 1 ? 8 : elSize <= 1024 ? 4 : 1;
+        return std::max(floorCap, wanted);
+    }
+    return std::max(cap * 2, wanted);
+}
+
+inline int VecAbsCap(int cap) {
+    return cap < 0 ? -cap : cap;
+}
 
 #if defined(DEBUG)
 int VecDbgBirth(const char* file, int line, const char* func, char kind,
@@ -505,84 +502,6 @@ template <typename T>
 VecNonTemplated* VecNT(Vec<T>& v);
 
 template <typename T>
-auto VecReserve(Arena* arena, T& v, int n) -> decltype(v.els);
-
-template <typename T>
-inline T* VecReserve(Vec<T>& v, int n);
-
-template <typename T>
-bool VecResize(Vec<T>& v, int newSize);
-
-template <typename T>
-T* VecInsertSpace(Vec<T>& v, int idx, int count);
-
-template <typename T>
-void VecClear(Vec<T>& v);
-
-template <typename T>
-void VecReset(Vec<T>& v);
-
-template <typename T>
-void VecFreeMembers(Vec<T>& v);
-
-template <typename T>
-T* VecTake(Vec<T>& v);
-
-template <typename T>
-T* VecData(const Vec<T>& v);
-
-template <typename T>
-bool VecAppend(Vec<T>& v, const VecIdentityT<T>& el);
-
-template <typename T>
-bool VecAppendVec(Vec<T>& v, const Vec<T>& other);
-
-template <typename T>
-bool VecAppendN(Vec<T>& v, const T* src, int count);
-
-template <typename T>
-T* VecAppendBlanks(Vec<T>& v, int count);
-
-template <typename T>
-bool VecInsertAt(Vec<T>& v, int idx, const VecIdentityT<T>& el);
-
-template <typename T, typename E>
-bool VecPush(Arena* arena, T& v, E el);
-
-template <typename T>
-void VecRemoveAtN(Vec<T>& v, int idx, int count);
-
-template <typename T>
-void VecRemoveAt(Vec<T>& v, int idx);
-
-template <typename T>
-T VecPopAt(Vec<T>& v, int idx);
-
-template <typename T>
-void VecRemoveAtFast(Vec<T>& v, int idx);
-
-template <typename T>
-void VecRemoveLast(Vec<T>& v);
-
-template <typename T>
-T VecPop(Vec<T>& v);
-
-template <typename T>
-int VecRemove(Vec<T>& v, const T& el);
-
-template <typename T>
-bool VecIsValidIndex(const Vec<T>& v, int idx);
-
-template <typename T>
-T& VecLast(const Vec<T>& v);
-
-template <typename T>
-int VecFind(const Vec<T>& v, const T& el, int startAt = 0);
-
-template <typename T>
-bool VecContains(const Vec<T>& v, const T& el);
-
-template <typename T>
 struct Vec {
     int len = 0;
 
@@ -611,7 +530,7 @@ struct Vec {
 
     ~Vec() {
 #if defined(DEBUG)
-        VecDbgDeath(dbgId, len, cap < 0 ? -cap : cap);
+        VecDbgDeath(dbgId, len, VecAbsCap(cap));
 #endif
         VecReset(*this);
     }
@@ -636,13 +555,13 @@ static_assert(sizeof(Vec<double>) == sizeof(VecNonTemplated));
 #endif
 
 template <typename T>
-inline int len(const Vec<T>& v) {
-    return v.len;
+VecNonTemplated* VecNT(Vec<T>& v) {
+    return (VecNonTemplated*)&v;
 }
 
 template <typename T>
-VecNonTemplated* VecNT(Vec<T>& v) {
-    return (VecNonTemplated*)&v;
+inline int len(const Vec<T>& v) {
+    return v.len;
 }
 
 template <typename T>
@@ -666,12 +585,10 @@ inline void VecUseExternalBuffer(Vec<T>& v, T (&buf)[N]) {
 template <typename T>
 inline T* VecReserve(Vec<T>& v, int n) {
 #if defined(DEBUG)
-    int curCap = v.cap < 0 ? -v.cap : v.cap;
+    int curCap = VecAbsCap(v.cap);
     if (n > curCap) {
-        int floorCap = sizeof(T) == 1 ? 8 : sizeof(T) <= 1024 ? 4 : 1;
-        int next =
-            curCap == 0 ? std::max(floorCap, n) : std::max(curCap * 2, n);
-        VecDbgGrow(v.dbgId, v.len, curCap, n, next);
+        VecDbgGrow(v.dbgId, len(v), curCap, n,
+                   VecNextCap(curCap, n, (int)sizeof(T)));
     }
 #endif
     return VecReserve(nullptr, v, n);
@@ -698,31 +615,18 @@ void VecReset(Vec<T>& v) {
 }
 
 template <typename T>
-void VecFreeMembers(Vec<T>& v) {
-    for (int i = 0; i < v.len; i++) {
-        free(v.els[i]);
-    }
-    VecReset(v);
-}
-
-template <typename T>
 T* VecTake(Vec<T>& v) {
     return (T*)VecTakeNT(VecNT(v), (int)sizeof(T));
 }
 
 template <typename T>
-T* VecData(const Vec<T>& v) {
-    return v.els;
-}
-
-template <typename T>
 bool VecAppend(Vec<T>& v, const VecIdentityT<T>& el) {
-    return VecInsertAt(v, v.len, el);
+    return VecInsertAt(v, len(v), el);
 }
 
 template <typename T>
 bool VecAppendVec(Vec<T>& v, const Vec<T>& other) {
-    return VecAppendN(v, other.els, other.len);
+    return VecAppendN(v, other.els, len(other));
 }
 
 template <typename T>
@@ -730,7 +634,7 @@ bool VecAppendN(Vec<T>& v, const T* src, int count) {
     if (count == 0) {
         return true;
     }
-    T* dst = VecInsertSpace(v, v.len, count);
+    T* dst = VecInsertSpace(v, len(v), count);
     if (!dst) {
         return false;
     }
@@ -740,7 +644,7 @@ bool VecAppendN(Vec<T>& v, const T* src, int count) {
 
 template <typename T>
 T* VecAppendBlanks(Vec<T>& v, int count) {
-    return VecInsertSpace(v, v.len, count);
+    return VecInsertSpace(v, len(v), count);
 }
 
 template <typename T>
@@ -786,15 +690,15 @@ void VecRemoveAtFast(Vec<T>& v, int idx) {
 
 template <typename T>
 void VecRemoveLast(Vec<T>& v) {
-    if (v.len > 0) {
-        VecRemoveAt(v, v.len - 1);
+    if (len(v) > 0) {
+        VecRemoveAt(v, len(v) - 1);
     }
 }
 
 template <typename T>
 T VecPop(Vec<T>& v) {
-    T el = v.els[v.len - 1];
-    VecRemoveAtFast(v, v.len - 1);
+    T el = v.els[len(v) - 1];
+    VecRemoveAtFast(v, len(v) - 1);
     return el;
 }
 
@@ -808,26 +712,18 @@ int VecRemove(Vec<T>& v, const T& el) {
 }
 
 template <typename T>
-inline void DeleteVecMembers(Vec<T>& v) {
-    for (T& el : v) {
-        delete el;
-    }
-    VecClear(v);
-}
-
-template <typename T>
 bool VecIsValidIndex(const Vec<T>& v, int idx) {
-    return idx >= 0 && idx < v.len;
+    return idx >= 0 && idx < len(v);
 }
 
 template <typename T>
 T& VecLast(const Vec<T>& v) {
-    return v.els[v.len - 1];
+    return v.els[len(v) - 1];
 }
 
 template <typename T>
-int VecFind(const Vec<T>& v, const T& el, int startAt) {
-    for (int i = startAt; i < v.len; i++) {
+int VecFind(const Vec<T>& v, const T& el, int startAt = 0) {
+    for (int i = startAt; i < len(v); i++) {
         if (v.els[i] == el) {
             return i;
         }
@@ -841,33 +737,10 @@ bool VecContains(const Vec<T>& v, const T& el) {
 }
 
 template <typename T>
-struct VecSortCmp {
-    using Fn = int (*)(const T* a, const T* b);
-};
-
-template <typename T>
-void VecSort(Vec<T>& v, typename VecSortCmp<T>::Fn cmpFunc) {
-    if (v.len > 0) {
-        auto cmp = (int (*)(const void*, const void*))cmpFunc;
-        qsort((void*)v.els, (size_t)v.len, sizeof(T), cmp);
-    }
-}
-
-template <typename T>
-void VecReverse(Vec<T>& v) {
-    for (int i = 0; i < v.len / 2; i++) {
-        std::swap(v.els[i], v.els[v.len - i - 1]);
-    }
-}
-
-template <typename T>
 struct ArenaVecSegment {
-
     ArenaPtr<ArenaVecSegment<T>> next;
-
     int base;
     int len;
-
     int cap;
 
     static constexpr int HeaderSize() {
@@ -894,9 +767,7 @@ struct ArenaVec {
     ArenaPtr<Segment> last = {};
     int len = 0;
 #if defined(DEBUG)
-
     int dbgId = 0;
-
     int dbgTotalCap = 0;
     int dbgSegs = 0;
 
@@ -906,7 +777,6 @@ struct ArenaVec {
 #endif
 
     T& operator[](int idx) const {
-
         Segment* seg = ArenaPtrGet(a, first);
         if (first == last) {
             return seg->Els()[idx];
@@ -918,9 +788,7 @@ struct ArenaVec {
     }
 
     struct Iter {
-
         Arena* a;
-
         Segment* seg;
         int idx;
 
@@ -953,18 +821,7 @@ struct ArenaVec {
     }
     Iter end() const { return Iter{a, nullptr, 0}; }
 
-    bool Append(Arena* arena, const T& el) {
-        Segment* seg = ArenaPtrGet(a, last);
-        if (!seg || seg->len >= seg->cap) {
-            seg = NextSegment(arena, 1);
-            if (!seg) {
-                return false;
-            }
-        }
-        seg->Els()[seg->len++] = el;
-        len++;
-        return true;
-    }
+    bool Append(Arena* arena, const T& el) { return AppendMany(arena, &el, 1); }
 
     bool AppendMany(Arena* arena, const T* src, int n) {
         while (n > 0) {
@@ -1041,20 +898,23 @@ struct ArenaVec {
     }
 
     static constexpr int CapFor(int count, int bytes) {
-        return bytes / (int)sizeof(T) < count
-                   ? (bytes / (int)sizeof(T) > 0 ? bytes / (int)sizeof(T) : 1)
-                   : count;
+        int byBytes = bytes / (int)sizeof(T);
+        if (byBytes < 1) {
+            byBytes = 1;
+        }
+        return byBytes < count ? byBytes : count;
     }
 
     static int NextCap(int prevCap) {
-        if (prevCap < CapFor(kArenaVecCap0, kArenaVecBytes0)) {
-            return CapFor(kArenaVecCap0, kArenaVecBytes0);
-        }
-        if (prevCap < CapFor(kArenaVecCap1, kArenaVecBytes1)) {
-            return CapFor(kArenaVecCap1, kArenaVecBytes1);
-        }
-        if (prevCap < CapFor(kArenaVecCap2, kArenaVecBytes2)) {
-            return CapFor(kArenaVecCap2, kArenaVecBytes2);
+        const int steps[3] = {
+            CapFor(kArenaVecCap0, kArenaVecBytes0),
+            CapFor(kArenaVecCap1, kArenaVecBytes1),
+            CapFor(kArenaVecCap2, kArenaVecBytes2),
+        };
+        for (int s : steps) {
+            if (prevCap < s) {
+                return s;
+            }
         }
         return prevCap * 2;
     }
@@ -1113,6 +973,11 @@ struct ArenaVec {
         return seg;
     }
 };
+
+template <typename T>
+inline int len(const ArenaVec<T>& v) {
+    return v.len;
+}
 
 struct PointF {
     float x = 0.0f;
@@ -1193,7 +1058,6 @@ struct LocalDate {
 };
 
 LocalDate DateToday();
-
 LocalDate DateAddDays(LocalDate base, int days);
 
 void StrFree(Str s);
@@ -1203,65 +1067,71 @@ Str StrDup(Arena*, Str str);
 Str StrDup(Str s);
 
 void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out);
-void StrFree2(Str s);
 
 GPUI_NOINLINE bool StrEqRest(Str s1, Str s2);
 inline bool StrEq(Str s1, Str s2) {
-    if (s1.len != s2.len) {
+    if (len(s1) != len(s2)) {
         return false;
     }
     return StrEqRest(s1, s2);
 }
-bool StrEq(Str s1, const char* s2);
+inline bool StrEq(Str s1, const char* s2) {
+    return StrEq(s1, Str(s2));
+}
 int StrCmp(Str s1, Str s2);
 GPUI_NOINLINE bool StrEqIRest(Str s1, Str s2);
 inline bool StrEqI(Str s1, Str s2) {
-    if (s1.len != s2.len) {
+    if (len(s1) != len(s2)) {
         return false;
     }
     return StrEqIRest(s1, s2);
 }
-bool StrEqI(Str s1, const char* s2);
-bool StrStartsWith(Str s, Str prefix);
-bool StrStartsWith(Str s, const char* prefix);
-bool StrStartsWithAny(Str s, const char* chars);
-inline bool StrStartsWithI(Str s, Str prefix) {
-    if (prefix.len > s.len) {
-        return false;
-    }
-    return StrEqI(Str(s.s, prefix.len), prefix);
+inline bool StrEqI(Str s1, const char* s2) {
+    return StrEqI(s1, Str(s2));
 }
-bool StrStartsWithI(Str s, const char* prefix);
+bool StrStartsWith(Str s, Str prefix);
+inline bool StrStartsWith(Str s, const char* prefix) {
+    return StrStartsWith(s, Str(prefix));
+}
+bool StrStartsWithAny(Str s, const char* chars);
+bool StrStartsWithI(Str s, Str prefix);
+inline bool StrStartsWithI(Str s, const char* prefix) {
+    return StrStartsWithI(s, Str(prefix));
+}
 bool StrEndsWith(Str s, Str suffix);
-bool StrEndsWith(Str s, const char* suffix);
+inline bool StrEndsWith(Str s, const char* suffix) {
+    return StrEndsWith(s, Str(suffix));
+}
 bool StrEndsWithI(Str s, Str suffix);
-bool StrEndsWithI(Str s, const char* suffix);
+inline bool StrEndsWithI(Str s, const char* suffix) {
+    return StrEndsWithI(s, Str(suffix));
+}
 int StrFind(Str s, Str sub);
-int StrFind(Str s, const char* sub);
+inline int StrFind(Str s, const char* sub) {
+    return StrFind(s, Str(sub));
+}
 int StrFindI(Str s, Str sub);
-int StrFindI(Str s, const char* sub);
-bool StrContains(Str s, Str sub);
-bool StrContainsI(Str s, Str sub);
-
+inline int StrFindI(Str s, const char* sub) {
+    return StrFindI(s, Str(sub));
+}
+inline bool StrContains(Str s, Str sub) {
+    return StrFind(s, sub) >= 0;
+}
+inline bool StrContainsI(Str s, Str sub) {
+    return StrFindI(s, sub) >= 0;
+}
 Str StrTrimAscii(Str s);
-
 Str StrReplaceAll(Str value, Str from, Str to);
 
 using SeqStrings = const char*;
 
 Str SeqStrFirst(SeqStrings strs);
-
 Str SeqStrNext(Str s);
-
 int SeqStrIndex(SeqStrings strs, Str toFind);
 int SeqStrIndexIS(SeqStrings strs, Str toFind);
-
 bool SeqStrContainsI(SeqStrings strs, Str toFind);
-
 Str SeqStrByIndex(SeqStrings strs, int idx);
-
 int SeqStrCount(SeqStrings strs);
-
 void StrLowerAscii(char* s);
 
 struct StrBuilder : Vec<char> {
@@ -2135,11 +2005,11 @@ constexpr AlignItems ResolveSelfRelative(AlignItems value,
                                          bool axisIsInline) {
     bool flip = axisIsInline && itemDirection != containerDirection;
     if (value.keyword == AlignItemsKeyword::SelfStart) {
-        value.keyword = flip ? AlignItemsKeyword::End
-                             : AlignItemsKeyword::Start;
+        value
+            .keyword = flip ? AlignItemsKeyword::End : AlignItemsKeyword::Start;
     } else if (value.keyword == AlignItemsKeyword::SelfEnd) {
-        value.keyword = flip ? AlignItemsKeyword::Start
-                             : AlignItemsKeyword::End;
+        value
+            .keyword = flip ? AlignItemsKeyword::Start : AlignItemsKeyword::End;
     }
     return value;
 }
@@ -2259,8 +2129,7 @@ struct SizeAvail {
         return {AvailableSpace::MinContent(), AvailableSpace::MinContent()};
     }
     static SizeAvail Definite(SizeF s) {
-        return {AvailableSpace::Definite(s.w),
-                AvailableSpace::Definite(s.h)};
+        return {AvailableSpace::Definite(s.w), AvailableSpace::Definite(s.h)};
     }
     static SizeAvail From(SizeFOpt s) {
         return {AvailableSpace::From(s.w), AvailableSpace::From(s.h)};
@@ -3162,13 +3031,11 @@ struct Layout {
     float ContentBoxY() const { return location.y + border.top + padding.top; }
 
     float ScrollWidth() const {
-        return F32Max(0.0f, contentSize.w +
-                                F32Min(scrollbarSize.w, size.w) -
+        return F32Max(0.0f, contentSize.w + F32Min(scrollbarSize.w, size.w) -
                                 size.w + border.left + border.right);
     }
     float ScrollHeight() const {
-        return F32Max(0.0f, contentSize.h +
-                                F32Min(scrollbarSize.h, size.h) -
+        return F32Max(0.0f, contentSize.h + F32Min(scrollbarSize.h, size.h) -
                                 size.h + border.top + border.bottom);
     }
 };
@@ -3302,7 +3169,7 @@ struct TaffyTree {
     NodeId ChildAtIndex(NodeId parent, int childIndex) const;
     int TotalNodeCount() const { return liveCount; }
 
-    int SlotCount() const { return slots.len; }
+    int SlotCount() const { return len(slots); }
 
     NodeId Parent(NodeId child, bool* hasParent) const;
 
@@ -3387,9 +3254,9 @@ struct ClipboardItem {
     Str externalPaths = {};
 
     bool HasImage() const { return imageBytes && imageBytesLen > 0; }
-    bool HasExternalPaths() const { return externalPaths.len > 0; }
+    bool HasExternalPaths() const { return len(externalPaths) > 0; }
     bool IsEmpty() const {
-        return text.len <= 0 && !HasImage() && !HasExternalPaths();
+        return len(text) <= 0 && !HasImage() && !HasExternalPaths();
     }
 };
 
@@ -3621,6 +3488,15 @@ enum class TouchPhase : uint8_t {
     Moved,
     Ended,
     Cancelled
+};
+
+enum class TouchHostKind : uint8_t {
+    None,
+    Pending,
+    LongPress,
+    Scroll,
+    BarDrag,
+    HandleDrag
 };
 
 struct OngoingScroll {
@@ -3950,6 +3826,7 @@ enum class ImageLoadState : uint8_t {
 
 struct PaintApp;
 struct RenderImage;
+struct ImageStore;
 
 enum class ImageSourceKind : uint8_t {
     Resource,
@@ -4377,8 +4254,13 @@ struct AnchoredPosition {
 AnchoredPosition AnchoredSideResolve(Bounds trigger, Size popup, Size view,
                                      float margin, int preferred, int align,
                                      float offset);
+AnchoredPosition AnchoredSideResolve(Bounds trigger, Size popup, Size view,
+                                     Edges margin, int preferred, int align,
+                                     float offset);
 AnchoredPosition AnchoredCornerResolve(Anchor anchor, Point at, Size popup,
                                        Size view, float margin);
+AnchoredPosition AnchoredCornerResolve(Anchor anchor, Point at, Size popup,
+                                       Size view, Edges margin);
 
 struct Style {
 
@@ -4850,6 +4732,8 @@ struct El {
     AccessibilityInfo accessibility = {};
 
     ImageSource imageSource;
+
+    EntityId imageCache = {};
     Func0 onClick;
 
     Listener listener;
@@ -4894,6 +4778,8 @@ struct El {
 
     SliderState* sliderBounds = nullptr;
     void (*customPaint)(PaintCtx* ctx, El* e, void* user) = nullptr;
+
+    void (*prePaint)(PaintCtx* ctx, El* e, void* user) = nullptr;
     void* customUser = nullptr;
     El* first = nullptr;
     El* last = nullptr;
@@ -4940,6 +4826,9 @@ struct El {
     float x = 0, y = 0, w = 0, h = 0;
 
     gpui::Bounds Bounds() const { return {x, y, w, h}; }
+
+    float paintDx = 0;
+    float paintDy = 0;
     float scrollY = 0;
 
     float scrollX = 0;
@@ -5070,6 +4959,7 @@ struct El {
     El* ObjectFitMode(gpui::ObjectFit fit);
     El* WithLoading(El* loading);
     El* WithFallback(El* fallback);
+    El* WithImageCache(EntityId cache);
     El* H(float v);
     El* SizeFull();
     El* MinH(float v);
@@ -5127,6 +5017,7 @@ struct El {
     El* ClipY();
     El* ScrollY(float off);
     El* ScrollX(float off);
+    El* PaintOffset(float dx, float dy);
     El* ClipX();
     El* ScrollMode(ScrollbarMode m);
     El* ScrollId(int v);
@@ -5291,7 +5182,7 @@ struct El {
 
 static_assert(sizeof(unsigned int) == 4,
               "El flags require a four-byte unsigned int");
-static_assert(sizeof(El) <= 1800,
+static_assert(sizeof(El) <= 1848,
               "keep El flags packed and members alignment-ordered");
 
 enum class BtnKind : uint8_t {
@@ -5700,6 +5591,15 @@ enum class EditIntent : uint8_t {
     Atomic
 };
 
+struct TokenDelta;
+
+struct AutoClosedPairRange {
+    int openStart = 0;
+    int openEnd = 0;
+    int closeStart = 0;
+    int closeEnd = 0;
+};
+
 struct Change {
     Selection oldRange = {};
     Str oldText = {};
@@ -5707,6 +5607,7 @@ struct Change {
     Str newText = {};
     Selection selBefore = {};
     Selection selAfter = {};
+    TokenDelta* tokenDelta = nullptr;
 };
 
 struct UndoTransaction {
@@ -5721,6 +5622,11 @@ struct UndoTransaction {
     int nSelsBefore = 0;
     CursorSelection* selsAfter = nullptr;
     int nSelsAfter = 0;
+
+    AutoClosedPairRange* pairsBefore = nullptr;
+    int nPairsBefore = 0;
+    AutoClosedPairRange* pairsAfter = nullptr;
+    int nPairsAfter = 0;
 };
 
 struct UndoManager {
@@ -5895,6 +5801,10 @@ inline int SearchMatcherIndex(const SearchMatcher* m) {
     return m->current;
 }
 
+inline int SearchMatcherCurrentIndex(const SearchMatcher* m) {
+    return m->ranges.len == 0 ? -1 : m->current;
+}
+
 Str SearchMatcherLabel(Arena* a, const SearchMatcher* m);
 
 void SearchMatcherSetIndex(SearchMatcher* m, int ix);
@@ -5958,6 +5868,7 @@ struct FoldIconBox {
 };
 
 struct SearchSession {
+
     bool open = false;
     bool replaceMode = false;
     bool caseInsensitive = true;
@@ -5967,11 +5878,17 @@ struct SearchSession {
     int anchorOffset = -1;
     SearchMatcher matcher;
 
+    bool active = false;
+
     ~SearchSession() {
         StrFree(query);
         StrFree(replacement);
     }
 };
+
+inline bool SearchSessionIsActive(const SearchSession* s) {
+    return s && s->active;
+}
 
 void SearchSessionSetQuery(SearchSession* s, Str query, bool insensitive);
 void SearchSessionSetReplacement(SearchSession* s, Str replacement);
@@ -6307,6 +6224,8 @@ struct InputState {
     double numberMax = 0;
 
     bool masked = false;
+
+    struct InlineTokenStore* tokens = nullptr;
     bool cleanOnEscape = false;
     bool submitOnEnter = false;
 
@@ -6315,6 +6234,8 @@ struct InputState {
 
     bool autoClose = true;
     bool smartIndent = true;
+
+    Vec<AutoClosedPairRange> autoClosed;
 
     bool searchable = false;
     bool replaceable = true;
@@ -6517,6 +6438,8 @@ int InputStartOfLine(const InputState* s, Window* win = nullptr);
 int InputEndOfLine(const InputState* s, Window* win = nullptr);
 int InputPreviousStartOfWord(const InputState* s);
 int InputNextEndOfWord(const InputState* s);
+int InputPreviousStartOfWordAt(const InputState* s, int offset);
+int InputNextEndOfWordAt(const InputState* s, int offset);
 
 void InputMoveTo(InputState* s, App* app, Window* win, int offset);
 void InputMoveToWithAffinity(InputState* s, App* app, Window* win, int offset,
@@ -6708,10 +6631,12 @@ void InputTypeChar(InputState* s, App* app, Window* win, uint32_t ch);
 
 void InputOpenSearch(InputState* s, App* app, Window* win, bool replaceMode);
 uint64_t InputSearchActivationRevision(const InputState* s);
+
 void InputCloseSearch(InputState* s, App* app, Window* win);
 
 bool InputIsReplaceable(const InputState* s);
 void InputSetSearchReplaceMode(InputState* s, App* app, Window* win, bool on);
+
 void InputSetSearchQuery(InputState* s, App* app, Window* win, Str query,
                          bool insensitive);
 
@@ -7059,6 +6984,8 @@ struct App {
     int nextSubId = 1;
     int exitCode = 0;
 
+    ImageStore* images = nullptr;
+
     App() = default;
 };
 
@@ -7079,6 +7006,8 @@ struct Window {
     EntityId root = {};
 
     Vec<EntityId> rendered;
+
+    Vec<EntityId> imageCacheStack;
 
     Vec<ScrollRect> prevScrolls;
 
@@ -7169,6 +7098,11 @@ struct Window {
     Listener scrollDragNotifyListener = {};
     ScrollEvent scrollDragNotifyEvent = {};
     bool longPressSelection = false;
+
+    TouchHostKind touchHost = TouchHostKind::None;
+    Point touchHostStart = {};
+    Point touchHostLast = {};
+    double touchHostStartAt = 0;
     InputState* input = nullptr;
 
     EntityId tooltip = {};
@@ -8926,6 +8860,8 @@ bool MotionReduced();
 
 void MotionSetReduced(bool on);
 
+void MotionResetReduceForTest();
+
 template <typename T>
 struct MotionState {
     T from = {};
@@ -9042,9 +8978,9 @@ struct Sequence {
     SequenceSample<T> Sample(Ctx* cx) const {
         SequenceSample<T> out;
         out.value = from;
-        if (!cx || steps.len == 0) return out;
+        if (!cx || len(steps) == 0) return out;
 
-        const int32_t last = steps.len - 1;
+        const int32_t last = len(steps) - 1;
         uint32_t stateKey = id.key ^ 0x9e3779b9u;
         auto* state = (SequenceState<T>*)MotionSlot(
             cx, stateKey, (int)sizeof(SequenceState<T>));
@@ -9710,6 +9646,8 @@ namespace gpui {
 struct ComponentStateFlags {
     bool selected = false;
     bool secondarySelected = false;
+
+    bool open = false;
     bool disabled = false;
     bool focusRing = true;
     bool collapsed = false;
@@ -10092,9 +10030,6 @@ struct DockState {
 
     bool toggleButtonVisible = true;
 
-    bool hasTilesScrollbarMode = false;
-    ScrollbarMode tilesScrollbarMode = ScrollbarMode::Always;
-
     bool hasVersion = false;
     int version = 0;
 
@@ -10141,7 +10076,7 @@ struct DockState {
     static void OnResizeEnd(DockState* self, Ctx* cx, const MouseUpEvent* ev);
 
     ~DockState() {
-        for (int i = 0; i < nodes.len; i++) {
+        for (int i = 0; i < len(nodes); i++) {
             VecReset(nodes[i].child);
             VecReset(nodes[i].size);
             VecReset(nodes[i].panel);
@@ -10348,7 +10283,6 @@ struct DockRenderer {
 
 using DockAreaRenderer = DockRenderer;
 using TabGroupRenderer = DockRenderer;
-using TilesRenderer = DockRenderer;
 
 struct DockArea {
     static El* New(Ctx* cx, Str id, Entity<DockState> state,
@@ -10366,20 +10300,9 @@ enum class RootKind : uint8_t {
     Any
 };
 
-struct TilePanel {
-    PanelId panel = {};
-    Bounds bounds = {};
-    int zIndex = 0;
-
-    static TilePanel New(PanelId panel, Bounds bounds);
-    TilePanel WithZIndex(int value) const;
-    TilePanel WithBounds(Bounds value) const;
-};
-
 enum class PaneKind : uint8_t {
     Split,
-    Tabs,
-    Tiles
+    Tabs
 };
 
 struct PaneNode;
@@ -10391,7 +10314,6 @@ struct PaneRef {
     const Vec<float>* sizes = nullptr;
     const Vec<uint8_t>* sizeKnown = nullptr;
     const Vec<PanelId>* panels = nullptr;
-    const Vec<TilePanel>* tiles = nullptr;
     int activeIx = 0;
 };
 
@@ -10405,11 +10327,9 @@ struct PaneNode {
     Vec<uint8_t> sizeKnown;
     Vec<PanelId> panels;
     int activeIx = 0;
-    Vec<TilePanel> tiles;
 
     static PaneNode* Split(NodeId id, Axis axis);
     static PaneNode* Tabs(NodeId id);
-    static PaneNode* Tiles(NodeId id);
     NodeId Id() const { return nodeId; }
     PaneRef Kind() const;
     void Walk(Func1<const PaneNode*> visit) const;
@@ -10419,8 +10339,7 @@ struct PaneNode {
 
 enum class InsertTargetKind : uint8_t {
     Tabs,
-    Split,
-    Tile
+    Split
 };
 
 struct InsertTarget {
@@ -10431,12 +10350,9 @@ struct InsertTarget {
     Placement placement = Placement::Right;
     bool hasSize = false;
     float size = 0;
-    Bounds bounds = {};
-
     static InsertTarget Tabs(NodeId node, int ix = -1, bool activate = true);
     static InsertTarget Split(NodeId node, Placement placement,
                               const float* size = nullptr);
-    static InsertTarget Tile(NodeId node, Bounds bounds);
 };
 
 struct EditResult {
@@ -10447,6 +10363,12 @@ struct EditResult {
 struct DockLayout;
 struct PanelSource;
 struct DockAreaState;
+struct PanelStateNode;
+
+struct PaneBuilder {
+    void* data = nullptr;
+    PanelId (*build)(void* data, const PanelStateNode* state) = nullptr;
+};
 
 struct PaneTree {
     PaneNode* root = nullptr;
@@ -10470,7 +10392,6 @@ struct PaneTree {
 
     NodeId SetRootSplit(Axis axis);
     NodeId SetRootTabs(const PanelId* panels, int count, int activeIx = 0);
-    NodeId SetRootTiles(const TilePanel* panels, int count);
     NodeId AddSplit(NodeId parent, Axis axis, const float* size = nullptr);
     NodeId AddTabs(NodeId parent, const PanelId* panels, int count,
                    const float* size = nullptr);
@@ -10483,12 +10404,13 @@ struct PaneTree {
     EditResult SetActive(NodeId node, int ix);
     EditResult SetSizes(NodeId node, const float* sizes, const uint8_t* known,
                         int count);
-    EditResult SetTileBounds(PanelId panel, Bounds bounds);
-    EditResult BringToFront(PanelId panel);
     void Normalize();
     bool IsNormalized() const;
 
     int ToState(const PanelSource& source, DockAreaState* out) const;
+
+    void FromState(const DockAreaState* st, int nodeIx,
+                   const PaneBuilder& builder);
 
     static PaneTree* FromLayout(DockLayout* layout, RootKind kind,
                                 Vec<DockPanelDef>* panels = nullptr);
@@ -10498,7 +10420,6 @@ struct PaneTree {
     bool DetachPanel(PanelId panel);
     bool InsertBeside(NodeId at, PanelId panel, Placement placement,
                       const float* size);
-    int MaxZIndex() const;
 };
 
 struct DockLayout {
@@ -10509,16 +10430,13 @@ struct DockLayout {
     Vec<uint8_t> sizeKnown;
     Vec<PanelId> panelIds;
     Vec<DockPanelDef> panelViews;
-    Vec<Bounds> tileBounds;
     int activeIx = 0;
 
     static DockLayout* HSplit();
     static DockLayout* VSplit();
     static DockLayout* Tabs();
-    static DockLayout* Tiles();
     DockLayout* Child(DockLayout* child, const float* size = nullptr);
     DockLayout* Panel(PanelId id, DockPanelDef view = {});
-    DockLayout* Tile(PanelId id, Bounds bounds, DockPanelDef view = {});
     DockLayout* ActiveIndex(int ix);
     ~DockLayout();
 };
@@ -10584,307 +10502,6 @@ struct JsonWriter {
 
 }
 
-#line 1 "src/base/undo_history.h"
-
-namespace gpui {
-template <typename T>
-struct UndoHistory {
-    Vec<Vec<T>*> undos;
-    Vec<Vec<T>*> redos;
-    double lastChangedAt = 0;
-    bool hasLastChangedAt = false;
-    int maxUndos = 1000;
-    double groupInterval = 0;
-    bool hasGroupInterval = false;
-    bool grouping = false;
-    bool ignoring = false;
-
-    UndoHistory() = default;
-    UndoHistory(const UndoHistory&) = delete;
-    UndoHistory& operator=(const UndoHistory&) = delete;
-    ~UndoHistory() { Clear(); }
-    UndoHistory& MaxUndos(int n) {
-        maxUndos = std::max(0, n);
-        EnforceMaxUndos();
-        return *this;
-    }
-    UndoHistory& GroupInterval(double seconds) {
-        groupInterval = std::max(0.0, seconds);
-        hasGroupInterval = true;
-        return *this;
-    }
-    UndoHistory& GroupIntervalMs(int64_t ms) {
-        return GroupInterval((double)ms / 1000);
-    }
-    void StartGrouping() { grouping = true; }
-    void EndGrouping() { grouping = false; }
-    bool IsIgnoring() const { return ignoring; }
-    void SetIgnoring(bool value) { ignoring = value; }
-    bool CanUndo() const { return undos.len > 0; }
-    bool CanRedo() const { return redos.len > 0; }
-    void Push(T item) {
-        if (ignoring || maxUndos == 0) return;
-        double now = TimeNow();
-        bool group = grouping || (hasLastChangedAt && hasGroupInterval &&
-                                  now - lastChangedAt <= groupInterval);
-        if (!group || !undos.len) {
-            VecAppend(undos, new Vec<T>());
-            EnforceMaxUndos();
-        }
-        VecAppend(*undos[undos.len - 1], item);
-        lastChangedAt = now;
-        hasLastChangedAt = true;
-        ClearStack(redos);
-    }
-    Vec<T> Undo() { return Move(undos, redos, true); }
-    Vec<T> Redo() {
-        if (maxUndos == 0) return Vec<T>();
-        Vec<T> result = Move(redos, undos, false);
-        EnforceMaxUndos();
-        return result;
-    }
-    void Clear() {
-        ClearStack(undos);
-        ClearStack(redos);
-        hasLastChangedAt = false;
-    }
-
-  private:
-    static void ClearStack(Vec<Vec<T>*>& stack) {
-        for (auto* transaction : stack) delete transaction;
-        VecClear(stack);
-    }
-    void EnforceMaxUndos() {
-        int excess = undos.len - maxUndos;
-        if (excess <= 0) return;
-        for (int i = 0; i < excess; i++) delete undos[i];
-        for (int i = excess; i < undos.len; i++) undos[i - excess] = undos[i];
-        undos.len -= excess;
-    }
-    Vec<T> Move(Vec<Vec<T>*>& from, Vec<Vec<T>*>& to, bool reverse) {
-        Vec<T> result;
-        if (!from.len) return result;
-        Vec<T>* transaction = from[from.len - 1];
-        from.len--;
-        for (int i = 0; i < transaction->len; i++) {
-            VecAppend(result,
-                      (*transaction)[reverse ? transaction->len - 1 - i : i]);
-        }
-        VecAppend(to, transaction);
-        hasLastChangedAt = false;
-        return result;
-    }
-};
-}
-
-#line 1 "src/base/tiles.h"
-
-namespace gpui {
-
-const float kTileMinW = 100.f;
-const float kTileMinH = 100.f;
-
-const float kTileDragBarH = 30.f;
-
-const float kTileHandleSize = 5.f;
-
-const float kTileGridSize = 8.f;
-
-const float kTileKeepVisible = 64.f;
-
-const Size MINIMUM_SIZE = {kTileMinW, kTileMinH};
-const float DRAG_BAR_HEIGHT = kTileDragBarH;
-const float HANDLE_SIZE = kTileHandleSize;
-
-extern const Str kTileMoveDrag;
-extern const Str kTileResizeDrag;
-
-enum class TileSide : uint8_t {
-    None,
-    Left,
-    Right,
-    Top,
-    Bottom,
-    BottomRight
-};
-
-using ResizeSide = TileSide;
-
-struct ResizeDrag {
-    ResizeSide side = ResizeSide::None;
-    Point startPosition = {};
-    Bounds lastBounds = {};
-
-    static ResizeDrag New(ResizeSide side, Point startPosition, Bounds bounds) {
-        return ResizeDrag{side, startPosition, bounds};
-    }
-    ResizeSide Side() const { return side; }
-    Point StartPosition() const { return startPosition; }
-    Bounds LastBounds() const { return lastBounds; }
-    ResizeDrag WithLastBounds(Bounds value) const {
-        ResizeDrag copy = *this;
-        copy.lastBounds = value;
-        return copy;
-    }
-};
-
-enum class TilesEvent : uint8_t {
-    BoundsChanged,
-    BringToFront,
-    ClosePanel,
-    DragDrop,
-    ZoomIn,
-    ZoomOut
-};
-
-struct TileItem {
-
-    int panel = 0;
-    Bounds bounds = {};
-    int zIndex = 0;
-};
-
-struct TileChange {
-    int tile = 0;
-    bool hasBounds = false;
-    Bounds oldBounds = {};
-    Bounds newBounds = {};
-    bool hasOrder = false;
-    int oldOrder = 0;
-    int newOrder = 0;
-};
-
-struct TilesState {
-    NodeId node = {};
-
-    Vec<TileItem> items;
-
-    int dragging = -1;
-
-    int pressed = -1;
-    Point dragInitialMouse = {};
-    Bounds dragInitialBounds = {};
-
-    int resizing = -1;
-    TileSide side = TileSide::None;
-    Point resizeInitialMouse = {};
-    Bounds resizeInitialBounds = {};
-
-    Bounds bounds = {};
-
-    float scrollX = 0;
-    float scrollY = 0;
-
-    ScrollbarMode scrollbarMode = ScrollbarMode::Always;
-
-    UndoHistory<TileChange> history;
-    TilesState() { history.GroupIntervalMs(100); }
-
-    int zoomedPanel = -1;
-
-    static void OnMoveDown(TilesState* self, Ctx* cx, const MouseDownEvent* ev,
-                           intptr_t ix);
-    static void OnResizeDown(TilesState* self, Ctx* cx,
-                             const MouseDownEvent* ev, intptr_t packed);
-    static void OnMoveDrag(TilesState* self, Ctx* cx, const DragMoveEvent* ev);
-    static void OnResizeDrag(TilesState* self, Ctx* cx,
-                             const DragMoveEvent* ev);
-    static void OnDragEnd(TilesState* self, Ctx* cx, const MouseUpEvent* ev);
-    static void OnScroll(TilesState* self, Ctx* cx, const ScrollEvent* ev);
-
-    static void OnTileDown(TilesState* self, Ctx* cx, const MouseDownEvent* ev,
-                           intptr_t ix);
-    static void OnTileUp(TilesState* self, Ctx* cx, const MouseUpEvent* ev,
-                         intptr_t ix);
-
-    ~TilesState() { VecReset(items); }
-};
-
-struct TileContext {
-    TilesState* state = nullptr;
-    NodeId node = {};
-    int ix = -1;
-
-    const TileItem* Item() const {
-        return state && ix >= 0 && ix < state->items.len ? &state->items[ix]
-                                                         : nullptr;
-    }
-    void BeginMove(Point pointer) const;
-    void MoveTo(Point pointer) const;
-    void EndMove() const;
-    void BeginResize(ResizeSide side, Point pointer) const;
-    void ResizeTo(Point pointer) const;
-    void EndResize() const;
-    void BringToFront() const;
-    void ToggleZoom() const;
-    void Close() const;
-};
-
-inline int TileResizePack(int ix, TileSide side) {
-    return ix * 8 + (int)side;
-}
-inline int TileResizeTile(int packed) {
-    return packed / 8;
-}
-inline TileSide TileResizeSide(int packed) {
-    return (TileSide)(packed % 8);
-}
-
-Size TilesContentSize(const TilesState* s);
-
-void TilesPaintOrder(const TilesState* s, int* out);
-
-int TilesAdd(TilesState* s, int panel, Bounds bounds);
-void TilesRemove(TilesState* s, int ix);
-
-int TilesIndexOfPanel(const TilesState* s, int panel);
-
-bool TileSnapEdge(float edge, const float* candidates, int n, float threshold,
-                  float* out);
-
-float TileRoundToGrid(float v, float grid);
-
-Bounds TileComputeResizedBounds(Bounds prev, const float* newX,
-                                const float* newY, const float* newW,
-                                const float* newH, const Bounds* others,
-                                int nOthers, float grid);
-
-void TilesMagneticSnap(const TilesState* s, Bounds dragging, int itemIx,
-                       float threshold, bool* hasX, float* snapX, bool* hasY,
-                       float* snapY);
-
-Point TilesConstrainOrigin(const TilesState* s, Point origin);
-
-void TilesBeginMove(TilesState* s, int ix, float x, float y);
-void TilesBeginResize(TilesState* s, int ix, TileSide side, float x, float y);
-
-void TilesUpdatePosition(TilesState* s, float x, float y);
-
-void TilesUpdateResize(TilesState* s, float x, float y);
-
-void TilesMouseUp(TilesState* s);
-
-int TilesBringToFront(TilesState* s, int ix);
-
-bool TilesCanUndo(const TilesState* s);
-bool TilesCanRedo(const TilesState* s);
-void TilesUndo(TilesState* s);
-void TilesRedo(TilesState* s);
-
-bool snap_edge(float edge, const float* candidates, int count, float threshold,
-               float* out);
-Bounds compute_resized_bounds(Bounds previous, const float* newX,
-                              const float* newY, const float* newW,
-                              const float* newH, const Bounds* others,
-                              int count, float gridSize);
-float round_to_grid(float value, float gridSize);
-Point magnetic_snap(Bounds moving, const Bounds* others, int count,
-                    float threshold);
-Point apply_boundary_constraints(Point origin, float draggingWidth);
-Size content_size(const Bounds* tiles, int count);
-
-}
-
 #line 1 "src/base/dock_state.h"
 
 namespace gpui {
@@ -10892,16 +10509,10 @@ namespace gpui {
 enum class PanelInfoKind : uint8_t {
     Panel,
     Stack,
-    Tabs,
-    Tiles
+    Tabs
 };
 
 using PanelInfo = PanelInfoKind;
-
-struct TileMeta {
-    Bounds bounds = {10, 10, 200, 200};
-    int zIndex = 0;
-};
 
 struct PanelStateNode {
     Str panelName = {};
@@ -10913,8 +10524,6 @@ struct PanelStateNode {
     Axis axis = Axis::Horizontal;
 
     int activeIndex = 0;
-
-    Vec<TileMeta> metas;
 
     Str info = {};
     bool infoIsJson = false;
@@ -10959,10 +10568,9 @@ struct DockAreaState {
     void Clear();
 
     ~DockAreaState() {
-        for (int i = 0; i < nodes.len; i++) {
+        for (int i = 0; i < len(nodes); i++) {
             VecReset(nodes[i].children);
             VecReset(nodes[i].sizes);
-            VecReset(nodes[i].metas);
         }
         VecReset(nodes);
     }
@@ -10982,11 +10590,6 @@ bool DockLoad(DockState* s, const DockAreaState* st, Arena* a,
               El* (*invalidRender)(Ctx* cx, void* data) = nullptr,
               App* app = nullptr, Window* win = nullptr,
               Entity<DockState> dockArea = {});
-
-int TilesToMetas(const TilesState* s, TileMeta* out, int* outPanels, int cap);
-
-void TilesFromMetas(TilesState* s, const TileMeta* metas, const int* panels,
-                    int n);
 
 }
 
@@ -11137,32 +10740,32 @@ struct History {
         EnforceMaxEntries();
     }
     const T* Current() const {
-        return entries.len ? &entries[entries.len - 1] : nullptr;
+        return len(entries) ? &entries[len(entries) - 1] : nullptr;
     }
     void ReplaceCurrent(T entry) {
-        if (entries.len)
-            entries[entries.len - 1] = entry;
+        if (len(entries))
+            entries[len(entries) - 1] = entry;
         else
             Push(entry);
     }
     bool RemoveCurrent(T* out = nullptr) {
-        if (!entries.len) return false;
-        if (out) *out = entries[entries.len - 1];
+        if (!len(entries)) return false;
+        if (out) *out = entries[len(entries) - 1];
         entries.len--;
         return true;
     }
-    bool CanBack() const { return entries.len > 1; }
-    bool CanForward() const { return forwardEntries.len > 0; }
+    bool CanBack() const { return len(entries) > 1; }
+    bool CanForward() const { return len(forwardEntries) > 0; }
     bool Back(T* out = nullptr) {
         if (!CanBack()) return false;
-        VecAppend(forwardEntries, entries[entries.len - 1]);
+        VecAppend(forwardEntries, entries[len(entries) - 1]);
         entries.len--;
         if (out) *out = *Current();
         return true;
     }
     bool Forward(T* out = nullptr) {
         if (maxEntries == 0 || !CanForward()) return false;
-        VecAppend(entries, forwardEntries[forwardEntries.len - 1]);
+        VecAppend(entries, forwardEntries[len(forwardEntries) - 1]);
         forwardEntries.len--;
         EnforceMaxEntries();
         if (out) *out = *Current();
@@ -11170,7 +10773,7 @@ struct History {
     }
     const Vec<T>& Entries() const { return entries; }
     HistoryForwardEntries<T> ForwardEntries() const {
-        return {forwardEntries.els, forwardEntries.len};
+        return {forwardEntries.els, len(forwardEntries)};
     }
     void Retain(bool (*keep)(const T&, void*), void* user = nullptr) {
         RetainIf(entries, keep, user);
@@ -11183,9 +10786,9 @@ struct History {
 
   private:
     void EnforceMaxEntries() {
-        int excess = entries.len - maxEntries;
+        int excess = len(entries) - maxEntries;
         if (excess <= 0) return;
-        for (int i = excess; i < entries.len; i++)
+        for (int i = excess; i < len(entries); i++)
             entries[i - excess] = entries[i];
         entries.len -= excess;
     }
@@ -11196,6 +10799,99 @@ struct History {
         for (const T& value : values)
             if (keep(value, user)) values[n++] = value;
         values.len = n;
+    }
+};
+}
+
+#line 1 "src/base/undo_history.h"
+
+namespace gpui {
+template <typename T>
+struct UndoHistory {
+    Vec<Vec<T>*> undos;
+    Vec<Vec<T>*> redos;
+    double lastChangedAt = 0;
+    bool hasLastChangedAt = false;
+    int maxUndos = 1000;
+    double groupInterval = 0;
+    bool hasGroupInterval = false;
+    bool grouping = false;
+    bool ignoring = false;
+
+    UndoHistory() = default;
+    UndoHistory(const UndoHistory&) = delete;
+    UndoHistory& operator=(const UndoHistory&) = delete;
+    ~UndoHistory() { Clear(); }
+    UndoHistory& MaxUndos(int n) {
+        maxUndos = std::max(0, n);
+        EnforceMaxUndos();
+        return *this;
+    }
+    UndoHistory& GroupInterval(double seconds) {
+        groupInterval = std::max(0.0, seconds);
+        hasGroupInterval = true;
+        return *this;
+    }
+    UndoHistory& GroupIntervalMs(int64_t ms) {
+        return GroupInterval((double)ms / 1000);
+    }
+    void StartGrouping() { grouping = true; }
+    void EndGrouping() { grouping = false; }
+    bool IsIgnoring() const { return ignoring; }
+    void SetIgnoring(bool value) { ignoring = value; }
+    bool CanUndo() const { return len(undos) > 0; }
+    bool CanRedo() const { return len(redos) > 0; }
+    void Push(T item) {
+        if (ignoring || maxUndos == 0) return;
+        double now = TimeNow();
+        bool group = grouping || (hasLastChangedAt && hasGroupInterval &&
+                                  now - lastChangedAt <= groupInterval);
+        if (!group || !len(undos)) {
+            VecAppend(undos, new Vec<T>());
+            EnforceMaxUndos();
+        }
+        VecAppend(*undos[len(undos) - 1], item);
+        lastChangedAt = now;
+        hasLastChangedAt = true;
+        ClearStack(redos);
+    }
+    Vec<T> Undo() { return Move(undos, redos, true); }
+    Vec<T> Redo() {
+        if (maxUndos == 0) return Vec<T>();
+        Vec<T> result = Move(redos, undos, false);
+        EnforceMaxUndos();
+        return result;
+    }
+    void Clear() {
+        ClearStack(undos);
+        ClearStack(redos);
+        hasLastChangedAt = false;
+    }
+
+  private:
+    static void ClearStack(Vec<Vec<T>*>& stack) {
+        for (auto* transaction : stack) delete transaction;
+        VecClear(stack);
+    }
+    void EnforceMaxUndos() {
+        int excess = len(undos) - maxUndos;
+        if (excess <= 0) return;
+        for (int i = 0; i < excess; i++) delete undos[i];
+        for (int i = excess; i < len(undos); i++) undos[i - excess] = undos[i];
+        undos.len -= excess;
+    }
+    Vec<T> Move(Vec<Vec<T>*>& from, Vec<Vec<T>*>& to, bool reverse) {
+        Vec<T> result;
+        if (!len(from)) return result;
+        Vec<T>* transaction = from[len(from) - 1];
+        from.len--;
+        for (int i = 0; i < transaction->len; i++) {
+            VecAppend(result,
+                      (*transaction)[reverse ? transaction->len - 1 - i : i]);
+        }
+        VecAppend(to, transaction);
+        hasLastChangedAt = false;
+        return result;
     }
 };
 }
@@ -11428,7 +11124,7 @@ struct NativeMenu {
     NativeMenu& Menu(Str label, InputAction action);
     NativeMenu& MenuWithDisabled(Str label, bool disabled, InputAction action);
     NativeMenu& Separator();
-    bool IsEmpty() const { return items.len == 0; }
+    bool IsEmpty() const { return len(items) == 0; }
 };
 
 void InputDefaultNativeMenu(const InputState* state, NativeMenu* out);
@@ -11551,8 +11247,8 @@ struct DiagnosticSet {
     void Reset(Str value);
     void Push(const Diagnostic& diagnostic);
     void Extend(const Diagnostic* values, int n);
-    int Len() const { return diagnostics.len; }
-    bool IsEmpty() const { return diagnostics.len == 0; }
+    int Len() const { return len(diagnostics); }
+    bool IsEmpty() const { return len(diagnostics) == 0; }
     void Clear();
     DiagnosticSummary Summary() const;
     int Range(Selection range, const DiagnosticEntry** out, int cap) const;
@@ -11606,7 +11302,7 @@ struct DisplayMap {
     BufferPoint ClipBufferPoint(BufferPoint point) const;
     DisplayPoint BufferPosToDisplayPos(BufferPoint point) const;
     BufferPoint DisplayPosToBufferPos(DisplayPoint point) const;
-    int DisplayRowCount() const { return rows.len; }
+    int DisplayRowCount() const { return len(rows); }
     int WrapRowCount() const;
     int BufferLineCount() const;
     int DisplayRowToBufferLine(int row) const;
@@ -11664,10 +11360,17 @@ struct AutoClosingPair {
 };
 
 struct IndentationRules {
+
+    Str increasePattern = {};
+    Str decreasePattern = {};
     void* data = nullptr;
     bool (*increaseIndent)(void* data, Str text) = nullptr;
     bool (*decreaseIndent)(void* data, Str text) = nullptr;
+
+    static IndentationRules FromPatterns(Str increase, Str decrease);
 };
+
+bool IndentPatternMatch(Str pattern, Str text);
 
 struct LanguageConfig {
     const BracketPair* brackets = nullptr;
@@ -11849,6 +11552,136 @@ struct Lsp {
                                const HighlightStyleResolver& resolver,
                                TextSpan* out, int cap) const;
 };
+
+}
+
+#line 1 "src/base/input_tokens.h"
+
+namespace gpui {
+
+enum class InlineTokenError : uint8_t {
+    Ok = 0,
+    InvalidRange,
+    InvalidBoundary,
+    InvalidToken,
+    OverlappingTokens,
+    TextMismatch,
+    UnsupportedMode,
+    ValidationRejected,
+    CompositionActive
+};
+
+const char* InlineTokenErrorMessage(InlineTokenError e);
+
+struct InlineToken {
+    Str id = {};
+    Str text = {};
+    Str label = {};
+
+    static InlineToken New(Str id, Str text);
+    InlineToken WithLabel(Str label) const;
+    InlineTokenError Validate() const;
+};
+
+struct InlineTokenSpan {
+    int start = 0;
+    int end = 0;
+    InlineToken token = {};
+};
+
+InlineToken InlineTokenDup(InlineToken t);
+void InlineTokenFree(InlineToken* t);
+InlineTokenSpan InlineTokenSpanDup(InlineTokenSpan s);
+void InlineTokenSpanFree(InlineTokenSpan* s);
+bool InlineTokenEq(InlineToken a, InlineToken b);
+
+struct TokenDelta {
+    Vec<InlineTokenSpan> removed;
+    Vec<InlineTokenSpan> inserted;
+};
+
+void TokenDeltaFree(TokenDelta* d);
+TokenDelta* TokenDeltaDup(const TokenDelta* d);
+
+void InlineTokenSpansClear(Vec<InlineTokenSpan>* spans);
+
+TokenDelta* TokenStoreReplace(Vec<InlineTokenSpan>* spans, int start, int end,
+                              int newLen, const InlineTokenSpan* inserted,
+                              int nInserted);
+
+int TokenBoundary(const Vec<InlineTokenSpan>& spans, int offset, Bias bias);
+void NormalizeTokenRange(const Vec<InlineTokenSpan>& spans, int* start,
+                         int* end);
+
+struct InputContent {
+    Str text = {};
+    Vec<InlineTokenSpan> tokens;
+
+    static InputContent New(Str text);
+
+    InlineTokenError WithToken(int start, int end, InlineToken token);
+};
+
+InputContent InputContentDup(const InputContent& content);
+void InputContentFree(InputContent* content);
+InputContent InputGetContent(const InputState* s);
+
+struct InlineTokenContext {
+    InlineTokenSpan span = {};
+    bool selected = false;
+    bool disabled = false;
+    bool readonly = false;
+    float lineHeight = 0;
+    float availableWidth = 0;
+
+    const InlineToken& Token() const { return span.token; }
+};
+
+struct InlineTokenClickEvent {
+    InlineTokenSpan span = {};
+    Bounds bounds = {};
+    ClickEvent click = {};
+
+    const InlineToken& Token() const { return span.token; }
+};
+
+typedef El* (*InlineTokenRenderer)(Ctx* cx, const InlineTokenContext* ctx,
+                                   void* user);
+typedef void (*InlineTokenClickListener)(const InlineTokenClickEvent* ev,
+                                         Ctx* cx, void* user);
+
+struct InlineTokenStore {
+    Vec<InlineTokenSpan> spans;
+    InlineToken pending = {};
+    bool hasPending = false;
+    InlineTokenRenderer renderer = nullptr;
+    void* rendererUser = nullptr;
+    InlineTokenClickListener click = nullptr;
+    void* clickUser = nullptr;
+    bool secret = false;
+    bool replaying = false;
+    bool validatedEdit = false;
+};
+
+void InlineTokenStoreFree(InlineTokenStore* store);
+InlineTokenStore* InputTokenStore(InputState* s, bool create);
+const InlineTokenStore* InputTokenStore(const InputState* s);
+bool InputTokensVisible(const InputState* s);
+const Vec<InlineTokenSpan>* InputTokens(const InputState* s);
+int InputTokenBoundary(const InputState* s, int offset, Bias bias);
+void InputNormalizeTokenRange(const InputState* s, int* start, int* end);
+void InputSetTokenPresentation(InputState* s, InlineTokenRenderer renderer,
+                               void* rendererUser,
+                               InlineTokenClickListener click, void* clickUser,
+                               bool secret);
+void InputSetValue(InputState* s, const InputContent& content);
+InlineTokenError InputReplaceRangeWithToken(InputState* s, App* app,
+                                            Window* win, int start, int end,
+                                            InlineToken token);
+InlineTokenError InputReplaceWithToken(InputState* s, App* app, Window* win,
+                                       InlineToken token);
+int InputPreviousStartOfWordAt(const InputState* s, int offset);
+int InputNextEndOfWordAt(const InputState* s, int offset);
 
 }
 
@@ -12165,7 +11998,8 @@ struct NavStackState {
 
     EntityId ViewAt(int index) const {
         const Vec<NavEntry>& undos = history.Entries();
-        return index >= 0 && index < undos.len ? undos[index].view : EntityId{};
+        return index >= 0 && index < len(undos) ? undos[index].view
+                                                : EntityId{};
     }
 
     int ForwardCount() const { return history.ForwardEntries().len; }
@@ -12545,6 +12379,11 @@ ResolvedPosition PositionSide(Bounds trigger, Size popup, Size view,
 
 ResolvedPosition PositionCorner(Anchor anchor, Point at, Size popup, Size view,
                                 float margin);
+ResolvedPosition PositionCorner(Anchor anchor, Point at, Size popup, Size view,
+                                Edges margin);
+
+Edges PositionerFrameInsets(bool clientDecorated, Tiling tiling,
+                            float clientInset);
 
 }
 
@@ -13314,7 +13153,7 @@ struct TextSelectionProjection {
     Vec<TextSelectionRange> ranges;
     bool active = false;
 
-    int Len() const { return ranges.len; }
+    int Len() const { return len(ranges); }
     const TextSelectionRange* Ranges() const { return ranges.els; }
     bool IsActive() const { return active; }
     void Reset() { VecReset(ranges); }
@@ -13429,7 +13268,19 @@ struct WindowSelection {
     Vec<EntityId> participants;
 
     SelectionFormat format = SelectionFormat::Plain;
+
+    bool touchMenuOpen = false;
+    TouchEdgeDrag touchEdgeDrag = {};
+    bool hasTouchEdgeDrag = false;
+    Bounds touchUi = {};
+    bool hasTouchUi = false;
+    bool touchUiThisFrame = false;
 };
+
+bool WindowSelectionTouchSnapshot(Window* win, TouchSelectionSnapshot* out);
+void WindowSelectionCloseEditMenu(Window* win);
+void WindowSelectionRegisterTouchUi(Window* win, Bounds bounds);
+bool WindowSelectionTouchUiContains(const Window* win, Point at);
 
 WindowSelection* WindowSelectionOf(Window* win);
 void WindowSelectionFree(Window* win);
@@ -13454,6 +13305,8 @@ int WindowSelectionTextForEntity(Window* win, EntityId owner, char* out,
                                  int cap, SelectionFormat fmt);
 bool WindowSelectionHasEntity(const Window* win, EntityId owner);
 void WindowSelectionSelectAll(Window* win, EntityId owner);
+
+void WindowSelectionSelectAllTouched(Window* win);
 
 void WindowSelectionSetFormat(Window* win, SelectionFormat fmt);
 SelectionFormat WindowSelectionFormat(Window* win);
@@ -14258,8 +14111,8 @@ inline ReferenceKind NodeRefKind(const Node* n) {
 }
 
 inline void NodeSetRefKind(Node* n, ReferenceKind k) {
-    n->flags = (uint8_t)((n->flags & ~NodeRefKindMask) |
-                         (((uint8_t)k & 3) << 6));
+    n->flags =
+        (uint8_t)((n->flags & ~NodeRefKindMask) | (((uint8_t)k & 3) << 6));
 }
 
 Node* NodeNew(Arena* a, NodeKind kind);
@@ -15197,15 +15050,15 @@ struct ToastManager {
         return out;
     }
 
-    int Len() const { return entries.len; }
-    bool IsEmpty() const { return entries.len == 0; }
+    int Len() const { return len(entries); }
+    bool IsEmpty() const { return len(entries) == 0; }
 
     const ManagedToast<I, T>* At(int index) const {
-        return index >= 0 && index < entries.len ? &entries[index] : nullptr;
+        return index >= 0 && index < len(entries) ? &entries[index] : nullptr;
     }
 
     const T* Get(const I& id) const {
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             if (entries[i].id == id) {
                 return &entries[i].value;
             }
@@ -15215,7 +15068,7 @@ struct ToastManager {
 
     int Visible(int limit, ToastVisible<I, T>* out, int cap) const {
         int active = 0;
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             if (entries[i].status != ToastTransitionStatus::Ending) {
                 active++;
             }
@@ -15223,7 +15076,7 @@ struct ToastManager {
         int first = active > limit ? active - limit : 0;
         int activeIndex = 0;
         int count = 0;
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             const ManagedToast<I, T>& entry = entries[i];
             bool ending = entry.status == ToastTransitionStatus::Ending;
             bool visible = ending || activeIndex >= first;
@@ -15246,7 +15099,7 @@ struct ToastManager {
         if (hadReplaced) {
             *hadReplaced = false;
         }
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             if (!(entries[i].id == id)) {
                 continue;
             }
@@ -15269,7 +15122,7 @@ struct ToastManager {
     }
 
     bool Dismiss(const I& id, int64_t nowMs) {
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             ManagedToast<I, T>& entry = entries[i];
             if (!(entry.id == id) ||
                 entry.status == ToastTransitionStatus::Ending) {
@@ -15285,7 +15138,7 @@ struct ToastManager {
 
     Vec<I> DismissAll(int64_t nowMs) {
         Vec<I> changed;
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             ManagedToast<I, T>& entry = entries[i];
             if (entry.status == ToastTransitionStatus::Ending) {
                 continue;
@@ -15300,7 +15153,7 @@ struct ToastManager {
 
     ToastAdvance<I, T> Advance(int64_t nowMs, bool paused) {
         ToastAdvance<I, T> out;
-        for (int i = 0; i < entries.len; i++) {
+        for (int i = 0; i < len(entries); i++) {
             ManagedToast<I, T>& entry = entries[i];
             int64_t elapsed = nowMs - entry.lastAdvanceMs;
             int delta = elapsed > 0x7fffffffLL ? 0x7fffffff
@@ -15335,7 +15188,7 @@ struct ToastManager {
             }
         }
         int index = 0;
-        while (index < entries.len) {
+        while (index < len(entries)) {
             ManagedToast<I, T>& entry = entries[index];
             if (entry.status != ToastTransitionStatus::Ending ||
                 entry.transitionElapsedMs < exitDurationMs) {
@@ -15355,12 +15208,12 @@ struct ToastManager {
 
   private:
     void EraseAt(int index) {
-        for (int i = index; i < entries.len - 1; i++) {
+        for (int i = index; i < len(entries) - 1; i++) {
             entries[i] = entries[i + 1];
         }
         entries.len--;
         if (entries.els) {
-            entries.els[entries.len] = {};
+            entries.els[len(entries)] = {};
         }
     }
 };
@@ -15675,9 +15528,10 @@ using VirtualRangeFn = void (*)(void* user, Ctx* cx, int first, int end,
 struct VirtualListOpts {
     int count = 0;
     float rowH = 32;
-    float viewH = 192;
 
-    float viewW = 192;
+    float viewH = 0;
+
+    float viewW = 0;
     const float* sizes = nullptr;
 
     float scrollY = 0;
@@ -15694,6 +15548,12 @@ struct VirtualListOpts {
     float gap = 0;
 
     float pad = 0;
+
+    float overdraw = 0;
+
+    bool logicalScroll = false;
+    int topItem = 0;
+    float topInto = 0;
     VirtualRowFn row = nullptr;
     VirtualRangeFn range = nullptr;
     void* user = nullptr;
@@ -15705,6 +15565,12 @@ struct VirtualList {
 
     static El* New(Ctx* cx, Str id, const VirtualListOpts& o);
 };
+
+float VirtualListPixelFromLogical(const float* sizes, int count, int item,
+                                  float into);
+
+void VirtualListLogicalFromPixel(const float* sizes, int count, float rowH,
+                                 float pixel, int* item, float* into);
 
 El* virtual_list(Ctx* cx, Str id, Axis axis, const VirtualListOpts& opts);
 El* v_virtual_list(Ctx* cx, Str id, const VirtualListOpts& opts);
@@ -15805,8 +15671,8 @@ struct TreeState {
     static void OnScroll(TreeState* self, Ctx* cx, const ScrollEvent* ev);
 
     ~TreeState() {
-        for (int i = 0; i < items.len; i++) {
-            StrFree2(items[i].id);
+        for (int i = 0; i < len(items); i++) {
+            StrFree(items[i].id);
         }
         VecReset(items);
         VecReset(entries);
@@ -15872,6 +15738,8 @@ constexpr bool IsMobile() {
 
 void ApplySystemReduceMotion();
 
+void ApplyReduceMotionPreference(bool reduce);
+
 void BaseInit(App* app);
 
 }
@@ -15926,6 +15794,7 @@ struct SheetSettings {
 namespace gpui {
 
 struct App;
+struct ThemeConfig;
 
 enum class ThemeMode : uint8_t {
     Light,
@@ -16215,6 +16084,7 @@ struct Theme {
 
     float radiusFull;
     ThemeMode mode = ThemeMode::Light;
+
     Str fontFamily = Str(".SystemUIFont");
     float fontSize = 16.f;
 #if GPUI_OS_MAC
@@ -16281,6 +16151,32 @@ bool ThemeFocusRing(const App* app);
 void ThemeSetFocusRing(App* app, bool on);
 const Theme& ThemeNow(const App* app);
 void ThemeSet(App* app, ThemeMode mode);
+
+struct ThemeUpdateScope {
+    App* app = nullptr;
+    ThemeMode modeBefore = ThemeMode::Light;
+    bool reloadMode = false;
+    Theme colorsBefore = {};
+    ThemeTokens tokensBefore = {};
+    Str activeBefore[2] = {};
+};
+Theme* ThemeBeginUpdate(App* app, bool reloadMode, ThemeUpdateScope* scope);
+void ThemeEndUpdate(ThemeUpdateScope* scope);
+template <typename F>
+void ThemeUpdate(App* app, F edit) {
+    ThemeUpdateScope scope;
+    Theme* t = ThemeBeginUpdate(app, false, &scope);
+    edit(t);
+    ThemeEndUpdate(&scope);
+}
+
+void ThemeSetColors(Theme* t, const Theme& colors);
+
+bool ThemeApplyConfig(App* app, Theme* t, const ThemeConfig* cfg);
+bool ThemeTokensEq(const ThemeTokens& a, const ThemeTokens& b);
+
+Str ThemeSubstituteSystemFont(Str requested, Str resolved, const Str* installed,
+                              int n);
 ThemeMode ThemeGet(const App* app);
 
 ScrollbarMode ScrollbarModeNow(const App* app);
@@ -16502,7 +16398,7 @@ struct ThemeRegistry {
     ~ThemeRegistry();
     static ThemeRegistry* Global(App* app);
     static const ThemeRegistry* Global(const App* app);
-    int Count() const { return themes.len; }
+    int Count() const { return len(themes); }
 };
 
 void ThemeRegistryInit(App* app);
@@ -17835,6 +17731,8 @@ struct Button {
     bool compact = false;
     bool justifyStart = false;
     bool selected = false;
+
+    bool open = false;
     bool dropdown = false;
 
     bool hoverGroup = false;
@@ -17894,6 +17792,9 @@ struct Button {
 
     Button* JustifyStart(bool v = true);
     Button* Selected(bool v);
+
+    Button* Open(bool v);
+    bool ShowsSelectedStyle() const;
     Button* SelectedStyle(const StateStyle& s);
     Button* DisabledStyle(const StateStyle& s);
     Button* DropdownCaret(bool v = true);
@@ -18120,12 +18021,64 @@ struct CarouselEvent {
     int index = 0;
 };
 
+struct CarouselPointerGesture {
+    Point startPosition = {};
+    Point startOffset = {};
+    int startIndex = -1;
+    float totalDelta = 0;
+    bool axisLocked = false;
+    bool active = false;
+};
+
+struct CarouselScrollGesture {
+    Point startOffset = {};
+    int startIndex = -1;
+    float totalDelta = 0;
+    bool active = false;
+};
+
+struct CarouselLoopLayout {
+    float cycleExtent = 0;
+    float trackGap = 0;
+    float runwayExtent = 0;
+    bool runwayReady = false;
+    bool active = false;
+};
+
 struct CarouselState {
     Entity<CarouselState> self = {};
     int itemCount = 0;
     int selectedIndex = -1;
     Axis axis = Axis::Horizontal;
     bool looping = false;
+    Point offset = {};
+    Point maxOffset = {};
+    Bounds viewport = {};
+    Bounds frame = {};
+    Vec<Bounds> items;
+    bool hasViewport = false;
+    bool hasFrame = false;
+    CarouselPointerGesture pointerGesture = {};
+    CarouselScrollGesture scrollGesture = {};
+    bool ignoreScrollUntilQuiet = false;
+    int scrollSettleEpoch = 0;
+    bool suppressPointerClick = false;
+    int motionRevision = 0;
+    int geometryRevision = 0;
+    CarouselLoopLayout loopLayout = {};
+    bool geometryHasRunway = false;
+    bool loopLayoutRemovalPending = false;
+    Point loopMotionTarget = {};
+    bool hasLoopMotionTarget = false;
+    bool wheelBurstActive = false;
+    int wheelBurstEpoch = 0;
+    FocusHandle focus = {};
+    bool focusRingSuppressed = false;
+    OngoingScroll wheelLock = {};
+    Vec<Bounds> pendingItems;
+    Bounds pendingViewport = {};
+    Bounds pendingFrame = {};
+    bool pendingHasRunway = false;
 
     static CarouselState New(int itemCount);
     CarouselState& WithSelectedIndex(int index);
@@ -18146,6 +18099,38 @@ struct CarouselState {
     bool SelectNext(Ctx* cx);
     bool SelectFirst(Ctx* cx);
     bool SelectLast(Ctx* cx);
+    FocusHandle Focus(Ctx* cx);
+    void SuppressFocusRing(bool suppressed);
+    bool IsFocusRingSuppressed() const { return focusRingSuppressed; }
+    bool IsInteracting() const;
+    bool HasScrollGesture() const { return scrollGesture.active; }
+    bool IsPointerDragLocked() const;
+    bool ShouldSuppressPointerClick() const { return suppressPointerClick; }
+    int MotionRevision() const { return motionRevision; }
+    Size FrameSize() const;
+    void SetGeometry(Bounds viewport, Bounds frame, const Bounds* itemBounds,
+                     int n, bool hasRunway);
+    void SetGeometry(Bounds viewport, const Bounds* itemBounds, int n);
+    float LoopRunway() const;
+    bool IsLoopLayoutTransitioning() const;
+    Point LoopItemOffset(int index) const;
+    Point MotionTargetFor(int index) const;
+    bool HasMotionTargetFor(int index) const;
+    bool SettleLoopMotion(Point rendered, Point* out, Ctx* cx);
+    bool HasSnapTarget(int index) const;
+    Point SnapTargetFor(int index) const;
+    int NearestIndex(Point offset) const;
+    bool NormalizeLoopCoordinate();
+    bool BeginDrag(Point position, Ctx* cx);
+    bool UpdateDrag(Point position, Ctx* cx);
+    bool FinishDrag(Ctx* cx);
+    bool HandleScrollDelta(Axis axis, float delta, TouchPhase phase, Ctx* cx);
+    bool FinishScroll(bool cancelled, Ctx* cx);
+    void DeferScrollToAncestor(Ctx* cx);
+    bool HandleWheelStep(Axis axis, float delta, Ctx* cx);
+    Point Offset() const { return offset; }
+    void SetOffset(Point value) { offset = value; }
+    void IngestPendingGeometry(Ctx* cx);
 
     static void OnAction(CarouselState* self, Ctx* cx,
                          const ActionEvent* event);
@@ -18154,6 +18139,22 @@ struct CarouselState {
     static void OnNext(CarouselState* self, Ctx* cx, const ClickEvent* event);
     static void OnSelect(CarouselState* self, Ctx* cx, const ClickEvent* event,
                          intptr_t index);
+    static void OnPointerDown(CarouselState* self, Ctx* cx,
+                              const MouseDownEvent* event);
+    static void OnPointerMove(CarouselState* self, Ctx* cx,
+                              const DragMoveEvent* event);
+    static void OnPointerUp(CarouselState* self, Ctx* cx,
+                            const MouseUpEvent* event);
+    static void OnWheel(CarouselState* self, Ctx* cx,
+                        const ScrollWheelEvent* event);
+    static void OnScrollSettle(CarouselState* self, Ctx* cx,
+                               const TickEvent* event, intptr_t epoch);
+    static void OnIgnoredScrollRecovery(CarouselState* self, Ctx* cx,
+                                        const TickEvent* event, intptr_t epoch);
+    static void OnWheelBurstEnd(CarouselState* self, Ctx* cx,
+                                const TickEvent* event, intptr_t epoch);
+    static void OnRootMouseDown(CarouselState* self, Ctx* cx,
+                                const MouseDownEvent* event);
 };
 
 Entity<CarouselState> CarouselStateNew(App* app, int itemCount);
@@ -18386,6 +18387,12 @@ namespace gpui {
 
 namespace component {
 
+Spring ChartPointerSpring(const App* app);
+
+const float kChartHoverDotSize = 8;
+
+float ChartHoverHaloSize(float focus);
+
 struct PieSlice {
     float value = 0;
     Rgba color = {};
@@ -18398,7 +18405,8 @@ struct PieChart {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     ArenaVec<PieSlice> slices;
-    float outerRadius = 100;
+
+    float outerRadius = 0;
     float innerRadius = 0;
     float padAngle = 0;
 
@@ -18407,6 +18415,8 @@ struct PieChart {
     float labelGap = 15;
     bool hasLabelColor = false;
     Rgba labelColor = {};
+    Str tooltipName = {};
+    bool tooltip = false;
 
     static PieChart* New(Ctx* cx);
     PieChart* Slice(float value, Rgba color, float outerInset = 0);
@@ -18416,6 +18426,10 @@ struct PieChart {
     PieChart* PadAngle(float radians);
     PieChart* LabelGap(float gap);
     PieChart* LabelColor(Rgba c);
+
+    PieChart* Tooltip(Str name);
+
+    float ResolveOuterRadius(float height) const;
     El* IntoEl();
 };
 
@@ -18556,10 +18570,13 @@ struct CandlestickChart {
     Rgba down = {};
     float padding = 0.3f;
     float bodyWidthRatio = 0.8f;
+    Str tooltipName = {};
+    bool tooltip = false;
 
     static CandlestickChart* New(Ctx* cx, const float* opens,
                                  const float* highs, const float* lows,
                                  const float* closes, int n);
+    CandlestickChart* Tooltip(Str name);
     CandlestickChart* Colors(Rgba up, Rgba down);
     CandlestickChart* Labels(const char* const* l);
     CandlestickChart* TickMargin(int n);
@@ -18600,8 +18617,11 @@ struct RadarChart {
     float labelGap = 10;
     Rgba labelColor = {};
     bool hasLabelColor = false;
+    Str tooltipName = {};
+    bool tooltip = false;
 
     static RadarChart* New(Ctx* cx, const float* values, int n);
+    RadarChart* Tooltip(Str name);
     RadarChart* Stroke(Rgba c);
     RadarChart* Fill(Rgba c);
     RadarChart* Labels(const char* const* l);
@@ -18668,8 +18688,11 @@ struct SankeyChart {
     float labelGap = kSankeyChartLabelGap;
 
     bool showValues = false;
+    Str tooltipName = {};
+    bool tooltip = false;
 
     static SankeyChart* New(Ctx* cx);
+    SankeyChart* Tooltip(Str name);
 
     SankeyChart* Node(Str label);
     SankeyChart* NodeColored(Str label, Rgba color);
@@ -20565,10 +20588,6 @@ struct DockSkin {
     void SetPanelStyle(App* app, Window* win, PanelStyle style);
     bool IsToggleButtonVisible(App* app) const;
     void SetToggleButtonVisible(App* app, Window* win, bool visible);
-    bool HasTilesScrollbarMode(App* app) const;
-    ScrollbarMode GetTilesScrollbarMode(App* app) const;
-    void SetTilesScrollbarMode(App* app, Window* win, bool hasMode,
-                               ScrollbarMode mode = ScrollbarMode::Always);
     const DockRenderer* Renderer() const;
 };
 
@@ -20683,49 +20702,6 @@ struct Empty {
     Empty* Content(EmptyContent* value);
     Empty* Child(El* child);
     Empty* Refine(const Style& value, uint32_t fields);
-    El* IntoEl();
-};
-
-}
-}
-
-#line 1 "src/ui/tiles.h"
-
-namespace gpui {
-
-namespace component {
-
-struct DragMoving {
-    int node = -1;
-};
-
-struct DragResizing {
-    int node = -1;
-};
-
-struct TilePanelDef {
-    Str title = {};
-    El* content = nullptr;
-
-    El* suffix = nullptr;
-    PanelView view = {};
-    bool hasView = false;
-};
-
-struct Tiles {
-    Arena* a = nullptr;
-    Ctx* cx = nullptr;
-    Str id = {};
-    Entity<TilesState> state = {};
-    const DockSkin* skin = nullptr;
-
-    ArenaVec<TilePanelDef> panels;
-
-    static Tiles* New(Ctx* cx, Str id, Entity<TilesState> state);
-
-    Tiles* Panel(Str title, El* content, El* suffix = nullptr);
-    Tiles* Panel(PanelHandle panel, El* content = nullptr);
-    Tiles* WithSkin(const DockSkin* value);
     El* IntoEl();
 };
 
@@ -21221,6 +21197,8 @@ namespace input_syntax {
 struct Tree {};
 }
 
+void InputLanguageInit(App* app);
+
 enum class AnyInputKind : uint8_t {
     None,
     Input,
@@ -21338,6 +21316,10 @@ struct Input {
     Listener onToggleMask;
     InputPasteFn onPaste = nullptr;
     void* onPasteData = nullptr;
+    InlineTokenRenderer tokenRenderer = nullptr;
+    void* tokenRendererUser = nullptr;
+    InlineTokenClickListener tokenClick = nullptr;
+    void* tokenClickUser = nullptr;
 
     static Input* New(Ctx* cx, Str id, InputState* state);
     Input* Label(Str s);
@@ -21367,6 +21349,21 @@ struct Input {
     Input* OnChange(Listener fn);
     Input* OnFocus(Listener fn);
     Input* OnPaste(InputPasteFn fn, void* data = nullptr);
+
+    Input* Token(InlineTokenRenderer fn, void* user = nullptr);
+    Input* OnTokenClick(InlineTokenClickListener fn, void* user = nullptr);
+    El* IntoEl();
+};
+
+struct InputToken {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    InlineTokenContext context = {};
+    IconName icon = IconName::None;
+    bool hasIcon = false;
+
+    static InputToken* New(Ctx* cx, const InlineTokenContext& context);
+    InputToken* Icon(IconName name);
     El* IntoEl();
 };
 
@@ -21499,9 +21496,18 @@ struct Textarea {
     bool softWrap = true;
     AccessibilityRole accessibilityRole = AccessibilityRole::MultilineTextInput;
     Str ariaLabel = {};
+    Str accessibilityId = {};
+    bool appearance = true;
+    bool disabled = false;
+    bool readonly = false;
+    bool focusRing = true;
     Listener onFocus;
     InputPasteFn onPaste = nullptr;
     void* onPasteData = nullptr;
+    InlineTokenRenderer tokenRenderer = nullptr;
+    void* tokenRendererUser = nullptr;
+    InlineTokenClickListener tokenClick = nullptr;
+    void* tokenClickUser = nullptr;
 
     static Textarea* New(Ctx* cx, Str id, InputState* state);
 
@@ -21509,9 +21515,116 @@ struct Textarea {
     Textarea* H(float px);
     Textarea* SoftWrap(bool v);
     Textarea* Role(AccessibilityRole role);
+    Textarea* AccessibilityId(Str id);
     Textarea* AriaLabel(Str label);
+    Textarea* Disabled(bool v);
+    Textarea* Readonly(bool v = true);
+    Textarea* Appearance(bool v);
+    Textarea* FocusRing(bool v);
     Textarea* OnFocus(Listener fn);
     Textarea* OnPaste(InputPasteFn fn, void* data = nullptr);
+    Textarea* Token(InlineTokenRenderer fn, void* user = nullptr);
+    Textarea* OnTokenClick(InlineTokenClickListener fn, void* user = nullptr);
+    El* IntoEl();
+};
+
+enum class InputGroupAddonAlignment : uint8_t {
+    InlineStart,
+    InlineEnd,
+    BlockStart,
+    BlockEnd
+};
+
+struct InputGroupAppearance {
+    Rgba background = {};
+    Rgba border = {};
+    Rgba ring = {};
+    bool hasRing = false;
+
+    static InputGroupAppearance New(const Theme& th, bool focused,
+                                    bool disabled, bool invalid);
+};
+
+struct InputGroupButton {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Button* button = nullptr;
+    UiSize size = UiSize::XSmall;
+
+    static InputGroupButton* New(Ctx* cx, Str id);
+    InputGroupButton* Label(Str s);
+    InputGroupButton* Icon(IconName n);
+    InputGroupButton* Icon(Str path);
+    InputGroupButton* Tooltip(Str s);
+    InputGroupButton* AriaLabel(Str s);
+    InputGroupButton* WithSize(UiSize s);
+    InputGroupButton* WithVariant(ButtonVariant v);
+    InputGroupButton* Disabled(bool v);
+    InputGroupButton* Loading(bool v);
+    InputGroupButton* Outline();
+    InputGroupButton* OnClick(Listener fn);
+    InputGroupButton* Child(El* el);
+    El* IntoEl();
+};
+
+struct InputGroupText {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    ArenaVec<El*> children;
+
+    static InputGroupText* New(Ctx* cx);
+    InputGroupText* Child(El* el);
+    El* IntoEl();
+};
+
+struct InputGroupAddon {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    InputGroupAddonAlignment alignment = InputGroupAddonAlignment::InlineStart;
+    UiSize size = UiSize::Medium;
+    ArenaVec<El*> children;
+
+    static InputGroupAddon* New(Ctx* cx, Str id);
+    InputGroupAddon* Align(InputGroupAddonAlignment v);
+    InputGroupAddon* Child(El* el);
+    El* IntoEl();
+};
+
+using InputGroupInput = Input;
+using InputGroupTextarea = Textarea;
+
+struct InputGroupControl {
+    Input* input = nullptr;
+    Textarea* textarea = nullptr;
+};
+
+struct InputGroup {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    Input* input = nullptr;
+    Textarea* textarea = nullptr;
+    ArenaVec<InputGroupAddon*> addons;
+    UiSize size = UiSize::Medium;
+    bool disabled = false;
+    bool readonly = false;
+    bool invalid = false;
+    bool focusRing = true;
+    Str ariaLabel = {};
+
+    El* controlEl = nullptr;
+
+    static InputGroup* New(Ctx* cx, Str id);
+    InputGroup* Input(Input* control);
+    InputGroup* Input(Textarea* control);
+    InputGroup* Addon(InputGroupAddon* addon);
+    InputGroup* Disabled(bool v);
+    InputGroup* Readonly(bool v = true);
+    InputGroup* Invalid(bool v);
+    InputGroup* FocusRing(bool v);
+    InputGroup* AriaLabel(Str label);
+    InputGroup* WithSize(UiSize s);
     El* IntoEl();
 };
 
@@ -22294,7 +22407,7 @@ struct NativeMenu {
     NativeMenu* Separator();
     NativeMenu* Submenu(Str label, NativeMenu* menu);
     NativeMenu* OnSelect(Listener l);
-    bool IsEmpty() const { return items.len == 0; }
+    bool IsEmpty() const { return len(items) == 0; }
 
     bool Show(float x, float y);
 
@@ -22645,6 +22758,8 @@ struct ScaleBand {
 
     float BandWidth() const;
 
+    float Step() const;
+
     bool Tick(int index, float* out) const;
 
     int LeastIndex(float tick) const;
@@ -22906,8 +23021,15 @@ struct Arc {
     Point Centroid(const ArcData& arc) const;
     Path* PathFor(PaintCtx* ctx, const ArcData& arc, Bounds bounds,
                   float innerOverride = -1, float outerOverride = -1) const;
+
+    bool Contains(const ArcData& arc, Point position, Bounds bounds,
+                  float innerOverride = -1, float outerOverride = -1) const;
     void Paint(PaintCtx* ctx, const ArcData& arc, Rgba color, Bounds bounds,
                float innerOverride = -1, float outerOverride = -1) const;
+
+    void PaintCached(PaintCtx* ctx, const ArcData& arc, Rgba color,
+                     Bounds bounds, PathCache* cache, float innerOverride = -1,
+                     float outerOverride = -1) const;
 };
 
 struct Pie {
@@ -23029,10 +23151,13 @@ struct Dot {
     Rgba stroke = RgbaTransparent();
     Rgba fill = RgbaTransparent();
 
+    float halo = 0;
+
     static Dot New(Point point);
     Dot* Size(float value);
     Dot* Stroke(Rgba value);
     Dot* Fill(Rgba value);
+    Dot* Halo(float value);
     El* IntoEl(Ctx* cx) const;
 };
 
@@ -23045,6 +23170,20 @@ struct TooltipState {
     static TooltipState New(int index, Point crossLine, const Point* dots,
                             int dotCount);
 };
+
+struct PlotHover {
+    TooltipState state = {};
+    float focus = 0;
+    bool hovered = false;
+
+    const TooltipState& State() const { return state; }
+    float Focus() const { return focus; }
+    bool IsHovered() const { return hovered; }
+    bool IsEntering() const { return hovered && focus == 0.f; }
+};
+
+bool TrackHover(Ctx* cx, const TooltipState* live, const Point* cursor,
+                PlotHover* outHover, Point* outCursor);
 
 struct TooltipRow {
     Rgba color = {};
@@ -23067,6 +23206,8 @@ struct Tooltip {
     Point cursor = {};
     Size within = {};
 
+    float focus = -1.f;
+
     static Tooltip* New(Ctx* cx, Point cursor, Size within);
     Tooltip* Title(Str value);
     Tooltip* Row(Rgba color, Str label, Str value);
@@ -23075,6 +23216,7 @@ struct Tooltip {
     Tooltip* Dots(const Dot* values, int count);
     Tooltip* Appearance(bool value);
     Tooltip* Child(El* value);
+    Tooltip* Focus(float value);
     El* IntoEl();
 };
 
@@ -23851,6 +23993,11 @@ bool SettingItemMatches(const SettingItem* it, Str query);
 bool SettingGroupMatches(const SettingGroup* g, Str query);
 bool SettingPageMatches(const SettingPage* p, Str query);
 
+SelectIndex SettingsResolveSelectedIndex(const ArenaVec<SettingPage>& pages,
+                                         Str query, SelectIndex selected);
+
+bool SettingGroupIsResettable(const SettingGroup* g, Str query);
+
 struct SettingBinding {
     SettingFieldKind kind = SettingFieldKind::Element;
     bool* boolValue = nullptr;
@@ -24406,6 +24553,9 @@ struct Switch {
     UiSize size = UiSize::Medium;
     Rgba color = {};
     bool hasColor = false;
+    bool focusRing = true;
+    int tabIndex = 0;
+    bool tabStop = true;
     Listener onClick;
 
     static Switch* New(Ctx* cx, Str id);
@@ -24416,6 +24566,10 @@ struct Switch {
     Switch* Disabled(bool v);
     Switch* WithSize(UiSize s);
     Switch* Color(Rgba c);
+
+    Switch* FocusRing(bool v);
+    Switch* TabIndex(int v);
+    Switch* TabStop(bool v);
     Switch* OnClick(Listener fn);
 
     Switch* OnChange(Listener fn);
@@ -25276,6 +25430,48 @@ struct Tooltip {
 }
 }
 
+#line 1 "src/ui/touch_selection.h"
+
+namespace gpui {
+
+namespace component {
+
+struct EditMenuItem {
+    Str label = {};
+    Listener onClick = {};
+};
+
+struct EditMenu {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    Bounds anchor = {};
+    ArenaVec<EditMenuItem> items;
+
+    static EditMenu* New(Ctx* cx, Str id, Bounds anchor);
+    EditMenu* Item(Str label, Listener onClick);
+    El* IntoEl();
+};
+
+struct TouchSelectionOverlay {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    TouchSelectionSnapshot snapshot = {};
+    bool hasSnapshot = false;
+    ArenaVec<EditMenuItem> items;
+
+    static TouchSelectionOverlay* New(Ctx* cx, Str id);
+    TouchSelectionOverlay* Snapshot(const TouchSelectionSnapshot& snap);
+    TouchSelectionOverlay* Item(Str label, Listener onClick);
+    El* IntoEl();
+};
+
+El* WindowTouchSelectionOverlay(Ctx* cx);
+
+}
+}
+
 #line 1 "src/ui/tree.h"
 
 namespace gpui {
@@ -25715,19 +25911,70 @@ const uint8_t* AssetIconForPath(Str assetPath, int* lenOut);
 namespace gpui {
 
 struct RenderImage;
+struct ImageStore;
 
+struct ImageLookup {
+    App* app = nullptr;
+    Window* win = nullptr;
+    PaintApp* pa = nullptr;
+    EntityId cache = {};
+
+    static ImageLookup Of(PaintApp* pa) {
+        ImageLookup l;
+        l.pa = pa;
+        return l;
+    }
+    static ImageLookup Of(PaintCtx* ctx, EntityId cache = {}) {
+        ImageLookup l;
+        if (ctx) {
+            l.app = ctx->app;
+            l.win = ctx->window;
+            l.pa = ctx->pa;
+        }
+        l.cache = cache;
+        return l;
+    }
+};
+
+struct ImageCache {
+    ImageStore* store = nullptr;
+
+    ImageCache();
+    ImageCache(const ImageCache&) = delete;
+    ImageCache& operator=(const ImageCache&) = delete;
+    ~ImageCache();
+
+    void Clear();
+    void Remove(Str src);
+    int Len() const;
+    bool Empty() const { return Len() == 0; }
+};
+
+ImageStore* ImageStoreNew();
+void ImageStoreFree(ImageStore* s);
+
+RenderImage* ImageForSrc(const ImageLookup& cx, Str src);
 RenderImage* ImageForSrc(PaintApp* pa, Str src);
+RenderImage* ImageForSource(const ImageLookup& cx, const ImageSource& source);
 RenderImage* ImageForSource(PaintApp* pa, const ImageSource& source);
 
+ImageLoadState ImageSrcState(const ImageLookup& cx, Str src,
+                             double* loadingSeconds = nullptr);
 ImageLoadState ImageSrcState(PaintApp* pa, Str src,
                              double* loadingSeconds = nullptr);
+ImageLoadState ImageSourceState(const ImageLookup& cx,
+                                const ImageSource& source,
+                                double* loadingSeconds = nullptr);
 ImageLoadState ImageSourceState(PaintApp* pa, const ImageSource& source,
                                 double* loadingSeconds = nullptr);
 
 int ImageFrameIndex(RenderImage* image, bool reducedMotion,
                     bool* wantsAnimation);
 
+const uint8_t* ImageVectorForSrc(const ImageLookup& cx, Str src, int* lenOut);
 const uint8_t* ImageVectorForSrc(Str src, int* lenOut);
+const uint8_t* ImageVectorForSource(const ImageLookup& cx,
+                                    const ImageSource& source, int* lenOut);
 const uint8_t* ImageVectorForSource(PaintApp* pa, const ImageSource& source,
                                     int* lenOut);
 
@@ -25736,6 +25983,10 @@ bool ImageSrcIsLocal(Str src);
 Str ImageAssetFor(Arena* a, Str src);
 
 void ImageCacheClear();
+void ImageCacheClear(App* app);
+
+int ImageCacheResourceCount(App* app = nullptr);
+int ImageCacheEncodedCount(App* app = nullptr);
 
 }
 
@@ -25845,6 +26096,10 @@ const float kLineHeight = 1.618034f;
 PaintApp* PaintAppNew();
 void PaintAppFree(PaintApp* pa);
 
+const Str* PaintInstalledFontNames(PaintApp* pa, int* n);
+
+Str PaintSystemUIFontMappedFamily();
+
 bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH);
 
 bool PaintTargetBeginOffscreen(PaintCtx* ctx, int pxW, int pxH);
@@ -25926,6 +26181,9 @@ enum class RenderImageStatus : uint8_t {
 };
 
 RenderImage* RenderImageDecode(PaintApp* pa, const uint8_t* bytes, int len);
+
+RenderImage* RenderImageNewLoading();
+void RenderImageComplete(RenderImage* img, RenderImage* decoded);
 
 void RenderImageRetain(RenderImage* img);
 void RenderImageRelease(RenderImage* img);
@@ -26072,6 +26330,21 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
 
 bool PlatReduceMotion();
 
+#if GPUI_OS_IOS || GPUI_OS_ANDROID
+inline bool PlatReduceMotionKnown(bool* out) {
+    if (out) {
+        *out = PlatReduceMotion();
+    }
+    return true;
+}
+inline void PlatReduceMotionFollow(void (*onChange)(bool reduce)) {
+    (void)onChange;
+}
+#else
+bool PlatReduceMotionKnown(bool* out);
+void PlatReduceMotionFollow(void (*onChange)(bool reduce));
+#endif
+
 bool WindowKeyDown(Window* win, int key, bool shift, bool ctrl, bool alt,
                    bool platform = false, bool function = false);
 
@@ -26096,6 +26369,14 @@ PlatformInput InputScrollWheel(float x, float y, float deltaX, float deltaY,
                                TouchPhase phase);
 PlatformInput InputTouchDrag(TouchPhase phase, Point start, Point position);
 PlatformInput InputLongPress(TouchPhase phase, Point start, Point position);
+
+void WindowTouchBegin(Window* win, float x, float y);
+void WindowTouchMove(Window* win, float x, float y);
+void WindowTouchEnd(Window* win, float x, float y);
+void WindowTouchCancel(Window* win);
+void WindowTouchPoll(Window* win, double now);
+
+bool WindowScrollApply(Window* win, float x, float y, float dx, float dy);
 
 int WindowClickCount(Window* win, float x, float y, MouseButton button);
 
@@ -26190,6 +26471,8 @@ int SceneLevelOn();
 inline bool SceneOn() {
     return SceneLevelOn() > kSceneOff;
 }
+
+bool SceneTakeArg(Str arg);
 
 namespace scene {
 
@@ -26390,6 +26673,19 @@ Node* ParseDocument(Arena* a, Str source, ParseOptions options = {});
 Node* ParseFragment(Arena* a, Str source, Str context = Str{},
                     ParseOptions options = {});
 Str Serialize(Arena* a, const Node* node, SerializeOptions options = {});
+
+struct Parser {
+    Arena* a = nullptr;
+    ParseOptions options = {};
+    void* impl = nullptr;
+};
+
+Parser* ParserNew(Arena* a, ParseOptions options = {});
+Parser* ParserNewFragment(Arena* a, Str context, ParseOptions options = {});
+void ParserProcess(Parser* parser, Str chunk);
+bool ParserIsPaused(const Parser* parser);
+void ParserResumeAfterCurrentScript(Parser* parser);
+Node* ParserFinish(Parser* parser);
 
 inline Str AttributeName(Arena* a, const Attribute* attr) {
     return attr ? ArenaStrGet(a, attr->name) : Str{};
@@ -27142,7 +27438,7 @@ struct Slice {
     int32_t before = 0;
     int32_t after = 0;
 
-    int32_t Len() const { return bytes.len + before + after; }
+    int32_t Len() const { return len(bytes) + before + after; }
 };
 
 Slice SliceFromPosition(Str bytes, const Position& position);
@@ -28051,7 +28347,7 @@ namespace gpui {
 struct ShellError {
     Str message;
 
-    bool IsSet() const { return message.len > 0; }
+    bool IsSet() const { return len(message) > 0; }
 };
 
 void ShellErrorClear(ShellError* error);
@@ -28111,7 +28407,7 @@ struct HostArguments {
     Vec<HostValue*> values;
 
     void Free();
-    int Len() const { return values.len; }
+    int Len() const { return len(values); }
     const HostValue* Get(int index) const;
     bool Value(int index, const HostValue** value, HostError* error) const;
     bool String(int index, Str* value, HostError* error) const;
@@ -28144,8 +28440,7 @@ class HostModule {
     HostModule* Retain();
     void Release();
 
-    HostModule* Function(Str name, Func1<HostCall*> body,
-                         Func0 release = {});
+    HostModule* Function(Str name, Func1<HostCall*> body, Func0 release = {});
     HostModule* AsyncFunction(Str name, Func1<HostCall*> work,
                               Func0 release = {});
     HostModule* AsyncFunction(Str name, Func1<HostAsyncRequest*> begin,
@@ -28465,6 +28760,13 @@ enum class ComponentKind : uint8_t {
 
     List,
     UniformList,
+
+    InputGroup,
+    InputGroupAddon,
+    InputGroupButton,
+    InputGroupInput,
+    InputGroupTextarea,
+    InputGroupText,
 };
 
 enum class TextViewFormat : uint8_t {
@@ -28708,8 +29010,6 @@ struct DockChromeHooks {
     CallbackId emptyGroup = 0;
     CallbackId dropIndicator = 0;
     CallbackId dock = 0;
-    CallbackId tileDragBar = 0;
-    CallbackId tileResizeHandles = 0;
 };
 
 struct RetainedCallback {
@@ -28852,6 +29152,8 @@ struct MaterializedDependencies;
 }
 namespace gpui {
 struct ShellTaskDriver;
+struct InlineTokenContext;
+struct InlineTokenClickEvent;
 
 class ShellRuntime {
   public:
@@ -28951,6 +29253,12 @@ class ShellRuntime {
                             shell::CallbackId onItemSecondaryClick, int first,
                             int end, Ctx* cx, El** out);
 
+    void BeginTokenFrame();
+    El* RenderInlineToken(shell::CallbackId render,
+                          const InlineTokenContext* ctx, Str text, Ctx* cx);
+    void DispatchTokenClick(shell::CallbackId click,
+                            const InlineTokenClickEvent* ev, Str text, Ctx* cx);
+
   private:
     friend struct ShellRuntimeAccess;
     friend struct ShellTaskDriver;
@@ -29033,6 +29341,12 @@ struct ShellNumberBinding {
     shell::CallbackId onStep = 0;
 };
 
+struct ShellInputGroupBinding {
+    shell::EntityHandle handle = 0;
+    shell::CallbackId onChange = 0;
+    InputState* state = nullptr;
+};
+
 struct ShellMouseButtonBinding {
     shell::CallbackId left = 0;
     shell::CallbackId right = 0;
@@ -29098,6 +29412,8 @@ struct ScriptView {
                             intptr_t binding);
     static void OnInputEvent(ScriptView* self, Ctx* cx, const InputEvent* event,
                              intptr_t handle);
+    static void OnInputGroupEvent(ScriptView* self, Ctx* cx,
+                                  const InputEvent* event, intptr_t binding);
     static void OnSliderEvent(ScriptView* self, Ctx* cx,
                               const SliderEvent* event, intptr_t handle);
     static void OnOtpEvent(ScriptView* self, Ctx* cx, const OtpEvent* event,
@@ -29508,8 +29824,6 @@ void ShellTabGroupData(const DockTabGroup* group, StrBuilder* out);
 void ShellDockData(const DockCtx* dock, StrBuilder* out);
 
 void ShellDropIndicatorData(const DockState* state, Bounds to, StrBuilder* out);
-void ShellTileData(const TileContext* tile, const DockState* dock,
-                   StrBuilder* out);
 
 }
 
@@ -30440,7 +30754,8 @@ struct NewWindowFeatures {
 
 using DownloadStartedHandler = bool (*)(void* ctx, Str url, Str* path);
 
-using DownloadCompletedHandler = void (*)(void* ctx, Str url, const Str* path, bool success);
+using DownloadCompletedHandler = void (*)(void* ctx, Str url, const Str* path,
+                                          bool success);
 
 enum class DragDropKind : uint8_t {
     Enter,
@@ -30515,15 +30830,16 @@ struct WebViewAttributes {
 
     bool (*navigationHandler)(void* ctx, Str url) = nullptr;
     void (*documentTitleChangedHandler)(void* ctx, Str title) = nullptr;
-    void (*onPageLoadHandler)(void* ctx, PageLoadEvent event, Str url) = nullptr;
+    void (*onPageLoadHandler)(void* ctx, PageLoadEvent event,
+                              Str url) = nullptr;
 
     DownloadStartedHandler downloadStartedHandler = AllowDownload;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;
     DragDropHandler dragDropHandler = nullptr;
 
-    NewWindowResponse (*newWindowReqHandler)(void* ctx, Str url,
-                                             const NewWindowFeatures* features,
-                                             WebView** createdWebView) = nullptr;
+    NewWindowResponse (*newWindowReqHandler)(
+        void* ctx, Str url, const NewWindowFeatures* features,
+        WebView** createdWebView) = nullptr;
 
     bool clipboard = false;
 #if defined(DEBUG) || defined(_DEBUG)
@@ -30573,7 +30889,8 @@ struct WebViewAttributes {
     void* webviewEnvironment = nullptr;
 };
 
-WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs, bool asChild);
+WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
+                    bool asChild);
 
 void WebViewFree(WebView* webview);
 

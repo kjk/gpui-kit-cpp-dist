@@ -12,9 +12,9 @@ static const bool kContextCodeblockEnabled = true;
 
 static void CursorAdvance(Results* res, Str part) {
     int i = 0;
-    while (i < part.len) {
+    while (i < len(part)) {
         char c = part.s[i];
-        if (c == '\r' && i + 1 < part.len && part.s[i + 1] == '\n') {
+        if (c == '\r' && i + 1 < len(part) && part.s[i + 1] == '\n') {
             res->line++;
             res->col = 1;
             i += 2;
@@ -40,16 +40,16 @@ void EmitIgnore(Results* res, Str part) {
 
 static Str TrimStart(Str s, int* leadingBytes) {
     int i = 0;
-    while (i < s.len && (s.s[i] == ' ' || s.s[i] == '\t' || s.s[i] == '\r' ||
-                         s.s[i] == '\n' || s.s[i] == '\f')) {
+    while (i < len(s) && (s.s[i] == ' ' || s.s[i] == '\t' || s.s[i] == '\r' ||
+                          s.s[i] == '\n' || s.s[i] == '\f')) {
         i++;
     }
     *leadingBytes = i;
-    return Str(s.s + i, s.len - i);
+    return Str(s.s + i, len(s) - i);
 }
 
 static Str TrimEnd(Str s) {
-    int end = s.len;
+    int end = len(s);
     while (end > 0 && (s.s[end - 1] == ' ' || s.s[end - 1] == '\t' ||
                        s.s[end - 1] == '\r' || s.s[end - 1] == '\n' ||
                        s.s[end - 1] == '\f')) {
@@ -82,8 +82,8 @@ void EmitText(Results* res, Str rule, Str part) {
         }
         int subLine = 0;
         int lineStart = 0;
-        for (int i = 0; i <= part.len; i++) {
-            if (i < part.len && part.s[i] != '\n') {
+        for (int i = 0; i <= len(part); i++) {
+            if (i < len(part) && part.s[i] != '\n') {
                 continue;
             }
             Str lineStr(part.s + lineStart, i - lineStart);
@@ -114,8 +114,8 @@ void EmitText(Results* res, Str rule, Str part) {
 
     int lineStart = 0;
     bool first = true;
-    for (int i = 0; i <= part.len; i++) {
-        if (i < part.len && part.s[i] != '\n') {
+    for (int i = 0; i <= len(part); i++) {
+        if (i < len(part) && part.s[i] != '\n') {
             continue;
         }
         if (!first) {
@@ -167,22 +167,22 @@ static void EmitSub(Results* res, Str part, Str lang, Str code,
     }
     if (!replaceInPart) {
         res->out.Append(sub.out);
-    } else if (code.len == 0) {
+    } else if (len(code) == 0) {
 
         res->out.Append(part);
     } else {
 
         int at = 0;
-        while (at + code.len <= part.len) {
-            if (StrEq(Str(part.s + at, code.len), code)) {
+        while (at + len(code) <= len(part)) {
+            if (StrEq(Str(part.s + at, len(code)), code)) {
                 res->out.Append(sub.out);
-                at += code.len;
+                at += len(code);
                 continue;
             }
             res->out.AppendChar(part.s[at]);
             at++;
         }
-        res->out.Append(Str(part.s + at, part.len - at));
+        res->out.Append(Str(part.s + at, len(part) - at));
     }
     CursorAdvance(res, part);
 }
@@ -218,7 +218,7 @@ FormatResult FormatTake(Results* res, Str raw) {
     FormatResult out;
     out.error = res->error;
 
-    out.out = res->error.len > 0
+    out.out = len(res->error) > 0
                   ? base::StrDup(res->a, raw)
                   : base::StrDup(res->a, Str(res->out.els, res->out.len));
     return out;
@@ -285,12 +285,10 @@ FormatResult FormatFor(Arena* a, Str raw, Str filenameOrExt) {
 namespace autocorrect {
 
 static const char* const kRuleNames[kNRules] = {
-    "space-word",         "space-punctuation",
-    "space-bracket",      "space-dash",
-    "space-backticks",    "space-dollar",
-    "fullwidth",          "halfwidth-word",
-    "halfwidth-punctuation", "no-space-fullwidth",
-    "no-space-fullwidth-quote", "spellcheck",
+    "space-word",         "space-punctuation",        "space-bracket",
+    "space-dash",         "space-backticks",          "space-dollar",
+    "fullwidth",          "halfwidth-word",           "halfwidth-punctuation",
+    "no-space-fullwidth", "no-space-fullwidth-quote", "spellcheck",
 };
 
 SeverityMode RuleSeverity(int rule) {
@@ -307,8 +305,7 @@ SeverityMode RuleSeverity(int rule) {
 int RuleIdByName(Str name) {
     for (int i = 0; i < kNRules; i++) {
         Str candidate(kRuleNames[i]);
-        if (name.len == candidate.len &&
-            base::StrEqI(name, kRuleNames[i])) {
+        if (len(name) == len(candidate) && base::StrEqI(name, kRuleNames[i])) {
             return i;
         }
     }
@@ -434,7 +431,8 @@ static const FileType kFileTypes[] = {
     {"txt", "text"},
 };
 
-static const int kNFileTypes = (int)(sizeof(kFileTypes) / sizeof(kFileTypes[0]));
+static const int kNFileTypes =
+    (int)(sizeof(kFileTypes) / sizeof(kFileTypes[0]));
 
 static Str FileTypeFor(Str ext) {
     for (int i = 0; i < kNFileTypes; i++) {
@@ -446,7 +444,7 @@ static Str FileTypeFor(Str ext) {
 }
 
 bool IsSupportType(Str filenameOrExt) {
-    return FileTypeFor(filenameOrExt).len > 0;
+    return len(FileTypeFor(filenameOrExt)) > 0;
 }
 
 Str GetFileExtension(Arena* a, Str filename) {
@@ -455,9 +453,9 @@ Str GetFileExtension(Arena* a, Str filename) {
         return base::StrDup(a, name);
     }
 
-    for (int i = name.len - 1; i >= 0; i--) {
+    for (int i = len(name) - 1; i >= 0; i--) {
         if (name.s[i] == '/') {
-            name = Str(name.s + i + 1, name.len - i - 1);
+            name = Str(name.s + i + 1, len(name) - i - 1);
             break;
         }
     }
@@ -465,7 +463,7 @@ Str GetFileExtension(Arena* a, Str filename) {
     int lastDot = -1;
     int secondLastDot = -1;
     int nDots = 0;
-    for (int i = 0; i < name.len; i++) {
+    for (int i = 0; i < len(name); i++) {
         if (name.s[i] == '.') {
             secondLastDot = lastDot;
             lastDot = i;
@@ -475,9 +473,10 @@ Str GetFileExtension(Arena* a, Str filename) {
     if (nDots == 0) {
         return base::StrDup(a, name);
     }
-    Str ext(name.s + lastDot + 1, name.len - lastDot - 1);
+    Str ext(name.s + lastDot + 1, len(name) - lastDot - 1);
     if (nDots >= 2) {
-        Str doubleExt(name.s + secondLastDot + 1, name.len - secondLastDot - 1);
+        Str doubleExt(name.s + secondLastDot + 1,
+                      len(name) - secondLastDot - 1);
         if (IsSupportType(doubleExt)) {
             ext = doubleExt;
         }
@@ -488,7 +487,7 @@ Str GetFileExtension(Arena* a, Str filename) {
 Str MatchFilename(Arena* a, Str filenameOrExt) {
     Str ext = GetFileExtension(a, filenameOrExt);
     Str type = FileTypeFor(ext);
-    if (type.len > 0) {
+    if (len(type) > 0) {
         return type;
     }
     return base::StrDup(a, filenameOrExt);
@@ -518,7 +517,7 @@ static bool IsSpecialPunct(char c) {
 
 static int MatchClassRun(Str s, int i, bool (*pred)(uint32_t)) {
     int at = i;
-    while (at < s.len) {
+    while (at < len(s)) {
         int next = at;
         if (!pred(Utf8Next(s, &next))) {
             break;
@@ -547,12 +546,12 @@ static Str FullwidthFor(char c) {
 
 static void AppendMappedSpan(StrBuilder* out, Str span) {
     int i = 0;
-    while (i < span.len) {
+    while (i < len(span)) {
         char c = span.s[i];
         if (IsNormalPunct(c) || IsSpecialPunct(c)) {
             out->Append(FullwidthFor(c));
             i++;
-            while (i < span.len && span.s[i] == ' ') {
+            while (i < len(span) && span.s[i] == ' ') {
                 i++;
             }
             continue;
@@ -569,11 +568,11 @@ static int MatchLeft(Str s, int i) {
         return -1;
     }
     int at = i + a;
-    if (at >= s.len || !IsNormalPunct(s.s[at])) {
+    if (at >= len(s) || !IsNormalPunct(s.s[at])) {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     int b = MatchClassRun(s, at, IsCjClassCp);
@@ -589,11 +588,11 @@ static int MatchRight(Str s, int i) {
         return -1;
     }
     int at = i + a;
-    if (at >= s.len || !IsNormalPunct(s.s[at])) {
+    if (at >= len(s) || !IsNormalPunct(s.s[at])) {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     return at - i;
@@ -605,11 +604,11 @@ static int MatchSpecial(Str s, int i) {
         return -1;
     }
     int at = i + a;
-    if (at >= s.len || !IsSpecialPunct(s.s[at])) {
+    if (at >= len(s) || !IsSpecialPunct(s.s[at])) {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     int b = MatchClassRun(s, at, IsCjClassCp);
@@ -625,17 +624,17 @@ static int MatchSpecialLast(Str s, int i) {
         return -1;
     }
     int at = i + a;
-    if (at >= s.len || !IsSpecialPunct(s.s[at])) {
+    if (at >= len(s) || !IsSpecialPunct(s.s[at])) {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
-    if (at < s.len && (s.s[at] == '"' || s.s[at] == '\'')) {
+    if (at < len(s) && (s.s[at] == '"' || s.s[at] == '\'')) {
         at++;
     }
-    return at == s.len ? at - i : -1;
+    return at == len(s) ? at - i : -1;
 }
 
 using MatchFn = int (*)(Str, int);
@@ -643,7 +642,7 @@ using MatchFn = int (*)(Str, int);
 static bool PassReplace(Str in, MatchFn match, StrBuilder* out) {
     bool changed = false;
     int i = 0;
-    while (i < in.len) {
+    while (i < len(in)) {
         int n = match(in, i);
         if (n > 0) {
             AppendMappedSpan(out, Str(in.s + i, n));
@@ -728,7 +727,7 @@ static void AppendCp(StrBuilder* out, uint32_t cp) {
 bool FormatHalfwidthWord(Arena* a, Str in, Str* out) {
     StrBuilder b;
     bool changed = false;
-    for (int i = 0; i < in.len;) {
+    for (int i = 0; i < len(in);) {
         uint32_t cp = Utf8Next(in, &i);
 
         if ((cp >= 0xFF10 && cp <= 0xFF19) || (cp >= 0xFF21 && cp <= 0xFF3A) ||
@@ -748,13 +747,13 @@ bool FormatHalfwidthWord(Arena* a, Str in, Str* out) {
     Str cur = changed ? Str(b.els, b.len) : in;
     StrBuilder t;
     bool timeHit = false;
-    for (int i = 0; i < cur.len;) {
+    for (int i = 0; i < len(cur);) {
         int save = i;
         uint32_t cp = Utf8Next(cur, &i);
-        if (IsAsciiDigitCp(cp) && i < cur.len) {
+        if (IsAsciiDigitCp(cp) && i < len(cur)) {
             int j = i;
             uint32_t c2 = Utf8Next(cur, &j);
-            if (c2 == 0xFF1A && j < cur.len &&
+            if (c2 == 0xFF1A && j < len(cur) &&
                 IsAsciiDigitCp(Utf8At(cur, j))) {
                 AppendCp(&t, cp);
                 t.AppendChar(':');
@@ -826,23 +825,23 @@ static bool IsEnglishSep(uint32_t cp) {
 
 static bool HasEnglishShape(Str s) {
     int i = 0;
-    while (i < s.len) {
+    while (i < len(s)) {
         if (!IsWordCp(Utf8At(s, i))) {
             Utf8Next(s, &i);
             continue;
         }
 
-        while (i < s.len && IsWordCp(Utf8At(s, i))) {
+        while (i < len(s) && IsWordCp(Utf8At(s, i))) {
             Utf8Next(s, &i);
         }
 
         int seps = 0;
-        while (i < s.len && IsEnglishSep(Utf8At(s, i))) {
+        while (i < len(s) && IsEnglishSep(Utf8At(s, i))) {
             Utf8Next(s, &i);
             seps++;
         }
 
-        if (seps > 0 && i < s.len && IsWordCp(Utf8At(s, i))) {
+        if (seps > 0 && i < len(s) && IsWordCp(Utf8At(s, i))) {
             return true;
         }
     }
@@ -851,10 +850,10 @@ static bool HasEnglishShape(Str s) {
 
 static bool StartsWithWord(Str s) {
     int i = 0;
-    while (i < s.len && IsWhitespaceCp(Utf8At(s, i))) {
+    while (i < len(s) && IsWhitespaceCp(Utf8At(s, i))) {
         Utf8Next(s, &i);
     }
-    return i < s.len && IsWordCp(Utf8At(s, i));
+    return i < len(s) && IsWordCp(Utf8At(s, i));
 }
 
 static bool IsQuoteCh(uint32_t cp) {
@@ -863,21 +862,21 @@ static bool IsQuoteCh(uint32_t cp) {
 
 static bool IsQuoted(Str s) {
     int first = 0;
-    while (first < s.len && IsWhitespaceCp(Utf8At(s, first))) {
+    while (first < len(s) && IsWhitespaceCp(Utf8At(s, first))) {
         Utf8Next(s, &first);
     }
-    if (first >= s.len || !IsQuoteCh(Utf8At(s, first))) {
+    if (first >= len(s) || !IsQuoteCh(Utf8At(s, first))) {
         return false;
     }
     int last = -1;
-    for (int i = first; i < s.len;) {
+    for (int i = first; i < len(s);) {
         int at = i;
         uint32_t cp = Utf8Next(s, &i);
         if (IsQuoteCh(cp)) {
 
             int j = i;
             bool tail = true;
-            while (j < s.len) {
+            while (j < len(s)) {
                 if (!IsWhitespaceCp(Utf8At(s, j))) {
                     tail = false;
                     break;
@@ -906,7 +905,7 @@ static bool IsQuoted(Str s) {
 
 static bool HasTwoLetters(Str s) {
     int run = 0;
-    for (int i = 0; i < s.len; i++) {
+    for (int i = 0; i < len(s); i++) {
         char c = s.s[i];
         bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
         run = letter ? run + 1 : 0;
@@ -918,11 +917,11 @@ static bool HasTwoLetters(Str s) {
 }
 
 static bool LooksLikeCodeString(Str s) {
-    for (int i = 0; i < s.len; i++) {
+    for (int i = 0; i < len(s); i++) {
         char c = s.s[i];
-        if ((c == '#' || c == '%' || c == '$') && i + 2 < s.len &&
+        if ((c == '#' || c == '%' || c == '$') && i + 2 < len(s) &&
             s.s[i + 1] == '{') {
-            for (int j = i + 3; j < s.len && s.s[j] != '\n'; j++) {
+            for (int j = i + 3; j < len(s) && s.s[j] != '\n'; j++) {
                 if (s.s[j] == '}') {
                     return true;
                 }
@@ -930,20 +929,20 @@ static bool LooksLikeCodeString(Str s) {
         }
     }
     int i = 0;
-    while (i < s.len) {
+    while (i < len(s)) {
         if (!IsWordCp(Utf8At(s, i))) {
             Utf8Next(s, &i);
             continue;
         }
-        while (i < s.len && IsWordCp(Utf8At(s, i))) {
+        while (i < len(s) && IsWordCp(Utf8At(s, i))) {
             Utf8Next(s, &i);
         }
-        if (i + 1 < s.len && s.s[i] == '.' && IsWordCp(Utf8At(s, i + 1))) {
+        if (i + 1 < len(s) && s.s[i] == '.' && IsWordCp(Utf8At(s, i + 1))) {
             int j = i + 1;
-            while (j < s.len && IsWordCp(Utf8At(s, j))) {
+            while (j < len(s) && IsWordCp(Utf8At(s, j))) {
                 Utf8Next(s, &j);
             }
-            if (j < s.len && s.s[j] == '(') {
+            if (j < len(s) && s.s[j] == '(') {
                 return true;
             }
         }
@@ -985,7 +984,7 @@ static bool FormatLine(Str line, uint32_t wrapQuote, StrBuilder* out) {
     bool changed = false;
     uint32_t lastCp = 0;
     bool hasLast = false;
-    for (int i = 0; i < line.len;) {
+    for (int i = 0; i < len(line);) {
         uint32_t cp = Utf8Next(line, &i);
         const ReplaceRule* rule = RuleFor(cp);
         if (!rule) {
@@ -994,7 +993,7 @@ static bool FormatLine(Str line, uint32_t wrapQuote, StrBuilder* out) {
             hasLast = true;
             continue;
         }
-        bool hasNext = i < line.len;
+        bool hasNext = i < len(line);
         uint32_t next = hasNext ? Utf8At(line, i) : 0;
 
         if (!hasNext && rule->type == CharType::LeftQuote) {
@@ -1033,7 +1032,7 @@ static bool FormatLine(Str line, uint32_t wrapQuote, StrBuilder* out) {
 bool FormatHalfwidthPunctuation(Arena* a, Str in, Str* out) {
 
     uint32_t wrapQuote = ' ';
-    for (int i = 0; i < in.len;) {
+    for (int i = 0; i < len(in);) {
         uint32_t cp = Utf8Next(in, &i);
         if (!IsWhitespaceCp(cp)) {
             wrapQuote = cp;
@@ -1043,13 +1042,13 @@ bool FormatHalfwidthPunctuation(Arena* a, Str in, Str* out) {
     StrBuilder b;
     bool changed = false;
     int lineStart = 0;
-    for (int i = 0; i <= in.len; i++) {
-        bool eol = i == in.len || in.s[i] == '\n';
+    for (int i = 0; i <= len(in); i++) {
+        bool eol = i == len(in) || in.s[i] == '\n';
         if (!eol) {
             continue;
         }
 
-        int end = i == in.len ? i : i + 1;
+        int end = i == len(in) ? i : i + 1;
         if (end > lineStart) {
             changed |= FormatLine(Str(in.s + lineStart, end - lineStart),
                                   wrapQuote, &b);
@@ -1071,7 +1070,7 @@ namespace autocorrect {
 
 static bool HtmlLitI(Str s, int i, const char* lit) {
     for (int k = 0; lit[k]; k++) {
-        if (i + k >= s.len) {
+        if (i + k >= len(s)) {
             return false;
         }
         char c = s.s[i + k];
@@ -1094,11 +1093,11 @@ static int HtmlLitLen(const char* lit) {
 }
 
 static int MatchTag(Str s, int i) {
-    if (i >= s.len || s.s[i] != '<') {
+    if (i >= len(s) || s.s[i] != '<') {
         return -1;
     }
     char quote = 0;
-    for (int at = i + 1; at < s.len; at++) {
+    for (int at = i + 1; at < len(s); at++) {
         char c = s.s[at];
         if (quote) {
             if (c == quote) {
@@ -1126,11 +1125,11 @@ static int MatchCloseTag(Str s, int i, const char* name) {
         return -1;
     }
     at += HtmlLitLen(name);
-    while (at < s.len && (s.s[at] == ' ' || s.s[at] == '\t' ||
-                          s.s[at] == '\n' || s.s[at] == '\r')) {
+    while (at < len(s) && (s.s[at] == ' ' || s.s[at] == '\t' ||
+                           s.s[at] == '\n' || s.s[at] == '\r')) {
         at++;
     }
-    if (at >= s.len || s.s[at] != '>') {
+    if (at >= len(s) || s.s[at] != '>') {
         return -1;
     }
     return at + 1 - i;
@@ -1148,11 +1147,11 @@ static int FindCloseTag(Str s, int from, const char* name, int* len) {
 }
 
 static bool AtOpenTag(Str s, int i, const char* name) {
-    if (i >= s.len || s.s[i] != '<' || !HtmlLitI(s, i + 1, name)) {
+    if (i >= len(s) || s.s[i] != '<' || !HtmlLitI(s, i + 1, name)) {
         return false;
     }
     int after = i + 1 + HtmlLitLen(name);
-    if (after >= s.len) {
+    if (after >= len(s)) {
         return false;
     }
     char c = s.s[after];
@@ -1168,11 +1167,11 @@ void ScanHtml(Results* res, Str raw) {
             EmitIgnore(res, Str(raw.s + ignoreStart, upTo - ignoreStart));
         }
     };
-    while (i < raw.len) {
+    while (i < len(raw)) {
         if (raw.s[i] != '<') {
 
             int start = i;
-            while (i < raw.len && raw.s[i] != '<') {
+            while (i < len(raw) && raw.s[i] != '<') {
                 i++;
             }
             flush(start);
@@ -1183,7 +1182,7 @@ void ScanHtml(Results* res, Str raw) {
 
         if (HtmlLitI(raw, i, "<!--")) {
             int end = -1;
-            for (int at = i + 4; at + 3 <= raw.len; at++) {
+            for (int at = i + 4; at + 3 <= len(raw); at++) {
                 if (raw.s[at] == '-' && raw.s[at + 1] == '-' &&
                     raw.s[at + 2] == '>') {
                     end = at + 3;
@@ -1203,7 +1202,7 @@ void ScanHtml(Results* res, Str raw) {
 
         if (HtmlLitI(raw, i, "<%")) {
             int end = -1;
-            for (int at = i + 2; at + 2 <= raw.len; at++) {
+            for (int at = i + 2; at + 2 <= len(raw); at++) {
                 if (raw.s[at] == '%' && raw.s[at + 1] == '>') {
                     end = at + 2;
                     break;
@@ -1272,7 +1271,7 @@ void ScanHtml(Results* res, Str raw) {
 
         i++;
     }
-    flush(raw.len);
+    flush(len(raw));
 }
 
 }
@@ -1382,7 +1381,7 @@ static bool PatternMatches(const IgnorePattern& pat, Str path, bool isDir) {
         return false;
     }
     const char* pe = pat.glob.s + pat.glob.len;
-    const char* te = path.s + path.len;
+    const char* te = path.s + len(path);
     if (pat.anchored) {
         return GlobMatch(pat.glob.s, pe, path.s, te);
     }
@@ -1413,7 +1412,7 @@ static int MatchedOrParents(const Ignorer* ig, Str path, bool isDir) {
     if (m != 0) {
         return m;
     }
-    int end = path.len;
+    int end = len(path);
     for (;;) {
         while (end > 0 && path.s[end - 1] != '/') {
             end--;
@@ -1431,13 +1430,13 @@ static int MatchedOrParents(const Ignorer* ig, Str path, bool isDir) {
 
 static void AddPatternsFromFile(base::Vec<IgnorePattern>& out, Str workDir,
                                 Str name) {
-    int dirLen = workDir.len;
+    int dirLen = len(workDir);
     while (dirLen > 0 &&
            (workDir.s[dirLen - 1] == '/' || workDir.s[dirLen - 1] == '\\')) {
         dirLen--;
     }
     base::TempStr path = base::fmt("%s/%s", Str(workDir.s, dirLen), name);
-    if (path.len >= 1024) {
+    if (len(path) >= 1024) {
         return;
     }
     FILE* f = fopen(path.s, "rb");
@@ -1461,8 +1460,8 @@ static void AddPatternsFromFile(base::Vec<IgnorePattern>& out, Str workDir,
     fclose(f);
     Str text(buf, (int)got);
     int lineStart = 0;
-    for (int i = 0; i <= text.len; i++) {
-        if (i < text.len && text.s[i] != '\n') {
+    for (int i = 0; i <= len(text); i++) {
+        if (i < len(text) && text.s[i] != '\n') {
             continue;
         }
         int end = i;
@@ -1473,27 +1472,27 @@ static void AddPatternsFromFile(base::Vec<IgnorePattern>& out, Str workDir,
         }
         Str line(text.s + lineStart, end - lineStart);
         lineStart = i + 1;
-        if (line.len == 0 || line.s[0] == '#') {
+        if (len(line) == 0 || line.s[0] == '#') {
             continue;
         }
         IgnorePattern pat;
         if (line.s[0] == '!') {
             pat.negated = true;
-            line = Str(line.s + 1, line.len - 1);
+            line = Str(line.s + 1, len(line) - 1);
         }
-        if (line.len > 0 && line.s[line.len - 1] == '/') {
+        if (len(line) > 0 && line.s[len(line) - 1] == '/') {
             pat.dirOnly = true;
-            line = Str(line.s, line.len - 1);
+            line = Str(line.s, len(line) - 1);
         }
 
-        if (line.len > 0 && line.s[0] == '/') {
+        if (len(line) > 0 && line.s[0] == '/') {
             pat.anchored = true;
-            line = Str(line.s + 1, line.len - 1);
+            line = Str(line.s + 1, len(line) - 1);
         }
-        if (line.len == 0) {
+        if (len(line) == 0) {
             continue;
         }
-        for (int k = 0; !pat.anchored && k < line.len; k++) {
+        for (int k = 0; !pat.anchored && k < len(line); k++) {
             if (line.s[k] == '/') {
                 pat.anchored = true;
             }
@@ -1512,35 +1511,35 @@ void IgnorerInit(Ignorer* ig, Str workDir) {
 
     AddPatternsFromFile(patterns, workDir, StrL(".autocorrectignore"));
     AddPatternsFromFile(patterns, workDir, StrL(".gitignore"));
-    if (patterns.len == 0) {
+    if (len(patterns) == 0) {
         return;
     }
     ig->patterns = (IgnorePattern*)base::Alloc(
-        nullptr, patterns.len * (int)sizeof(IgnorePattern));
+        nullptr, len(patterns) * (int)sizeof(IgnorePattern));
     if (!ig->patterns) {
-        for (int i = 0; i < patterns.len; i++) {
+        for (int i = 0; i < len(patterns); i++) {
             base::StrFree(patterns[i].glob);
         }
         return;
     }
     memcpy(ig->patterns, patterns.els,
-           (size_t)patterns.len * sizeof(IgnorePattern));
-    ig->nPatterns = patterns.len;
+           (size_t)len(patterns) * sizeof(IgnorePattern));
+    ig->nPatterns = len(patterns);
 }
 
 bool IgnorerIsIgnored(const Ignorer* ig, Str relativePath) {
-    if (!ig || ig->nPatterns == 0 || relativePath.len == 0) {
+    if (!ig || ig->nPatterns == 0 || len(relativePath) == 0) {
         return false;
     }
 
-    base::TempStr buf = base::AllocStrTemp(std::min(relativePath.len, 1024));
+    base::TempStr buf = base::AllocStrTemp(std::min(len(relativePath), 1024));
     int n = 0;
     int start = 0;
-    if (relativePath.len >= 2 && relativePath.s[0] == '.' &&
+    if (len(relativePath) >= 2 && relativePath.s[0] == '.' &&
         (relativePath.s[1] == '/' || relativePath.s[1] == '\\')) {
         start = 2;
     }
-    for (int i = start; i < relativePath.len && n < buf.len; i++) {
+    for (int i = start; i < len(relativePath) && n < len(buf); i++) {
         char c = relativePath.s[i];
         buf.s[n++] = c == '\\' ? '/' : c;
     }
@@ -1622,7 +1621,7 @@ void AddChild(MdNode* parent, MdNode* child) {
 
 bool AtLit(Str s, int i, const char* lit) {
     for (int k = 0; lit[k]; k++) {
-        if (i + k >= s.len || s.s[i + k] != lit[k]) {
+        if (i + k >= len(s) || s.s[i + k] != lit[k]) {
             return false;
         }
     }
@@ -1630,10 +1629,10 @@ bool AtLit(Str s, int i, const char* lit) {
 }
 
 int MatchNewline(Str s, int i) {
-    if (i < s.len && s.s[i] == '\n') {
+    if (i < len(s) && s.s[i] == '\n') {
         return 1;
     }
-    if (i + 1 < s.len && s.s[i] == '\r' && s.s[i + 1] == '\n') {
+    if (i + 1 < len(s) && s.s[i] == '\r' && s.s[i + 1] == '\n') {
         return 2;
     }
     return -1;
@@ -1652,7 +1651,7 @@ bool MdIsAsciiAlnumCh(char c) {
 MdNode* ParseInline(MdParser* p, int* pos);
 
 bool InlineStartsAt(MdParser* p, int i) {
-    char c = i < p->s.len ? p->s.s[i] : 0;
+    char c = i < len(p->s) ? p->s.s[i] : 0;
     if (c != '[' && c != '!' && c != '`' && c != '*' && c != '~' && c != '"') {
         return false;
     }
@@ -1663,9 +1662,10 @@ bool InlineStartsAt(MdParser* p, int i) {
 int ScanString(MdParser* p, int i) {
     Str s = p->s;
     int at = i;
-    while (at < s.len) {
+    while (at < len(s)) {
         char c = s.s[at];
-        if (c == '\n' || (c == '\r' && at + 1 < s.len && s.s[at + 1] == '\n')) {
+        if (c == '\n' ||
+            (c == '\r' && at + 1 < len(s) && s.s[at + 1] == '\n')) {
             break;
         }
         if ((c == '[' || c == '!' || c == '`' || c == '*' || c == '~' ||
@@ -1684,7 +1684,7 @@ MdNode* ParseWikilinks(MdParser* p, int* pos) {
     if (!AtLit(s, i, "[[")) {
         return nullptr;
     }
-    for (int at = i + 2; at + 1 < s.len; at++) {
+    for (int at = i + 2; at + 1 < len(s); at++) {
         if (s.s[at] == ']' && s.s[at + 1] == ']') {
             MdNode* n = NewNode(p, MdRule::Container, i);
             n->end = at + 2;
@@ -1696,17 +1696,17 @@ MdNode* ParseWikilinks(MdParser* p, int* pos) {
 }
 
 int MatchParen(Str s, int i) {
-    if (i >= s.len || s.s[i] != '(') {
+    if (i >= len(s) || s.s[i] != '(') {
         return -1;
     }
     int at = i + 1;
-    if (at < s.len && s.s[at] == ')') {
+    if (at < len(s) && s.s[at] == ')') {
         return at + 1 - i;
     }
     auto inner = [&s](int from) {
         int j = from;
-        while (j < s.len && s.s[j] != '\n' && s.s[j] != '(' && s.s[j] != ')' &&
-               !(s.s[j] == '\r' && j + 1 < s.len && s.s[j + 1] == '\n')) {
+        while (j < len(s) && s.s[j] != '\n' && s.s[j] != '(' && s.s[j] != ')' &&
+               !(s.s[j] == '\r' && j + 1 < len(s) && s.s[j + 1] == '\n')) {
             j++;
         }
         return j;
@@ -1724,7 +1724,7 @@ int MatchParen(Str s, int i) {
         at += sub;
     }
     at = inner(at);
-    if (at >= s.len || s.s[at] != ')') {
+    if (at >= len(s) || s.s[at] != ')') {
         return -1;
     }
     return at + 1 - i;
@@ -1735,7 +1735,7 @@ MdNode* ParseMark(MdParser* p, int* pos);
 MdNode* ParseLink(MdParser* p, int* pos) {
     Str s = p->s;
     int i = *pos;
-    if (i >= s.len || s.s[i] != '[') {
+    if (i >= len(s) || s.s[i] != '[') {
         return nullptr;
     }
     MdNode* n = NewNode(p, MdRule::Container, i);
@@ -1750,10 +1750,10 @@ MdNode* ParseLink(MdParser* p, int* pos) {
         AddChild(n, mark);
     }
     int stringStart = at;
-    while (at < s.len && s.s[at] != ']') {
+    while (at < len(s) && s.s[at] != ']') {
         at++;
     }
-    if (at >= s.len) {
+    if (at >= len(s)) {
         return nullptr;
     }
     MdNode* ls = NewNode(p, MdRule::LinkString, stringStart);
@@ -1772,15 +1772,15 @@ MdNode* ParseLink(MdParser* p, int* pos) {
 MdNode* ParseCodeInline(MdParser* p, int* pos) {
     Str s = p->s;
     int i = *pos;
-    if (i >= s.len || s.s[i] != '`') {
+    if (i >= len(s) || s.s[i] != '`') {
         return nullptr;
     }
     int at = i + 1;
-    while (at < s.len && s.s[at] != '`' && s.s[at] != '\n' &&
-           !(s.s[at] == '\r' && at + 1 < s.len && s.s[at + 1] == '\n')) {
+    while (at < len(s) && s.s[at] != '`' && s.s[at] != '\n' &&
+           !(s.s[at] == '\r' && at + 1 < len(s) && s.s[at + 1] == '\n')) {
         at++;
     }
-    if (at >= s.len || s.s[at] != '`') {
+    if (at >= len(s) || s.s[at] != '`') {
         return nullptr;
     }
     MdNode* n = NewNode(p, MdRule::Container, i);
@@ -1820,7 +1820,7 @@ MdNode* ParseMark(MdParser* p, int* pos) {
             at = save;
 
             int stringStart = at;
-            while (at < s.len && !AtLit(s, at, open)) {
+            while (at < len(s) && !AtLit(s, at, open)) {
                 char c = s.s[at];
                 if ((c == '[' || c == '!' || c == '`' || c == '*' || c == '~' ||
                      c == '"')) {
@@ -1851,7 +1851,7 @@ MdNode* ParseMark(MdParser* p, int* pos) {
 MdNode* ParseImg(MdParser* p, int* pos) {
     Str s = p->s;
     int i = *pos;
-    if (i >= s.len || s.s[i] != '!') {
+    if (i >= len(s) || s.s[i] != '!') {
         return nullptr;
     }
     int at = i + 1;
@@ -1894,7 +1894,7 @@ MdNode* ParseComment(MdParser* p, int* pos) {
     if (!AtLit(s, i, "<!--")) {
         return nullptr;
     }
-    for (int at = i + 4; at + 3 <= s.len; at++) {
+    for (int at = i + 4; at + 3 <= len(s); at++) {
         if (AtLit(s, at, "-->")) {
             MdNode* n = NewNode(p, MdRule::Comment, i);
             n->end = at + 3;
@@ -1906,15 +1906,15 @@ MdNode* ParseComment(MdParser* p, int* pos) {
 }
 
 int MatchTagSelf(Str s, int i) {
-    if (i >= s.len || s.s[i] != '<') {
+    if (i >= len(s) || s.s[i] != '<') {
         return -1;
     }
     int at = i + 1;
-    while (at < s.len) {
+    while (at < len(s)) {
         if (s.s[at] == '>') {
             return -1;
         }
-        if (s.s[at] == '/' && at + 1 < s.len && s.s[at + 1] == '>') {
+        if (s.s[at] == '/' && at + 1 < len(s) && s.s[at + 1] == '>') {
             return at + 2 - i;
         }
         at++;
@@ -1923,11 +1923,11 @@ int MatchTagSelf(Str s, int i) {
 }
 
 int MatchTagStart(Str s, int i) {
-    if (i >= s.len || s.s[i] != '<') {
+    if (i >= len(s) || s.s[i] != '<') {
         return -1;
     }
     int at = i + 1;
-    while (at < s.len) {
+    while (at < len(s)) {
         if (s.s[at] == '/') {
             return -1;
         }
@@ -1943,7 +1943,7 @@ int MatchTagEnd(Str s, int i) {
     if (!AtLit(s, i, "</")) {
         return -1;
     }
-    for (int at = i + 2; at < s.len; at++) {
+    for (int at = i + 2; at < len(s); at++) {
         if (s.s[at] == '>') {
             return at + 1 - i;
         }
@@ -1971,7 +1971,7 @@ MdNode* ParseHtml(MdParser* p, int* pos) {
     MdNode* node = NewNode(p, MdRule::Container, i);
     int at = i + n;
 
-    while (at < s.len && (s.s[at] == ' ' || MatchNewline(s, at) > 0)) {
+    while (at < len(s) && (s.s[at] == ' ' || MatchNewline(s, at) > 0)) {
         at += s.s[at] == ' ' ? 1 : MatchNewline(s, at);
     }
 
@@ -1987,7 +1987,7 @@ MdNode* ParseHtml(MdParser* p, int* pos) {
         at = save;
 
         int textStart = at;
-        while (at < s.len && s.s[at] != '<' && s.s[at] != '>') {
+        while (at < len(s) && s.s[at] != '<' && s.s[at] != '>') {
             at++;
         }
         if (at == textStart) {
@@ -2008,7 +2008,7 @@ MdNode* ParseHtml(MdParser* p, int* pos) {
 
 int MatchMetaWrap(Str s, int i) {
     int at = i;
-    while (at < s.len && s.s[at] == '-') {
+    while (at < len(s) && s.s[at] == '-') {
         at++;
     }
     return at - i >= 3 ? at - i : -1;
@@ -2016,14 +2016,14 @@ int MatchMetaWrap(Str s, int i) {
 
 int MatchMetaKey(Str s, int i) {
     int at = i;
-    while (at < s.len && s.s[at] != ':' && IsIdentifierCh(s.s[at])) {
+    while (at < len(s) && s.s[at] != ':' && IsIdentifierCh(s.s[at])) {
         at++;
     }
-    if (at >= s.len || s.s[at] != ':') {
+    if (at >= len(s) || s.s[at] != ':') {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     return at - i;
@@ -2084,7 +2084,7 @@ MdNode* ParseMetaInfo(MdParser* p, int* pos) {
 
 bool IsMetaTagsItemCh(Str s, int* i) {
     int at = *i;
-    if (at >= s.len) {
+    if (at >= len(s)) {
         return false;
     }
     char c = s.s[at];
@@ -2115,12 +2115,12 @@ int MatchMetaTags(Str s, int i) {
         while (IsMetaTagsItemCh(s, &at)) {
         }
         int save = at;
-        while (at < s.len && s.s[at] == ' ') {
+        while (at < len(s) && s.s[at] == ' ') {
             at++;
         }
-        if (at < s.len && s.s[at] == ',') {
+        if (at < len(s) && s.s[at] == ',') {
             at++;
-            while (at < s.len && s.s[at] == ' ') {
+            while (at < len(s) && s.s[at] == ' ') {
                 at++;
             }
             commas++;
@@ -2141,18 +2141,18 @@ int MatchMetaTags(Str s, int i) {
 
 int MatchHr(Str s, int i) {
     int at = i;
-    while (at < s.len && s.s[at] == '-') {
+    while (at < len(s) && s.s[at] == '-') {
         at++;
     }
     return at - i >= 3 ? at - i : -1;
 }
 
 int MatchIndent(Str s, int i) {
-    if (i < s.len && s.s[i] == '\t') {
+    if (i < len(s) && s.s[i] == '\t') {
         return 1;
     }
     int at = i;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     return at - i >= 4 ? at - i : -1;
@@ -2164,15 +2164,15 @@ MdNode* ParseCodeblock(MdParser* p, int* pos) {
     if (AtLit(s, i, "```")) {
         int at = i + 3;
         int langStart = at;
-        while (at < s.len && IsIdentifierCh(s.s[at])) {
+        while (at < len(s) && IsIdentifierCh(s.s[at])) {
             at++;
         }
         int langEnd = at;
         int codeStart = at;
-        while (at < s.len && !AtLit(s, at, "```")) {
+        while (at < len(s) && !AtLit(s, at, "```")) {
             at++;
         }
-        if (at >= s.len) {
+        if (at >= len(s)) {
             return nullptr;
         }
         MdNode* n = NewNode(p, MdRule::Codeblock, i);
@@ -2193,8 +2193,8 @@ MdNode* ParseCodeblock(MdParser* p, int* pos) {
             break;
         }
         int j = at + indent;
-        while (j < s.len && s.s[j] != '\n' &&
-               !(s.s[j] == '\r' && j + 1 < s.len && s.s[j + 1] == '\n')) {
+        while (j < len(s) && s.s[j] != '\n' &&
+               !(s.s[j] == '\r' && j + 1 < len(s) && s.s[j + 1] == '\n')) {
             j++;
         }
         int nl = MatchNewline(s, j);
@@ -2242,18 +2242,18 @@ int ParseInlineOrStringSeq(MdParser* p, int* pos, MdNode* parent) {
 
 int MatchListPrefix(Str s, int i) {
     int at = i;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
-    if (at >= s.len) {
+    if (at >= len(s)) {
         return -1;
     }
     char c = s.s[at];
     if (c == '*' || c == '-') {
         at++;
-    } else if (c >= '0' && c <= '9' && at + 1 < s.len && s.s[at + 1] == '.') {
+    } else if (c >= '0' && c <= '9' && at + 1 < len(s) && s.s[at + 1] == '.') {
         at += 2;
-    } else if (c == '[' && at + 2 < s.len &&
+    } else if (c == '[' && at + 2 < len(s) &&
                (s.s[at + 1] == ' ' || s.s[at + 1] == 'x' ||
                 s.s[at + 1] == 'X') &&
                s.s[at + 2] == ']') {
@@ -2261,7 +2261,7 @@ int MatchListPrefix(Str s, int i) {
     } else {
         return -1;
     }
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     return at - i;
@@ -2352,11 +2352,11 @@ MdNode* ParseBlockItem(MdParser* p, int* pos) {
     Str s = p->s;
     int i = *pos;
     int at = i;
-    if (at < s.len && s.s[at] == '>') {
+    if (at < len(s) && s.s[at] == '>') {
         at++;
     } else {
         int hashes = 0;
-        while (at < s.len && s.s[at] == '#' && hashes < 6) {
+        while (at < len(s) && s.s[at] == '#' && hashes < 6) {
             at++;
             hashes++;
         }
@@ -2364,7 +2364,7 @@ MdNode* ParseBlockItem(MdParser* p, int* pos) {
             return nullptr;
         }
     }
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     MdNode* n = NewNode(p, MdRule::Container, i);
@@ -2466,14 +2466,14 @@ MdNode* ParseBlock(MdParser* p, int* pos) {
 
 int MatchTdTag(Str s, int i) {
     int at = i;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
-    if (at >= s.len || s.s[at] != '|') {
+    if (at >= len(s) || s.s[at] != '|') {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     return at - i;
@@ -2553,9 +2553,9 @@ void ScanMarkdown(Results* res, Str raw) {
     p.s = raw;
     p.a = res->a;
     MdNode* root = NewNode(&p, MdRule::Container, 0);
-    root->end = raw.len;
+    root->end = len(raw);
     int pos = 0;
-    while (pos < raw.len) {
+    while (pos < len(raw)) {
 
         int save = pos;
         MdNode* n = ParseComment(&p, &pos);
@@ -2614,23 +2614,23 @@ static bool IsPathCh(char c) {
 static bool IsMatchPath(Str s) {
 
     int i = 0;
-    while (i < s.len && IsAsciiAlnumCh(s.s[i])) {
+    while (i < len(s) && IsAsciiAlnumCh(s.s[i])) {
         i++;
     }
-    if (i > 0 && i + 2 < s.len && s.s[i] == ':' && s.s[i + 1] == '/' &&
+    if (i > 0 && i + 2 < len(s) && s.s[i] == ':' && s.s[i + 1] == '/' &&
         s.s[i + 2] == '/') {
         return true;
     }
 
     i = 0;
-    if (i < s.len && s.s[i] == '/') {
+    if (i < len(s) && s.s[i] == '/') {
         i++;
     }
     int start = i;
-    while (i < s.len && IsPathCh(s.s[i])) {
+    while (i < len(s) && IsPathCh(s.s[i])) {
         i++;
     }
-    return i - start >= 2 && i < s.len && s.s[i] == '/';
+    return i - start >= 2 && i < len(s) && s.s[i] == '/';
 }
 
 static bool IsWordDashDotCp(uint32_t cp) {
@@ -2639,21 +2639,21 @@ static bool IsWordDashDotCp(uint32_t cp) {
 
 static bool IsMatchPathHash(Str s) {
     s = base::StrTrimAscii(s);
-    for (int i = 0; i < s.len; i++) {
+    for (int i = 0; i < len(s); i++) {
         if (!IsPathCh(s.s[i])) {
             continue;
         }
         int j = i;
-        while (j < s.len && IsPathCh(s.s[j])) {
+        while (j < len(s) && IsPathCh(s.s[j])) {
             j++;
         }
-        if (j >= s.len || s.s[j] != '#') {
+        if (j >= len(s) || s.s[j] != '#') {
             i = j;
             continue;
         }
 
         int k = j + 1;
-        while (k < s.len) {
+        while (k < len(s)) {
             int at = k;
             uint32_t cp = Utf8Next(s, &at);
             if (!IsWordDashDotCp(cp)) {
@@ -2742,7 +2742,7 @@ RuleResult FormatOrLintText(Arena* a, Str text, bool lint,
         StrBuilder joined;
         Severity severity = Severity::Pass;
         int start = 0;
-        for (int i = 0; i < text.len; i++) {
+        for (int i = 0; i < len(text); i++) {
             char c = text.s[i];
             if (c != ' ' && c != '\n' && c != '\r') {
                 continue;
@@ -2755,9 +2755,9 @@ RuleResult FormatOrLintText(Arena* a, Str text, bool lint,
             severity = sub.severity;
             start = i + 1;
         }
-        if (start < text.len) {
+        if (start < len(text)) {
             RuleResult sub;
-            sub.out = Str(text.s + start, text.len - start);
+            sub.out = Str(text.s + start, len(text) - start);
             sub.severity = severity;
             FormatPart(a, lint, disableMask, &sub);
             joined.Append(sub.out);
@@ -2788,10 +2788,11 @@ namespace autocorrect {
 
 static int LitLen(Str s, int i, const char* lit) {
     Str literal = Str(lit);
-    if (i + literal.len > s.len || !StrEq(Str(s.s + i, literal.len), literal)) {
+    if (i + len(literal) > len(s) ||
+        !StrEq(Str(s.s + i, len(literal)), literal)) {
         return -1;
     }
-    return literal.len;
+    return len(literal);
 }
 
 static int MatchLineComment(Str s, int i, const char* prefix) {
@@ -2800,7 +2801,7 @@ static int MatchLineComment(Str s, int i, const char* prefix) {
         return -1;
     }
     int at = i + n;
-    while (at < s.len && s.s[at] != '\n') {
+    while (at < len(s) && s.s[at] != '\n') {
         at++;
     }
     return at - i;
@@ -2812,8 +2813,8 @@ static int MatchBlock(Str s, int i, const char* open, const char* close) {
         return -1;
     }
     Str closing = Str(close);
-    int closeLen = closing.len;
-    for (int at = i + n; at + closeLen <= s.len; at++) {
+    int closeLen = len(closing);
+    for (int at = i + n; at + closeLen <= len(s); at++) {
         if (StrEq(Str(s.s + at, closeLen), closing)) {
             return at + closeLen - i;
         }
@@ -2822,10 +2823,10 @@ static int MatchBlock(Str s, int i, const char* open, const char* close) {
 }
 
 static int MatchSingleLine(Str s, int i, char q) {
-    if (i >= s.len || s.s[i] != q) {
+    if (i >= len(s) || s.s[i] != q) {
         return -1;
     }
-    for (int at = i + 1; at < s.len && s.s[at] != '\n'; at++) {
+    for (int at = i + 1; at < len(s) && s.s[at] != '\n'; at++) {
         if (s.s[at] == q) {
             return at + 1 - i;
         }
@@ -2834,10 +2835,10 @@ static int MatchSingleLine(Str s, int i, char q) {
 }
 
 static int MatchMultiLine(Str s, int i, char q) {
-    if (i >= s.len || s.s[i] != q) {
+    if (i >= len(s) || s.s[i] != q) {
         return -1;
     }
-    for (int at = i + 1; at < s.len; at++) {
+    for (int at = i + 1; at < len(s); at++) {
         if (s.s[at] == q) {
             return at + 1 - i;
         }
@@ -2854,7 +2855,7 @@ static int MatchCallWithString(Str s, int i, const char* fn,
         return -1;
     }
     int at = i + n;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     int sn = matchString(s, at);
@@ -2862,10 +2863,10 @@ static int MatchCallWithString(Str s, int i, const char* fn,
         return -1;
     }
     at += sn;
-    while (at < s.len && s.s[at] != ')') {
+    while (at < len(s) && s.s[at] != ')') {
         at++;
     }
-    if (at >= s.len) {
+    if (at >= len(s)) {
         return -1;
     }
     return at + 1 - i;
@@ -2879,7 +2880,7 @@ struct Alt {
 static void ScanAlts(Results* res, Str raw, const Alt* alts, int nAlts) {
     int ignoreStart = 0;
     int i = 0;
-    while (i < raw.len) {
+    while (i < len(raw)) {
         int matched = -1;
         const Alt* hit = nullptr;
         for (int k = 0; k < nAlts; k++) {
@@ -2903,8 +2904,8 @@ static void ScanAlts(Results* res, Str raw, const Alt* alts, int nAlts) {
 
         i += matched;
     }
-    if (raw.len > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, raw.len - ignoreStart));
+    if (len(raw) > ignoreStart) {
+        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
     }
 }
 
@@ -2938,22 +2939,22 @@ static int RustString(Str s, int i) {
         return n;
     }
 
-    if (i >= s.len || s.s[i] != 'r') {
+    if (i >= len(s) || s.s[i] != 'r') {
         return -1;
     }
     int hashes = 0;
     int at = i + 1;
-    while (at < s.len && s.s[at] == '#') {
+    while (at < len(s) && s.s[at] == '#') {
         at++;
         hashes++;
     }
-    if (hashes == 0 || at >= s.len || s.s[at] != '"') {
+    if (hashes == 0 || at >= len(s) || s.s[at] != '"') {
         return -1;
     }
     at++;
 
-    for (; at < s.len; at++) {
-        bool atHashes = at + hashes <= s.len;
+    for (; at < len(s); at++) {
+        bool atHashes = at + hashes <= len(s);
         for (int h = 0; atHashes && h < hashes; h++) {
             atHashes = s.s[at + h] == '#';
         }
@@ -2961,12 +2962,12 @@ static int RustString(Str s, int i) {
             break;
         }
     }
-    if (at >= s.len || s.s[at] != '"') {
+    if (at >= len(s) || s.s[at] != '"') {
         return -1;
     }
     at++;
     for (int h = 0; h < hashes; h++) {
-        if (at >= s.len || s.s[at] != '#') {
+        if (at >= len(s) || s.s[at] != '#') {
             return -1;
         }
         at++;
@@ -2991,7 +2992,7 @@ static int CInclude(Str s, int i) {
     }
     int at = i + n;
     int spaces = 0;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
         spaces++;
     }
@@ -3021,8 +3022,8 @@ static int ObjcString(Str s, int i) {
 }
 
 static int ObjcSkipBlank(Str s, int i) {
-    while (i < s.len && ((uint8_t)s.s[i] == ' ' || s.s[i] == '\t' ||
-                         s.s[i] == '\n' || s.s[i] == '\r')) {
+    while (i < len(s) && ((uint8_t)s.s[i] == ' ' || s.s[i] == '\t' ||
+                          s.s[i] == '\n' || s.s[i] == '\r')) {
         i++;
     }
     return i;
@@ -3037,7 +3038,7 @@ static int ObjcIgnoreString(Str s, int i) {
             continue;
         }
         int at = i + n;
-        if (at >= s.len || s.s[at] != '(') {
+        if (at >= len(s) || s.s[at] != '(') {
             continue;
         }
         at = ObjcSkipBlank(s, at + 1);
@@ -3053,7 +3054,7 @@ static int ObjcIgnoreString(Str s, int i) {
             continue;
         }
         int at = i + n;
-        if (at >= s.len || s.s[at] != ':') {
+        if (at >= len(s) || s.s[at] != ':') {
             continue;
         }
         at = ObjcSkipBlank(s, at + 1);
@@ -3086,7 +3087,7 @@ static int PyString(Str s, int i) {
     if (n > 0) {
 
         int at = i + n;
-        while (at < s.len && s.s[at] == '"') {
+        while (at < len(s) && s.s[at] == '"') {
             at++;
         }
         return at - i;
@@ -3094,7 +3095,7 @@ static int PyString(Str s, int i) {
     return MatchSingleLine(s, i, '"');
 }
 static int PyRegexp(Str s, int i) {
-    if (i < s.len && s.s[i] == 'r') {
+    if (i < len(s) && s.s[i] == 'r') {
         int n = PyString(s, i + 1);
         if (n > 0) {
             return 1 + n;
@@ -3124,7 +3125,7 @@ static int RubyRegexp(Str s, int i) {
     }
     n = LitLen(s, i, "%r{");
     if (n > 0) {
-        for (int at = i + n; at < s.len && s.s[at] != '\n'; at++) {
+        for (int at = i + n; at < len(s) && s.s[at] != '\n'; at++) {
             if (s.s[at] == '}') {
                 return at + 1 - i;
             }
@@ -3145,11 +3146,11 @@ void ScanRuby(Results* res, Str raw) {
 }
 
 static int GoString(Str s, int i) {
-    char q = i < s.len ? s.s[i] : 0;
+    char q = i < len(s) ? s.s[i] : 0;
     if (q != '"' && q != '`') {
         return -1;
     }
-    for (int at = i + 1; at < s.len; at++) {
+    for (int at = i + 1; at < len(s); at++) {
         char c = s.s[at];
         if (c == q) {
             return at + 1 - i;
@@ -3157,7 +3158,7 @@ static int GoString(Str s, int i) {
         if (q == '"' && c == '\n') {
             return -1;
         }
-        if (c == '%' && at + 1 < s.len &&
+        if (c == '%' && at + 1 < len(s) &&
             (s.s[at + 1] == 's' || s.s[at + 1] == 'q' || s.s[at + 1] == 'v')) {
             return -1;
         }
@@ -3172,16 +3173,16 @@ static int GoCall(Str s, int i, const char* pkg) {
     }
     int at = i + n;
     int letters = 0;
-    while (at < s.len && ((s.s[at] >= 'a' && s.s[at] <= 'z') ||
-                          (s.s[at] >= 'A' && s.s[at] <= 'Z'))) {
+    while (at < len(s) && ((s.s[at] >= 'a' && s.s[at] <= 'z') ||
+                           (s.s[at] >= 'A' && s.s[at] <= 'Z'))) {
         at++;
         letters++;
     }
-    if (letters == 0 || at >= s.len || s.s[at] != '(') {
+    if (letters == 0 || at >= len(s) || s.s[at] != '(') {
         return -1;
     }
     at++;
-    while (at < s.len && s.s[at] == ' ') {
+    while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
     int sn = GoString(s, at);
@@ -3189,10 +3190,10 @@ static int GoCall(Str s, int i, const char* pkg) {
         return -1;
     }
     at += sn;
-    while (at < s.len && s.s[at] != ')') {
+    while (at < len(s) && s.s[at] != ')') {
         at++;
     }
-    return at < s.len ? at + 1 - i : -1;
+    return at < len(s) ? at + 1 - i : -1;
 }
 
 static int GoRegexp(Str s, int i) {
@@ -3296,7 +3297,7 @@ static int SwiftIgnoreString(Str s, int i) {
             continue;
         }
         int at = i + n;
-        if (at >= s.len || s.s[at] != '(') {
+        if (at >= len(s) || s.s[at] != '(') {
             continue;
         }
         at = ObjcSkipBlank(s, at + 1);
@@ -3312,7 +3313,7 @@ static int SwiftIgnoreString(Str s, int i) {
             continue;
         }
         int at = i + n;
-        if (at >= s.len || s.s[at] != ':') {
+        if (at >= len(s) || s.s[at] != ':') {
             continue;
         }
         at = ObjcSkipBlank(s, at + 1);
@@ -3368,7 +3369,7 @@ static int ScalaString(Str s, int i) {
     return n > 0 ? n : MatchSingleLine(s, i, '"');
 }
 static int ScalaStringLiteral(Str s, int i) {
-    if (i >= s.len || s.s[i] != 's') {
+    if (i >= len(s) || s.s[i] != 's') {
         return -1;
     }
     int n = ScalaString(s, i + 1);
@@ -3408,7 +3409,7 @@ static int DartString(Str s, int i) {
     return n > 0 ? n : MatchSingleLine(s, i, '"');
 }
 static int DartRegexp(Str s, int i) {
-    if (i >= s.len || s.s[i] != 'r') {
+    if (i >= len(s) || s.s[i] != 'r') {
         return -1;
     }
     int n = DartString(s, i + 1);
@@ -3438,7 +3439,7 @@ static int ElixirString(Str s, int i) {
         return n;
     }
     if ((LitLen(s, i, "~s(") > 0 || LitLen(s, i, "~c(") > 0)) {
-        for (int at = i + 3; at < s.len && s.s[at] != '\n'; at++) {
+        for (int at = i + 3; at < len(s) && s.s[at] != '\n'; at++) {
             if (s.s[at] == ')') {
                 return at + 1 - i;
             }
@@ -3448,7 +3449,7 @@ static int ElixirString(Str s, int i) {
 }
 static int ElixirRegexp(Str s, int i) {
     if (LitLen(s, i, "~r/") > 0) {
-        for (int at = i + 3; at < s.len && s.s[at] != '\n'; at++) {
+        for (int at = i + 3; at < len(s) && s.s[at] != '\n'; at++) {
             if (s.s[at] == '/') {
                 return at + 1 - i;
             }
@@ -3469,7 +3470,7 @@ void ScanElixir(Results* res, Str raw) {
 }
 
 static int JsString(Str s, int i) {
-    char q = i < s.len ? s.s[i] : 0;
+    char q = i < len(s) ? s.s[i] : 0;
     if (q == '\'') {
         return MatchMultiLine(s, i, '\'');
     }
@@ -3483,7 +3484,7 @@ static int JsString(Str s, int i) {
         }
 
         int at = i + n;
-        while (at < s.len && s.s[at] == '`') {
+        while (at < len(s) && s.s[at] == '`') {
             at++;
         }
         return at - i;
@@ -3499,16 +3500,16 @@ static int JsRegexp(Str s, int i) {
     n = LitLen(s, i, "RegExp(");
     if (n > 0) {
         int at = i + n;
-        while (at < s.len && s.s[at] == ' ') {
+        while (at < len(s) && s.s[at] == ' ') {
             at++;
         }
         int sn = JsString(s, at);
         if (sn > 0) {
             at += sn;
-            while (at < s.len && s.s[at] != ')') {
+            while (at < len(s) && s.s[at] != ')') {
                 at++;
             }
-            if (at < s.len) {
+            if (at < len(s)) {
                 return at + 1 - i;
             }
         }
@@ -3517,10 +3518,10 @@ static int JsRegexp(Str s, int i) {
 }
 
 static int JsOpenHtml(Str s, int i) {
-    if (i >= s.len || s.s[i] != '<') {
+    if (i >= len(s) || s.s[i] != '<') {
         return -1;
     }
-    for (int at = i + 1; at < s.len; at++) {
+    for (int at = i + 1; at < len(s); at++) {
         if (s.s[at] == '>') {
             return at + 1 - i;
         }
@@ -3532,7 +3533,7 @@ static int JsCloseHtml(Str s, int i) {
     if (LitLen(s, i, "</") < 0) {
         return -1;
     }
-    for (int at = i + 2; at < s.len; at++) {
+    for (int at = i + 2; at < len(s); at++) {
         if (s.s[at] == '>') {
             return at + 1 - i;
         }
@@ -3547,7 +3548,7 @@ static int JsHtmlNode(Str s, int i) {
     }
     int at = i + n;
     int children = 0;
-    while (at < s.len) {
+    while (at < len(s)) {
         int c = JsCloseHtml(s, at);
         if (c > 0) {
             return children > 0 ? at + c - i : -1;
@@ -3559,7 +3560,7 @@ static int JsHtmlNode(Str s, int i) {
             }
             at += sub;
         } else {
-            while (at < s.len && s.s[at] != '<') {
+            while (at < len(s) && s.s[at] != '<') {
                 at++;
             }
         }
@@ -3576,7 +3577,7 @@ void ScanJavascript(Results* res, Str raw) {
             EmitIgnore(res, Str(raw.s + ignoreStart, upTo - ignoreStart));
         }
     };
-    while (i < raw.len) {
+    while (i < len(raw)) {
         int n = CppLineComment(raw, i);
         if (n < 0) {
             n = CppBlockComment(raw, i);
@@ -3592,12 +3593,12 @@ void ScanJavascript(Results* res, Str raw) {
         n = JsString(raw, i);
         if (n > 0) {
             int at = i + n;
-            while (at < raw.len && raw.s[at] == ' ') {
+            while (at < len(raw) && raw.s[at] == ' ') {
                 at++;
             }
-            if (at < raw.len && raw.s[at] == ':') {
+            if (at < len(raw) && raw.s[at] == ':') {
                 at++;
-                while (at < raw.len && raw.s[at] == ' ') {
+                while (at < len(raw) && raw.s[at] == ' ') {
                     at++;
                 }
                 int vn = JsString(raw, at);
@@ -3653,7 +3654,7 @@ void ScanJavascript(Results* res, Str raw) {
         }
         i++;
     }
-    flush(raw.len);
+    flush(len(raw));
 }
 
 static int PhpString(Str s, int i) {
@@ -3677,7 +3678,7 @@ void ScanPhp(Results* res, Str raw) {
         {CppBlockComment, "COMMENT"}, {PhpRegexp, nullptr},
         {PhpString, "string"},
     };
-    while (i < raw.len) {
+    while (i < len(raw)) {
         if (!inPhp) {
 
             int matched = -1;
@@ -3733,17 +3734,17 @@ void ScanPhp(Results* res, Str raw) {
         }
         i += matched;
     }
-    if (raw.len > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, raw.len - ignoreStart));
+    if (len(raw) > ignoreStart) {
+        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
     }
 }
 
 static int JsonString(Str s, int i) {
 
-    if (i >= s.len || s.s[i] != '"') {
+    if (i >= len(s) || s.s[i] != '"') {
         return -1;
     }
-    for (int at = i + 1; at < s.len; at++) {
+    for (int at = i + 1; at < len(s); at++) {
         if (s.s[at] == '\\') {
             at++;
             continue;
@@ -3758,7 +3759,7 @@ static int JsonString(Str s, int i) {
 void ScanJson(Results* res, Str raw) {
     int ignoreStart = 0;
     int i = 0;
-    while (i < raw.len) {
+    while (i < len(raw)) {
         int n = CppLineComment(raw, i);
         bool isComment = n > 0;
         if (!isComment) {
@@ -3778,10 +3779,10 @@ void ScanJson(Results* res, Str raw) {
         if (n > 0) {
 
             int at = i + n;
-            while (at < raw.len && (raw.s[at] == ' ' || raw.s[at] == '\t')) {
+            while (at < len(raw) && (raw.s[at] == ' ' || raw.s[at] == '\t')) {
                 at++;
             }
-            bool isKey = at < raw.len && raw.s[at] == ':';
+            bool isKey = at < len(raw) && raw.s[at] == ':';
             if (!isKey) {
                 if (i > ignoreStart) {
                     EmitIgnore(res, Str(raw.s + ignoreStart, i - ignoreStart));
@@ -3794,22 +3795,22 @@ void ScanJson(Results* res, Str raw) {
         }
         i++;
     }
-    if (raw.len > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, raw.len - ignoreStart));
+    if (len(raw) > ignoreStart) {
+        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
     }
 }
 
 void ScanYaml(Results* res, Str raw) {
     int ignoreStart = 0;
     int i = 0;
-    while (i < raw.len) {
+    while (i < len(raw)) {
         int at = i;
-        while (at < raw.len && raw.s[at] == ' ') {
+        while (at < len(raw) && raw.s[at] == ' ') {
             at++;
         }
-        if (at < raw.len && raw.s[at] == '#') {
+        if (at < len(raw) && raw.s[at] == '#') {
             int end = at;
-            while (end < raw.len && raw.s[end] != '\n') {
+            while (end < len(raw) && raw.s[end] != '\n') {
                 end++;
             }
             if (at > ignoreStart) {
@@ -3817,46 +3818,46 @@ void ScanYaml(Results* res, Str raw) {
             }
             EmitText(res, StrL("comment"), Str(raw.s + at, end - at));
             ignoreStart = end;
-            i = end < raw.len ? end + 1 : end;
+            i = end < len(raw) ? end + 1 : end;
             continue;
         }
 
         int keyEnd = at;
-        if (at < raw.len && raw.s[at] == '"') {
+        if (at < len(raw) && raw.s[at] == '"') {
             int n = MatchSingleLine(raw, at, '"');
             keyEnd = n > 0 ? at + n : at;
         } else {
-            while (keyEnd < raw.len && raw.s[keyEnd] != ':' &&
+            while (keyEnd < len(raw) && raw.s[keyEnd] != ':' &&
                    raw.s[keyEnd] != '"' && raw.s[keyEnd] != '\'' &&
                    raw.s[keyEnd] != '\n') {
                 keyEnd++;
             }
         }
-        bool isPair = keyEnd > at && keyEnd < raw.len && raw.s[keyEnd] == ':';
+        bool isPair = keyEnd > at && keyEnd < len(raw) && raw.s[keyEnd] == ':';
         if (!isPair) {
 
-            while (i < raw.len && raw.s[i] != '\n') {
+            while (i < len(raw) && raw.s[i] != '\n') {
                 i++;
             }
-            if (i < raw.len) {
+            if (i < len(raw)) {
                 i++;
             }
             continue;
         }
         int valueStart = keyEnd + 1;
-        if (valueStart < raw.len && raw.s[valueStart] == ' ') {
+        if (valueStart < len(raw) && raw.s[valueStart] == ' ') {
             valueStart++;
         }
 
         int valueEnd = valueStart;
-        if (valueStart < raw.len &&
+        if (valueStart < len(raw) &&
             (raw.s[valueStart] == '"' || raw.s[valueStart] == '\'')) {
             int n = MatchSingleLine(raw, valueStart, raw.s[valueStart]);
             if (n > 0) {
                 valueEnd = valueStart + n;
             }
         } else {
-            while (valueEnd < raw.len && raw.s[valueEnd] != '\n' &&
+            while (valueEnd < len(raw) && raw.s[valueEnd] != '\n' &&
                    raw.s[valueEnd] != '"' && raw.s[valueEnd] != '\'') {
                 valueEnd++;
             }
@@ -3868,15 +3869,15 @@ void ScanYaml(Results* res, Str raw) {
                  Str(raw.s + valueStart, valueEnd - valueStart));
         ignoreStart = valueEnd;
         i = valueEnd;
-        while (i < raw.len && raw.s[i] != '\n') {
+        while (i < len(raw) && raw.s[i] != '\n') {
             i++;
         }
-        if (i < raw.len) {
+        if (i < len(raw)) {
             i++;
         }
     }
-    if (raw.len > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, raw.len - ignoreStart));
+    if (len(raw) > ignoreStart) {
+        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
     }
 }
 
@@ -3893,9 +3894,9 @@ static bool IsAsciiAlnum(char c) {
 
 static int MatchRuleName(Str s, int i) {
     int at = i;
-    while (at < s.len && IsAsciiAlnum(s.s[at])) {
+    while (at < len(s) && IsAsciiAlnum(s.s[at])) {
         at++;
-        while (at < s.len && (s.s[at] == '-' || s.s[at] == '_')) {
+        while (at < len(s) && (s.s[at] == '-' || s.s[at] == '_')) {
             at++;
         }
     }
@@ -3915,18 +3916,18 @@ static void ToggleAddRule(Toggle* t, Str name) {
 Toggle ToggleParse(Str comment) {
     Str s = comment;
     static const Str kWord = StrL("autocorrect");
-    for (int i = 0; i + kWord.len <= s.len; i++) {
-        if (!base::StrEq(Str(s.s + i, kWord.len), kWord)) {
+    for (int i = 0; i + len(kWord) <= len(s); i++) {
+        if (!base::StrEq(Str(s.s + i, len(kWord)), kWord)) {
             continue;
         }
-        int at = i + kWord.len;
+        int at = i + len(kWord);
 
-        if (at < s.len && s.s[at] == ':') {
+        if (at < len(s) && s.s[at] == ':') {
             at++;
-            while (at < s.len && s.s[at] == ' ') {
+            while (at < len(s) && s.s[at] == ' ') {
                 at++;
             }
-        } else if (at < s.len && s.s[at] == '-') {
+        } else if (at < len(s) && s.s[at] == '-') {
             at++;
         } else {
             continue;
@@ -3936,29 +3937,29 @@ Toggle ToggleParse(Str comment) {
         static const Str kTrue = StrL("true");
         static const Str kDisable = StrL("disable");
         static const Str kFalse = StrL("false");
-        if (at + kEnable.len <= s.len &&
-            base::StrEq(Str(s.s + at, kEnable.len), kEnable)) {
+        if (at + len(kEnable) <= len(s) &&
+            base::StrEq(Str(s.s + at, len(kEnable)), kEnable)) {
             kind = ToggleKind::Enable;
-            at += kEnable.len;
-        } else if (at + kTrue.len <= s.len &&
-                   base::StrEq(Str(s.s + at, kTrue.len), kTrue)) {
+            at += len(kEnable);
+        } else if (at + len(kTrue) <= len(s) &&
+                   base::StrEq(Str(s.s + at, len(kTrue)), kTrue)) {
             kind = ToggleKind::Enable;
-            at += kTrue.len;
-        } else if (at + kDisable.len <= s.len &&
-                   base::StrEq(Str(s.s + at, kDisable.len), kDisable)) {
+            at += len(kTrue);
+        } else if (at + len(kDisable) <= len(s) &&
+                   base::StrEq(Str(s.s + at, len(kDisable)), kDisable)) {
             kind = ToggleKind::Disable;
-            at += kDisable.len;
-        } else if (at + kFalse.len <= s.len &&
-                   base::StrEq(Str(s.s + at, kFalse.len), kFalse)) {
+            at += len(kDisable);
+        } else if (at + len(kFalse) <= len(s) &&
+                   base::StrEq(Str(s.s + at, len(kFalse)), kFalse)) {
             kind = ToggleKind::Disable;
-            at += kFalse.len;
+            at += len(kFalse);
         } else {
             continue;
         }
         Toggle t;
         t.kind = kind;
 
-        while (at < s.len && s.s[at] == ' ') {
+        while (at < len(s) && s.s[at] == ' ') {
             at++;
             for (;;) {
                 int n = MatchRuleName(s, at);
@@ -3967,7 +3968,7 @@ Toggle ToggleParse(Str comment) {
                 }
                 ToggleAddRule(&t, Str(s.s + at, n));
                 at += n;
-                while (at < s.len && (s.s[at] == ',' || s.s[at] == ' ')) {
+                while (at < len(s) && (s.s[at] == ',' || s.s[at] == ' ')) {
                     at++;
                 }
             }
@@ -4030,15 +4031,15 @@ uint32_t Utf8Next(Str s, int* i) {
 
     int size = 1;
     uint32_t cp = b0;
-    if ((b0 & 0xE0) == 0xC0 && at + 1 < s.len) {
+    if ((b0 & 0xE0) == 0xC0 && at + 1 < len(s)) {
         size = 2;
         cp = ((uint32_t)(b0 & 0x1F) << 6) | ((uint8_t)s.s[at + 1] & 0x3F);
-    } else if ((b0 & 0xF0) == 0xE0 && at + 2 < s.len) {
+    } else if ((b0 & 0xF0) == 0xE0 && at + 2 < len(s)) {
         size = 3;
         cp = ((uint32_t)(b0 & 0x0F) << 12) |
              (((uint32_t)(uint8_t)s.s[at + 1] & 0x3F) << 6) |
              ((uint8_t)s.s[at + 2] & 0x3F);
-    } else if ((b0 & 0xF8) == 0xF0 && at + 3 < s.len) {
+    } else if ((b0 & 0xF8) == 0xF0 && at + 3 < len(s)) {
         size = 4;
         cp = ((uint32_t)(b0 & 0x07) << 18) |
              (((uint32_t)(uint8_t)s.s[at + 1] & 0x3F) << 12) |
@@ -4062,7 +4063,7 @@ uint32_t Utf8At(Str s, int i) {
 
 int Utf8Count(Str s) {
     int n = 0;
-    for (int i = 0; i < s.len;) {
+    for (int i = 0; i < len(s);) {
         Utf8Next(s, &i);
         n++;
     }
@@ -4123,7 +4124,8 @@ static const CpRange kBopomofo[] = {
 };
 
 bool IsHan(uint32_t cp) {
-    return cp >= 0x2E80 && InRanges(cp, kHan, (int)(sizeof(kHan) / sizeof(kHan[0])));
+    return cp >= 0x2E80 &&
+           InRanges(cp, kHan, (int)(sizeof(kHan) / sizeof(kHan[0])));
 }
 
 bool IsHangul(uint32_t cp) {
@@ -4178,7 +4180,7 @@ bool IsWordCp(uint32_t cp) {
 }
 
 bool HasCjk(Str s) {
-    for (int i = 0; i < s.len;) {
+    for (int i = 0; i < len(s);) {
         if (IsCjk(Utf8Next(s, &i))) {
             return true;
         }
@@ -4213,7 +4215,7 @@ static bool IsCjkClassCp(uint32_t cp) {
 }
 
 static int MatchCp(Str s, int i, bool (*pred)(uint32_t)) {
-    if (i >= s.len) {
+    if (i >= len(s)) {
         return -1;
     }
     int at = i;
@@ -4222,7 +4224,7 @@ static int MatchCp(Str s, int i, bool (*pred)(uint32_t)) {
 }
 
 static int SideCjkWordOne(Str s, int i) {
-    if (i >= s.len) {
+    if (i >= len(s)) {
         return -1;
     }
     int at = i;
@@ -4230,7 +4232,7 @@ static int SideCjkWordOne(Str s, int i) {
     if (IsHan(cp) || IsHangul(cp) || IsKatakana(cp) || IsHiragana(cp)) {
         return at - i;
     }
-    if (IsBopomofo(cp) && at < s.len) {
+    if (IsBopomofo(cp) && at < len(s)) {
         uint32_t c2 = Utf8Next(s, &at);
         if (c2 != '%' && c2 != '$' && c2 != '\\') {
             return at - i;
@@ -4244,7 +4246,7 @@ static int SideAlnum(Str s, int i) {
 }
 
 static int SideNotEscapeThenAlnum(Str s, int i) {
-    if (i >= s.len) {
+    if (i >= len(s)) {
         return -1;
     }
     int at = i;
@@ -4252,7 +4254,7 @@ static int SideNotEscapeThenAlnum(Str s, int i) {
     if (cp == '%' || cp == '$' || cp == '\\') {
         return -1;
     }
-    if (at >= s.len || !IsAsciiAlnumCp(Utf8At(s, at))) {
+    if (at >= len(s) || !IsAsciiAlnumCp(Utf8At(s, at))) {
         return -1;
     }
     return at + 1 - i;
@@ -4263,12 +4265,12 @@ static int SideCjk(Str s, int i) {
 }
 
 static int SideSignedNumber(Str s, int i) {
-    if (i >= s.len || (s.s[i] != '-' && s.s[i] != '+')) {
+    if (i >= len(s) || (s.s[i] != '-' && s.s[i] != '+')) {
         return -1;
     }
     int at = i + 1;
     int digits = 0;
-    while (at < s.len && s.s[at] >= '0' && s.s[at] <= '9') {
+    while (at < len(s) && s.s[at] >= '0' && s.s[at] <= '9') {
         at++;
         digits++;
     }
@@ -4283,19 +4285,19 @@ static int SideStartAlnum(Str s, int i) {
 }
 
 static int SideDigitPercent(Str s, int i) {
-    if (i + 1 < s.len && s.s[i] >= '0' && s.s[i] <= '9' && s.s[i + 1] == '%') {
+    if (i + 1 < len(s) && s.s[i] >= '0' && s.s[i] <= '9' && s.s[i + 1] == '%') {
         return 2;
     }
     return -1;
 }
 
 static int SideAlnumPlusHash(Str s, int i) {
-    if (i >= s.len || !IsAsciiAlnumCp((uint8_t)s.s[i])) {
+    if (i >= len(s) || !IsAsciiAlnumCp((uint8_t)s.s[i])) {
         return -1;
     }
     int at = i + 1;
     int n = 0;
-    while (at < s.len && (s.s[at] == '+' || s.s[at] == '#')) {
+    while (at < len(s) && (s.s[at] == '+' || s.s[at] == '#')) {
         at++;
         n++;
     }
@@ -4333,14 +4335,14 @@ static int SideCjkOrLeftQuote(Str s, int i) {
 }
 
 static int SidePipeThenOpen(Str s, int i) {
-    if (i >= s.len || (s.s[i] != '|' && s.s[i] != '+')) {
+    if (i >= len(s) || (s.s[i] != '|' && s.s[i] != '+')) {
         return -1;
     }
     int n = MatchCp(s, i + 1, IsCjkSpaceOrLeftQuoteCp);
     return n > 0 ? 1 + n : -1;
 }
 static int SideDashThenOpen(Str s, int i) {
-    if (i >= s.len || s.s[i] != '-') {
+    if (i >= len(s) || s.s[i] != '-') {
         return -1;
     }
     int n = MatchCp(s, i + 1, IsCjkSpaceOrLeftQuoteCp);
@@ -4349,37 +4351,36 @@ static int SideDashThenOpen(Str s, int i) {
 
 static int SideCloseThenPipe(Str s, int i) {
     int n = MatchCp(s, i, IsCjkSpaceOrCloseQuoteCp);
-    if (n <= 0 || i + n >= s.len ||
-        (s.s[i + n] != '|' && s.s[i + n] != '+')) {
+    if (n <= 0 || i + n >= len(s) || (s.s[i + n] != '|' && s.s[i + n] != '+')) {
         return -1;
     }
     return n + 1;
 }
 static int SideCloseThenDash(Str s, int i) {
     int n = MatchCp(s, i, IsCjkSpaceOrCloseQuoteCp);
-    if (n <= 0 || i + n >= s.len || s.s[i + n] != '-') {
+    if (n <= 0 || i + n >= len(s) || s.s[i + n] != '-') {
         return -1;
     }
     return n + 1;
 }
 
 static int SideBang(Str s, int i) {
-    return i < s.len && s.s[i] == '!' ? 1 : -1;
+    return i < len(s) && s.s[i] == '!' ? 1 : -1;
 }
 
 static int SideOpenBracket(Str s, int i) {
-    return i < s.len && (s.s[i] == '[' || s.s[i] == '(') ? 1 : -1;
+    return i < len(s) && (s.s[i] == '[' || s.s[i] == '(') ? 1 : -1;
 }
 static int SideCloseBracket(Str s, int i) {
-    return i < s.len && (s.s[i] == ']' || s.s[i] == ')') ? 1 : -1;
+    return i < len(s) && (s.s[i] == ']' || s.s[i] == ')') ? 1 : -1;
 }
 
 static int SideBacktickString(Str s, int i) {
-    if (i >= s.len || s.s[i] != '`') {
+    if (i >= len(s) || s.s[i] != '`') {
         return -1;
     }
     int last = -1;
-    for (int j = i + 1; j < s.len && s.s[j] != '\n'; j++) {
+    for (int j = i + 1; j < len(s) && s.s[j] != '\n'; j++) {
         if (s.s[j] == '`' && j > i + 1) {
             last = j;
         }
@@ -4388,7 +4389,7 @@ static int SideBacktickString(Str s, int i) {
 }
 
 static int SideDollar(Str s, int i) {
-    return i < s.len && s.s[i] == '$' ? 1 : -1;
+    return i < len(s) && s.s[i] == '$' ? 1 : -1;
 }
 
 static bool IsWordCjkOrBacktickCp(uint32_t cp) {
@@ -4441,7 +4442,7 @@ static int SideFullwidthQuote(Str s, int i) {
 static bool PassAdd(Str in, SideFn one, SideFn other, StrBuilder* out) {
     bool changed = false;
     int i = 0;
-    while (i < in.len) {
+    while (i < len(in)) {
         int n1 = one(in, i);
         if (n1 > 0) {
             int n2 = other(in, i + n1);
@@ -4464,11 +4465,11 @@ static bool PassAdd(Str in, SideFn one, SideFn other, StrBuilder* out) {
 static bool PassRemove(Str in, SideFn one, SideFn other, StrBuilder* out) {
     bool changed = false;
     int i = 0;
-    while (i < in.len) {
+    while (i < len(in)) {
         int n1 = one(in, i);
         if (n1 > 0) {
             int sp = i + n1;
-            while (sp < in.len && in.s[sp] == ' ') {
+            while (sp < len(in) && in.s[sp] == ' ') {
                 sp++;
             }
             if (sp > i + n1) {
@@ -4558,11 +4559,11 @@ bool FormatSpaceDash(Arena* a, Str in, Str* out) {
 static bool PassBacktickThenCjk(Str in, StrBuilder* out) {
     bool changed = false;
     int i = 0;
-    while (i < in.len) {
+    while (i < len(in)) {
         if (in.s[i] == '`') {
             int end = -1;
-            for (int j = i + 2; j < in.len && in.s[j] != '\n'; j++) {
-                if (in.s[j] == '`' && j + 1 < in.len &&
+            for (int j = i + 2; j < len(in) && in.s[j] != '\n'; j++) {
+                if (in.s[j] == '`' && j + 1 < len(in) &&
                     SideCjk(in, j + 1) > 0) {
                     end = j + 1;
                 }

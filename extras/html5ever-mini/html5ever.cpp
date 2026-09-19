@@ -16,7 +16,7 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 static int VscprintfUtf8(const char* fmt, va_list args);
 
 float StrToFloatUnchecked(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return 0;
     }
     TempStr text = StrDupTemp(s);
@@ -24,21 +24,21 @@ float StrToFloatUnchecked(Str s) {
 }
 
 int StrToIntUnchecked(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return 0;
     }
     int i = 0;
-    while (i < s.len && s.s[i] <= ' ') {
+    while (i < len(s) && s.s[i] <= ' ') {
         i++;
     }
     bool negative = false;
-    Str rest = Str(s.s + i, s.len - i);
+    Str rest = Str(s.s + i, len(s) - i);
     if (StrStartsWithAny(rest, "+-")) {
         negative = rest.s[0] == '-';
         i++;
     }
     uint64_t value = 0;
-    while (i < s.len && s.s[i] >= '0' && s.s[i] <= '9') {
+    while (i < len(s) && s.s[i] >= '0' && s.s[i] <= '9') {
         value = value * 10 + (uint64_t)(s.s[i] - '0');
         i++;
     }
@@ -86,20 +86,11 @@ static uint64_t ArenaAlignPow2(uint64_t value, uint64_t align) {
     return (value + align - 1) & ~(align - 1);
 }
 
-static uint64_t ArenaMin(uint64_t a, uint64_t b) {
-    return (a < b) ? a : b;
-}
-
-static uint64_t ArenaMax(uint64_t a, uint64_t b) {
-    return (a > b) ? a : b;
-}
-
-static uint64_t ArenaClampTop(uint64_t value, uint64_t maxValue) {
-    return (value < maxValue) ? value : maxValue;
-}
-
-static uint64_t ArenaClampBot(uint64_t minValue, uint64_t value) {
-    return (value > minValue) ? value : minValue;
+static uint64_t ArenaPosAfter(Arena* current, uint64_t size, uint64_t align) {
+    if (align == 0) {
+        align = 1;
+    }
+    return ArenaAlignPow2(current->pos, align) + size;
 }
 
 static Arena* ArenaAlloc(const ArenaParams& params);
@@ -111,15 +102,10 @@ static void ArenaRelease(Arena* arena) {
 static bool ArenaPushWouldChainLocked(Arena* arena, uint64_t size,
                                       uint64_t align) {
     if (!arena || (arena->flags & ArenaFlagNoChain)) {
-
         return false;
     }
-    if (align == 0) {
-        align = 1;
-    }
-    Arena* current = arena->current;
-    uint64_t posPost = ArenaAlignPow2(current->pos, align) + size;
-    return current->reserved < posPost;
+    return arena->current
+               ->reserved < ArenaPosAfter(arena->current, size, align);
 }
 
 static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
@@ -127,17 +113,13 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
     if (!arena) {
         return nullptr;
     }
-    if (align == 0) {
-        align = 1;
-    }
-
     Arena* current = arena->current;
-    uint64_t posPre = ArenaAlignPow2(current->pos, align);
-    uint64_t posPost = posPre + size;
+    uint64_t posPost = ArenaPosAfter(current, size, align);
+    uint64_t posPre = posPost - size;
 
     uint64_t sizeToZero = 0;
     if (zero && current->committed > posPre) {
-        sizeToZero = ArenaMin(current->committed, posPost) - posPre;
+        sizeToZero = std::min(current->committed, posPost) - posPre;
     }
 
     if (current->reserved < posPost && !(arena->flags & ArenaFlagNoChain)) {
@@ -146,7 +128,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         uint64_t commitChunkSize = arena->commitChunkSize;
         if (size + kArenaHeaderSize > reserveChunkSize) {
             reserveChunkSize = ArenaAlignPow2(size + kArenaHeaderSize,
-                                              ArenaMax(align, PlatPageSize()));
+                                              std::max(align, PlatPageSize()));
             commitChunkSize = reserveChunkSize;
         }
 
@@ -167,8 +149,8 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         newBlock->prev = current;
         arena->current = newBlock;
         current = newBlock;
-        posPre = ArenaAlignPow2(current->pos, align);
-        posPost = posPre + size;
+        posPost = ArenaPosAfter(current, size, align);
+        posPre = posPost - size;
         sizeToZero = 0;
     }
 
@@ -178,7 +160,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         }
 
         uint64_t commitEnd = ArenaAlignPow2(posPost, current->commitChunkSize);
-        uint64_t commitClamped = ArenaClampTop(commitEnd, current->reserved);
+        uint64_t commitClamped = std::min(commitEnd, current->reserved);
         uint64_t commitSize = commitClamped - current->committed;
         void* commitPtr = (char*)current + current->committed;
         if (!PlatMemCommit(commitPtr, commitSize, false)) {
@@ -193,12 +175,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
 
     void* result = (char*)current + posPre;
     current->pos = posPost;
-
-    arena->nAllocsLifetime++;
     arena->nAllocsSinceReset++;
-    uint64_t used = current->basePos + posPost;
-    arena->peakBytesLifetime = std::max(used, arena->peakBytesLifetime);
-    arena->peakBytesSinceReset = std::max(used, arena->peakBytesSinceReset);
 
     if (sizeToZero) {
         memset(result, 0, (size_t)sizeToZero);
@@ -231,10 +208,10 @@ static Arena* ArenaAlloc(const ArenaParams& srcParams) {
     const uint64_t pageSize =
         useLargePages ? PlatLargePageSize() : PlatPageSize();
     uint64_t reserveSize = ArenaAlignPow2(
-        ArenaMax(params.reserveSize, kArenaHeaderSize), pageSize);
+        std::max(params.reserveSize, kArenaHeaderSize), pageSize);
     uint64_t commitSize =
-        ArenaAlignPow2(ArenaMax(params.commitSize, kArenaHeaderSize), pageSize);
-    commitSize = ArenaClampTop(commitSize, reserveSize);
+        ArenaAlignPow2(std::max(params.commitSize, kArenaHeaderSize), pageSize);
+    commitSize = std::min(commitSize, reserveSize);
 
     void* base = params.optionalBackingBuffer;
     bool usesExternalBuffer = (base != nullptr);
@@ -283,10 +260,7 @@ static Arena* ArenaAlloc(const ArenaParams& srcParams) {
     arena->allocationSiteLine = params.allocationSiteLine;
     arena->name = params.name;
     arena->usesExternalBuffer = usesExternalBuffer;
-    arena->nAllocsLifetime = 0;
-    arena->peakBytesLifetime = 0;
     arena->nAllocsSinceReset = 0;
-    arena->peakBytesSinceReset = 0;
     return arena;
 }
 
@@ -316,7 +290,7 @@ void Arena::PopTo(uint64_t popPos) {
     Arena* arena = this;
     lock.Lock();
 
-    uint64_t bigPos = ArenaClampBot(kArenaHeaderSize, popPos);
+    uint64_t bigPos = std::max(kArenaHeaderSize, popPos);
     Arena* node = arena->current;
     while (node && node->basePos >= bigPos) {
         Arena* prevNode = node->prev;
@@ -345,14 +319,6 @@ uint64_t ArenaUsed(Arena* arena) {
     }
     Arena* cur = arena->current;
     return cur ? cur->basePos + cur->pos : 0;
-}
-
-static Arena* ArenaBlockAt(Arena* arena, uint64_t pos) {
-    Arena* node = arena ? arena->current : nullptr;
-    while (node && node->basePos > pos) {
-        node = node->prev;
-    }
-    return node;
 }
 
 int VarintSize(uint32_t v) {
@@ -391,33 +357,30 @@ int VarintGet(const char* src, uint32_t* out) {
 }
 
 static char* ArenaStrAt(Arena* a, ArenaStr s) {
-    Arena* node = ArenaBlockAt(a, s);
-    if (!node) {
-        return nullptr;
-    }
-    return (char*)node + ((uint64_t)s - node->basePos);
+    return (char*)ArenaAtOffset(a, s);
+}
+
+static uint64_t ArenaBlockOff(Arena* block, const void* p) {
+    return block->basePos + (uint64_t)((const char*)p - (const char*)block);
 }
 
 ArenaStr ArenaStrDup(Arena* a, Str src) {
-    if (!a || !src.s || src.len <= 0) {
+    if (!a || !src.s || len(src) <= 0) {
         return kArenaStrNone;
     }
-    uint32_t len = (uint32_t)src.len;
-    int vlen = VarintSize(len);
+    uint32_t n = (uint32_t)len(src);
+    int vlen = VarintSize(n);
     a->lock.Lock();
-
-    char* dst = (char*)ArenaPushLocked(a, (uint64_t)vlen + len + 1, 1, false);
-    Arena* cur = a->current;
-    uint64_t at = dst ? cur->basePos + (uint64_t)((char*)dst - (char*)cur) : 0;
+    char* dst = (char*)ArenaPushLocked(a, (uint64_t)vlen + n + 1, 1, false);
+    uint64_t at = dst ? ArenaBlockOff(a->current, dst) : 0;
     a->lock.Unlock();
     if (!dst) {
         return kArenaStrNone;
     }
-    VarintPut(dst, len);
-    memcpy(dst + vlen, src.s, (size_t)len);
-    dst[vlen + len] = 0;
+    VarintPut(dst, n);
+    memcpy(dst + vlen, src.s, (size_t)n);
+    dst[vlen + n] = 0;
     if (at > UINT32_MAX) {
-
         return kArenaStrNone;
     }
     return (ArenaStr)at;
@@ -437,7 +400,7 @@ uint32_t ArenaStrLen(Arena* a, ArenaStr s) {
 }
 
 ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
-    if (!a || !more.s || more.len <= 0) {
+    if (!a || !more.s || len(more) <= 0) {
         return s;
     }
     if (!ArenaStrIsSet(s)) {
@@ -454,9 +417,7 @@ ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
     bool newest = p && (uint64_t)s + vlen + len + 1 == used;
     uint32_t nlen = len + (uint32_t)more.len;
     int nvlen = VarintSize(nlen);
-
     uint64_t want = (uint64_t)nvlen + nlen + 1;
-
     if (newest && !ArenaPushWouldChainLocked(
                       a, (uint64_t)(nvlen - vlen) + (uint64_t)more.len, 1)) {
         want = (uint64_t)(nvlen - vlen) + (uint64_t)more.len;
@@ -464,11 +425,7 @@ ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
         newest = false;
     }
     char* dst = (char*)ArenaPushLocked(a, want, 1, false);
-    uint64_t at = 0;
-    if (dst) {
-        Arena* after = a->current;
-        at = after->basePos + (uint64_t)((char*)dst - (char*)after);
-    }
+    uint64_t at = dst ? ArenaBlockOff(a->current, dst) : 0;
     a->lock.Unlock();
     if (!dst) {
         return s;
@@ -520,7 +477,7 @@ uint32_t ArenaOffsetOf(Arena* a, const void* p) {
         if (at < lo || at >= lo + node->pos) {
             continue;
         }
-        uint64_t off = node->basePos + (uint64_t)(at - lo);
+        uint64_t off = ArenaBlockOff(node, at);
         if (off > UINT32_MAX) {
 
             return kArenaPtrNone;
@@ -530,43 +487,37 @@ uint32_t ArenaOffsetOf(Arena* a, const void* p) {
     return kArenaPtrNone;
 }
 
-void* Arena::Alloc(int size) {
-    if (size <= 0) {
+static void* AllocBytes(Arena* arena, uint64_t size) {
+    if (size == 0) {
         return nullptr;
     }
-    return Push((uint64_t)size, 8, false);
+    if (!arena) {
+        return malloc((size_t)size);
+    }
+    return arena->Push(size, 8, false);
+}
+
+void* Arena::Alloc(int size) {
+    return AllocBytes(this, size <= 0 ? 0 : (uint64_t)size);
 }
 
 void Arena::Reset() {
     PopTo(0);
     nAllocsSinceReset = 0;
-    peakBytesSinceReset = 0;
 }
 
 void* Alloc(Arena* arena, int size) {
-    if (size <= 0) {
-        return nullptr;
-    }
-    if (!arena) {
-        return malloc(size);
-    }
-    return arena->Alloc(size);
+    return AllocBytes(arena, size <= 0 ? 0 : (uint64_t)size);
 }
 
 void Free(Arena* arena, void* mem) {
-
-    if (arena) return;
-    free(mem);
+    if (!arena) {
+        free(mem);
+    }
 }
 
 static void* Alloc(Arena* arena, size_t size) {
-    if (size == 0) {
-        return nullptr;
-    }
-    if (!arena) {
-        return malloc(size);
-    }
-    return arena->Push((uint64_t)size, 8, false);
+    return AllocBytes(arena, (uint64_t)size);
 }
 
 static void* Realloc(Arena* arena, void* mem, size_t newSize, size_t copySize) {
@@ -707,18 +658,10 @@ GPUI_NOINLINE bool VecRealloc(Arena* a, void** els, int len, int* cap,
     return true;
 }
 
-static int VecNextCap(int cap, int wanted, int elSize) {
-    if (cap == 0) {
-        int floorCap = elSize == 1 ? 8 : elSize <= 1024 ? 4 : 1;
-        return std::max(floorCap, wanted);
-    }
-    return std::max(cap * 2, wanted);
-}
-
 GPUI_NOINLINE bool VecReserveNT(Arena* arena, VecNonTemplated* v, int elSize,
                                 int wantedSize) {
     int cap = v->cap;
-    int curCap = cap < 0 ? -cap : cap;
+    int curCap = VecAbsCap(cap);
     if (wantedSize <= curCap) {
         return true;
     }
@@ -760,12 +703,12 @@ GPUI_NOINLINE bool VecResizeNT(VecNonTemplated* v, int elSize, int newSize) {
     if (newSize < 0) {
         return false;
     }
-    int curCap = v->cap < 0 ? -v->cap : v->cap;
+    int curCap = VecAbsCap(v->cap);
     if (newSize > curCap) {
         if (!VecReserveNT(nullptr, v, elSize, newSize)) {
             return false;
         }
-        curCap = v->cap < 0 ? -v->cap : v->cap;
+        curCap = VecAbsCap(v->cap);
     }
     v->len = newSize;
     if (v->els && curCap > newSize) {
@@ -820,7 +763,7 @@ GPUI_NOINLINE void VecFreeElementsNT(VecNonTemplated* v) {
 
 GPUI_NOINLINE void VecClearNT(VecNonTemplated* v, int elSize) {
     v->len = 0;
-    int curCap = v->cap < 0 ? -v->cap : v->cap;
+    int curCap = VecAbsCap(v->cap);
     if (v->els && curCap > 0) {
         memset(v->els, 0, (size_t)curCap * (size_t)elSize);
     }
@@ -859,7 +802,7 @@ GPUI_NOINLINE void VecCopyFromNT(VecNonTemplated* v, int elSize, int srcLen,
         memcpy(v->els, srcEls, (size_t)srcLen * (size_t)elSize);
     }
     if (zeroTail && v->els) {
-        int curCap = v->cap < 0 ? -v->cap : v->cap;
+        int curCap = VecAbsCap(v->cap);
         if (curCap > srcLen) {
             char* tail = (char*)v->els + (size_t)srcLen * (size_t)elSize;
             memset(tail, 0, (size_t)(curCap - srcLen) * (size_t)elSize);
@@ -868,7 +811,6 @@ GPUI_NOINLINE void VecCopyFromNT(VecNonTemplated* v, int elSize, int srcLen,
 }
 
 #if defined(DEBUG)
-
 static FILE* gVecDbgFile = nullptr;
 static bool gVecDbgOpened = false;
 static int gVecDbgNextId = 1;
@@ -936,27 +878,13 @@ void VecDbgArenaDeath(int id, int len, int totalCap, int segCount) noexcept {
 }
 #endif
 
-static bool StrIsNull(const Str& s) {
-    return !s.s;
-}
-
-static Str WrapAllocated(char* s, int cch = -1) {
-    if (!s) {
-        return {};
-    }
-    if (cch < 0) {
-        return Str(s);
-    }
-    return Str(s, cch);
-}
-
 Str StrDup(Arena* a, Str s) {
-    if (StrIsNull(s) || s.len < 0) {
+    if (!s.s || len(s) < 0) {
         return {};
     }
-    int cch = s.len;
-    return WrapAllocated(
-        (char*)MemDup(a, s.s, (size_t)cch * sizeof(char), sizeof(char)), cch);
+    char* p =
+        (char*)MemDup(a, s.s, (size_t)len(s) * sizeof(char), sizeof(char));
+    return p ? Str(p, len(s)) : Str{};
 }
 
 Str StrDup(Str s) {
@@ -966,8 +894,8 @@ Str StrDup(Str s) {
 void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out) {
     s1Out = {};
     s2Out = {};
-    int n1 = (!s1.s || s1.len < 0) ? 0 : s1.len;
-    int n2 = (!s2.s || s2.len < 0) ? 0 : s2.len;
+    int n1 = (!s1.s || len(s1) < 0) ? 0 : len(s1);
+    int n2 = (!s2.s || len(s2) < 0) ? 0 : len(s2);
     if (n2 > INT_MAX - 2 - n1) {
         return;
     }
@@ -990,10 +918,6 @@ void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out) {
 
 void StrFree(Str s) {
     free(s.s);
-}
-
-void StrFree2(Str s) {
-    StrFree(s);
 }
 
 static bool DateParseIso(const char* s, LocalDate* out) {
@@ -1086,55 +1010,50 @@ void StrLowerAscii(char* s) {
     }
 }
 
-GPUI_NOINLINE bool StrEqRest(Str s1, Str s2) {
-    if (s1.s == s2.s || s1.len == 0) {
+static bool StrEqRestCommon(Str s1, Str s2, bool ignoreCase) {
+    if (s1.s == s2.s || len(s1) == 0) {
         return true;
     }
     if (!s1.s || !s2.s) {
         return false;
     }
-    return memcmp(s1.s, s2.s, (size_t)s1.len) == 0;
+    return ignoreCase ? StrCmpNI(s1.s, s2.s, len(s1)) == 0
+                      : memcmp(s1.s, s2.s, (size_t)len(s1)) == 0;
 }
 
-bool StrEq(Str s1, const char* s2) {
-    return StrEq(s1, Str(s2));
+GPUI_NOINLINE bool StrEqRest(Str s1, Str s2) {
+    return StrEqRestCommon(s1, s2, false);
 }
 
 int StrCmp(Str s1, Str s2) {
-    int common = std::min(s1.len, s2.len);
+    int common = std::min(len(s1), len(s2));
     int cmp = common > 0 ? memcmp(s1.s, s2.s, (size_t)common) : 0;
     if (cmp != 0) {
         return cmp;
     }
-    return s1.len < s2.len ? -1 : s1.len > s2.len ? 1 : 0;
+    return len(s1) < len(s2) ? -1 : len(s1) > len(s2) ? 1 : 0;
 }
 
 GPUI_NOINLINE bool StrEqIRest(Str s1, Str s2) {
-    if (s1.s == s2.s || s1.len == 0) {
-        return true;
-    }
-    if (StrIsNull(s1) || StrIsNull(s2)) {
-        return false;
-    }
-    return 0 == StrCmpNI(s1.s, s2.s, s1.len);
+    return StrEqRestCommon(s1, s2, true);
 }
 
-bool StrEqI(Str s1, const char* s2) {
-    return StrEqI(s1, Str(s2));
+static bool StrHasAffix(Str s, Str affix, bool fromEnd, bool ignoreCase) {
+    if (len(affix) > len(s)) {
+        return false;
+    }
+    if (len(affix) == 0) {
+        return true;
+    }
+    if (!s.s || !affix.s) {
+        return false;
+    }
+    Str slice(s.s + (fromEnd ? len(s) - len(affix) : 0), len(affix));
+    return ignoreCase ? StrEqI(slice, affix) : StrEq(slice, affix);
 }
 
 bool StrStartsWith(Str s, Str prefix) {
-    if (prefix.len > s.len) {
-        return false;
-    }
-    if (prefix.len == 0) {
-        return true;
-    }
-    return s.s && prefix.s && StrEq(Str(s.s, prefix.len), prefix);
-}
-
-bool StrStartsWith(Str s, const char* prefix) {
-    return StrStartsWith(s, Str(prefix));
+    return StrHasAffix(s, prefix, false, false);
 }
 
 bool StrStartsWithAny(Str s, const char* chars) {
@@ -1149,78 +1068,37 @@ bool StrStartsWithAny(Str s, const char* chars) {
     return false;
 }
 
-bool StrStartsWithI(Str s, const char* prefix) {
-    return StrStartsWithI(s, Str(prefix));
+bool StrStartsWithI(Str s, Str prefix) {
+    return StrHasAffix(s, prefix, false, true);
 }
 
 bool StrEndsWith(Str s, Str suffix) {
-    if (suffix.len > s.len) {
-        return false;
-    }
-    if (suffix.len == 0) {
-        return true;
-    }
-    return s.s && suffix.s &&
-           StrEq(Str(s.s + s.len - suffix.len, suffix.len), suffix);
-}
-
-bool StrEndsWith(Str s, const char* suffix) {
-    return StrEndsWith(s, Str(suffix));
+    return StrHasAffix(s, suffix, true, false);
 }
 
 bool StrEndsWithI(Str s, Str suffix) {
-    if (suffix.len > s.len) {
-        return false;
-    }
-    if (suffix.len == 0) {
-        return true;
-    }
-    return s.s && suffix.s &&
-           StrEqI(Str(s.s + s.len - suffix.len, suffix.len), suffix);
+    return StrHasAffix(s, suffix, true, true);
 }
 
-bool StrEndsWithI(Str s, const char* suffix) {
-    return StrEndsWithI(s, Str(suffix));
+static int StrFindCommon(Str s, Str sub, bool ignoreCase) {
+    if (!s.s || !sub.s || len(sub) <= 0 || len(sub) > len(s)) {
+        return -1;
+    }
+    for (int off = 0; off + len(sub) <= len(s); off++) {
+        Str slice(s.s + off, len(sub));
+        if (ignoreCase ? StrEqI(slice, sub) : StrEq(slice, sub)) {
+            return off;
+        }
+    }
+    return -1;
 }
 
 int StrFind(Str s, Str sub) {
-    if (!s.s || !sub.s || sub.len <= 0 || sub.len > s.len) {
-        return -1;
-    }
-    for (int off = 0; off + sub.len <= s.len; off++) {
-        if (StrEq(Str(s.s + off, sub.len), sub)) {
-            return off;
-        }
-    }
-    return -1;
-}
-
-int StrFind(Str s, const char* sub) {
-    return StrFind(s, Str(sub));
+    return StrFindCommon(s, sub, false);
 }
 
 int StrFindI(Str s, Str sub) {
-    if (!s.s || !sub.s || sub.len <= 0 || sub.len > s.len) {
-        return -1;
-    }
-    for (int off = 0; off + sub.len <= s.len; off++) {
-        if (StrEqI(Str(s.s + off, sub.len), sub)) {
-            return off;
-        }
-    }
-    return -1;
-}
-
-int StrFindI(Str s, const char* sub) {
-    return StrFindI(s, Str(sub));
-}
-
-bool StrContains(Str s, Str sub) {
-    return StrFind(s, sub) >= 0;
-}
-
-bool StrContainsI(Str s, Str sub) {
-    return StrFindI(s, sub) >= 0;
+    return StrFindCommon(s, sub, true);
 }
 
 static bool IsStrTrimAscii(char c) {
@@ -1228,11 +1106,11 @@ static bool IsStrTrimAscii(char c) {
 }
 
 Str StrTrimAscii(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return s;
     }
     int start = 0;
-    int end = s.len;
+    int end = len(s);
     while (start < end && IsStrTrimAscii(s.s[start])) {
         start++;
     }
@@ -1243,24 +1121,24 @@ Str StrTrimAscii(Str s) {
 }
 
 Str StrReplaceAll(Str value, Str from, Str to) {
-    if (from.len == 0 || from.len > value.len) {
+    if (len(from) == 0 || len(from) > len(value)) {
         return value;
     }
     int count = 0;
-    for (int i = 0; i <= value.len - from.len;) {
-        if (StrEq(Str(value.s + i, from.len), from)) {
-            count++;
-            i += from.len;
-        } else {
-            i++;
+    for (int i = 0; i <= len(value) - len(from);) {
+        int at = StrFind(Str(value.s + i, len(value) - i), from);
+        if (at < 0) {
+            break;
         }
+        count++;
+        i += at + len(from);
     }
     if (count == 0) {
         return value;
     }
 
-    int64_t grown = (int64_t)value.len +
-                    (int64_t)count * ((int64_t)to.len - (int64_t)from.len);
+    int64_t grown = (int64_t)len(value) +
+                    (int64_t)count * ((int64_t)len(to) - (int64_t)len(from));
     if (grown < 0 || grown > (int64_t)INT_MAX - 1) {
         return value;
     }
@@ -1271,15 +1149,25 @@ Str StrReplaceAll(Str value, Str from, Str to) {
     }
     int src = 0;
     int dst = 0;
-    while (src < value.len) {
-        if (src <= value.len - from.len &&
-            StrEq(Str(value.s + src, from.len), from)) {
-            memcpy(result.s + dst, to.s, (size_t)to.len);
-            src += from.len;
-            dst += to.len;
-        } else {
-            result.s[dst++] = value.s[src++];
+    while (src < len(value)) {
+        int remain = len(value) - src;
+        int at = remain >= len(from) ? StrFind(Str(value.s + src, remain), from)
+                                     : -1;
+        if (at < 0) {
+            memcpy(result.s + dst, value.s + src, (size_t)remain);
+            dst += remain;
+            break;
         }
+        if (at > 0) {
+            memcpy(result.s + dst, value.s + src, (size_t)at);
+            dst += at;
+            src += at;
+        }
+        if (len(to) > 0) {
+            memcpy(result.s + dst, to.s, (size_t)len(to));
+            dst += len(to);
+        }
+        src += len(from);
     }
     result.s[dst] = 0;
     result.len = dst;
@@ -1294,33 +1182,23 @@ Str SeqStrFirst(SeqStrings strs) {
 }
 
 Str SeqStrNext(Str s) {
-    if (s.len == 0) {
+    if (len(s) == 0) {
         return {};
     }
-    const char* next = s.s + s.len + 1;
+    const char* next = s.s + len(s) + 1;
     return next[0] ? Str(next) : Str{};
 }
 
 static int SeqStrIndexCmp(SeqStrings strs, Str toFind, bool ignoreCase) {
-    if (!strs || !toFind) return -1;
-    const char* candidate = strs;
+    if (!strs || !toFind) {
+        return -1;
+    }
     int idx = 0;
-    while (*candidate) {
-        int i = 0;
-        while (i < toFind.len && candidate[i]) {
-            char a = candidate[i];
-            char b = toFind.s[i];
-            if (ignoreCase) {
-                if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
-                if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
-            }
-            if (a != b) break;
-            i++;
+    for (Str cand = SeqStrFirst(strs); len(cand) > 0;
+         cand = SeqStrNext(cand), idx++) {
+        if (ignoreCase ? StrEqI(cand, toFind) : StrEq(cand, toFind)) {
+            return idx;
         }
-        if (i == toFind.len && !candidate[i]) return idx;
-        while (*candidate) candidate++;
-        candidate++;
-        idx++;
     }
     return -1;
 }
@@ -1342,7 +1220,7 @@ Str SeqStrByIndex(SeqStrings strs, int idx) {
         return {};
     }
     Str s = SeqStrFirst(strs);
-    while (idx > 0 && s.len > 0) {
+    while (idx > 0 && len(s) > 0) {
         s = SeqStrNext(s);
         idx--;
     }
@@ -1351,7 +1229,7 @@ Str SeqStrByIndex(SeqStrings strs, int idx) {
 
 int SeqStrCount(SeqStrings strs) {
     int n = 0;
-    for (Str s = SeqStrFirst(strs); s.len > 0; s = SeqStrNext(s)) {
+    for (Str s = SeqStrFirst(strs); len(s) > 0; s = SeqStrNext(s)) {
         n++;
     }
     return n;
@@ -1397,9 +1275,9 @@ void StrBuilderUseExternalBuffer(StrBuilder& b, Str buf) {
     if (b.els || b.len != 0) {
         return;
     }
-    if (buf.s && buf.len > kPadding) {
+    if (buf.s && len(buf) > kPadding) {
         b.els = buf.s;
-        b.cap = -(buf.len - kPadding);
+        b.cap = -(len(buf) - kPadding);
         b.els[0] = 0;
     }
 }
@@ -1422,7 +1300,7 @@ bool StrBuilder::AppendChar(char c) {
 }
 
 bool StrBuilder::Append(Str src) {
-    if (StrIsNull(src) || 0 == src.len) {
+    if (!src.s || src.len == 0) {
         return true;
     }
     if (!StrBuilderEnsureCap(*this, len + src.len)) {
@@ -1504,6 +1382,15 @@ struct Fmt {
     char buf[256] = {};
 };
 
+static int parseUintAt(Str f, int* off) {
+    int n = 0;
+    while (*off < len(f) && IsDigit(f.s[*off])) {
+        n = (n * 10) + (f.s[*off] - '0');
+        (*off)++;
+    }
+    return n;
+}
+
 static void addRawStr(Fmt& fmt, int off, size_t n) {
     if (n == 0) {
         return;
@@ -1523,17 +1410,18 @@ static int parseArgDefBrace(Fmt& fmt, int off) {
     off++;
     int n = 0;
     bool positional = false;
-
-    while (off < fmt.format.len && fmt.format.s[off] != '}') {
+    if (off < len(fmt.format) && IsDigit(fmt.format.s[off])) {
+        n = parseUintAt(fmt.format, &off);
+        positional = true;
+    }
+    while (off < len(fmt.format) && fmt.format.s[off] != '}') {
         if (!IsDigit(fmt.format.s[off])) {
             fmt.isOk = false;
             return off;
         }
-        n = (n * 10) + (fmt.format.s[off] - '0');
-        positional = true;
         off++;
     }
-    if (off >= fmt.format.len) {
+    if (off >= len(fmt.format)) {
         fmt.isOk = false;
         return off;
     }
@@ -1584,7 +1472,7 @@ static FmtArg::Kind typeFromConv(char c) {
 static bool startsWith(Str s, int off, const char* prefix) {
     int i = 0;
     while (prefix[i]) {
-        if (off + i >= s.len || s.s[off + i] != prefix[i]) {
+        if (off + i >= len(s) || s.s[off + i] != prefix[i]) {
             return false;
         }
         i++;
@@ -1592,13 +1480,42 @@ static bool startsWith(Str s, int off, const char* prefix) {
     return true;
 }
 
+static int parseLenMod(Str f, int off, int* bits) {
+    *bits = 32;
+    struct Mod {
+        const char* s;
+        int n;
+        int wide;
+    };
+    static const Mod kMods[] = {
+        {"I64", 3, 64},
+        {"I32", 3, 32},
+        {"ll", 2, 64},
+        {"hh", 2, 32},
+    };
+    for (const Mod& m : kMods) {
+        if (startsWith(f, off, m.s)) {
+            *bits = m.wide;
+            return off + m.n;
+        }
+    }
+    char c = off < len(f) ? f.s[off] : 0;
+    if (c == 'l' || c == 'h' || c == 'L' || c == 'w') {
+        return off + 1;
+    }
+    if (c == 'z' || c == 'j' || c == 't' || c == 'I') {
+        *bits = 64;
+        return off + 1;
+    }
+    return off;
+}
+
 static int parseArgDefPerc(Fmt& fmt, int off) {
     Str f = fmt.format;
     off++;
     int fwpStart = off;
     bool leftJust = false;
-
-    while (off < f.len &&
+    while (off < len(f) &&
            (f.s[off] == '-' || f.s[off] == '+' || f.s[off] == ' ' ||
             f.s[off] == '0' || f.s[off] == '#')) {
         if (f.s[off] == '-') {
@@ -1606,48 +1523,16 @@ static int parseArgDefPerc(Fmt& fmt, int off) {
         }
         off++;
     }
-
-    int width = 0;
-    while (off < f.len && IsDigit(f.s[off])) {
-        width = (width * 10) + (f.s[off] - '0');
-        off++;
-    }
-
+    int width = parseUintAt(f, &off);
     int prec = -1;
-    if (off < f.len && f.s[off] == '.') {
+    if (off < len(f) && f.s[off] == '.') {
         off++;
-        prec = 0;
-        while (off < f.len && IsDigit(f.s[off])) {
-            prec = (prec * 10) + (f.s[off] - '0');
-            off++;
-        }
+        prec = parseUintAt(f, &off);
     }
     int fwpEnd = off;
-
     int bits = 32;
-    char lenMod = (off < f.len) ? f.s[off] : 0;
-    bool is32BitLenMod =
-        lenMod == 'l' || lenMod == 'h' || lenMod == 'L' || lenMod == 'w';
-
-    bool is64BitLenMod =
-        lenMod == 'z' || lenMod == 'j' || lenMod == 't' || lenMod == 'I';
-    if (startsWith(f, off, "I64")) {
-        bits = 64;
-        off += 3;
-    } else if (startsWith(f, off, "I32")) {
-        off += 3;
-    } else if (startsWith(f, off, "ll")) {
-        bits = 64;
-        off += 2;
-    } else if (startsWith(f, off, "hh")) {
-        off += 2;
-    } else if (is32BitLenMod) {
-        off++;
-    } else if (is64BitLenMod) {
-        bits = 64;
-        off++;
-    }
-    char conv = (off < f.len) ? f.s[off] : 0;
+    off = parseLenMod(f, off, &bits);
+    char conv = (off < len(f)) ? f.s[off] : 0;
     off++;
 
     if (fmt.nInst >= (int)dimof(fmt.instructions)) {
@@ -1709,18 +1594,18 @@ static bool ParseFormat(Fmt& o, Str fmtStr) {
 
     int start = 0;
     int off = 0;
-    while (off < fmtStr.len && fmtStr.s[off]) {
+    while (off < len(fmtStr) && fmtStr.s[off]) {
         char c = fmtStr.s[off];
         if ('%' == c) {
 
-            if (off + 1 < fmtStr.len && '%' == fmtStr.s[off + 1]) {
+            if (off + 1 < len(fmtStr) && '%' == fmtStr.s[off + 1]) {
                 addRawStr(o, start, off - start);
                 start = off + 1;
                 off += 2;
                 continue;
             }
             addRawStr(o, start, off - start);
-            if (off + 1 < fmtStr.len && '{' == fmtStr.s[off + 1]) {
+            if (off + 1 < len(fmtStr) && '{' == fmtStr.s[off + 1]) {
                 off = parseArgDefBrace(o, off + 1);
             } else {
                 off = parseArgDefPerc(o, off);
@@ -1759,7 +1644,7 @@ static bool appendConv(Fmt& fmt, const char* spec, ...) {
     int n = VsnprintfUtf8(bufS, spec, args);
     va_end(args);
     fmt.buf[dimof(fmt.buf) - 1] = 0;
-    if (n >= 0 && n < bufS.len) {
+    if (n >= 0 && n < len(bufS)) {
         va_end(retry);
         return fmt.res.Append(Str(fmt.buf, n));
     }
@@ -1814,33 +1699,44 @@ static int64_t argToI64(const FmtArg& arg) {
     }
 }
 
+static bool appendSpaces(Fmt& fmt, int n) {
+    for (int j = 0; j < n; j++) {
+        if (!fmt.res.AppendChar(' ')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool isFloatConv(char c) {
+    return c == 'f' || c == 'F' || c == 'e' || c == 'E' || c == 'g' ||
+           c == 'G' || c == 'a' || c == 'A';
+}
+
+static bool isUnsignedConv(char c) {
+    return c == 'u' || c == 'o' || c == 'x' || c == 'X';
+}
+
 static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     if (inst.conv == 's' || inst.conv == 'S') {
-        Str sv = arg.str;
-        int slen = sv.len;
+        int slen = arg.str.len;
         if (inst.prec >= 0 && inst.prec < slen) {
             slen = inst.prec;
         }
-        int pad = inst.width - slen;
-        pad = std::max(pad, 0);
-        if (!inst.leftJust) {
-            for (int j = 0; j < pad; j++) {
-                if (!fmt.res.AppendChar(' ')) {
-                    return false;
-                }
-            }
-        }
-        if (!fmt.res.Append(Str(sv.s, slen))) {
+        int pad = std::max(inst.width - slen, 0);
+        if (!inst.leftJust && !appendSpaces(fmt, pad)) {
             return false;
         }
-        if (inst.leftJust) {
-            for (int j = 0; j < pad; j++) {
-                if (!fmt.res.AppendChar(' ')) {
-                    return false;
-                }
-            }
+        if (!fmt.res.Append(Str(arg.str.s, slen))) {
+            return false;
         }
-        return true;
+        return inst.leftJust ? appendSpaces(fmt, pad) : true;
+    }
+    if (inst.conv == 'p') {
+        const void* pv = arg.t == FmtArg::Kind::Ptr
+                             ? arg.ptr
+                             : (const void*)(intptr_t)argToI64(arg);
+        return appendConv(fmt, "%p", pv);
     }
 
     char fbuf[64];
@@ -1849,70 +1745,31 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     for (int j = 0; j < inst.fwpLen && k < (int)dimof(fbuf) - 5; j++) {
         fbuf[k++] = fmt.format.s[inst.fwpOff + j];
     }
-    char conv = inst.conv;
-    int64_t ival = argToI64(arg);
-    bool ok = true;
-    switch (conv) {
-        case 'd':
-        case 'i':
-            if (inst.intBits == 64) {
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'd';
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (long long)ival);
-            } else {
-                fbuf[k++] = 'd';
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (int)ival);
-            }
-            break;
-        case 'u':
-        case 'o':
-        case 'x':
-        case 'X':
-            if (inst.intBits == 64) {
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'l';
-                fbuf[k++] = conv;
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (unsigned long long)ival);
-            } else {
-                fbuf[k++] = conv;
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf,
-                                (unsigned int)(unsigned long long)ival);
-            }
-            break;
-        case 'c':
-            fbuf[k++] = 'c';
-            fbuf[k] = 0;
-            ok = appendConv(fmt, fbuf, (int)ival);
-            break;
-        case 'f':
-        case 'F':
-        case 'e':
-        case 'E':
-        case 'g':
-        case 'G':
-        case 'a':
-        case 'A': {
-            fbuf[k++] = conv;
-            fbuf[k] = 0;
-            double dv = (arg.t == FmtArg::Kind::Double) ? arg.d : (double)arg.f;
-            ok = appendConv(fmt, fbuf, dv);
-        } break;
-        case 'p': {
-
-            const void* pv = (arg.t == FmtArg::Kind::Ptr)
-                                 ? arg.ptr
-                                 : (const void*)(intptr_t)ival;
-            ok = appendConv(fmt, "%p", pv);
-        } break;
-        default:
-            break;
+    bool wideInt =
+        inst.intBits == 64 &&
+        (inst.conv == 'd' || inst.conv == 'i' || isUnsignedConv(inst.conv));
+    if (wideInt) {
+        fbuf[k++] = 'l';
+        fbuf[k++] = 'l';
     }
-    return ok;
+    fbuf[k++] = inst.conv == 'i' ? 'd' : inst.conv;
+    fbuf[k] = 0;
+
+    if (isFloatConv(inst.conv)) {
+        double dv = arg.t == FmtArg::Kind::Double ? arg.d : (double)arg.f;
+        return appendConv(fmt, fbuf, dv);
+    }
+    int64_t ival = argToI64(arg);
+    if (isUnsignedConv(inst.conv)) {
+        if (wideInt) {
+            return appendConv(fmt, fbuf, (unsigned long long)ival);
+        }
+        return appendConv(fmt, fbuf, (unsigned int)(unsigned long long)ival);
+    }
+    if (wideInt) {
+        return appendConv(fmt, fbuf, (long long)ival);
+    }
+    return appendConv(fmt, fbuf, (int)ival);
 }
 
 bool Fmt::Eval(const FmtArg** args, int nArgs) {
@@ -2026,10 +1883,10 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args) {
 #if defined(_MSC_VER)
     _locale_t loc = GetUtf8FormatLocale();
     if (loc) {
-        return _vsnprintf_l(buf.s, (size_t)buf.len, fmt, loc, args);
+        return _vsnprintf_l(buf.s, (size_t)len(buf), fmt, loc, args);
     }
 #endif
-    return vsnprintf(buf.s, (size_t)buf.len, fmt, args);
+    return vsnprintf(buf.s, (size_t)len(buf), fmt, args);
 }
 }
 
@@ -2101,7 +1958,7 @@ static void AppendCp(StrBuilder& out, uint32_t cp) {
 
 static ArenaStr Decode(Arena* a, Str value) {
     bool needsDecode = false;
-    for (int i = 0; i < value.len; i++) {
+    for (int i = 0; i < len(value); i++) {
         if (value.s[i] == '&') {
             needsDecode = true;
             break;
@@ -2110,23 +1967,23 @@ static ArenaStr Decode(Arena* a, Str value) {
     if (!needsDecode) return ArenaStrDup(a, value);
 
     StrBuilder out(a);
-    out.Reserve(value.len);
-    for (int i = 0; i < value.len;) {
+    out.Reserve(len(value));
+    for (int i = 0; i < len(value);) {
         if (value.s[i] != '&') {
             out.AppendChar(value.s[i++]);
             continue;
         }
         int start = i++;
-        if (i < value.len && value.s[i] == '#') {
+        if (i < len(value) && value.s[i] == '#') {
             i++;
             int radix = 10;
-            if (i < value.len && (value.s[i] == 'x' || value.s[i] == 'X')) {
+            if (i < len(value) && (value.s[i] == 'x' || value.s[i] == 'X')) {
                 radix = 16;
                 i++;
             }
             int digits = i;
             uint32_t cp = 0;
-            while (i < value.len) {
+            while (i < len(value)) {
                 char c = value.s[i];
                 int d = c >= '0' && c <= '9'                  ? c - '0'
                         : radix == 16 && c >= 'a' && c <= 'f' ? c - 'a' + 10
@@ -2141,12 +1998,12 @@ static ArenaStr Decode(Arena* a, Str value) {
                 out.AppendChar('&');
                 continue;
             }
-            if (i < value.len && value.s[i] == ';') i++;
+            if (i < len(value) && value.s[i] == ';') i++;
             AppendCp(out, cp);
             continue;
         }
         int end = i;
-        while (end < value.len && Alpha(value.s[end])) end++;
+        while (end < len(value) && Alpha(value.s[end])) end++;
         Str decoded = {};
         int used = 0;
         for (int n = end - i; n > 0; n--) {
@@ -2164,7 +2021,7 @@ static ArenaStr Decode(Arena* a, Str value) {
         }
         out.Append(decoded);
         i += used;
-        if (i < value.len && value.s[i] == ';') i++;
+        if (i < len(value) && value.s[i] == ';') i++;
     }
     return ArenaStrDup(a, out.TakeStr());
 }
@@ -2184,14 +2041,14 @@ static void Emit(Lex* l, const Token& token) {
 }
 
 static void SkipSpace(Lex* l) {
-    while (l->at < l->source.len && Space(l->source.s[l->at])) {
+    while (l->at < len(l->source) && Space(l->source.s[l->at])) {
         if (l->source.s[l->at++] == '\n') l->line++;
     }
 }
 
 static ArenaStr Name(Lex* l) {
     int start = l->at;
-    while (l->at < l->source.len && NameChar(l->source.s[l->at])) l->at++;
+    while (l->at < len(l->source) && NameChar(l->source.s[l->at])) l->at++;
     return Lower(l->a, Str(l->source.s + start, l->at - start));
 }
 
@@ -2201,19 +2058,19 @@ static Attribute* Attrs(Lex* l, bool* selfClose) {
     *selfClose = false;
     for (;;) {
         SkipSpace(l);
-        if (l->at >= l->source.len) return first;
+        if (l->at >= len(l->source)) return first;
         if (l->source.s[l->at] == '>') {
             l->at++;
             return first;
         }
-        if (l->source.s[l->at] == '/' && l->at + 1 < l->source.len &&
+        if (l->source.s[l->at] == '/' && l->at + 1 < len(l->source) &&
             l->source.s[l->at + 1] == '>') {
             l->at += 2;
             *selfClose = true;
             return first;
         }
         int start = l->at;
-        while (l->at < l->source.len && NameChar(l->source.s[l->at])) l->at++;
+        while (l->at < len(l->source) && NameChar(l->source.s[l->at])) l->at++;
         if (start == l->at) {
             l->at++;
             continue;
@@ -2221,23 +2078,23 @@ static Attribute* Attrs(Lex* l, bool* selfClose) {
         ArenaStr name = Lower(l->a, Str(l->source.s + start, l->at - start));
         SkipSpace(l);
         ArenaStr value = {};
-        if (l->at < l->source.len && l->source.s[l->at] == '=') {
+        if (l->at < len(l->source) && l->source.s[l->at] == '=') {
             l->at++;
             SkipSpace(l);
             char quote = 0;
-            if (l->at < l->source.len &&
+            if (l->at < len(l->source) &&
                 (l->source.s[l->at] == '\'' || l->source.s[l->at] == '"')) {
                 quote = l->source.s[l->at++];
             }
             start = l->at;
-            while (l->at < l->source.len &&
+            while (l->at < len(l->source) &&
                    (quote ? l->source.s[l->at] != quote
                           : !Space(l->source.s[l->at]) &&
                                 l->source.s[l->at] != '>')) {
                 l->at++;
             }
             value = Decode(l->a, Str(l->source.s + start, l->at - start));
-            if (quote && l->at < l->source.len) l->at++;
+            if (quote && l->at < len(l->source)) l->at++;
         }
         Attribute* attr = ArenaNew<Attribute>(l->a);
         attr->name = name;
@@ -2251,13 +2108,13 @@ static Attribute* Attrs(Lex* l, bool* selfClose) {
 }
 
 static int RawEnd(Lex* l, Str name) {
-    for (int i = l->at; i + name.len + 2 <= l->source.len; i++) {
+    for (int i = l->at; i + len(name) + 2 <= len(l->source); i++) {
         if (l->source.s[i] == '<' && l->source.s[i + 1] == '/' &&
-            StrEqI(Str(l->source.s + i + 2, name.len), name)) {
+            StrEqI(Str(l->source.s + i + 2, len(name)), name)) {
             return i;
         }
     }
-    return l->source.len;
+    return len(l->source);
 }
 
 void Tokenize(Arena* a, Str source, TokenSink sink, void* user,
@@ -2270,7 +2127,7 @@ void Tokenize(Arena* a, Str source, TokenSink sink, void* user,
     l.user = user;
     l.options = options;
     Str rawName = {};
-    while (l.at < source.len) {
+    while (l.at < len(source)) {
         if (rawName.s) {
             int end = RawEnd(&l, rawName);
             Token token;
@@ -2284,7 +2141,7 @@ void Tokenize(Arena* a, Str source, TokenSink sink, void* user,
         }
         if (source.s[l.at] != '<') {
             int start = l.at;
-            while (l.at < source.len && source.s[l.at] != '<') l.at++;
+            while (l.at < len(source) && source.s[l.at] != '<') l.at++;
             Token token;
             token.kind = TokenKind::Character;
             token.data = Decode(a, Str(source.s + start, l.at - start));
@@ -2292,11 +2149,11 @@ void Tokenize(Arena* a, Str source, TokenSink sink, void* user,
             Emit(&l, token);
             continue;
         }
-        if (l.at + 3 < source.len &&
+        if (l.at + 3 < len(source) &&
             StrEq(Str(source.s + l.at, 4), StrL("<!--"))) {
             l.at += 4;
             int start = l.at;
-            while (l.at + 2 < source.len &&
+            while (l.at + 2 < len(source) &&
                    !(source.s[l.at] == '-' && source.s[l.at + 1] == '-' &&
                      source.s[l.at + 2] == '>')) {
                 l.at++;
@@ -2304,25 +2161,25 @@ void Tokenize(Arena* a, Str source, TokenSink sink, void* user,
             Token token;
             token.kind = TokenKind::Comment;
             token.data = ArenaStrDup(a, Str(source.s + start, l.at - start));
-            if (l.at + 2 < source.len) l.at += 3;
+            if (l.at + 2 < len(source)) l.at += 3;
             Emit(&l, token);
             continue;
         }
-        if (l.at + 1 < source.len && source.s[l.at + 1] == '!') {
+        if (l.at + 1 < len(source) && source.s[l.at + 1] == '!') {
             l.at += 2;
-            while (l.at < source.len && source.s[l.at] != '>') l.at++;
-            if (l.at < source.len) l.at++;
+            while (l.at < len(source) && source.s[l.at] != '>') l.at++;
+            if (l.at < len(source)) l.at++;
             continue;
         }
         Token token;
         token.line = l.line;
-        if (l.at + 1 < source.len && source.s[l.at + 1] == '/') {
+        if (l.at + 1 < len(source) && source.s[l.at + 1] == '/') {
             l.at += 2;
             token.kind = TokenKind::EndTag;
             token.name = Name(&l);
-            while (l.at < source.len && source.s[l.at] != '>') l.at++;
-            if (l.at < source.len) l.at++;
-        } else if (l.at + 1 < source.len && Alpha(source.s[l.at + 1])) {
+            while (l.at < len(source) && source.s[l.at] != '>') l.at++;
+            if (l.at < len(source)) l.at++;
+        } else if (l.at + 1 < len(source) && Alpha(source.s[l.at + 1])) {
             l.at++;
             token.kind = TokenKind::StartTag;
             token.name = Name(&l);
@@ -2434,7 +2291,7 @@ Str AttrValue(Arena* a, const Node* node, Str name) {
 }
 
 static void WriteEscaped(StrBuilder& out, Str value, bool attribute) {
-    for (int i = 0; i < value.len; i++) {
+    for (int i = 0; i < len(value); i++) {
         char c = value.s[i];
         if (c == '&')
             out.Append(StrL("&amp;"));
@@ -2491,6 +2348,85 @@ Str Serialize(Arena* a, const Node* node, SerializeOptions options) {
     StrBuilder out(a);
     Write(a, out, node, options.includeNode);
     return out.TakeStr();
+}
+
+struct MiniParser {
+    char* buf = nullptr;
+    int len = 0;
+    int cap = 0;
+    bool paused = false;
+    bool sawScriptEnd = false;
+    bool fragment = false;
+    Str context = {};
+};
+
+Parser* ParserNew(Arena* a, ParseOptions options) {
+    if (!a) return nullptr;
+    Parser* parser = ArenaNew<Parser>(a);
+    parser->a = a;
+    parser->options = options;
+    parser->impl = ArenaNew<MiniParser>(a);
+    return parser;
+}
+
+Parser* ParserNewFragment(Arena* a, Str context, ParseOptions options) {
+    Parser* parser = ParserNew(a, options);
+    MiniParser* impl = parser ? (MiniParser*)parser->impl : nullptr;
+    if (impl) {
+        impl->fragment = true;
+        impl->context =
+            context.s ? ArenaStrGet(a, ArenaStrDup(a, context)) : Str{};
+    }
+    return parser;
+}
+
+void ParserProcess(Parser* parser, Str chunk) {
+    MiniParser* impl = parser ? (MiniParser*)parser->impl : nullptr;
+    if (!impl || !parser->a) return;
+    int n = len(chunk);
+    if (n > 0) {
+        int need = impl->len + n;
+        if (need > impl->cap) {
+            int cap = impl->cap > 0 ? impl->cap * 2 : 256;
+            while (cap < need) cap *= 2;
+            char* fresh = (char*)parser->a->Push((uint64_t)cap, 1, false);
+            if (impl->len > 0 && impl->buf) {
+                memcpy(fresh, impl->buf, (size_t)impl->len);
+            }
+            impl->buf = fresh;
+            impl->cap = cap;
+        }
+        memcpy(impl->buf + impl->len, chunk.s, (size_t)n);
+        impl->len += n;
+    }
+    if (parser->options.scriptingEnabled && !impl->sawScriptEnd) {
+        Str all = Str(impl->buf, impl->len);
+        if (StrContainsI(all, StrL("</script>"))) {
+            impl->sawScriptEnd = true;
+            impl->paused = true;
+        }
+    }
+}
+
+bool ParserIsPaused(const Parser* parser) {
+    MiniParser* impl = parser ? (MiniParser*)parser->impl : nullptr;
+    return impl && impl->paused;
+}
+
+void ParserResumeAfterCurrentScript(Parser* parser) {
+    MiniParser* impl = parser ? (MiniParser*)parser->impl : nullptr;
+    if (impl) impl->paused = false;
+}
+
+Node* ParserFinish(Parser* parser) {
+    MiniParser* impl = parser ? (MiniParser*)parser->impl : nullptr;
+    if (!impl) return nullptr;
+    impl->paused = false;
+    Str source = Str(impl->buf, impl->len);
+    if (impl->fragment) {
+        return ParseFragment(parser->a, source, impl->context, parser->options);
+    }
+    return ParseDocument(parser->a, source, parser->options);
 }
 
 }
@@ -2798,7 +2734,7 @@ int PlatListDir(const char* dir, DirEntry* out, int max) {
         StrCopyZ(e.name, (int)sizeof(e.name), ent->d_name);
         TempStr full = fmt("%s/%s", Str(dir), name);
         struct stat st = {};
-        if (full.len >= kMaxPath || lstat(full.s, &st) != 0) {
+        if (len(full) >= kMaxPath || lstat(full.s, &st) != 0) {
             continue;
         }
         e.isSymlink = S_ISLNK(st.st_mode);
@@ -3053,8 +2989,8 @@ void StrCopyZ(char* dst, int cap, const char* src) {
 WCHAR* ToCWstrTemp(Str s) {
     Arena* arena = GetTempArena();
     int n = 0;
-    if (s.s && s.len > 0) {
-        n = MultiByteToWideChar(CP_UTF8, 0, s.s, s.len, nullptr, 0);
+    if (s.s && len(s) > 0) {
+        n = MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), nullptr, 0);
         if (n < 0) {
             n = 0;
         }
@@ -3062,7 +2998,7 @@ WCHAR* ToCWstrTemp(Str s) {
     auto res = (WCHAR*)arena->Push((uint64_t)(n + 1) * sizeof(WCHAR),
                                    alignof(WCHAR), false);
     if (n > 0) {
-        MultiByteToWideChar(CP_UTF8, 0, s.s, s.len, res, n);
+        MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), res, n);
     }
     res[n] = 0;
     return res;

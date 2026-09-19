@@ -17,7 +17,7 @@ First install [bun](https://bun.sh/), then a compiler:
 
 - **Windows** — Visual Studio 2026; the free Community edition is fine, and
   2022 works too. `build.ts` finds it with vswhere, so no developer prompt.
-- **Linux** — `g++` or `clang++`, plus `pkg-config`, X11, cairo and pangocairo.
+- **Linux** — `g++` or `clang++`, plus `pkg-config`, X11, cairo, pangocairo and gdk-pixbuf.
 - **macOS** — the Xcode command line tools (`xcode-select --install`).
 
 Then:
@@ -101,7 +101,7 @@ guards, so the same source set builds on all four:
   compatibility default is Direct2D. `WIN_BACKEND_ALL` compiles and links all
   three. The custom backends already contain their shader bytecode and do not
   require `d3dcompiler.lib` or `D3DCompiler_47.dll`.
-- **Linux** — `g++ -std=c++20` with `pkg-config --cflags --libs x11 cairo pangocairo`.
+- **Linux** — `g++ -std=c++20` with `pkg-config --cflags --libs x11 cairo pangocairo gdk-pixbuf-2.0`.
 - **macOS** — `clang++ -std=c++20 -x objective-c++` with the Cocoa, CoreText and
   IOKit frameworks. The file is Objective-C++ because the mac half is.
 - **wasm** — `em++ -std=c++20` with `-sALLOW_MEMORY_GROWTH`; the browser half
@@ -153,7 +153,7 @@ No other dependencies, no nested build system, no STL containers.
 
 ## This copy
 
-Amalgamated from gpui-kit-cpp [`ca2decea7c02c6e6914327eb3340a08d1fd4c15a`](https://github.com/kjk/gpui-kit-cpp/commit/ca2decea7c02c6e6914327eb3340a08d1fd4c15a).
+Amalgamated from gpui-kit-cpp [`d5bfe14d51b61e3daa8ea617dce0ac17f4748ffc`](https://github.com/kjk/gpui-kit-cpp/commit/d5bfe14d51b61e3daa8ea617dce0ac17f4748ffc).
 
-[What has changed in gpui-kit-cpp since](https://github.com/kjk/gpui-kit-cpp/compare/ca2decea7c02c6e6914327eb3340a08d1fd4c15a...main)
+[What has changed in gpui-kit-cpp since](https://github.com/kjk/gpui-kit-cpp/compare/d5bfe14d51b61e3daa8ea617dce0ac17f4748ffc...main)
 shows every commit this copy is behind by; if that page is empty, it is current.

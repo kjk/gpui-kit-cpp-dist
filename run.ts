@@ -538,17 +538,17 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "d604a2ace1c6d8629b94e0498a9158c4a713defa",
-  date: "2026-09-16",
-  subject: "setting: Fix delegate number step and clamp to InputState (#3099)",
+  sha: "6b8581a1e5458eace91beb842376f833beaef2ff",
+  date: "2026-09-19",
+  subject: "Version 0.6.4",
   crates: {
-    "gpui-kit": "0.6.1",
-    "gpui-base": "0.6.1",
-    "gpui-component": "0.6.1",
-    "gpui-component-story": "0.6.1",
-    "gpui-wry": "0.6.1",
-    "gpui-shell": "0.6.1",
-    "gpui-component-shell": "0.6.1",
+    "gpui-kit": "0.6.4",
+    "gpui-base": "0.6.4",
+    "gpui-component": "0.6.4",
+    "gpui-component-story": "0.6.4",
+    "gpui-wry": "0.6.4",
+    "gpui-shell": "0.6.4",
+    "gpui-component-shell": "0.6.4",
   },
   dir: ".work/gpui-component",
 } as const;
@@ -821,7 +821,6 @@ const rustStoryExamples: Record<string, string> = {
   large_text: "large-text",
   markdown: "markdown",
   stream_markdown: "stream_markdown",
-  tiles: "tiles",
 };
 
 /** null when the port wrote this example and gpui-kit has no such thing. */

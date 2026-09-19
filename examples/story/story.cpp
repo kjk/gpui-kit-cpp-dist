@@ -122,6 +122,8 @@ static const StoryInfo kMeta[StoryCount] = {
     {"input", "Input",
      "Capture and validate short-form text, credentials, "
      "identifiers, and formatted values."},
+    {"input-group", "Input Group",
+     "A shared frame around one text control and its addons."},
     {"kbd", "Kbd", "A tag style to display keyboard shortcuts"},
     {"label", "Label",
      "Display concise text with hierarchy, highlighting, and masking."},
@@ -754,16 +756,11 @@ static El* SearchBox(StoryApp* app, Ctx* cx) {
 // story window opens at 1600 wide (crates/story/src/lib.rs), so the sidebar
 // tracks 255/1600 of the window width, clamped to the size_range. It is 200 at
 // half a 1920 screen and 221 at 1400, which is what the Rust app draws.
-static float SidebarWidth(Ctx* cx) {
-    float w = WindowSize(cx->win).dipW * (255.f / 1600.f);
-    w = (float)lroundf(w); // GPUI rounds; truncating is off by one at 1400
-    if (w < 200.f) {
-        w = 200.f;
-    }
-    if (w > 320.f) {
-        w = 320.f;
-    }
-    return w;
+static float SidebarWidth(Ctx*) {
+    // gallery.rs: Sidebar::new().w(px(255.)).collapsible(Offcanvas). The
+    // resizable wrapper is gone; the sidebar is a fixed 255 DIP column that
+    // slides out of the layout when collapsed.
+    return 255.f;
 }
 
 static El* Sidebar(StoryApp* app, Ctx* cx) {
@@ -1172,6 +1169,11 @@ static void OnGithub(StoryApp*, Ctx*, const ClickEvent*) {
     OpenUrl(StrL("https://github.com/longbridge/gpui-kit"));
 }
 
+static void OnToggleSidebar(StoryApp* app, Ctx* cx, const ClickEvent*) {
+    app->collapsed = !app->collapsed;
+    Notify(cx);
+}
+
 // ─── app_menus.rs ─────────────────────────────────────────────────────────
 //
 // One table, two bars. Rust builds its `Vec<Menu>` once and hands it to both
@@ -1511,7 +1513,7 @@ static int StoryBuildMenus(Ctx* cx, MenuDef* out, int cap) {
 static uint32_t StoryMenuHash(const MenuRow* rows, int n, uint32_t h) {
     for (int i = 0; i < n; i++) {
         const MenuRow& r = rows[i];
-        for (int c = 0; c < r.label.len; c++) {
+        for (int c = 0; c < len(r.label); c++) {
             h = (h ^ (uint32_t)(uint8_t)r.label.s[c]) * 16777619u;
         }
         h = (h ^ r.action) * 16777619u;
@@ -1534,7 +1536,7 @@ static void StorySetSystemMenus(StoryApp* app, Ctx* cx, const MenuDef* menus,
                                 int n) {
     uint32_t h = 2166136261u;
     for (int i = 0; i < n; i++) {
-        for (int c = 0; c < menus[i].name.len; c++) {
+        for (int c = 0; c < len(menus[i].name); c++) {
             h = (h ^ (uint32_t)(uint8_t)menus[i].name.s[c]) * 16777619u;
         }
         h = StoryMenuHash(menus[i].items, menus[i].n, h);
@@ -1553,7 +1555,7 @@ static component::PopupMenu* StoryPopupMenu(Ctx* cx, Str id,
     component::PopupMenu* menu = component::PopupMenu::New(cx, id);
     for (int i = 0; i < n; i++) {
         const MenuRow& r = rows[i];
-        if (r.separator || r.label.len <= 0) {
+        if (r.separator || len(r.label) <= 0) {
             menu->Separator();
             continue;
         }
@@ -1678,6 +1680,16 @@ static El* Footer(StoryApp* app, Ctx* cx) {
                 ->FlexRow()
                 ->Gap(8)
                 ->ItemsCenter()
+                ->Child(component::Button::New(cx, StrL("toggle-sidebar"))
+                            ->Ghost()
+                            ->WithSize(UiSize::XSmall)
+                            ->Icon(app->collapsed ? IconName::PanelLeftOpen
+                                                  : IconName::PanelLeftClose)
+                            ->Tooltip(app->collapsed ? StrL("Show sidebar")
+                                                     : StrL("Hide sidebar"))
+                            ->OnClick(Listen(cx, &OnToggleSidebar))
+                            ->IntoEl()
+                            ->Cursor(CursorKind::Pointer))
                 ->Child(IconEl(a, IconName::GalleryVerticalEnd, 12)
                             ->Fg(th.mutedFg))
                 ->Child(StoryTxt(cx, StoryFmt(cx, "%d components", StoryCount),
@@ -1731,7 +1743,9 @@ El* StoryApp::Render(StoryApp* app, Ctx* cx) {
         root->Child(StoryTitleBar(app, cx, defs, nDefs));
     }
     El* body = Div(frame)->FlexRow()->Flex1()->W(kFill)->MinH(0)->H(kFill);
-    body->Child(Sidebar(app, cx));
+    if (!app->collapsed) {
+        body->Child(Sidebar(app, cx));
+    }
     // The resizable handle reads as a 1px rule. Rust anchors it over the
     // boundary rather than in the flow, so the content starts where the
     // sidebar ends; a border here is painted inside the box without taking

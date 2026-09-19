@@ -16,7 +16,7 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 static int VscprintfUtf8(const char* fmt, va_list args);
 
 float StrToFloatUnchecked(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return 0;
     }
     TempStr text = StrDupTemp(s);
@@ -24,21 +24,21 @@ float StrToFloatUnchecked(Str s) {
 }
 
 int StrToIntUnchecked(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return 0;
     }
     int i = 0;
-    while (i < s.len && s.s[i] <= ' ') {
+    while (i < len(s) && s.s[i] <= ' ') {
         i++;
     }
     bool negative = false;
-    Str rest = Str(s.s + i, s.len - i);
+    Str rest = Str(s.s + i, len(s) - i);
     if (StrStartsWithAny(rest, "+-")) {
         negative = rest.s[0] == '-';
         i++;
     }
     uint64_t value = 0;
-    while (i < s.len && s.s[i] >= '0' && s.s[i] <= '9') {
+    while (i < len(s) && s.s[i] >= '0' && s.s[i] <= '9') {
         value = value * 10 + (uint64_t)(s.s[i] - '0');
         i++;
     }
@@ -86,20 +86,11 @@ static uint64_t ArenaAlignPow2(uint64_t value, uint64_t align) {
     return (value + align - 1) & ~(align - 1);
 }
 
-static uint64_t ArenaMin(uint64_t a, uint64_t b) {
-    return (a < b) ? a : b;
-}
-
-static uint64_t ArenaMax(uint64_t a, uint64_t b) {
-    return (a > b) ? a : b;
-}
-
-static uint64_t ArenaClampTop(uint64_t value, uint64_t maxValue) {
-    return (value < maxValue) ? value : maxValue;
-}
-
-static uint64_t ArenaClampBot(uint64_t minValue, uint64_t value) {
-    return (value > minValue) ? value : minValue;
+static uint64_t ArenaPosAfter(Arena* current, uint64_t size, uint64_t align) {
+    if (align == 0) {
+        align = 1;
+    }
+    return ArenaAlignPow2(current->pos, align) + size;
 }
 
 static Arena* ArenaAlloc(const ArenaParams& params);
@@ -111,15 +102,10 @@ static void ArenaRelease(Arena* arena) {
 static bool ArenaPushWouldChainLocked(Arena* arena, uint64_t size,
                                       uint64_t align) {
     if (!arena || (arena->flags & ArenaFlagNoChain)) {
-
         return false;
     }
-    if (align == 0) {
-        align = 1;
-    }
-    Arena* current = arena->current;
-    uint64_t posPost = ArenaAlignPow2(current->pos, align) + size;
-    return current->reserved < posPost;
+    return arena->current
+               ->reserved < ArenaPosAfter(arena->current, size, align);
 }
 
 static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
@@ -127,17 +113,13 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
     if (!arena) {
         return nullptr;
     }
-    if (align == 0) {
-        align = 1;
-    }
-
     Arena* current = arena->current;
-    uint64_t posPre = ArenaAlignPow2(current->pos, align);
-    uint64_t posPost = posPre + size;
+    uint64_t posPost = ArenaPosAfter(current, size, align);
+    uint64_t posPre = posPost - size;
 
     uint64_t sizeToZero = 0;
     if (zero && current->committed > posPre) {
-        sizeToZero = ArenaMin(current->committed, posPost) - posPre;
+        sizeToZero = std::min(current->committed, posPost) - posPre;
     }
 
     if (current->reserved < posPost && !(arena->flags & ArenaFlagNoChain)) {
@@ -146,7 +128,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         uint64_t commitChunkSize = arena->commitChunkSize;
         if (size + kArenaHeaderSize > reserveChunkSize) {
             reserveChunkSize = ArenaAlignPow2(size + kArenaHeaderSize,
-                                              ArenaMax(align, PlatPageSize()));
+                                              std::max(align, PlatPageSize()));
             commitChunkSize = reserveChunkSize;
         }
 
@@ -167,8 +149,8 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         newBlock->prev = current;
         arena->current = newBlock;
         current = newBlock;
-        posPre = ArenaAlignPow2(current->pos, align);
-        posPost = posPre + size;
+        posPost = ArenaPosAfter(current, size, align);
+        posPre = posPost - size;
         sizeToZero = 0;
     }
 
@@ -178,7 +160,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
         }
 
         uint64_t commitEnd = ArenaAlignPow2(posPost, current->commitChunkSize);
-        uint64_t commitClamped = ArenaClampTop(commitEnd, current->reserved);
+        uint64_t commitClamped = std::min(commitEnd, current->reserved);
         uint64_t commitSize = commitClamped - current->committed;
         void* commitPtr = (char*)current + current->committed;
         if (!PlatMemCommit(commitPtr, commitSize, false)) {
@@ -193,12 +175,7 @@ static void* ArenaPushLocked(Arena* arena, uint64_t size, uint64_t align,
 
     void* result = (char*)current + posPre;
     current->pos = posPost;
-
-    arena->nAllocsLifetime++;
     arena->nAllocsSinceReset++;
-    uint64_t used = current->basePos + posPost;
-    arena->peakBytesLifetime = std::max(used, arena->peakBytesLifetime);
-    arena->peakBytesSinceReset = std::max(used, arena->peakBytesSinceReset);
 
     if (sizeToZero) {
         memset(result, 0, (size_t)sizeToZero);
@@ -231,10 +208,10 @@ static Arena* ArenaAlloc(const ArenaParams& srcParams) {
     const uint64_t pageSize =
         useLargePages ? PlatLargePageSize() : PlatPageSize();
     uint64_t reserveSize = ArenaAlignPow2(
-        ArenaMax(params.reserveSize, kArenaHeaderSize), pageSize);
+        std::max(params.reserveSize, kArenaHeaderSize), pageSize);
     uint64_t commitSize =
-        ArenaAlignPow2(ArenaMax(params.commitSize, kArenaHeaderSize), pageSize);
-    commitSize = ArenaClampTop(commitSize, reserveSize);
+        ArenaAlignPow2(std::max(params.commitSize, kArenaHeaderSize), pageSize);
+    commitSize = std::min(commitSize, reserveSize);
 
     void* base = params.optionalBackingBuffer;
     bool usesExternalBuffer = (base != nullptr);
@@ -283,10 +260,7 @@ static Arena* ArenaAlloc(const ArenaParams& srcParams) {
     arena->allocationSiteLine = params.allocationSiteLine;
     arena->name = params.name;
     arena->usesExternalBuffer = usesExternalBuffer;
-    arena->nAllocsLifetime = 0;
-    arena->peakBytesLifetime = 0;
     arena->nAllocsSinceReset = 0;
-    arena->peakBytesSinceReset = 0;
     return arena;
 }
 
@@ -316,7 +290,7 @@ void Arena::PopTo(uint64_t popPos) {
     Arena* arena = this;
     lock.Lock();
 
-    uint64_t bigPos = ArenaClampBot(kArenaHeaderSize, popPos);
+    uint64_t bigPos = std::max(kArenaHeaderSize, popPos);
     Arena* node = arena->current;
     while (node && node->basePos >= bigPos) {
         Arena* prevNode = node->prev;
@@ -345,14 +319,6 @@ uint64_t ArenaUsed(Arena* arena) {
     }
     Arena* cur = arena->current;
     return cur ? cur->basePos + cur->pos : 0;
-}
-
-static Arena* ArenaBlockAt(Arena* arena, uint64_t pos) {
-    Arena* node = arena ? arena->current : nullptr;
-    while (node && node->basePos > pos) {
-        node = node->prev;
-    }
-    return node;
 }
 
 int VarintSize(uint32_t v) {
@@ -391,33 +357,30 @@ int VarintGet(const char* src, uint32_t* out) {
 }
 
 static char* ArenaStrAt(Arena* a, ArenaStr s) {
-    Arena* node = ArenaBlockAt(a, s);
-    if (!node) {
-        return nullptr;
-    }
-    return (char*)node + ((uint64_t)s - node->basePos);
+    return (char*)ArenaAtOffset(a, s);
+}
+
+static uint64_t ArenaBlockOff(Arena* block, const void* p) {
+    return block->basePos + (uint64_t)((const char*)p - (const char*)block);
 }
 
 ArenaStr ArenaStrDup(Arena* a, Str src) {
-    if (!a || !src.s || src.len <= 0) {
+    if (!a || !src.s || len(src) <= 0) {
         return kArenaStrNone;
     }
-    uint32_t len = (uint32_t)src.len;
-    int vlen = VarintSize(len);
+    uint32_t n = (uint32_t)len(src);
+    int vlen = VarintSize(n);
     a->lock.Lock();
-
-    char* dst = (char*)ArenaPushLocked(a, (uint64_t)vlen + len + 1, 1, false);
-    Arena* cur = a->current;
-    uint64_t at = dst ? cur->basePos + (uint64_t)((char*)dst - (char*)cur) : 0;
+    char* dst = (char*)ArenaPushLocked(a, (uint64_t)vlen + n + 1, 1, false);
+    uint64_t at = dst ? ArenaBlockOff(a->current, dst) : 0;
     a->lock.Unlock();
     if (!dst) {
         return kArenaStrNone;
     }
-    VarintPut(dst, len);
-    memcpy(dst + vlen, src.s, (size_t)len);
-    dst[vlen + len] = 0;
+    VarintPut(dst, n);
+    memcpy(dst + vlen, src.s, (size_t)n);
+    dst[vlen + n] = 0;
     if (at > UINT32_MAX) {
-
         return kArenaStrNone;
     }
     return (ArenaStr)at;
@@ -437,7 +400,7 @@ uint32_t ArenaStrLen(Arena* a, ArenaStr s) {
 }
 
 ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
-    if (!a || !more.s || more.len <= 0) {
+    if (!a || !more.s || len(more) <= 0) {
         return s;
     }
     if (!ArenaStrIsSet(s)) {
@@ -454,9 +417,7 @@ ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
     bool newest = p && (uint64_t)s + vlen + len + 1 == used;
     uint32_t nlen = len + (uint32_t)more.len;
     int nvlen = VarintSize(nlen);
-
     uint64_t want = (uint64_t)nvlen + nlen + 1;
-
     if (newest && !ArenaPushWouldChainLocked(
                       a, (uint64_t)(nvlen - vlen) + (uint64_t)more.len, 1)) {
         want = (uint64_t)(nvlen - vlen) + (uint64_t)more.len;
@@ -464,11 +425,7 @@ ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more) {
         newest = false;
     }
     char* dst = (char*)ArenaPushLocked(a, want, 1, false);
-    uint64_t at = 0;
-    if (dst) {
-        Arena* after = a->current;
-        at = after->basePos + (uint64_t)((char*)dst - (char*)after);
-    }
+    uint64_t at = dst ? ArenaBlockOff(a->current, dst) : 0;
     a->lock.Unlock();
     if (!dst) {
         return s;
@@ -520,7 +477,7 @@ uint32_t ArenaOffsetOf(Arena* a, const void* p) {
         if (at < lo || at >= lo + node->pos) {
             continue;
         }
-        uint64_t off = node->basePos + (uint64_t)(at - lo);
+        uint64_t off = ArenaBlockOff(node, at);
         if (off > UINT32_MAX) {
 
             return kArenaPtrNone;
@@ -530,43 +487,37 @@ uint32_t ArenaOffsetOf(Arena* a, const void* p) {
     return kArenaPtrNone;
 }
 
-void* Arena::Alloc(int size) {
-    if (size <= 0) {
+static void* AllocBytes(Arena* arena, uint64_t size) {
+    if (size == 0) {
         return nullptr;
     }
-    return Push((uint64_t)size, 8, false);
+    if (!arena) {
+        return malloc((size_t)size);
+    }
+    return arena->Push(size, 8, false);
+}
+
+void* Arena::Alloc(int size) {
+    return AllocBytes(this, size <= 0 ? 0 : (uint64_t)size);
 }
 
 void Arena::Reset() {
     PopTo(0);
     nAllocsSinceReset = 0;
-    peakBytesSinceReset = 0;
 }
 
 void* Alloc(Arena* arena, int size) {
-    if (size <= 0) {
-        return nullptr;
-    }
-    if (!arena) {
-        return malloc(size);
-    }
-    return arena->Alloc(size);
+    return AllocBytes(arena, size <= 0 ? 0 : (uint64_t)size);
 }
 
 void Free(Arena* arena, void* mem) {
-
-    if (arena) return;
-    free(mem);
+    if (!arena) {
+        free(mem);
+    }
 }
 
 static void* Alloc(Arena* arena, size_t size) {
-    if (size == 0) {
-        return nullptr;
-    }
-    if (!arena) {
-        return malloc(size);
-    }
-    return arena->Push((uint64_t)size, 8, false);
+    return AllocBytes(arena, (uint64_t)size);
 }
 
 static void* Realloc(Arena* arena, void* mem, size_t newSize, size_t copySize) {
@@ -707,18 +658,10 @@ GPUI_NOINLINE bool VecRealloc(Arena* a, void** els, int len, int* cap,
     return true;
 }
 
-static int VecNextCap(int cap, int wanted, int elSize) {
-    if (cap == 0) {
-        int floorCap = elSize == 1 ? 8 : elSize <= 1024 ? 4 : 1;
-        return std::max(floorCap, wanted);
-    }
-    return std::max(cap * 2, wanted);
-}
-
 GPUI_NOINLINE bool VecReserveNT(Arena* arena, VecNonTemplated* v, int elSize,
                                 int wantedSize) {
     int cap = v->cap;
-    int curCap = cap < 0 ? -cap : cap;
+    int curCap = VecAbsCap(cap);
     if (wantedSize <= curCap) {
         return true;
     }
@@ -760,12 +703,12 @@ GPUI_NOINLINE bool VecResizeNT(VecNonTemplated* v, int elSize, int newSize) {
     if (newSize < 0) {
         return false;
     }
-    int curCap = v->cap < 0 ? -v->cap : v->cap;
+    int curCap = VecAbsCap(v->cap);
     if (newSize > curCap) {
         if (!VecReserveNT(nullptr, v, elSize, newSize)) {
             return false;
         }
-        curCap = v->cap < 0 ? -v->cap : v->cap;
+        curCap = VecAbsCap(v->cap);
     }
     v->len = newSize;
     if (v->els && curCap > newSize) {
@@ -820,7 +763,7 @@ GPUI_NOINLINE void VecFreeElementsNT(VecNonTemplated* v) {
 
 GPUI_NOINLINE void VecClearNT(VecNonTemplated* v, int elSize) {
     v->len = 0;
-    int curCap = v->cap < 0 ? -v->cap : v->cap;
+    int curCap = VecAbsCap(v->cap);
     if (v->els && curCap > 0) {
         memset(v->els, 0, (size_t)curCap * (size_t)elSize);
     }
@@ -859,7 +802,7 @@ GPUI_NOINLINE void VecCopyFromNT(VecNonTemplated* v, int elSize, int srcLen,
         memcpy(v->els, srcEls, (size_t)srcLen * (size_t)elSize);
     }
     if (zeroTail && v->els) {
-        int curCap = v->cap < 0 ? -v->cap : v->cap;
+        int curCap = VecAbsCap(v->cap);
         if (curCap > srcLen) {
             char* tail = (char*)v->els + (size_t)srcLen * (size_t)elSize;
             memset(tail, 0, (size_t)(curCap - srcLen) * (size_t)elSize);
@@ -868,7 +811,6 @@ GPUI_NOINLINE void VecCopyFromNT(VecNonTemplated* v, int elSize, int srcLen,
 }
 
 #if defined(DEBUG)
-
 static FILE* gVecDbgFile = nullptr;
 static bool gVecDbgOpened = false;
 static int gVecDbgNextId = 1;
@@ -936,27 +878,13 @@ void VecDbgArenaDeath(int id, int len, int totalCap, int segCount) noexcept {
 }
 #endif
 
-static bool StrIsNull(const Str& s) {
-    return !s.s;
-}
-
-static Str WrapAllocated(char* s, int cch = -1) {
-    if (!s) {
-        return {};
-    }
-    if (cch < 0) {
-        return Str(s);
-    }
-    return Str(s, cch);
-}
-
 Str StrDup(Arena* a, Str s) {
-    if (StrIsNull(s) || s.len < 0) {
+    if (!s.s || len(s) < 0) {
         return {};
     }
-    int cch = s.len;
-    return WrapAllocated(
-        (char*)MemDup(a, s.s, (size_t)cch * sizeof(char), sizeof(char)), cch);
+    char* p =
+        (char*)MemDup(a, s.s, (size_t)len(s) * sizeof(char), sizeof(char));
+    return p ? Str(p, len(s)) : Str{};
 }
 
 Str StrDup(Str s) {
@@ -966,8 +894,8 @@ Str StrDup(Str s) {
 void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out) {
     s1Out = {};
     s2Out = {};
-    int n1 = (!s1.s || s1.len < 0) ? 0 : s1.len;
-    int n2 = (!s2.s || s2.len < 0) ? 0 : s2.len;
+    int n1 = (!s1.s || len(s1) < 0) ? 0 : len(s1);
+    int n2 = (!s2.s || len(s2) < 0) ? 0 : len(s2);
     if (n2 > INT_MAX - 2 - n1) {
         return;
     }
@@ -990,10 +918,6 @@ void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out) {
 
 void StrFree(Str s) {
     free(s.s);
-}
-
-void StrFree2(Str s) {
-    StrFree(s);
 }
 
 static bool DateParseIso(const char* s, LocalDate* out) {
@@ -1086,55 +1010,50 @@ void StrLowerAscii(char* s) {
     }
 }
 
-GPUI_NOINLINE bool StrEqRest(Str s1, Str s2) {
-    if (s1.s == s2.s || s1.len == 0) {
+static bool StrEqRestCommon(Str s1, Str s2, bool ignoreCase) {
+    if (s1.s == s2.s || len(s1) == 0) {
         return true;
     }
     if (!s1.s || !s2.s) {
         return false;
     }
-    return memcmp(s1.s, s2.s, (size_t)s1.len) == 0;
+    return ignoreCase ? StrCmpNI(s1.s, s2.s, len(s1)) == 0
+                      : memcmp(s1.s, s2.s, (size_t)len(s1)) == 0;
 }
 
-bool StrEq(Str s1, const char* s2) {
-    return StrEq(s1, Str(s2));
+GPUI_NOINLINE bool StrEqRest(Str s1, Str s2) {
+    return StrEqRestCommon(s1, s2, false);
 }
 
 int StrCmp(Str s1, Str s2) {
-    int common = std::min(s1.len, s2.len);
+    int common = std::min(len(s1), len(s2));
     int cmp = common > 0 ? memcmp(s1.s, s2.s, (size_t)common) : 0;
     if (cmp != 0) {
         return cmp;
     }
-    return s1.len < s2.len ? -1 : s1.len > s2.len ? 1 : 0;
+    return len(s1) < len(s2) ? -1 : len(s1) > len(s2) ? 1 : 0;
 }
 
 GPUI_NOINLINE bool StrEqIRest(Str s1, Str s2) {
-    if (s1.s == s2.s || s1.len == 0) {
-        return true;
-    }
-    if (StrIsNull(s1) || StrIsNull(s2)) {
-        return false;
-    }
-    return 0 == StrCmpNI(s1.s, s2.s, s1.len);
+    return StrEqRestCommon(s1, s2, true);
 }
 
-bool StrEqI(Str s1, const char* s2) {
-    return StrEqI(s1, Str(s2));
+static bool StrHasAffix(Str s, Str affix, bool fromEnd, bool ignoreCase) {
+    if (len(affix) > len(s)) {
+        return false;
+    }
+    if (len(affix) == 0) {
+        return true;
+    }
+    if (!s.s || !affix.s) {
+        return false;
+    }
+    Str slice(s.s + (fromEnd ? len(s) - len(affix) : 0), len(affix));
+    return ignoreCase ? StrEqI(slice, affix) : StrEq(slice, affix);
 }
 
 bool StrStartsWith(Str s, Str prefix) {
-    if (prefix.len > s.len) {
-        return false;
-    }
-    if (prefix.len == 0) {
-        return true;
-    }
-    return s.s && prefix.s && StrEq(Str(s.s, prefix.len), prefix);
-}
-
-bool StrStartsWith(Str s, const char* prefix) {
-    return StrStartsWith(s, Str(prefix));
+    return StrHasAffix(s, prefix, false, false);
 }
 
 bool StrStartsWithAny(Str s, const char* chars) {
@@ -1149,78 +1068,37 @@ bool StrStartsWithAny(Str s, const char* chars) {
     return false;
 }
 
-bool StrStartsWithI(Str s, const char* prefix) {
-    return StrStartsWithI(s, Str(prefix));
+bool StrStartsWithI(Str s, Str prefix) {
+    return StrHasAffix(s, prefix, false, true);
 }
 
 bool StrEndsWith(Str s, Str suffix) {
-    if (suffix.len > s.len) {
-        return false;
-    }
-    if (suffix.len == 0) {
-        return true;
-    }
-    return s.s && suffix.s &&
-           StrEq(Str(s.s + s.len - suffix.len, suffix.len), suffix);
-}
-
-bool StrEndsWith(Str s, const char* suffix) {
-    return StrEndsWith(s, Str(suffix));
+    return StrHasAffix(s, suffix, true, false);
 }
 
 bool StrEndsWithI(Str s, Str suffix) {
-    if (suffix.len > s.len) {
-        return false;
-    }
-    if (suffix.len == 0) {
-        return true;
-    }
-    return s.s && suffix.s &&
-           StrEqI(Str(s.s + s.len - suffix.len, suffix.len), suffix);
+    return StrHasAffix(s, suffix, true, true);
 }
 
-bool StrEndsWithI(Str s, const char* suffix) {
-    return StrEndsWithI(s, Str(suffix));
+static int StrFindCommon(Str s, Str sub, bool ignoreCase) {
+    if (!s.s || !sub.s || len(sub) <= 0 || len(sub) > len(s)) {
+        return -1;
+    }
+    for (int off = 0; off + len(sub) <= len(s); off++) {
+        Str slice(s.s + off, len(sub));
+        if (ignoreCase ? StrEqI(slice, sub) : StrEq(slice, sub)) {
+            return off;
+        }
+    }
+    return -1;
 }
 
 int StrFind(Str s, Str sub) {
-    if (!s.s || !sub.s || sub.len <= 0 || sub.len > s.len) {
-        return -1;
-    }
-    for (int off = 0; off + sub.len <= s.len; off++) {
-        if (StrEq(Str(s.s + off, sub.len), sub)) {
-            return off;
-        }
-    }
-    return -1;
-}
-
-int StrFind(Str s, const char* sub) {
-    return StrFind(s, Str(sub));
+    return StrFindCommon(s, sub, false);
 }
 
 int StrFindI(Str s, Str sub) {
-    if (!s.s || !sub.s || sub.len <= 0 || sub.len > s.len) {
-        return -1;
-    }
-    for (int off = 0; off + sub.len <= s.len; off++) {
-        if (StrEqI(Str(s.s + off, sub.len), sub)) {
-            return off;
-        }
-    }
-    return -1;
-}
-
-int StrFindI(Str s, const char* sub) {
-    return StrFindI(s, Str(sub));
-}
-
-bool StrContains(Str s, Str sub) {
-    return StrFind(s, sub) >= 0;
-}
-
-bool StrContainsI(Str s, Str sub) {
-    return StrFindI(s, sub) >= 0;
+    return StrFindCommon(s, sub, true);
 }
 
 static bool IsStrTrimAscii(char c) {
@@ -1228,11 +1106,11 @@ static bool IsStrTrimAscii(char c) {
 }
 
 Str StrTrimAscii(Str s) {
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return s;
     }
     int start = 0;
-    int end = s.len;
+    int end = len(s);
     while (start < end && IsStrTrimAscii(s.s[start])) {
         start++;
     }
@@ -1243,24 +1121,24 @@ Str StrTrimAscii(Str s) {
 }
 
 Str StrReplaceAll(Str value, Str from, Str to) {
-    if (from.len == 0 || from.len > value.len) {
+    if (len(from) == 0 || len(from) > len(value)) {
         return value;
     }
     int count = 0;
-    for (int i = 0; i <= value.len - from.len;) {
-        if (StrEq(Str(value.s + i, from.len), from)) {
-            count++;
-            i += from.len;
-        } else {
-            i++;
+    for (int i = 0; i <= len(value) - len(from);) {
+        int at = StrFind(Str(value.s + i, len(value) - i), from);
+        if (at < 0) {
+            break;
         }
+        count++;
+        i += at + len(from);
     }
     if (count == 0) {
         return value;
     }
 
-    int64_t grown = (int64_t)value.len +
-                    (int64_t)count * ((int64_t)to.len - (int64_t)from.len);
+    int64_t grown = (int64_t)len(value) +
+                    (int64_t)count * ((int64_t)len(to) - (int64_t)len(from));
     if (grown < 0 || grown > (int64_t)INT_MAX - 1) {
         return value;
     }
@@ -1271,15 +1149,25 @@ Str StrReplaceAll(Str value, Str from, Str to) {
     }
     int src = 0;
     int dst = 0;
-    while (src < value.len) {
-        if (src <= value.len - from.len &&
-            StrEq(Str(value.s + src, from.len), from)) {
-            memcpy(result.s + dst, to.s, (size_t)to.len);
-            src += from.len;
-            dst += to.len;
-        } else {
-            result.s[dst++] = value.s[src++];
+    while (src < len(value)) {
+        int remain = len(value) - src;
+        int at = remain >= len(from) ? StrFind(Str(value.s + src, remain), from)
+                                     : -1;
+        if (at < 0) {
+            memcpy(result.s + dst, value.s + src, (size_t)remain);
+            dst += remain;
+            break;
         }
+        if (at > 0) {
+            memcpy(result.s + dst, value.s + src, (size_t)at);
+            dst += at;
+            src += at;
+        }
+        if (len(to) > 0) {
+            memcpy(result.s + dst, to.s, (size_t)len(to));
+            dst += len(to);
+        }
+        src += len(from);
     }
     result.s[dst] = 0;
     result.len = dst;
@@ -1294,33 +1182,23 @@ Str SeqStrFirst(SeqStrings strs) {
 }
 
 Str SeqStrNext(Str s) {
-    if (s.len == 0) {
+    if (len(s) == 0) {
         return {};
     }
-    const char* next = s.s + s.len + 1;
+    const char* next = s.s + len(s) + 1;
     return next[0] ? Str(next) : Str{};
 }
 
 static int SeqStrIndexCmp(SeqStrings strs, Str toFind, bool ignoreCase) {
-    if (!strs || !toFind) return -1;
-    const char* candidate = strs;
+    if (!strs || !toFind) {
+        return -1;
+    }
     int idx = 0;
-    while (*candidate) {
-        int i = 0;
-        while (i < toFind.len && candidate[i]) {
-            char a = candidate[i];
-            char b = toFind.s[i];
-            if (ignoreCase) {
-                if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
-                if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
-            }
-            if (a != b) break;
-            i++;
+    for (Str cand = SeqStrFirst(strs); len(cand) > 0;
+         cand = SeqStrNext(cand), idx++) {
+        if (ignoreCase ? StrEqI(cand, toFind) : StrEq(cand, toFind)) {
+            return idx;
         }
-        if (i == toFind.len && !candidate[i]) return idx;
-        while (*candidate) candidate++;
-        candidate++;
-        idx++;
     }
     return -1;
 }
@@ -1342,7 +1220,7 @@ Str SeqStrByIndex(SeqStrings strs, int idx) {
         return {};
     }
     Str s = SeqStrFirst(strs);
-    while (idx > 0 && s.len > 0) {
+    while (idx > 0 && len(s) > 0) {
         s = SeqStrNext(s);
         idx--;
     }
@@ -1351,7 +1229,7 @@ Str SeqStrByIndex(SeqStrings strs, int idx) {
 
 int SeqStrCount(SeqStrings strs) {
     int n = 0;
-    for (Str s = SeqStrFirst(strs); s.len > 0; s = SeqStrNext(s)) {
+    for (Str s = SeqStrFirst(strs); len(s) > 0; s = SeqStrNext(s)) {
         n++;
     }
     return n;
@@ -1397,9 +1275,9 @@ void StrBuilderUseExternalBuffer(StrBuilder& b, Str buf) {
     if (b.els || b.len != 0) {
         return;
     }
-    if (buf.s && buf.len > kPadding) {
+    if (buf.s && len(buf) > kPadding) {
         b.els = buf.s;
-        b.cap = -(buf.len - kPadding);
+        b.cap = -(len(buf) - kPadding);
         b.els[0] = 0;
     }
 }
@@ -1422,7 +1300,7 @@ bool StrBuilder::AppendChar(char c) {
 }
 
 bool StrBuilder::Append(Str src) {
-    if (StrIsNull(src) || 0 == src.len) {
+    if (!src.s || src.len == 0) {
         return true;
     }
     if (!StrBuilderEnsureCap(*this, len + src.len)) {
@@ -1504,6 +1382,15 @@ struct Fmt {
     char buf[256] = {};
 };
 
+static int parseUintAt(Str f, int* off) {
+    int n = 0;
+    while (*off < len(f) && IsDigit(f.s[*off])) {
+        n = (n * 10) + (f.s[*off] - '0');
+        (*off)++;
+    }
+    return n;
+}
+
 static void addRawStr(Fmt& fmt, int off, size_t n) {
     if (n == 0) {
         return;
@@ -1523,17 +1410,18 @@ static int parseArgDefBrace(Fmt& fmt, int off) {
     off++;
     int n = 0;
     bool positional = false;
-
-    while (off < fmt.format.len && fmt.format.s[off] != '}') {
+    if (off < len(fmt.format) && IsDigit(fmt.format.s[off])) {
+        n = parseUintAt(fmt.format, &off);
+        positional = true;
+    }
+    while (off < len(fmt.format) && fmt.format.s[off] != '}') {
         if (!IsDigit(fmt.format.s[off])) {
             fmt.isOk = false;
             return off;
         }
-        n = (n * 10) + (fmt.format.s[off] - '0');
-        positional = true;
         off++;
     }
-    if (off >= fmt.format.len) {
+    if (off >= len(fmt.format)) {
         fmt.isOk = false;
         return off;
     }
@@ -1584,7 +1472,7 @@ static FmtArg::Kind typeFromConv(char c) {
 static bool startsWith(Str s, int off, const char* prefix) {
     int i = 0;
     while (prefix[i]) {
-        if (off + i >= s.len || s.s[off + i] != prefix[i]) {
+        if (off + i >= len(s) || s.s[off + i] != prefix[i]) {
             return false;
         }
         i++;
@@ -1592,13 +1480,42 @@ static bool startsWith(Str s, int off, const char* prefix) {
     return true;
 }
 
+static int parseLenMod(Str f, int off, int* bits) {
+    *bits = 32;
+    struct Mod {
+        const char* s;
+        int n;
+        int wide;
+    };
+    static const Mod kMods[] = {
+        {"I64", 3, 64},
+        {"I32", 3, 32},
+        {"ll", 2, 64},
+        {"hh", 2, 32},
+    };
+    for (const Mod& m : kMods) {
+        if (startsWith(f, off, m.s)) {
+            *bits = m.wide;
+            return off + m.n;
+        }
+    }
+    char c = off < len(f) ? f.s[off] : 0;
+    if (c == 'l' || c == 'h' || c == 'L' || c == 'w') {
+        return off + 1;
+    }
+    if (c == 'z' || c == 'j' || c == 't' || c == 'I') {
+        *bits = 64;
+        return off + 1;
+    }
+    return off;
+}
+
 static int parseArgDefPerc(Fmt& fmt, int off) {
     Str f = fmt.format;
     off++;
     int fwpStart = off;
     bool leftJust = false;
-
-    while (off < f.len &&
+    while (off < len(f) &&
            (f.s[off] == '-' || f.s[off] == '+' || f.s[off] == ' ' ||
             f.s[off] == '0' || f.s[off] == '#')) {
         if (f.s[off] == '-') {
@@ -1606,48 +1523,16 @@ static int parseArgDefPerc(Fmt& fmt, int off) {
         }
         off++;
     }
-
-    int width = 0;
-    while (off < f.len && IsDigit(f.s[off])) {
-        width = (width * 10) + (f.s[off] - '0');
-        off++;
-    }
-
+    int width = parseUintAt(f, &off);
     int prec = -1;
-    if (off < f.len && f.s[off] == '.') {
+    if (off < len(f) && f.s[off] == '.') {
         off++;
-        prec = 0;
-        while (off < f.len && IsDigit(f.s[off])) {
-            prec = (prec * 10) + (f.s[off] - '0');
-            off++;
-        }
+        prec = parseUintAt(f, &off);
     }
     int fwpEnd = off;
-
     int bits = 32;
-    char lenMod = (off < f.len) ? f.s[off] : 0;
-    bool is32BitLenMod =
-        lenMod == 'l' || lenMod == 'h' || lenMod == 'L' || lenMod == 'w';
-
-    bool is64BitLenMod =
-        lenMod == 'z' || lenMod == 'j' || lenMod == 't' || lenMod == 'I';
-    if (startsWith(f, off, "I64")) {
-        bits = 64;
-        off += 3;
-    } else if (startsWith(f, off, "I32")) {
-        off += 3;
-    } else if (startsWith(f, off, "ll")) {
-        bits = 64;
-        off += 2;
-    } else if (startsWith(f, off, "hh")) {
-        off += 2;
-    } else if (is32BitLenMod) {
-        off++;
-    } else if (is64BitLenMod) {
-        bits = 64;
-        off++;
-    }
-    char conv = (off < f.len) ? f.s[off] : 0;
+    off = parseLenMod(f, off, &bits);
+    char conv = (off < len(f)) ? f.s[off] : 0;
     off++;
 
     if (fmt.nInst >= (int)dimof(fmt.instructions)) {
@@ -1709,18 +1594,18 @@ static bool ParseFormat(Fmt& o, Str fmtStr) {
 
     int start = 0;
     int off = 0;
-    while (off < fmtStr.len && fmtStr.s[off]) {
+    while (off < len(fmtStr) && fmtStr.s[off]) {
         char c = fmtStr.s[off];
         if ('%' == c) {
 
-            if (off + 1 < fmtStr.len && '%' == fmtStr.s[off + 1]) {
+            if (off + 1 < len(fmtStr) && '%' == fmtStr.s[off + 1]) {
                 addRawStr(o, start, off - start);
                 start = off + 1;
                 off += 2;
                 continue;
             }
             addRawStr(o, start, off - start);
-            if (off + 1 < fmtStr.len && '{' == fmtStr.s[off + 1]) {
+            if (off + 1 < len(fmtStr) && '{' == fmtStr.s[off + 1]) {
                 off = parseArgDefBrace(o, off + 1);
             } else {
                 off = parseArgDefPerc(o, off);
@@ -1759,7 +1644,7 @@ static bool appendConv(Fmt& fmt, const char* spec, ...) {
     int n = VsnprintfUtf8(bufS, spec, args);
     va_end(args);
     fmt.buf[dimof(fmt.buf) - 1] = 0;
-    if (n >= 0 && n < bufS.len) {
+    if (n >= 0 && n < len(bufS)) {
         va_end(retry);
         return fmt.res.Append(Str(fmt.buf, n));
     }
@@ -1814,33 +1699,44 @@ static int64_t argToI64(const FmtArg& arg) {
     }
 }
 
+static bool appendSpaces(Fmt& fmt, int n) {
+    for (int j = 0; j < n; j++) {
+        if (!fmt.res.AppendChar(' ')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool isFloatConv(char c) {
+    return c == 'f' || c == 'F' || c == 'e' || c == 'E' || c == 'g' ||
+           c == 'G' || c == 'a' || c == 'A';
+}
+
+static bool isUnsignedConv(char c) {
+    return c == 'u' || c == 'o' || c == 'x' || c == 'X';
+}
+
 static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     if (inst.conv == 's' || inst.conv == 'S') {
-        Str sv = arg.str;
-        int slen = sv.len;
+        int slen = arg.str.len;
         if (inst.prec >= 0 && inst.prec < slen) {
             slen = inst.prec;
         }
-        int pad = inst.width - slen;
-        pad = std::max(pad, 0);
-        if (!inst.leftJust) {
-            for (int j = 0; j < pad; j++) {
-                if (!fmt.res.AppendChar(' ')) {
-                    return false;
-                }
-            }
-        }
-        if (!fmt.res.Append(Str(sv.s, slen))) {
+        int pad = std::max(inst.width - slen, 0);
+        if (!inst.leftJust && !appendSpaces(fmt, pad)) {
             return false;
         }
-        if (inst.leftJust) {
-            for (int j = 0; j < pad; j++) {
-                if (!fmt.res.AppendChar(' ')) {
-                    return false;
-                }
-            }
+        if (!fmt.res.Append(Str(arg.str.s, slen))) {
+            return false;
         }
-        return true;
+        return inst.leftJust ? appendSpaces(fmt, pad) : true;
+    }
+    if (inst.conv == 'p') {
+        const void* pv = arg.t == FmtArg::Kind::Ptr
+                             ? arg.ptr
+                             : (const void*)(intptr_t)argToI64(arg);
+        return appendConv(fmt, "%p", pv);
     }
 
     char fbuf[64];
@@ -1849,70 +1745,31 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     for (int j = 0; j < inst.fwpLen && k < (int)dimof(fbuf) - 5; j++) {
         fbuf[k++] = fmt.format.s[inst.fwpOff + j];
     }
-    char conv = inst.conv;
-    int64_t ival = argToI64(arg);
-    bool ok = true;
-    switch (conv) {
-        case 'd':
-        case 'i':
-            if (inst.intBits == 64) {
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'd';
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (long long)ival);
-            } else {
-                fbuf[k++] = 'd';
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (int)ival);
-            }
-            break;
-        case 'u':
-        case 'o':
-        case 'x':
-        case 'X':
-            if (inst.intBits == 64) {
-                fbuf[k++] = 'l';
-                fbuf[k++] = 'l';
-                fbuf[k++] = conv;
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf, (unsigned long long)ival);
-            } else {
-                fbuf[k++] = conv;
-                fbuf[k] = 0;
-                ok = appendConv(fmt, fbuf,
-                                (unsigned int)(unsigned long long)ival);
-            }
-            break;
-        case 'c':
-            fbuf[k++] = 'c';
-            fbuf[k] = 0;
-            ok = appendConv(fmt, fbuf, (int)ival);
-            break;
-        case 'f':
-        case 'F':
-        case 'e':
-        case 'E':
-        case 'g':
-        case 'G':
-        case 'a':
-        case 'A': {
-            fbuf[k++] = conv;
-            fbuf[k] = 0;
-            double dv = (arg.t == FmtArg::Kind::Double) ? arg.d : (double)arg.f;
-            ok = appendConv(fmt, fbuf, dv);
-        } break;
-        case 'p': {
-
-            const void* pv = (arg.t == FmtArg::Kind::Ptr)
-                                 ? arg.ptr
-                                 : (const void*)(intptr_t)ival;
-            ok = appendConv(fmt, "%p", pv);
-        } break;
-        default:
-            break;
+    bool wideInt =
+        inst.intBits == 64 &&
+        (inst.conv == 'd' || inst.conv == 'i' || isUnsignedConv(inst.conv));
+    if (wideInt) {
+        fbuf[k++] = 'l';
+        fbuf[k++] = 'l';
     }
-    return ok;
+    fbuf[k++] = inst.conv == 'i' ? 'd' : inst.conv;
+    fbuf[k] = 0;
+
+    if (isFloatConv(inst.conv)) {
+        double dv = arg.t == FmtArg::Kind::Double ? arg.d : (double)arg.f;
+        return appendConv(fmt, fbuf, dv);
+    }
+    int64_t ival = argToI64(arg);
+    if (isUnsignedConv(inst.conv)) {
+        if (wideInt) {
+            return appendConv(fmt, fbuf, (unsigned long long)ival);
+        }
+        return appendConv(fmt, fbuf, (unsigned int)(unsigned long long)ival);
+    }
+    if (wideInt) {
+        return appendConv(fmt, fbuf, (long long)ival);
+    }
+    return appendConv(fmt, fbuf, (int)ival);
 }
 
 bool Fmt::Eval(const FmtArg** args, int nArgs) {
@@ -2026,10 +1883,10 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args) {
 #if defined(_MSC_VER)
     _locale_t loc = GetUtf8FormatLocale();
     if (loc) {
-        return _vsnprintf_l(buf.s, (size_t)buf.len, fmt, loc, args);
+        return _vsnprintf_l(buf.s, (size_t)len(buf), fmt, loc, args);
     }
 #endif
-    return vsnprintf(buf.s, (size_t)buf.len, fmt, args);
+    return vsnprintf(buf.s, (size_t)len(buf), fmt, args);
 }
 }
 
@@ -8521,8 +8378,8 @@ State DocumentBeforeFrontmatter(Tokenizer* t) {
 
 State DocumentContainerExistingBefore(Tokenizer* t) {
 
-    if (t->tokenizeState.documentContinued <
-        t->tokenizeState.documentContainerStack.len) {
+    if (t->tokenizeState.documentContinued < t->tokenizeState
+                                                 .documentContainerStack.len) {
         const ContainerState& container =
             t->tokenizeState
                 .documentContainerStack[t->tokenizeState.documentContinued];
@@ -8532,7 +8389,8 @@ State DocumentContainerExistingBefore(Tokenizer* t) {
         } else if (container.kind == Container::ListItem) {
             name = StateName::ListItemContStart;
         }
-        TokenizerAttempt(t, StateNext(StateName::DocumentContainerExistingAfter),
+        TokenizerAttempt(t,
+                         StateNext(StateName::DocumentContainerExistingAfter),
                          StateNext(StateName::DocumentContainerNewBefore));
         return StateRetry(name);
     }
@@ -8547,8 +8405,8 @@ State DocumentContainerExistingAfter(Tokenizer* t) {
 
 State DocumentContainerNewBefore(Tokenizer* t) {
 
-    if (t->tokenizeState.documentContinued ==
-        t->tokenizeState.documentContainerStack.len) {
+    if (t->tokenizeState.documentContinued == t->tokenizeState
+                                                  .documentContainerStack.len) {
         Tokenizer* child = t->tokenizeState.documentChild;
         t->interrupt = child->interrupt;
 
@@ -8599,24 +8457,24 @@ State DocumentContainerNewBeforeNotList(Tokenizer* t) {
 
 static ContainerState SwapRemove(Vec<ContainerState>& stack, int32_t index) {
     ContainerState out = stack[index];
-    stack[index] = stack[stack.len - 1];
+    stack[index] = stack[len(stack) - 1];
     stack.len -= 1;
     return out;
 }
 
 State DocumentContainerNewBeforeNotGfmFootnoteDefinition(Tokenizer* t) {
-    SwapRemove(t->tokenizeState.documentContainerStack,
-               t->tokenizeState.documentContinued);
+    SwapRemove(t->tokenizeState.documentContainerStack, t->tokenizeState
+                                                            .documentContinued);
     return StateRetry(StateName::DocumentContainersAfter);
 }
 
 State DocumentContainerNewAfter(Tokenizer* t) {
-    ContainerState container = SwapRemove(
-        t->tokenizeState.documentContainerStack,
-        t->tokenizeState.documentContinued);
+    ContainerState container =
+        SwapRemove(t->tokenizeState.documentContainerStack,
+                   t->tokenizeState.documentContinued);
 
-    if (t->tokenizeState.documentContinued !=
-        t->tokenizeState.documentContainerStack.len) {
+    if (t->tokenizeState.documentContinued != t->tokenizeState
+                                                  .documentContainerStack.len) {
         ExitContainers(t, Phase::Prefix);
     }
 
@@ -8670,7 +8528,7 @@ State DocumentFlowEnd(Tokenizer* t) {
                       : StateNext(StateName::FlowStart);
     t->tokenizeState.documentChildStateSome = false;
 
-    ArenaVec<Event> emptyExits {};
+    ArenaVec<Event> emptyExits{};
     VecAppend(t->tokenizeState.documentExits, emptyExits);
 
     state = Push(child, child->point.index, child->point.vs, t->point.index,
@@ -8679,7 +8537,7 @@ State DocumentFlowEnd(Tokenizer* t) {
     t->tokenizeState.documentChildStateSome = true;
 
     bool documentLazyContinuationCurrent = false;
-    int32_t stackIndex = child->stack.len;
+    int32_t stackIndex = len(child->stack);
     while (!documentLazyContinuationCurrent && stackIndex > 0) {
         stackIndex -= 1;
         Name name = child->stack[stackIndex];
@@ -8701,12 +8559,12 @@ State DocumentFlowEnd(Tokenizer* t) {
 
     if (child->lazy && t->tokenizeState.documentLazyAcceptingBefore &&
         documentLazyContinuationCurrent) {
-        t->tokenizeState.documentContinued =
-            t->tokenizeState.documentContainerStack.len;
+        t->tokenizeState.documentContinued = t->tokenizeState
+                                                 .documentContainerStack.len;
     }
 
-    if (t->tokenizeState.documentContinued !=
-        t->tokenizeState.documentContainerStack.len) {
+    if (t->tokenizeState.documentContinued != t->tokenizeState
+                                                  .documentContainerStack.len) {
         ExitContainers(t, Phase::After);
     }
 
@@ -8718,8 +8576,8 @@ State DocumentFlowEnd(Tokenizer* t) {
     }
 
     t->tokenizeState.documentContinued = 0;
-    t->tokenizeState.documentLazyAcceptingBefore =
-        documentLazyContinuationCurrent;
+    t->tokenizeState
+        .documentLazyAcceptingBefore = documentLazyContinuationCurrent;
     t->interrupt = false;
     return StateRetry(StateName::DocumentContainerExistingBefore);
 }
@@ -8731,8 +8589,8 @@ static void ExitContainers(Tokenizer* t, Phase phase) {
          i < t->tokenizeState.documentContainerStack.len; i++) {
         VecAppend(stackClose, t->tokenizeState.documentContainerStack[i]);
     }
-    t->tokenizeState.documentContainerStack.len =
-        t->tokenizeState.documentContinued;
+    t->tokenizeState.documentContainerStack.len = t->tokenizeState
+                                                      .documentContinued;
 
     Tokenizer* child = t->tokenizeState.documentChild;
 
@@ -8744,11 +8602,11 @@ static void ExitContainers(Tokenizer* t, Phase phase) {
         Flush(child, state, false);
     }
 
-    if (stackClose.len > 0) {
+    if (len(stackClose) > 0) {
         int32_t index = t->tokenizeState.documentExits.len -
                         (phase == Phase::After ? 2 : 1);
-        ArenaVec<Event> exits {};
-        while (stackClose.len > 0) {
+        ArenaVec<Event> exits{};
+        while (len(stackClose) > 0) {
             ContainerState container = stackClose[--stackClose.len];
             Name name = Name::BlockQuote;
             if (container.kind == Container::GfmFootnoteDefinition) {
@@ -8762,11 +8620,11 @@ static void ExitContainers(Tokenizer* t, Phase phase) {
             event.point = t->point;
             exits.Append(t->parseState->scratch, event);
 
-            int32_t stackIndex = t->stack.len;
+            int32_t stackIndex = len(t->stack);
             while (stackIndex > 0) {
                 stackIndex -= 1;
                 if (t->stack[stackIndex] == name) {
-                    for (int32_t i = stackIndex; i + 1 < t->stack.len; i++) {
+                    for (int32_t i = stackIndex; i + 1 < len(t->stack); i++) {
                         t->stack[i] = t->stack[i + 1];
                     }
                     t->stack.len -= 1;
@@ -8800,14 +8658,14 @@ static void DocumentResolve(Tokenizer* t) {
             }
             if (line < t->tokenizeState.documentExits.len) {
                 ArenaVec<Event> exits = t->tokenizeState.documentExits[line];
-                if (exits.len > 0) {
+                if (len(exits) > 0) {
                     t->tokenizeState.documentExits[line] = ArenaVec<Event>{};
                     for (Event& exit : exits) {
                         exit.point = point;
                     }
                     EditMapAdd(child->map, injectIndex, 0,
                                exits.Flatten(t->parseState->scratch),
-                               exits.len);
+                               len(exits));
                 }
             }
             line += 1;
@@ -8830,7 +8688,7 @@ static void DocumentResolve(Tokenizer* t) {
 
     if (line < t->tokenizeState.documentExits.len) {
         ArenaVec<Event> exits = t->tokenizeState.documentExits[line];
-        if (exits.len > 0) {
+        if (len(exits) > 0) {
             t->tokenizeState.documentExits[line] = ArenaVec<Event>{};
             for (Event& exit : exits) {
                 exit.point = t->point;
@@ -9270,8 +9128,8 @@ State HeadingAtxBefore(Tokenizer* t) {
 }
 
 State HeadingAtxSequenceOpen(Tokenizer* t) {
-    if (t->current == '#' &&
-        t->tokenizeState.size < kHeadingAtxOpeningFenceSizeMax) {
+    if (t->current == '#' && t->tokenizeState
+                                     .size < kHeadingAtxOpeningFenceSizeMax) {
         t->tokenizeState.size += 1;
         Consume(t);
         return StateNext(StateName::HeadingAtxSequenceOpen);
@@ -9295,7 +9153,8 @@ State HeadingAtxAtBreak(Tokenizer* t) {
         return StateOk();
     }
     if (t->current == '\t' || t->current == ' ') {
-        TokenizerAttempt(t, StateNext(StateName::HeadingAtxAtBreak), StateNok());
+        TokenizerAttempt(t, StateNext(StateName::HeadingAtxAtBreak),
+                         StateNok());
         return StateRetry(SpaceOrTab(t));
     }
     if (t->current == '#') {
@@ -9435,7 +9294,8 @@ bool HeadingSetextResolve(Tokenizer* t, Subresult*) {
 
         Name names[3] = {Name::SpaceOrTab, Name::LineEnding,
                          Name::BlockQuotePrefix};
-        int32_t paragraphExitBefore = SkipOptBack(t->events, enter - 1, names, 3);
+        int32_t paragraphExitBefore =
+            SkipOptBack(t->events, enter - 1, names, 3);
 
         if (t->events[paragraphExitBefore].name == Name::Paragraph) {
             Name paragraph = Name::Paragraph;
@@ -9682,7 +9542,7 @@ bool ListItemResolve(Tokenizer* t, Subresult*) {
                 current.start = index;
                 current.end = end;
 
-                int32_t listIndex = listsWip.len;
+                int32_t listIndex = len(listsWip);
                 bool matched = false;
                 while (listIndex > 0) {
                     listIndex -= 1;
@@ -9696,7 +9556,8 @@ bool ListItemResolve(Tokenizer* t, Subresult*) {
                         previous.balance == current.balance &&
                         before == current.start) {
                         listsWip[listIndex].end = current.end;
-                        for (int32_t i = listIndex + 1; i < listsWip.len; i++) {
+                        for (int32_t i = listIndex + 1; i < len(listsWip);
+                             i++) {
                             VecAppend(lists, listsWip[i]);
                         }
                         listsWip.len = listIndex + 1;
@@ -9706,7 +9567,7 @@ bool ListItemResolve(Tokenizer* t, Subresult*) {
                 }
 
                 if (!matched) {
-                    int32_t i = listsWip.len;
+                    int32_t i = len(listsWip);
                     int32_t exit = -1;
                     while (i > 0) {
                         i -= 1;
@@ -9717,7 +9578,7 @@ bool ListItemResolve(Tokenizer* t, Subresult*) {
                         }
                     }
                     if (exit != -1) {
-                        for (int32_t j = exit; j < listsWip.len; j++) {
+                        for (int32_t j = exit; j < len(listsWip); j++) {
                             VecAppend(lists, listsWip[j]);
                         }
                         listsWip.len = exit;
@@ -9733,11 +9594,11 @@ bool ListItemResolve(Tokenizer* t, Subresult*) {
         index += 1;
     }
 
-    for (int32_t i = 0; i < listsWip.len; i++) {
+    for (int32_t i = 0; i < len(listsWip); i++) {
         VecAppend(lists, listsWip[i]);
     }
 
-    for (int32_t i = 0; i < lists.len; i++) {
+    for (int32_t i = 0; i < len(lists); i++) {
         const ListWip& listItem = lists[i];
         Event listStart = t->events[listItem.start];
         Event listEnd = t->events[listItem.end];
@@ -9795,8 +9656,8 @@ State DefinitionLabelAfter(Tokenizer* t) {
     t->tokenizeState.token3 = Name::Data;
     if (t->current == ':') {
         Name labelString = Name::DefinitionLabelString;
-        t->tokenizeState.end =
-            SkipToBack(t->events, t->events.len - 1, &labelString, 1);
+        t->tokenizeState
+            .end = SkipToBack(t->events, t->events.len - 1, &labelString, 1);
         Enter(t, Name::DefinitionMarker);
         Consume(t);
         Exit(t, Name::DefinitionMarker);
@@ -10140,9 +10001,9 @@ State GfmFootnoteDefinitionStart(Tokenizer* t) {
     }
     Enter(t, Name::GfmFootnoteDefinition);
     if (t->current == '\t' || t->current == ' ') {
-        TokenizerAttempt(
-            t, StateNext(StateName::GfmFootnoteDefinitionLabelBefore),
-            StateNok());
+        TokenizerAttempt(t,
+                         StateNext(StateName::GfmFootnoteDefinitionLabelBefore),
+                         StateNok());
         int32_t max = t->parseState->options->constructs.codeIndented
                           ? kTabSize - 1
                           : kSizeMax;
@@ -10180,7 +10041,8 @@ State GfmFootnoteDefinitionLabelAtMarker(Tokenizer* t) {
 State GfmFootnoteDefinitionLabelInside(Tokenizer* t) {
     if (t->tokenizeState.size > kLinkReferenceSizeMax || t->current < 0 ||
         t->current == '\t' || t->current == '\n' || t->current == ' ' ||
-        t->current == '[' || (t->current == ']' && t->tokenizeState.size == 0)) {
+        t->current == '[' ||
+        (t->current == ']' && t->tokenizeState.size == 0)) {
         t->tokenizeState.size = 0;
         return StateNok();
     }
@@ -10461,8 +10323,8 @@ State GfmTableHeadDelimiterRightAlignmentAfter(Tokenizer* t) {
 State GfmTableHeadDelimiterCellAfter(Tokenizer* t) {
     if (t->current < 0 || t->current == '\n') {
 
-        if (!t->tokenizeState.seen ||
-            t->tokenizeState.size != t->tokenizeState.sizeB) {
+        if (!t->tokenizeState.seen || t->tokenizeState.size != t->tokenizeState
+                                                                   .sizeB) {
             return StateRetry(StateName::GfmTableHeadDelimiterNok);
         }
         t->tokenizeState.seen = false;
@@ -10546,10 +10408,10 @@ struct CellRange {
     int32_t valueEnd = 0;
 };
 
-static void FlushCell(Tokenizer* t, const CellRange& range,
-                      bool inDelimiterRow, int32_t rowEnd) {
-    Name groupName = inDelimiterRow ? Name::GfmTableDelimiterCell
-                                    : Name::GfmTableCell;
+static void FlushCell(Tokenizer* t, const CellRange& range, bool inDelimiterRow,
+                      int32_t rowEnd) {
+    Name groupName =
+        inDelimiterRow ? Name::GfmTableDelimiterCell : Name::GfmTableCell;
     Name valueName = inDelimiterRow ? Name::GfmTableDelimiterCellValue
                                     : Name::GfmTableCellText;
 
@@ -10720,8 +10582,7 @@ bool GfmTableResolve(Tokenizer* t, Subresult*) {
 }
 
 State GfmAutolinkLiteralProtocolStart(Tokenizer* t) {
-    bool alphaBefore =
-        t->previous >= 0 && IsAsciiAlpha((uint8_t)t->previous);
+    bool alphaBefore = t->previous >= 0 && IsAsciiAlpha((uint8_t)t->previous);
     if (t->parseState->options->constructs.gfmAutolinkLiteral &&
         (t->current == 'H' || t->current == 'h') && !alphaBefore) {
         Enter(t, Name::GfmAutolinkLiteralProtocol);
@@ -10826,9 +10687,9 @@ State GfmAutolinkLiteralWwwPrefixAfter(Tokenizer* t) {
 
 State GfmAutolinkLiteralDomainInside(Tokenizer* t) {
     if (t->current == '.' || t->current == '_') {
-        TokenizerCheck(t, StateNext(StateName::GfmAutolinkLiteralDomainAfter),
-                       StateNext(
-                           StateName::GfmAutolinkLiteralDomainAtPunctuation));
+        TokenizerCheck(
+            t, StateNext(StateName::GfmAutolinkLiteralDomainAfter),
+            StateNext(StateName::GfmAutolinkLiteralDomainAtPunctuation));
         return StateRetry(StateName::GfmAutolinkLiteralTrail);
     }
 
@@ -10883,10 +10744,9 @@ State GfmAutolinkLiteralPathInside(Tokenizer* t) {
         return StateNext(StateName::GfmAutolinkLiteralPathInside);
     }
     int32_t c = t->current;
-    bool trailing = c == '!' || c == '"' || c == '&' || c == '\'' ||
-                    c == ')' || c == '*' || c == ',' || c == '.' ||
-                    c == ':' || c == ';' || c == '<' || c == '?' ||
-                    c == ']' || c == '_' || c == '~';
+    bool trailing = c == '!' || c == '"' || c == '&' || c == '\'' || c == ')' ||
+                    c == '*' || c == ',' || c == '.' || c == ':' || c == ';' ||
+                    c == '<' || c == '?' || c == ']' || c == '_' || c == '~';
     if (trailing) {
         StateName next = StateName::GfmAutolinkLiteralPathAfter;
         if (c == ')' && t->tokenizeState.sizeB < t->tokenizeState.size) {
@@ -10922,9 +10782,9 @@ State GfmAutolinkLiteralPathAfter(Tokenizer* t) {
 
 State GfmAutolinkLiteralTrail(Tokenizer* t) {
     int32_t c = t->current;
-    bool trailing = c == '!' || c == '"' || c == '\'' || c == ')' ||
-                    c == '*' || c == ',' || c == '.' || c == ':' ||
-                    c == ';' || c == '?' || c == '_' || c == '~';
+    bool trailing = c == '!' || c == '"' || c == '\'' || c == ')' || c == '*' ||
+                    c == ',' || c == '.' || c == ':' || c == ';' || c == '?' ||
+                    c == '_' || c == '~';
     if (trailing) {
         Consume(t);
         return StateNext(StateName::GfmAutolinkLiteralTrail);
@@ -10978,8 +10838,8 @@ static int32_t PeekBytesAtext(Str bytes, int32_t min, int32_t end) {
     int32_t index = end;
     while (index > min) {
         uint8_t byte = (uint8_t)bytes.s[index - 1];
-        bool atext = byte == '+' || byte == '-' || byte == '.' ||
-                     byte == '_' || IsAsciiAlphanumeric(byte);
+        bool atext = byte == '+' || byte == '-' || byte == '.' || byte == '_' ||
+                     IsAsciiAlphanumeric(byte);
         if (!atext) {
             break;
         }
@@ -11016,12 +10876,12 @@ static int32_t PeekProtocol(Str bytes, int32_t min, int32_t end, Name* name) {
 static int32_t PeekBytesEmailDomain(Str bytes, int32_t start, bool xmpp) {
     int32_t index = start;
     bool dot = false;
-    while (index < bytes.len) {
+    while (index < len(bytes)) {
         uint8_t byte = (uint8_t)bytes.s[index];
         if (byte == '-' || byte == '_' || IsAsciiAlphanumeric(byte) ||
             (byte == '/' && xmpp)) {
 
-        } else if (byte == '.' && index + 1 < bytes.len &&
+        } else if (byte == '.' && index + 1 < len(bytes) &&
                    IsAsciiAlphanumeric((uint8_t)bytes.s[index + 1])) {
             dot = true;
         } else {
@@ -11053,16 +10913,15 @@ void GfmAutolinkLiteralResolve(Tokenizer* t) {
         } else {
             if (event.name == Name::Data && links == 0) {
                 Position position = PositionFromExitEvent(t->events, index);
-                Slice slice =
-                    SliceFromPosition(t->parseState->bytes, position);
+                Slice slice = SliceFromPosition(t->parseState->bytes, position);
                 Str bytes = slice.bytes;
                 int32_t byteIndex = 0;
-                ArenaVec<Event> replace {};
+                ArenaVec<Event> replace{};
                 Point point = t->events[index - 1].point;
                 int32_t startIndex = point.index;
                 int32_t min = 0;
 
-                while (byteIndex < bytes.len) {
+                while (byteIndex < len(bytes)) {
                     if (bytes.s[byteIndex] == '@') {
                         int32_t rangeStart = 0;
                         int32_t rangeEnd = 0;
@@ -11090,9 +10949,9 @@ void GfmAutolinkLiteralResolve(Tokenizer* t) {
                                 enter.name = Name::Data;
                                 enter.point = point;
                                 replace.Append(a, enter);
-                                point = PointShiftTo(point,
-                                                     t->parseState->bytes,
-                                                     startIndex + rangeStart);
+                                point =
+                                    PointShiftTo(point, t->parseState->bytes,
+                                                 startIndex + rangeStart);
                                 Event exit;
                                 exit.kind = Kind::Exit;
                                 exit.name = Name::Data;
@@ -11117,7 +10976,7 @@ void GfmAutolinkLiteralResolve(Tokenizer* t) {
                     byteIndex += 1;
                 }
 
-                if (min != 0 && min < bytes.len) {
+                if (min != 0 && min < len(bytes)) {
                     Event enter;
                     enter.kind = Kind::Enter;
                     enter.name = Name::Data;
@@ -11130,9 +10989,9 @@ void GfmAutolinkLiteralResolve(Tokenizer* t) {
                     replace.Append(a, exit);
                 }
 
-                if (replace.len > 0) {
+                if (len(replace) > 0) {
                     EditMapAdd(t->map, index - 1, 2, replace.Flatten(a),
-                               replace.len);
+                               len(replace));
                 }
             }
             if (event.name == Name::Link) {
@@ -11158,7 +11017,8 @@ static const uint8_t kHtmlBasic = 6;
 static const uint8_t kHtmlComplete = 7;
 
 static bool NamesContainI(SeqStrings names, Str name) {
-    for (Str item = SeqStrFirst(names); item.len > 0; item = SeqStrNext(item)) {
+    for (Str item = SeqStrFirst(names); len(item) > 0;
+         item = SeqStrNext(item)) {
         if (base::StrEqI(item, name)) {
             return true;
         }
@@ -11249,7 +11109,8 @@ State HtmlFlowCommentOpenInside(Tokenizer* t) {
 }
 
 State HtmlFlowCdataOpenInside(Tokenizer* t) {
-    if (t->current == (int32_t)(uint8_t)kHtmlCdataPrefix.s[t->tokenizeState.size]) {
+    if (t->current == (int32_t)(uint8_t)kHtmlCdataPrefix
+                          .s[t->tokenizeState.size]) {
         Consume(t);
         t->tokenizeState.size += 1;
         if (t->tokenizeState.size == kHtmlCdataPrefix.len) {
@@ -11682,7 +11543,8 @@ State HtmlTextCommentEnd(Tokenizer* t) {
 }
 
 State HtmlTextCdataOpenInside(Tokenizer* t) {
-    if (t->current == (int32_t)(uint8_t)kHtmlCdataPrefix.s[t->tokenizeState.size]) {
+    if (t->current == (int32_t)(uint8_t)kHtmlCdataPrefix
+                          .s[t->tokenizeState.size]) {
         t->tokenizeState.size += 1;
         Consume(t);
         if (t->tokenizeState.size == kHtmlCdataPrefix.len) {
@@ -11943,8 +11805,7 @@ State HtmlTextLineEndingBefore(Tokenizer* t) {
 
 State HtmlTextLineEndingAfter(Tokenizer* t) {
     if (t->current == '\t' || t->current == ' ') {
-        TokenizerAttempt(t,
-                         StateNext(StateName::HtmlTextLineEndingAfterPrefix),
+        TokenizerAttempt(t, StateNext(StateName::HtmlTextLineEndingAfterPrefix),
                          StateNok());
         return StateRetry(SpaceOrTab(t));
     }
@@ -11963,7 +11824,7 @@ State HtmlTextLineEndingAfterPrefix(Tokenizer* t) {
 namespace markdown {
 
 static bool DefinitionsContain(const Vec<Str>& definitions, Str id) {
-    for (int32_t i = 0; i < definitions.len; i++) {
+    for (int32_t i = 0; i < len(definitions); i++) {
         if (base::StrEq(definitions[i], id)) {
             return true;
         }
@@ -12005,15 +11866,15 @@ State LabelEndAfter(Tokenizer* t) {
             return StateRetry(StateName::LabelEndOk);
         }
 
-        t->tokenizeState.labelStarts[startIndex].kind =
-            LabelKind::GfmUndefinedFootnote;
-        char* caret = (char*)base::Alloc(a, id.len + 2);
+        t->tokenizeState.labelStarts[startIndex]
+            .kind = LabelKind::GfmUndefinedFootnote;
+        char* caret = (char*)base::Alloc(a, len(id) + 2);
         caret[0] = '^';
-        if (id.len > 0) {
-            memcpy(caret + 1, id.s, (size_t)id.len);
+        if (len(id) > 0) {
+            memcpy(caret + 1, id.s, (size_t)len(id));
         }
-        caret[id.len + 1] = 0;
-        id = Str(caret, id.len + 1);
+        caret[len(id) + 1] = 0;
+        id = Str(caret, len(id) + 1);
     }
 
     bool defined = DefinitionsContain(t->parseState->definitions, id);
@@ -12025,10 +11886,9 @@ State LabelEndAfter(Tokenizer* t) {
         return StateRetry(StateName::LabelEndResourceStart);
     }
     if (t->current == '[') {
-        TokenizerAttempt(
-            t, StateNext(StateName::LabelEndOk),
-            StateNext(defined ? StateName::LabelEndReferenceNotFull
-                              : StateName::LabelEndNok));
+        TokenizerAttempt(t, StateNext(StateName::LabelEndOk),
+                         StateNext(defined ? StateName::LabelEndReferenceNotFull
+                                           : StateName::LabelEndNok));
         return StateRetry(StateName::LabelEndReferenceFull);
     }
     return StateRetry(defined ? StateName::LabelEndOk : StateName::LabelEndNok);
@@ -12067,8 +11927,8 @@ State LabelEndOk(Tokenizer* t) {
 }
 
 State LabelEndNok(Tokenizer* t) {
-    LabelStartMark start =
-        t->tokenizeState.labelStarts[--t->tokenizeState.labelStarts.len];
+    LabelStartMark start = t->tokenizeState
+                               .labelStarts[--t->tokenizeState.labelStarts.len];
     VecAppend(t->tokenizeState.labelStartsLoose, start);
     t->tokenizeState.end = 0;
     return StateNok();
@@ -12101,9 +11961,8 @@ State LabelEndResourceOpen(Tokenizer* t) {
     t->tokenizeState.token4 = Name::ResourceDestinationRaw;
     t->tokenizeState.token5 = Name::ResourceDestinationString;
     t->tokenizeState.sizeB = kResourceDestinationBalanceMax;
-    TokenizerAttempt(
-        t, StateNext(StateName::LabelEndResourceDestinationAfter),
-        StateNext(StateName::LabelEndResourceDestinationMissing));
+    TokenizerAttempt(t, StateNext(StateName::LabelEndResourceDestinationAfter),
+                     StateNext(StateName::LabelEndResourceDestinationMissing));
     return StateRetry(StateName::DestinationStart);
 }
 
@@ -12218,7 +12077,7 @@ State LabelEndReferenceCollapsedOpen(Tokenizer* t) {
 }
 
 static void InjectLabels(Tokenizer* t, const Vec<Label>& labels) {
-    for (int32_t index = 0; index < labels.len; index++) {
+    for (int32_t index = 0; index < len(labels); index++) {
         const Label& label = labels[index];
         Name groupName = Name::Link;
         if (label.kind == LabelKind::GfmFootnote) {
@@ -12284,7 +12143,7 @@ static void InjectLabels(Tokenizer* t, const Vec<Label>& labels) {
 }
 
 static void MarkAsData(Tokenizer* t, const Vec<LabelStartMark>& events) {
-    for (int32_t index = 0; index < events.len; index++) {
+    for (int32_t index = 0; index < len(events); index++) {
         int32_t dataEnterIndex = events[index].startA;
         int32_t dataExitIndex = events[index].startB;
         Event add[2];
@@ -12294,15 +12153,15 @@ static void MarkAsData(Tokenizer* t, const Vec<LabelStartMark>& events) {
         add[1].kind = Kind::Exit;
         add[1].name = Name::Data;
         add[1].point = t->events[dataExitIndex].point;
-        EditMapAdd(t->map, dataEnterIndex,
-                   dataExitIndex - dataEnterIndex + 1, add, 2);
+        EditMapAdd(t->map, dataEnterIndex, dataExitIndex - dataEnterIndex + 1,
+                   add, 2);
     }
 }
 
 bool LabelEndResolve(Tokenizer* t, Subresult*) {
 
     Vec<Label> labels;
-    for (int32_t i = 0; i < t->tokenizeState.labels.len; i++) {
+    for (int32_t i = 0; i < len(t->tokenizeState.labels); i++) {
         VecAppend(labels, t->tokenizeState.labels[i]);
     }
     t->tokenizeState.labels.len = 0;
@@ -12387,7 +12246,8 @@ State SpaceOrTabInside(Tokenizer* t) {
 }
 
 State SpaceOrTabAfter(Tokenizer* t) {
-    State state = t->tokenizeState.spaceOrTabSize >= t->tokenizeState.spaceOrTabMin
+    State state = t->tokenizeState.spaceOrTabSize >= t->tokenizeState
+                                                         .spaceOrTabMin
                       ? StateOk()
                       : StateNok();
     t->tokenizeState.spaceOrTabConnect = false;
@@ -12415,7 +12275,7 @@ StateName SpaceOrTabEol(Tokenizer* t) {
 State SpaceOrTabEolStart(Tokenizer* t) {
     if (t->current == '\t' || t->current == ' ') {
         TokenizerAttempt(t, StateNext(StateName::SpaceOrTabEolAfterFirst),
-                 StateNext(StateName::SpaceOrTabEolAtEol));
+                         StateNext(StateName::SpaceOrTabEolAtEol));
         SpaceOrTabOptions options;
         options.kind = Name::SpaceOrTab;
         options.min = 1;
@@ -12460,7 +12320,8 @@ State SpaceOrTabEolAtEol(Tokenizer* t) {
 
 State SpaceOrTabEolAfterEol(Tokenizer* t) {
     if (t->current == '\t' || t->current == ' ') {
-        TokenizerAttempt(t, StateNext(StateName::SpaceOrTabEolAfterMore), StateNok());
+        TokenizerAttempt(t, StateNext(StateName::SpaceOrTabEolAfterMore),
+                         StateNok());
         SpaceOrTabOptions options;
         options.kind = Name::SpaceOrTab;
         options.min = 1;
@@ -12516,7 +12377,8 @@ State DataAtBreak(Tokenizer* t) {
 }
 
 State DataInside(Tokenizer* t) {
-    if (t->current >= 0 && t->current != '\n' && !MarkersContain(t, t->current)) {
+    if (t->current >= 0 && t->current != '\n' &&
+        !MarkersContain(t, t->current)) {
         Consume(t);
         return StateNext(StateName::DataInside);
     }
@@ -12669,7 +12531,7 @@ State LabelAtBreak(Tokenizer* t) {
     }
     if (t->current == '\n') {
         TokenizerAttempt(t, StateNext(StateName::LabelEolAfter),
-                 StateNext(StateName::LabelNok));
+                         StateNext(StateName::LabelNok));
         SpaceOrTabEolOptions options;
         options.content = ContentKind::String;
         options.contentSome = true;
@@ -12776,7 +12638,7 @@ State TitleAtBreak(Tokenizer* t) {
     }
     if (t->current == '\n') {
         TokenizerAttempt(t, StateNext(StateName::TitleAfterEol),
-                 StateNext(StateName::TitleNok));
+                         StateNext(StateName::TitleNok));
         SpaceOrTabEolOptions options;
         options.content = ContentKind::String;
         options.contentSome = true;
@@ -12811,8 +12673,8 @@ State TitleInside(Tokenizer* t) {
         Exit(t, Name::Data);
         return StateRetry(StateName::TitleAtBreak);
     }
-    StateName name = t->current == '\\' ? StateName::TitleEscape
-                                        : StateName::TitleInside;
+    StateName name =
+        t->current == '\\' ? StateName::TitleEscape : StateName::TitleInside;
     Consume(t);
     return StateNext(name);
 }
@@ -12846,11 +12708,11 @@ static void TrimData(Tokenizer* t, int32_t exitIndex, bool trimStart,
             index -= 1;
         }
         int32_t diff = slice.bytes.len - index;
-        Name name = (hardBreak && spacesOnly &&
-                     diff >= kHardBreakPrefixSizeMin &&
-                     exitIndex + 1 < t->events.len)
-                        ? Name::HardBreakTrailing
-                        : Name::SpaceOrTab;
+        Name name =
+            (hardBreak && spacesOnly && diff >= kHardBreakPrefixSizeMin &&
+             exitIndex + 1 < t->events.len)
+                ? Name::HardBreakTrailing
+                : Name::SpaceOrTab;
         if (index == 0) {
             t->events[exitIndex - 1].name = name;
             t->events[exitIndex].name = name;
@@ -13019,8 +12881,8 @@ State RawFlowStart(Tokenizer* t) {
 
 State RawFlowBeforeSequenceOpen(Tokenizer* t) {
     int32_t prefix = 0;
-    if (t->events.len > 0 &&
-        t->events[t->events.len - 1].name == Name::SpaceOrTab) {
+    if (t->events.len > 0 && t->events[t->events.len - 1]
+                                     .name == Name::SpaceOrTab) {
         Position position = PositionFromExitEvent(t->events, t->events.len - 1);
         prefix = SliceFromPosition(t->parseState->bytes, position).Len();
     }
@@ -13104,7 +12966,8 @@ State RawFlowInfo(Tokenizer* t) {
     if (t->current == '\t' || t->current == ' ') {
         Exit(t, Name::Data);
         Exit(t, t->tokenizeState.token4);
-        TokenizerAttempt(t, StateNext(StateName::RawFlowMetaBefore), StateNok());
+        TokenizerAttempt(t, StateNext(StateName::RawFlowMetaBefore),
+                         StateNok());
         return StateRetry(SpaceOrTab(t));
     }
     if (t->current == (int32_t)t->tokenizeState.marker &&
@@ -13184,8 +13047,7 @@ State RawFlowSequenceClose(Tokenizer* t) {
         t->tokenizeState.sizeB = 0;
         Exit(t, t->tokenizeState.token3);
         if (t->current == '\t' || t->current == ' ') {
-            TokenizerAttempt(t,
-                             StateNext(StateName::RawFlowAfterSequenceClose),
+            TokenizerAttempt(t, StateNext(StateName::RawFlowAfterSequenceClose),
                              StateNok());
             return StateRetry(SpaceOrTab(t));
         }
@@ -13260,9 +13122,8 @@ State RawTextStart(Tokenizer* t) {
         t->parseState->options->constructs.codeText && t->current == '`';
     bool math =
         t->parseState->options->constructs.mathText && t->current == '$';
-    bool afterEscape =
-        t->events.len > 0 &&
-        t->events[t->events.len - 1].name == Name::CharacterEscape;
+    bool afterEscape = t->events.len > 0 && t->events[t->events.len - 1].name ==
+                                                Name::CharacterEscape;
     if ((code || math) && (t->previous != t->current || afterEscape)) {
         uint8_t marker = (uint8_t)t->current;
         if (marker == '`') {
@@ -13462,8 +13323,8 @@ State TextBeforeData(Tokenizer* t) {
 }
 
 bool TextResolve(Tokenizer* t, Subresult*) {
-    ResolveWhitespace(
-        t, t->parseState->options->constructs.hardBreakTrailing, true);
+    ResolveWhitespace(t, t->parseState->options->constructs.hardBreakTrailing,
+                      true);
     if (t->parseState->options->constructs.gfmAutolinkLiteral) {
         GfmAutolinkLiteralResolve(t);
     }
@@ -13573,8 +13434,8 @@ State CharacterReferenceValue(Tokenizer* t) {
     if (t->current == ';' && t->tokenizeState.size > 0) {
         if (t->tokenizeState.marker == '&') {
             Slice slice = SliceFromIndices(
-                t->parseState->bytes,
-                t->point.index - t->tokenizeState.size, t->point.index);
+                t->parseState->bytes, t->point.index - t->tokenizeState.size,
+                t->point.index);
             if (!DecodeNamed(t->parseState->scratch, slice.bytes).s) {
                 t->tokenizeState.marker = 0;
                 t->tokenizeState.size = 0;
@@ -13591,10 +13452,10 @@ State CharacterReferenceValue(Tokenizer* t) {
         return StateOk();
     }
     if (t->current >= 0 &&
-        t->tokenizeState.size <
-            CharacterReferenceValueMax(t->tokenizeState.marker) &&
-        CharacterReferenceValueTest(t->tokenizeState.marker,
-                                    (uint8_t)t->current)) {
+        t->tokenizeState
+                .size < CharacterReferenceValueMax(t->tokenizeState.marker) &&
+        CharacterReferenceValueTest(t->tokenizeState.marker, (uint8_t)t
+                                                                 ->current)) {
         t->tokenizeState.size += 1;
         Consume(t);
         return StateNext(StateName::CharacterReferenceValue);
@@ -13723,8 +13584,8 @@ State AutolinkSchemeInsideOrEmailAtext(Tokenizer* t) {
         t->tokenizeState.size = 0;
         return StateNext(StateName::AutolinkUrlInside);
     }
-    if (IsSchemeByte(t->current) &&
-        t->tokenizeState.size < kAutolinkSchemeSizeMax) {
+    if (IsSchemeByte(t->current) && t->tokenizeState
+                                            .size < kAutolinkSchemeSizeMax) {
         Consume(t);
         t->tokenizeState.size += 1;
         return StateNext(StateName::AutolinkSchemeInsideOrEmailAtext);
@@ -13812,7 +13673,7 @@ State AutolinkEmailValue(Tokenizer* t) {
 
 struct Sequence {
     uint8_t marker = 0;
-    ArenaVec<int32_t> stack {};
+    ArenaVec<int32_t> stack{};
     int32_t index = 0;
     Point startPoint = {};
     Point endPoint = {};
@@ -13824,8 +13685,8 @@ struct Sequence {
 State AttentionStart(Tokenizer* t) {
     bool emphasis = t->parseState->options->constructs.attention &&
                     (t->current == '*' || t->current == '_');
-    bool strikethrough =
-        t->parseState->options->constructs.gfmStrikethrough && t->current == '~';
+    bool strikethrough = t->parseState->options->constructs.gfmStrikethrough &&
+                         t->current == '~';
     if (emphasis || strikethrough) {
         t->tokenizeState.marker = (uint8_t)t->current;
         Enter(t, Name::AttentionSequence);
@@ -13846,7 +13707,7 @@ State AttentionInside(Tokenizer* t) {
 }
 
 static bool StackEq(const ArenaVec<int32_t>& a, const ArenaVec<int32_t>& b) {
-    if (a.len != b.len) {
+    if (len(a) != len(b)) {
         return false;
     }
 
@@ -13863,14 +13724,14 @@ static bool StackEq(const ArenaVec<int32_t>& a, const ArenaVec<int32_t>& b) {
 static void GetSequences(Tokenizer* t, Vec<Sequence>& sequences) {
     Arena* a = t->parseState->scratch;
     int32_t index = 0;
-    ArenaVec<int32_t> stack {};
+    ArenaVec<int32_t> stack{};
     while (index < t->events.len) {
         const Event& enter = t->events[index];
         if (enter.name == Name::AttentionSequence) {
             if (enter.kind == Kind::Enter) {
                 const Event& exit = t->events[index + 1];
-                uint8_t marker =
-                    (uint8_t)t->parseState->bytes.s[enter.point.index];
+                uint8_t marker = (uint8_t)t->parseState->bytes
+                                     .s[enter.point.index];
                 int32_t beforeChar =
                     CharBeforeIndex(t->parseState->bytes, enter.point.index);
                 CharKind before = Classify(beforeChar);
@@ -13880,14 +13741,16 @@ static void GetSequences(Tokenizer* t, Vec<Sequence>& sequences) {
                 bool gfm = t->parseState->options->constructs.gfmStrikethrough;
                 bool open =
                     after == CharKind::Other ||
-                    (after == CharKind::Punctuation && before != CharKind::Other) ||
+                    (after == CharKind::Punctuation &&
+                     before != CharKind::Other) ||
                     (marker != '~' && (afterChar == '*' || afterChar == '_')) ||
                     (marker != '~' && gfm && afterChar == '~');
-                bool close =
-                    before == CharKind::Other ||
-                    (before == CharKind::Punctuation && after != CharKind::Other) ||
-                    (marker != '~' && (beforeChar == '*' || beforeChar == '_')) ||
-                    (marker != '~' && gfm && beforeChar == '~');
+                bool close = before == CharKind::Other ||
+                             (before == CharKind::Punctuation &&
+                              after != CharKind::Other) ||
+                             (marker != '~' &&
+                              (beforeChar == '*' || beforeChar == '_')) ||
+                             (marker != '~' && gfm && beforeChar == '~');
 
                 Sequence sequence;
                 sequence.index = index;
@@ -13898,18 +13761,20 @@ static void GetSequences(Tokenizer* t, Vec<Sequence>& sequences) {
                 sequence.startPoint = enter.point;
                 sequence.endPoint = exit.point;
                 sequence.size = exit.point.index - enter.point.index;
-                sequence.open = marker == '_'
-                                    ? (open && (before != CharKind::Other || !close))
-                                    : open;
-                sequence.close = marker == '_'
-                                     ? (close && (after != CharKind::Other || !open))
-                                     : close;
+                sequence.open =
+                    marker == '_'
+                        ? (open && (before != CharKind::Other || !close))
+                        : open;
+                sequence.close =
+                    marker == '_'
+                        ? (close && (after != CharKind::Other || !open))
+                        : close;
                 sequence.marker = marker;
                 VecAppend(sequences, sequence);
             }
         } else if (enter.kind == Kind::Enter) {
             stack.Append(a, index);
-        } else if (stack.len > 0) {
+        } else if (len(stack) > 0) {
             stack.Pop();
         }
         index += 1;
@@ -13917,7 +13782,7 @@ static void GetSequences(Tokenizer* t, Vec<Sequence>& sequences) {
 }
 
 static void SequencesRemove(Vec<Sequence>& sequences, int32_t index) {
-    for (int32_t i = index; i + 1 < sequences.len; i++) {
+    for (int32_t i = index; i + 1 < len(sequences); i++) {
         sequences[i] = sequences[i + 1];
     }
     sequences.len -= 1;
@@ -14012,7 +13877,7 @@ bool AttentionResolve(Tokenizer* t, Subresult*) {
     GetSequences(t, sequences);
 
     int32_t close = 0;
-    while (close < sequences.len) {
+    while (close < len(sequences)) {
         int32_t nextIndex = close + 1;
         if (sequences[close].close) {
             int32_t open = close;
@@ -14044,7 +13909,7 @@ bool AttentionResolve(Tokenizer* t, Subresult*) {
         close = nextIndex;
     }
 
-    for (int32_t index = 0; index < sequences.len; index++) {
+    for (int32_t index = 0; index < len(sequences); index++) {
         t->events[sequences[index].index].name = Name::Data;
         t->events[sequences[index].index + 1].name = Name::Data;
     }
@@ -14173,9 +14038,9 @@ static int32_t NodeToStringFill(Arena* a, const Node* node, char* out,
     }
     Str value =
         NodeHasOwnValue(node) ? NodeGetStr(a, node, NodeStrKind::Value) : Str{};
-    if (value.len > 0) {
-        memcpy(out + at, value.s, (size_t)value.len);
-        at += value.len;
+    if (len(value) > 0) {
+        memcpy(out + at, value.s, (size_t)len(value));
+        at += len(value);
     }
     return at;
 }
@@ -14266,7 +14131,7 @@ Str NodeGetStr(Arena* a, const Node* n, NodeStrKind k) {
 
 int32_t NodeGetStrLen(Arena* a, const Node* n, NodeStrKind k) {
     char* rec = FindRec(a, n, k, nullptr);
-    return rec ? RecStr(rec).len : 0;
+    return rec ? len(RecStr(rec)) : 0;
 }
 
 bool NodeHasStr(Arena* a, const Node* n, NodeStrKind k) {
@@ -14292,18 +14157,18 @@ void NodeSetStr(Arena* a, Node* n, NodeStrKind k, Str s) {
         return;
     }
     NodeClearStr(a, n, k);
-    if (!s.s || s.len <= 0) {
+    if (!s.s || len(s) <= 0) {
         return;
     }
     int32_t head = 0;
-    char* rec = RecNew(a, n, k, (uint32_t)s.len, &head);
+    char* rec = RecNew(a, n, k, (uint32_t)len(s), &head);
     if (rec) {
-        memcpy(rec + head, s.s, (size_t)s.len);
+        memcpy(rec + head, s.s, (size_t)len(s));
     }
 }
 
 void NodeGrowStr(Arena* a, Node* n, NodeStrKind k, Str more) {
-    if (!a || !n || !more.s || more.len <= 0) {
+    if (!a || !n || !more.s || len(more) <= 0) {
         return;
     }
     char* prev = nullptr;
@@ -14315,15 +14180,15 @@ void NodeGrowStr(Arena* a, Node* n, NodeStrKind k, Str more) {
 
     int32_t head = 0;
     Str had = RecStr(rec, &head);
-    uint32_t nlen = (uint32_t)had.len + (uint32_t)more.len;
+    uint32_t nlen = (uint32_t)len(had) + (uint32_t)len(more);
     int32_t nhead = kRecLen + base::VarintSize(nlen);
 
     uint64_t used = base::ArenaUsed(a);
     uint64_t end = (uint64_t)base::ArenaOffsetOf(a, rec) + (uint64_t)head +
-                   (uint64_t)had.len + 1;
+                   (uint64_t)len(had) + 1;
 
     bool newest = end == used;
-    uint64_t want = newest ? (uint64_t)(nhead - head) + (uint64_t)more.len
+    uint64_t want = newest ? (uint64_t)(nhead - head) + (uint64_t)len(more)
                            : (uint64_t)nhead + nlen + 1;
     char* dst = (char*)a->Push(want, 1, false);
     if (!dst) {
@@ -14333,18 +14198,18 @@ void NodeGrowStr(Arena* a, Node* n, NodeStrKind k, Str more) {
 
     if (newest && at == used) {
         if (nhead != head) {
-            memmove(rec + nhead, rec + head, (size_t)had.len);
+            memmove(rec + nhead, rec + head, (size_t)len(had));
         }
         base::VarintPut(rec + kRecLen, nlen);
-        memcpy(rec + nhead + had.len, more.s, (size_t)more.len);
+        memcpy(rec + nhead + len(had), more.s, (size_t)len(more));
         rec[nhead + nlen] = 0;
         return;
     }
 
     dst[kRecKind] = (char)(uint8_t)k;
     base::VarintPut(dst + kRecLen, nlen);
-    memcpy(dst + nhead, had.s, (size_t)had.len);
-    memcpy(dst + nhead + had.len, more.s, (size_t)more.len);
+    memcpy(dst + nhead, had.s, (size_t)len(had));
+    memcpy(dst + nhead + len(had), more.s, (size_t)len(more));
     dst[nhead + nlen] = 0;
     if (prev) {
         RecSetNext(prev, RecNext(rec));
@@ -14438,8 +14303,8 @@ UnistPosition GetUnistPosition(Str md, uint32_t start, uint32_t end) {
     if (!md.s) {
         return out;
     }
-    if (stop > md.len) {
-        stop = md.len;
+    if (stop > len(md)) {
+        stop = len(md);
     }
     bool haveStart = false;
     while (at <= stop) {
@@ -14451,7 +14316,7 @@ UnistPosition GetUnistPosition(Str md, uint32_t start, uint32_t end) {
             break;
         }
         uint8_t byte = (uint8_t)md.s[at];
-        if (byte == '\r' && at + 1 < md.len && md.s[at + 1] == '\n') {
+        if (byte == '\r' && at + 1 < len(md) && md.s[at + 1] == '\n') {
 
             at += 1;
             continue;
@@ -14531,9 +14396,9 @@ void DivideEvents(EditMap& map, const Vec<Event>& events, int32_t linkIndex,
     Vec<DivideSlice> slices;
     int32_t sliceStart = 0;
     int32_t oldPrev = -1;
-    int32_t len = childEvents.len;
+    int32_t childLen = len(childEvents);
 
-    while (childIndex < len) {
+    while (childIndex < childLen) {
         const Point& current = childEvents[childIndex].point;
         const Point& end = events[linkIndex + 1].point;
 
@@ -14545,45 +14410,45 @@ void DivideEvents(EditMap& map, const Vec<Event>& events, int32_t linkIndex,
             linkIndex = events[linkIndex].link.next;
         }
 
-        if (childEvents[childIndex].hasLink &&
-            childEvents[childIndex].link.previous != -1) {
+        if (childEvents[childIndex].hasLink && childEvents[childIndex]
+                                                       .link.previous != -1) {
             Event& prevEvent = childEvents[oldPrev];
-            int32_t newLink = slices.len == 0
+            int32_t newLink = len(slices) == 0
                                   ? oldPrev + linkIndex + 2
-                                  : oldPrev + linkIndex - (slices.len - 1) * 2;
+                                  : oldPrev + linkIndex - (len(slices) - 1) * 2;
             prevEvent.link.next = newLink + *accB - *accA;
         }
 
-        if (childEvents[childIndex].hasLink &&
-            childEvents[childIndex].link.next != -1) {
+        if (childEvents[childIndex].hasLink && childEvents[childIndex]
+                                                       .link.next != -1) {
             int32_t next = childEvents[childIndex].link.next;
             oldPrev = childEvents[next].link.previous;
             if (childEvents[next].link.previous != -1) {
                 childEvents[next].link.previous =
                     childEvents[next].link.previous + linkIndex -
-                    (slices.len * 2) + *accB - *accA;
+                    (len(slices) * 2) + *accB - *accA;
             }
         }
 
         childIndex += 1;
     }
 
-    if (childEvents.len > 0) {
+    if (len(childEvents) > 0) {
         DivideSlice slice = {linkIndex, sliceStart};
         VecAppend(slices, slice);
     }
 
-    int32_t index = slices.len;
+    int32_t index = len(slices);
     while (index > 0) {
         index -= 1;
         int32_t from = slices[index].sliceStart;
         EditMapAdd(map, slices[index].linkIndex, 2, childEvents.els + from,
-                   childEvents.len - from);
+                   len(childEvents) - from);
         childEvents.len = from;
     }
 
-    *accA = *accA + slices.len * 2;
-    *accB = *accB + len;
+    *accA = *accA + len(slices) * 2;
+    *accB = *accB + childLen;
 }
 
 Subresult Subtokenize(Vec<Event>& events, ParseState* parseState,
@@ -14596,12 +14461,13 @@ Subresult Subtokenize(Vec<Event>& events, ParseState* parseState,
     int32_t accA = 0;
     int32_t accB = 0;
 
-    while (index < events.len) {
+    while (index < len(events)) {
         if (events[index].hasLink && events[index].link.previous == -1 &&
             (!hasFilter || events[index].link.content == filter)) {
             const Link& link = events[index].link;
             int32_t linkIndex = index;
-            Tokenizer* tokenizer = TokenizerNew(events[index].point, parseState);
+            Tokenizer* tokenizer =
+                TokenizerNew(events[index].point, parseState);
 
             StateName startName = StateName::TextStart;
             if (link.content == ContentKind::Content) {
@@ -14665,7 +14531,7 @@ Vec<Event> Parse(ParseState* parseState) {
 
     Vec<Event> events;
     events.els = tokenizer->events.els;
-    events.len = tokenizer->events.len;
+    events.len = len(tokenizer->events);
     events.cap = tokenizer->events.cap;
     tokenizer->events.els = nullptr;
     tokenizer->events.len = 0;
@@ -15061,7 +14927,7 @@ struct CompileContext {
 
 static Str IdentifierFrom(Arena* a, Str value) {
     Str id = NormalizeIdentifier(a, value);
-    for (int32_t i = 0; i < id.len; i++) {
+    for (int32_t i = 0; i < len(id); i++) {
         if (id.s[i] >= 'A' && id.s[i] <= 'Z') {
             id.s[i] = (char)(id.s[i] + 32);
         }
@@ -15071,13 +14937,13 @@ static Str IdentifierFrom(Arena* a, Str value) {
 
 static Str TrimEol(Str value, bool atStart, bool atEnd) {
     int32_t start = 0;
-    int32_t end = value.len;
-    if (atStart && value.len > 0) {
+    int32_t end = len(value);
+    if (atStart && len(value) > 0) {
         if (value.s[0] == '\n') {
             start += 1;
         } else if (value.s[0] == '\r') {
             start += 1;
-            if (value.len > 1 && value.s[1] == '\n') {
+            if (len(value) > 1 && value.s[1] == '\n') {
                 start += 1;
             }
         }
@@ -15414,36 +15280,36 @@ static void OnExitRawText(CompileContext* c) {
 
     if (c->gfmTableInside) {
         int32_t index = 0;
-        int32_t len = value.len;
+        int32_t n = len(value);
         bool replace = false;
         char* bytes = value.s;
-        while (index < len) {
-            if (index + 1 < len && bytes[index] == '\\' &&
+        while (index < n) {
+            if (index + 1 < n && bytes[index] == '\\' &&
                 bytes[index + 1] == '|') {
                 replace = true;
-                for (int32_t i = index; i + 1 < len; i++) {
+                for (int32_t i = index; i + 1 < n; i++) {
                     bytes[i] = bytes[i + 1];
                 }
-                len -= 1;
+                n -= 1;
             }
             index += 1;
         }
         if (replace) {
-            value.len = len;
-            value.s[len] = 0;
+            value.len = n;
+            value.s[n] = 0;
         }
     }
 
-    if (value.len > 2 && value.s[0] == ' ' && value.s[value.len - 1] == ' ') {
+    if (len(value) > 2 && value.s[0] == ' ' && value.s[len(value) - 1] == ' ') {
         bool allSpaces = true;
-        for (int32_t i = 0; i < value.len; i++) {
+        for (int32_t i = 0; i < len(value); i++) {
             if (value.s[i] != ' ') {
                 allSpaces = false;
                 break;
             }
         }
         if (!allSpaces) {
-            value = Str(value.s + 1, value.len - 2);
+            value = Str(value.s + 1, len(value) - 2);
         }
     }
 
@@ -15583,11 +15449,12 @@ static void OnExitListItem(CompileContext* c) {
                 start += 1;
             } else if (StrStartsWithAny(value, "\r\n")) {
                 start += 1;
-                if (value.len > 1 && value.s[0] == '\r' && value.s[1] == '\n') {
+                if (len(value) > 1 && value.s[0] == '\r' &&
+                    value.s[1] == '\n') {
                     start += 1;
                 }
             }
-            if (start == value.len) {
+            if (start == len(value)) {
 
                 Node* last = NodeLastChild(c->a, paragraph);
                 if (last == text) {
@@ -15597,7 +15464,7 @@ static void OnExitListItem(CompileContext* c) {
                 }
             } else {
                 Keep(c, text, NodeStrKind::Value,
-                     Str(value.s + start, value.len - start));
+                     Str(value.s + start, len(value) - start));
             }
         }
     }
@@ -15607,7 +15474,7 @@ static void OnExitListItem(CompileContext* c) {
 static void OnExitListItemValue(CompileContext* c) {
     Str value = ExitSlice(c).bytes;
     uint32_t start = 0;
-    for (int32_t i = 0; i < value.len; i++) {
+    for (int32_t i = 0; i < len(value); i++) {
         start = start * 10 + (uint32_t)(value.s[i] - '0');
     }
     Node* node = TailPenultimateMut(c);
@@ -15808,7 +15675,7 @@ Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState) {
     VecAppend(context.trees, frame);
 
     int32_t index = 0;
-    while (index < events.len) {
+    while (index < len(events)) {
         context.index = index;
         if (events[index].kind == Kind::Enter) {
             Enter(&context);
@@ -15842,7 +15709,7 @@ static ByteAction ByteActionAt(Str bytes, const Point& point) {
     uint8_t byte = (uint8_t)bytes.s[point.index];
     if (byte == '\r') {
 
-        if (point.index < bytes.len - 1 && bytes.s[point.index + 1] == '\n') {
+        if (point.index < len(bytes) - 1 && bytes.s[point.index + 1] == '\n') {
             return ByteAction{ByteActionKind::Ignore, 0};
         }
         return ByteAction{ByteActionKind::Normal, '\n'};
@@ -16219,11 +16086,11 @@ Subresult Flush(Tokenizer* t, State state, bool resolve) {
 
     if (resolve) {
         Vec<ResolveName> resolvers;
-        for (int32_t i = 0; i < t->resolvers.len; i++) {
+        for (int32_t i = 0; i < len(t->resolvers); i++) {
             VecAppend(resolvers, t->resolvers[i]);
         }
         t->resolvers.len = 0;
-        for (int32_t index = 0; index < resolvers.len; index++) {
+        for (int32_t index = 0; index < len(resolvers); index++) {
             Subresult result;
             if (ResolveCall(t, resolvers[index], &result)) {
                 SubresultAppend(value, result);
@@ -16248,93 +16115,122 @@ struct CodePointRange {
 };
 
 const CodePointRange kPunctuation[349] = {
-    {0x0021, 0x002F}, {0x003A, 0x0040}, {0x005B, 0x0060}, {0x007B, 0x007E},
-    {0x00A1, 0x00A9}, {0x00AB, 0x00AC}, {0x00AE, 0x00B1}, {0x00B4, 0x00B4},
-    {0x00B6, 0x00B8}, {0x00BB, 0x00BB}, {0x00BF, 0x00BF}, {0x00D7, 0x00D7},
-    {0x00F7, 0x00F7}, {0x02C2, 0x02C5}, {0x02D2, 0x02DF}, {0x02E5, 0x02EB},
-    {0x02ED, 0x02ED}, {0x02EF, 0x02FF}, {0x0375, 0x0375}, {0x037E, 0x037E},
-    {0x0384, 0x0385}, {0x0387, 0x0387}, {0x03F6, 0x03F6}, {0x0482, 0x0482},
-    {0x055A, 0x055F}, {0x0589, 0x058A}, {0x058D, 0x058F}, {0x05BE, 0x05BE},
-    {0x05C0, 0x05C0}, {0x05C3, 0x05C3}, {0x05C6, 0x05C6}, {0x05F3, 0x05F4},
-    {0x0606, 0x060F}, {0x061B, 0x061B}, {0x061D, 0x061F}, {0x066A, 0x066D},
-    {0x06D4, 0x06D4}, {0x06DE, 0x06DE}, {0x06E9, 0x06E9}, {0x06FD, 0x06FE},
-    {0x0700, 0x070D}, {0x07F6, 0x07F9}, {0x07FE, 0x07FF}, {0x0830, 0x083E},
-    {0x085E, 0x085E}, {0x0888, 0x0888}, {0x0964, 0x0965}, {0x0970, 0x0970},
-    {0x09F2, 0x09F3}, {0x09FA, 0x09FB}, {0x09FD, 0x09FD}, {0x0A76, 0x0A76},
-    {0x0AF0, 0x0AF1}, {0x0B70, 0x0B70}, {0x0BF3, 0x0BFA}, {0x0C77, 0x0C77},
-    {0x0C7F, 0x0C7F}, {0x0C84, 0x0C84}, {0x0D4F, 0x0D4F}, {0x0D79, 0x0D79},
-    {0x0DF4, 0x0DF4}, {0x0E3F, 0x0E3F}, {0x0E4F, 0x0E4F}, {0x0E5A, 0x0E5B},
-    {0x0F01, 0x0F17}, {0x0F1A, 0x0F1F}, {0x0F34, 0x0F34}, {0x0F36, 0x0F36},
-    {0x0F38, 0x0F38}, {0x0F3A, 0x0F3D}, {0x0F85, 0x0F85}, {0x0FBE, 0x0FC5},
-    {0x0FC7, 0x0FCC}, {0x0FCE, 0x0FDA}, {0x104A, 0x104F}, {0x109E, 0x109F},
-    {0x10FB, 0x10FB}, {0x1360, 0x1368}, {0x1390, 0x1399}, {0x1400, 0x1400},
-    {0x166D, 0x166E}, {0x169B, 0x169C}, {0x16EB, 0x16ED}, {0x1735, 0x1736},
-    {0x17D4, 0x17D6}, {0x17D8, 0x17DB}, {0x1800, 0x180A}, {0x1940, 0x1940},
-    {0x1944, 0x1945}, {0x19DE, 0x19FF}, {0x1A1E, 0x1A1F}, {0x1AA0, 0x1AA6},
-    {0x1AA8, 0x1AAD}, {0x1B4E, 0x1B4F}, {0x1B5A, 0x1B6A}, {0x1B74, 0x1B7F},
-    {0x1BFC, 0x1BFF}, {0x1C3B, 0x1C3F}, {0x1C7E, 0x1C7F}, {0x1CC0, 0x1CC7},
-    {0x1CD3, 0x1CD3}, {0x1FBD, 0x1FBD}, {0x1FBF, 0x1FC1}, {0x1FCD, 0x1FCF},
-    {0x1FDD, 0x1FDF}, {0x1FED, 0x1FEF}, {0x1FFD, 0x1FFE}, {0x2010, 0x2027},
-    {0x2030, 0x205E}, {0x207A, 0x207E}, {0x208A, 0x208E}, {0x20A0, 0x20C0},
-    {0x2100, 0x2101}, {0x2103, 0x2106}, {0x2108, 0x2109}, {0x2114, 0x2114},
-    {0x2116, 0x2118}, {0x211E, 0x2123}, {0x2125, 0x2125}, {0x2127, 0x2127},
-    {0x2129, 0x2129}, {0x212E, 0x212E}, {0x213A, 0x213B}, {0x2140, 0x2144},
-    {0x214A, 0x214D}, {0x214F, 0x214F}, {0x218A, 0x218B}, {0x2190, 0x2429},
-    {0x2440, 0x244A}, {0x249C, 0x24E9}, {0x2500, 0x2775}, {0x2794, 0x2B73},
-    {0x2B76, 0x2B95}, {0x2B97, 0x2BFF}, {0x2CE5, 0x2CEA}, {0x2CF9, 0x2CFC},
-    {0x2CFE, 0x2CFF}, {0x2D70, 0x2D70}, {0x2E00, 0x2E2E}, {0x2E30, 0x2E5D},
-    {0x2E80, 0x2E99}, {0x2E9B, 0x2EF3}, {0x2F00, 0x2FD5}, {0x2FF0, 0x2FFF},
-    {0x3001, 0x3004}, {0x3008, 0x3020}, {0x3030, 0x3030}, {0x3036, 0x3037},
-    {0x303D, 0x303F}, {0x309B, 0x309C}, {0x30A0, 0x30A0}, {0x30FB, 0x30FB},
-    {0x3190, 0x3191}, {0x3196, 0x319F}, {0x31C0, 0x31E5}, {0x31EF, 0x31EF},
-    {0x3200, 0x321E}, {0x322A, 0x3247}, {0x3250, 0x3250}, {0x3260, 0x327F},
-    {0x328A, 0x32B0}, {0x32C0, 0x33FF}, {0x4DC0, 0x4DFF}, {0xA490, 0xA4C6},
-    {0xA4FE, 0xA4FF}, {0xA60D, 0xA60F}, {0xA673, 0xA673}, {0xA67E, 0xA67E},
-    {0xA6F2, 0xA6F7}, {0xA700, 0xA716}, {0xA720, 0xA721}, {0xA789, 0xA78A},
-    {0xA828, 0xA82B}, {0xA836, 0xA839}, {0xA874, 0xA877}, {0xA8CE, 0xA8CF},
-    {0xA8F8, 0xA8FA}, {0xA8FC, 0xA8FC}, {0xA92E, 0xA92F}, {0xA95F, 0xA95F},
-    {0xA9C1, 0xA9CD}, {0xA9DE, 0xA9DF}, {0xAA5C, 0xAA5F}, {0xAA77, 0xAA79},
-    {0xAADE, 0xAADF}, {0xAAF0, 0xAAF1}, {0xAB5B, 0xAB5B}, {0xAB6A, 0xAB6B},
-    {0xABEB, 0xABEB}, {0xFB29, 0xFB29}, {0xFBB2, 0xFBC2}, {0xFD3E, 0xFD4F},
-    {0xFDCF, 0xFDCF}, {0xFDFC, 0xFDFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE52},
-    {0xFE54, 0xFE66}, {0xFE68, 0xFE6B}, {0xFF01, 0xFF0F}, {0xFF1A, 0xFF20},
-    {0xFF3B, 0xFF40}, {0xFF5B, 0xFF65}, {0xFFE0, 0xFFE6}, {0xFFE8, 0xFFEE},
-    {0xFFFC, 0xFFFD}, {0x10100, 0x10102}, {0x10137, 0x1013F}, {0x10179, 0x10189},
-    {0x1018C, 0x1018E}, {0x10190, 0x1019C}, {0x101A0, 0x101A0}, {0x101D0, 0x101FC},
-    {0x1039F, 0x1039F}, {0x103D0, 0x103D0}, {0x1056F, 0x1056F}, {0x10857, 0x10857},
-    {0x10877, 0x10878}, {0x1091F, 0x1091F}, {0x1093F, 0x1093F}, {0x10A50, 0x10A58},
-    {0x10A7F, 0x10A7F}, {0x10AC8, 0x10AC8}, {0x10AF0, 0x10AF6}, {0x10B39, 0x10B3F},
-    {0x10B99, 0x10B9C}, {0x10D6E, 0x10D6E}, {0x10D8E, 0x10D8F}, {0x10EAD, 0x10EAD},
-    {0x10F55, 0x10F59}, {0x10F86, 0x10F89}, {0x11047, 0x1104D}, {0x110BB, 0x110BC},
-    {0x110BE, 0x110C1}, {0x11140, 0x11143}, {0x11174, 0x11175}, {0x111C5, 0x111C8},
-    {0x111CD, 0x111CD}, {0x111DB, 0x111DB}, {0x111DD, 0x111DF}, {0x11238, 0x1123D},
-    {0x112A9, 0x112A9}, {0x113D4, 0x113D5}, {0x113D7, 0x113D8}, {0x1144B, 0x1144F},
-    {0x1145A, 0x1145B}, {0x1145D, 0x1145D}, {0x114C6, 0x114C6}, {0x115C1, 0x115D7},
-    {0x11641, 0x11643}, {0x11660, 0x1166C}, {0x116B9, 0x116B9}, {0x1173C, 0x1173F},
-    {0x1183B, 0x1183B}, {0x11944, 0x11946}, {0x119E2, 0x119E2}, {0x11A3F, 0x11A46},
-    {0x11A9A, 0x11A9C}, {0x11A9E, 0x11AA2}, {0x11B00, 0x11B09}, {0x11BE1, 0x11BE1},
-    {0x11C41, 0x11C45}, {0x11C70, 0x11C71}, {0x11EF7, 0x11EF8}, {0x11F43, 0x11F4F},
-    {0x11FD5, 0x11FF1}, {0x11FFF, 0x11FFF}, {0x12470, 0x12474}, {0x12FF1, 0x12FF2},
-    {0x16A6E, 0x16A6F}, {0x16AF5, 0x16AF5}, {0x16B37, 0x16B3F}, {0x16B44, 0x16B45},
-    {0x16D6D, 0x16D6F}, {0x16E97, 0x16E9A}, {0x16FE2, 0x16FE2}, {0x1BC9C, 0x1BC9C},
-    {0x1BC9F, 0x1BC9F}, {0x1CC00, 0x1CCEF}, {0x1CD00, 0x1CEB3}, {0x1CF50, 0x1CFC3},
-    {0x1D000, 0x1D0F5}, {0x1D100, 0x1D126}, {0x1D129, 0x1D164}, {0x1D16A, 0x1D16C},
-    {0x1D183, 0x1D184}, {0x1D18C, 0x1D1A9}, {0x1D1AE, 0x1D1EA}, {0x1D200, 0x1D241},
-    {0x1D245, 0x1D245}, {0x1D300, 0x1D356}, {0x1D6C1, 0x1D6C1}, {0x1D6DB, 0x1D6DB},
-    {0x1D6FB, 0x1D6FB}, {0x1D715, 0x1D715}, {0x1D735, 0x1D735}, {0x1D74F, 0x1D74F},
-    {0x1D76F, 0x1D76F}, {0x1D789, 0x1D789}, {0x1D7A9, 0x1D7A9}, {0x1D7C3, 0x1D7C3},
-    {0x1D800, 0x1D9FF}, {0x1DA37, 0x1DA3A}, {0x1DA6D, 0x1DA74}, {0x1DA76, 0x1DA83},
-    {0x1DA85, 0x1DA8B}, {0x1E14F, 0x1E14F}, {0x1E2FF, 0x1E2FF}, {0x1E5FF, 0x1E5FF},
-    {0x1E95E, 0x1E95F}, {0x1ECAC, 0x1ECAC}, {0x1ECB0, 0x1ECB0}, {0x1ED2E, 0x1ED2E},
-    {0x1EEF0, 0x1EEF1}, {0x1F000, 0x1F02B}, {0x1F030, 0x1F093}, {0x1F0A0, 0x1F0AE},
-    {0x1F0B1, 0x1F0BF}, {0x1F0C1, 0x1F0CF}, {0x1F0D1, 0x1F0F5}, {0x1F10D, 0x1F1AD},
-    {0x1F1E6, 0x1F202}, {0x1F210, 0x1F23B}, {0x1F240, 0x1F248}, {0x1F250, 0x1F251},
-    {0x1F260, 0x1F265}, {0x1F300, 0x1F6D7}, {0x1F6DC, 0x1F6EC}, {0x1F6F0, 0x1F6FC},
-    {0x1F700, 0x1F776}, {0x1F77B, 0x1F7D9}, {0x1F7E0, 0x1F7EB}, {0x1F7F0, 0x1F7F0},
-    {0x1F800, 0x1F80B}, {0x1F810, 0x1F847}, {0x1F850, 0x1F859}, {0x1F860, 0x1F887},
-    {0x1F890, 0x1F8AD}, {0x1F8B0, 0x1F8BB}, {0x1F8C0, 0x1F8C1}, {0x1F900, 0x1FA53},
-    {0x1FA60, 0x1FA6D}, {0x1FA70, 0x1FA7C}, {0x1FA80, 0x1FA89}, {0x1FA8F, 0x1FAC6},
-    {0x1FACE, 0x1FADC}, {0x1FADF, 0x1FAE9}, {0x1FAF0, 0x1FAF8}, {0x1FB00, 0x1FB92},
+    {0x0021, 0x002F},   {0x003A, 0x0040},   {0x005B, 0x0060},
+    {0x007B, 0x007E},   {0x00A1, 0x00A9},   {0x00AB, 0x00AC},
+    {0x00AE, 0x00B1},   {0x00B4, 0x00B4},   {0x00B6, 0x00B8},
+    {0x00BB, 0x00BB},   {0x00BF, 0x00BF},   {0x00D7, 0x00D7},
+    {0x00F7, 0x00F7},   {0x02C2, 0x02C5},   {0x02D2, 0x02DF},
+    {0x02E5, 0x02EB},   {0x02ED, 0x02ED},   {0x02EF, 0x02FF},
+    {0x0375, 0x0375},   {0x037E, 0x037E},   {0x0384, 0x0385},
+    {0x0387, 0x0387},   {0x03F6, 0x03F6},   {0x0482, 0x0482},
+    {0x055A, 0x055F},   {0x0589, 0x058A},   {0x058D, 0x058F},
+    {0x05BE, 0x05BE},   {0x05C0, 0x05C0},   {0x05C3, 0x05C3},
+    {0x05C6, 0x05C6},   {0x05F3, 0x05F4},   {0x0606, 0x060F},
+    {0x061B, 0x061B},   {0x061D, 0x061F},   {0x066A, 0x066D},
+    {0x06D4, 0x06D4},   {0x06DE, 0x06DE},   {0x06E9, 0x06E9},
+    {0x06FD, 0x06FE},   {0x0700, 0x070D},   {0x07F6, 0x07F9},
+    {0x07FE, 0x07FF},   {0x0830, 0x083E},   {0x085E, 0x085E},
+    {0x0888, 0x0888},   {0x0964, 0x0965},   {0x0970, 0x0970},
+    {0x09F2, 0x09F3},   {0x09FA, 0x09FB},   {0x09FD, 0x09FD},
+    {0x0A76, 0x0A76},   {0x0AF0, 0x0AF1},   {0x0B70, 0x0B70},
+    {0x0BF3, 0x0BFA},   {0x0C77, 0x0C77},   {0x0C7F, 0x0C7F},
+    {0x0C84, 0x0C84},   {0x0D4F, 0x0D4F},   {0x0D79, 0x0D79},
+    {0x0DF4, 0x0DF4},   {0x0E3F, 0x0E3F},   {0x0E4F, 0x0E4F},
+    {0x0E5A, 0x0E5B},   {0x0F01, 0x0F17},   {0x0F1A, 0x0F1F},
+    {0x0F34, 0x0F34},   {0x0F36, 0x0F36},   {0x0F38, 0x0F38},
+    {0x0F3A, 0x0F3D},   {0x0F85, 0x0F85},   {0x0FBE, 0x0FC5},
+    {0x0FC7, 0x0FCC},   {0x0FCE, 0x0FDA},   {0x104A, 0x104F},
+    {0x109E, 0x109F},   {0x10FB, 0x10FB},   {0x1360, 0x1368},
+    {0x1390, 0x1399},   {0x1400, 0x1400},   {0x166D, 0x166E},
+    {0x169B, 0x169C},   {0x16EB, 0x16ED},   {0x1735, 0x1736},
+    {0x17D4, 0x17D6},   {0x17D8, 0x17DB},   {0x1800, 0x180A},
+    {0x1940, 0x1940},   {0x1944, 0x1945},   {0x19DE, 0x19FF},
+    {0x1A1E, 0x1A1F},   {0x1AA0, 0x1AA6},   {0x1AA8, 0x1AAD},
+    {0x1B4E, 0x1B4F},   {0x1B5A, 0x1B6A},   {0x1B74, 0x1B7F},
+    {0x1BFC, 0x1BFF},   {0x1C3B, 0x1C3F},   {0x1C7E, 0x1C7F},
+    {0x1CC0, 0x1CC7},   {0x1CD3, 0x1CD3},   {0x1FBD, 0x1FBD},
+    {0x1FBF, 0x1FC1},   {0x1FCD, 0x1FCF},   {0x1FDD, 0x1FDF},
+    {0x1FED, 0x1FEF},   {0x1FFD, 0x1FFE},   {0x2010, 0x2027},
+    {0x2030, 0x205E},   {0x207A, 0x207E},   {0x208A, 0x208E},
+    {0x20A0, 0x20C0},   {0x2100, 0x2101},   {0x2103, 0x2106},
+    {0x2108, 0x2109},   {0x2114, 0x2114},   {0x2116, 0x2118},
+    {0x211E, 0x2123},   {0x2125, 0x2125},   {0x2127, 0x2127},
+    {0x2129, 0x2129},   {0x212E, 0x212E},   {0x213A, 0x213B},
+    {0x2140, 0x2144},   {0x214A, 0x214D},   {0x214F, 0x214F},
+    {0x218A, 0x218B},   {0x2190, 0x2429},   {0x2440, 0x244A},
+    {0x249C, 0x24E9},   {0x2500, 0x2775},   {0x2794, 0x2B73},
+    {0x2B76, 0x2B95},   {0x2B97, 0x2BFF},   {0x2CE5, 0x2CEA},
+    {0x2CF9, 0x2CFC},   {0x2CFE, 0x2CFF},   {0x2D70, 0x2D70},
+    {0x2E00, 0x2E2E},   {0x2E30, 0x2E5D},   {0x2E80, 0x2E99},
+    {0x2E9B, 0x2EF3},   {0x2F00, 0x2FD5},   {0x2FF0, 0x2FFF},
+    {0x3001, 0x3004},   {0x3008, 0x3020},   {0x3030, 0x3030},
+    {0x3036, 0x3037},   {0x303D, 0x303F},   {0x309B, 0x309C},
+    {0x30A0, 0x30A0},   {0x30FB, 0x30FB},   {0x3190, 0x3191},
+    {0x3196, 0x319F},   {0x31C0, 0x31E5},   {0x31EF, 0x31EF},
+    {0x3200, 0x321E},   {0x322A, 0x3247},   {0x3250, 0x3250},
+    {0x3260, 0x327F},   {0x328A, 0x32B0},   {0x32C0, 0x33FF},
+    {0x4DC0, 0x4DFF},   {0xA490, 0xA4C6},   {0xA4FE, 0xA4FF},
+    {0xA60D, 0xA60F},   {0xA673, 0xA673},   {0xA67E, 0xA67E},
+    {0xA6F2, 0xA6F7},   {0xA700, 0xA716},   {0xA720, 0xA721},
+    {0xA789, 0xA78A},   {0xA828, 0xA82B},   {0xA836, 0xA839},
+    {0xA874, 0xA877},   {0xA8CE, 0xA8CF},   {0xA8F8, 0xA8FA},
+    {0xA8FC, 0xA8FC},   {0xA92E, 0xA92F},   {0xA95F, 0xA95F},
+    {0xA9C1, 0xA9CD},   {0xA9DE, 0xA9DF},   {0xAA5C, 0xAA5F},
+    {0xAA77, 0xAA79},   {0xAADE, 0xAADF},   {0xAAF0, 0xAAF1},
+    {0xAB5B, 0xAB5B},   {0xAB6A, 0xAB6B},   {0xABEB, 0xABEB},
+    {0xFB29, 0xFB29},   {0xFBB2, 0xFBC2},   {0xFD3E, 0xFD4F},
+    {0xFDCF, 0xFDCF},   {0xFDFC, 0xFDFF},   {0xFE10, 0xFE19},
+    {0xFE30, 0xFE52},   {0xFE54, 0xFE66},   {0xFE68, 0xFE6B},
+    {0xFF01, 0xFF0F},   {0xFF1A, 0xFF20},   {0xFF3B, 0xFF40},
+    {0xFF5B, 0xFF65},   {0xFFE0, 0xFFE6},   {0xFFE8, 0xFFEE},
+    {0xFFFC, 0xFFFD},   {0x10100, 0x10102}, {0x10137, 0x1013F},
+    {0x10179, 0x10189}, {0x1018C, 0x1018E}, {0x10190, 0x1019C},
+    {0x101A0, 0x101A0}, {0x101D0, 0x101FC}, {0x1039F, 0x1039F},
+    {0x103D0, 0x103D0}, {0x1056F, 0x1056F}, {0x10857, 0x10857},
+    {0x10877, 0x10878}, {0x1091F, 0x1091F}, {0x1093F, 0x1093F},
+    {0x10A50, 0x10A58}, {0x10A7F, 0x10A7F}, {0x10AC8, 0x10AC8},
+    {0x10AF0, 0x10AF6}, {0x10B39, 0x10B3F}, {0x10B99, 0x10B9C},
+    {0x10D6E, 0x10D6E}, {0x10D8E, 0x10D8F}, {0x10EAD, 0x10EAD},
+    {0x10F55, 0x10F59}, {0x10F86, 0x10F89}, {0x11047, 0x1104D},
+    {0x110BB, 0x110BC}, {0x110BE, 0x110C1}, {0x11140, 0x11143},
+    {0x11174, 0x11175}, {0x111C5, 0x111C8}, {0x111CD, 0x111CD},
+    {0x111DB, 0x111DB}, {0x111DD, 0x111DF}, {0x11238, 0x1123D},
+    {0x112A9, 0x112A9}, {0x113D4, 0x113D5}, {0x113D7, 0x113D8},
+    {0x1144B, 0x1144F}, {0x1145A, 0x1145B}, {0x1145D, 0x1145D},
+    {0x114C6, 0x114C6}, {0x115C1, 0x115D7}, {0x11641, 0x11643},
+    {0x11660, 0x1166C}, {0x116B9, 0x116B9}, {0x1173C, 0x1173F},
+    {0x1183B, 0x1183B}, {0x11944, 0x11946}, {0x119E2, 0x119E2},
+    {0x11A3F, 0x11A46}, {0x11A9A, 0x11A9C}, {0x11A9E, 0x11AA2},
+    {0x11B00, 0x11B09}, {0x11BE1, 0x11BE1}, {0x11C41, 0x11C45},
+    {0x11C70, 0x11C71}, {0x11EF7, 0x11EF8}, {0x11F43, 0x11F4F},
+    {0x11FD5, 0x11FF1}, {0x11FFF, 0x11FFF}, {0x12470, 0x12474},
+    {0x12FF1, 0x12FF2}, {0x16A6E, 0x16A6F}, {0x16AF5, 0x16AF5},
+    {0x16B37, 0x16B3F}, {0x16B44, 0x16B45}, {0x16D6D, 0x16D6F},
+    {0x16E97, 0x16E9A}, {0x16FE2, 0x16FE2}, {0x1BC9C, 0x1BC9C},
+    {0x1BC9F, 0x1BC9F}, {0x1CC00, 0x1CCEF}, {0x1CD00, 0x1CEB3},
+    {0x1CF50, 0x1CFC3}, {0x1D000, 0x1D0F5}, {0x1D100, 0x1D126},
+    {0x1D129, 0x1D164}, {0x1D16A, 0x1D16C}, {0x1D183, 0x1D184},
+    {0x1D18C, 0x1D1A9}, {0x1D1AE, 0x1D1EA}, {0x1D200, 0x1D241},
+    {0x1D245, 0x1D245}, {0x1D300, 0x1D356}, {0x1D6C1, 0x1D6C1},
+    {0x1D6DB, 0x1D6DB}, {0x1D6FB, 0x1D6FB}, {0x1D715, 0x1D715},
+    {0x1D735, 0x1D735}, {0x1D74F, 0x1D74F}, {0x1D76F, 0x1D76F},
+    {0x1D789, 0x1D789}, {0x1D7A9, 0x1D7A9}, {0x1D7C3, 0x1D7C3},
+    {0x1D800, 0x1D9FF}, {0x1DA37, 0x1DA3A}, {0x1DA6D, 0x1DA74},
+    {0x1DA76, 0x1DA83}, {0x1DA85, 0x1DA8B}, {0x1E14F, 0x1E14F},
+    {0x1E2FF, 0x1E2FF}, {0x1E5FF, 0x1E5FF}, {0x1E95E, 0x1E95F},
+    {0x1ECAC, 0x1ECAC}, {0x1ECB0, 0x1ECB0}, {0x1ED2E, 0x1ED2E},
+    {0x1EEF0, 0x1EEF1}, {0x1F000, 0x1F02B}, {0x1F030, 0x1F093},
+    {0x1F0A0, 0x1F0AE}, {0x1F0B1, 0x1F0BF}, {0x1F0C1, 0x1F0CF},
+    {0x1F0D1, 0x1F0F5}, {0x1F10D, 0x1F1AD}, {0x1F1E6, 0x1F202},
+    {0x1F210, 0x1F23B}, {0x1F240, 0x1F248}, {0x1F250, 0x1F251},
+    {0x1F260, 0x1F265}, {0x1F300, 0x1F6D7}, {0x1F6DC, 0x1F6EC},
+    {0x1F6F0, 0x1F6FC}, {0x1F700, 0x1F776}, {0x1F77B, 0x1F7D9},
+    {0x1F7E0, 0x1F7EB}, {0x1F7F0, 0x1F7F0}, {0x1F800, 0x1F80B},
+    {0x1F810, 0x1F847}, {0x1F850, 0x1F859}, {0x1F860, 0x1F887},
+    {0x1F890, 0x1F8AD}, {0x1F8B0, 0x1F8BB}, {0x1F8C0, 0x1F8C1},
+    {0x1F900, 0x1FA53}, {0x1FA60, 0x1FA6D}, {0x1FA70, 0x1FA7C},
+    {0x1FA80, 0x1FA89}, {0x1FA8F, 0x1FAC6}, {0x1FACE, 0x1FADC},
+    {0x1FADF, 0x1FAE9}, {0x1FAF0, 0x1FAF8}, {0x1FB00, 0x1FB92},
     {0x1FB94, 0x1FBEF},
 };
 
@@ -16377,7 +16273,7 @@ Str StrOwn(Arena* a, const char* s, int32_t len) {
 }
 
 Str StrOwn(Arena* a, Str s) {
-    return StrOwn(a, s.s, s.len);
+    return StrOwn(a, s.s, len(s));
 }
 
 int32_t Utf8Encode(char* out, uint32_t cp) {
@@ -16440,7 +16336,7 @@ static int32_t Utf8Decode(Str bytes, int32_t index) {
 }
 
 int32_t CharAfterIndex(Str bytes, int32_t index) {
-    if (index >= bytes.len) {
+    if (index >= len(bytes)) {
         return -1;
     }
     return Utf8Decode(bytes, index);
@@ -16488,7 +16384,7 @@ CharKind Classify(int32_t cp) {
 }
 
 CharKind KindAfterIndex(Str bytes, int32_t index) {
-    if (index == bytes.len) {
+    if (index == len(bytes)) {
         return CharKind::Whitespace;
     }
     uint8_t byte = (uint8_t)bytes.s[index];
@@ -16574,9 +16470,9 @@ static void ShiftLinks(Vec<Event>& events, const Vec<Jump>& jumps) {
     int32_t index = 0;
     int32_t add = 0;
     int32_t rm = 0;
-    while (index < events.len) {
+    while (index < len(events)) {
         int32_t rmCurr = rm;
-        while (jumpIndex < jumps.len && jumps[jumpIndex].at <= index) {
+        while (jumpIndex < len(jumps) && jumps[jumpIndex].at <= index) {
             add = jumps[jumpIndex].add;
             rm = jumps[jumpIndex].remove;
             jumpIndex++;
@@ -16588,7 +16484,7 @@ static void ShiftLinks(Vec<Event>& events, const Vec<Jump>& jumps) {
         if (events[index].hasLink && events[index].link.next != -1) {
             int32_t next = events[index].link.next;
             events[next].link.previous = index + add - rm;
-            while (jumpIndex < jumps.len && jumps[jumpIndex].at <= next) {
+            while (jumpIndex < len(jumps) && jumps[jumpIndex].at <= next) {
                 add = jumps[jumpIndex].add;
                 rm = jumps[jumpIndex].remove;
                 jumpIndex++;
@@ -16605,7 +16501,7 @@ static int32_t BucketFor(const Vec<int32_t>& buckets,
                          const Vec<EditMap::Entry>& entries, int32_t at) {
     uint32_t h = (uint32_t)at * 2654435761u;
     h ^= h >> 15;
-    int32_t mask = buckets.len - 1;
+    int32_t mask = len(buckets) - 1;
     int32_t i = (int32_t)h & mask;
     while (buckets[i] != 0 && entries[buckets[i] - 1].at != at) {
         i = (i + 1) & mask;
@@ -16629,8 +16525,8 @@ static void AddImpl(EditMap& map, int32_t at, int32_t remove, const Event* add,
         return;
     }
 
-    if ((map.map.len + 1) * 4 >= map.buckets.len * 3) {
-        RehashBuckets(map, map.buckets.len > 0 ? map.buckets.len * 2 : 16);
+    if ((len(map.map) + 1) * 4 >= len(map.buckets) * 3) {
+        RehashBuckets(map, len(map.buckets) > 0 ? len(map.buckets) * 2 : 16);
     }
     int32_t bucket = BucketFor(map.buckets, map.map, at);
     if (map.buckets[bucket] != 0) {
@@ -16668,7 +16564,7 @@ void EditMapAddBefore(EditMap& map, int32_t index, int32_t remove,
 }
 
 static void SortEntries(Vec<EditMap::Entry>& entries) {
-    int32_t n = entries.len;
+    int32_t n = len(entries);
     if (n < 2) {
         return;
     }
@@ -16722,7 +16618,7 @@ void EditMapConsume(EditMap& map, Vec<Event>& events) {
     ShiftLinks(events, jumps);
 
     Vec<Event> out;
-    VecReserve(out, events.len + addAcc - removeAcc);
+    VecReserve(out, len(events) + addAcc - removeAcc);
     int32_t index = 0;
     for (int32_t i = 0; i < map.map.len; i++) {
         const EditMap::Entry& e = map.map[i];
@@ -16734,22 +16630,22 @@ void EditMapConsume(EditMap& map, Vec<Event>& events) {
         }
         index = e.at + e.remove;
     }
-    for (int32_t j = index; j < events.len; j++) {
+    for (int32_t j = index; j < len(events); j++) {
         VecAppend(out, events[j]);
     }
 
     VecReset(events);
     events.els = out.els;
-    events.len = out.len;
+    events.len = len(out);
     events.cap = out.cap;
     out.els = nullptr;
     out.len = 0;
     out.cap = 0;
     map.map.len = 0;
 
-    if (map.buckets.len > 0) {
+    if (len(map.buckets) > 0) {
         memset((void*)map.buckets.els, 0,
-               (size_t)map.buckets.len * sizeof(int32_t));
+               (size_t)len(map.buckets) * sizeof(int32_t));
     }
 }
 
@@ -16764,7 +16660,7 @@ static bool NamesContain(const Name* names, int32_t namesLen, Name name) {
 
 static int32_t SkipToImpl(const Vec<Event>& events, int32_t index,
                           const Name* names, int32_t namesLen, bool forward) {
-    while (index < events.len) {
+    while (index < len(events)) {
         if (NamesContain(names, namesLen, events[index].name)) {
             break;
         }
@@ -16777,7 +16673,7 @@ static int32_t SkipOptImpl(const Vec<Event>& events, int32_t index,
                            const Name* names, int32_t namesLen, bool forward) {
     int32_t balance = 0;
     Kind open = forward ? Kind::Enter : Kind::Exit;
-    while (index < events.len) {
+    while (index < len(events)) {
         Name current = events[index].name;
         if (!NamesContain(names, namesLen, current) || events[index]
                                                                .kind != open) {
@@ -16820,7 +16716,7 @@ int32_t SkipToBack(const Vec<Event>& events, int32_t index, const Name* names,
 }
 
 Str NormalizeIdentifier(Arena* a, Str value) {
-    char* out = (char*)Alloc(a, value.len + 1);
+    char* out = (char*)Alloc(a, len(value) + 1);
     if (!out) {
         return {};
     }
@@ -16828,7 +16724,7 @@ Str NormalizeIdentifier(Arena* a, Str value) {
     bool inWhitespace = true;
     int32_t index = 0;
     int32_t start = 0;
-    while (index < value.len) {
+    while (index < len(value)) {
         char c = value.s[index];
         if (c == '\t' || c == '\n' || c == '\r' || c == ' ') {
             if (!inWhitespace) {
@@ -16846,8 +16742,8 @@ Str NormalizeIdentifier(Arena* a, Str value) {
         index++;
     }
     if (!inWhitespace) {
-        memcpy(out + at, value.s + start, (size_t)(value.len - start));
-        at += value.len - start;
+        memcpy(out + at, value.s + start, (size_t)(len(value) - start));
+        at += len(value) - start;
     }
 
     for (int32_t i = 0; i < at; i++) {
@@ -16862,7 +16758,7 @@ Str NormalizeIdentifier(Arena* a, Str value) {
 bool ListLoose(const Vec<Event>& events, int32_t index, bool includeItems) {
     int32_t balance = 0;
     Name name = events[index].name;
-    while (index < events.len) {
+    while (index < len(events)) {
         const Event& event = events[index];
         if (event.kind == Kind::Enter) {
             balance += 1;
@@ -16903,7 +16799,7 @@ bool ListLoose(const Vec<Event>& events, int32_t index, bool includeItems) {
 
 bool ListItemLoose(const Vec<Event>& events, int32_t index) {
     int32_t balance = 0;
-    while (index < events.len) {
+    while (index < len(events)) {
         const Event& event = events[index];
         if (event.kind == Kind::Enter) {
             balance += 1;
@@ -16935,7 +16831,7 @@ static int32_t ScanTableAlign(const Vec<Event>& events, int32_t index, Arena* a,
                               ArenaAlign out) {
     bool inDelimiterRow = false;
     int32_t count = 0;
-    while (index < events.len) {
+    while (index < len(events)) {
         const Event& event = events[index];
         if (inDelimiterRow) {
             if (event.kind == Kind::Enter) {
@@ -17033,7 +16929,7 @@ Str DecodeNamed(Arena* a, Str name) {
 static uint32_t DecodeNumericCp(Str value, int radix) {
     uint32_t cp = 0;
     bool overflow = false;
-    for (int32_t i = 0; i < value.len; i++) {
+    for (int32_t i = 0; i < len(value); i++) {
         uint8_t c = (uint8_t)value.s[i];
         uint32_t digit;
         if (c >= '0' && c <= '9') {
@@ -17388,7 +17284,7 @@ int PlatListDir(const char* dir, DirEntry* out, int max) {
         StrCopyZ(e.name, (int)sizeof(e.name), ent->d_name);
         TempStr full = fmt("%s/%s", Str(dir), name);
         struct stat st = {};
-        if (full.len >= kMaxPath || lstat(full.s, &st) != 0) {
+        if (len(full) >= kMaxPath || lstat(full.s, &st) != 0) {
             continue;
         }
         e.isSymlink = S_ISLNK(st.st_mode);
@@ -17643,8 +17539,8 @@ void StrCopyZ(char* dst, int cap, const char* src) {
 WCHAR* ToCWstrTemp(Str s) {
     Arena* arena = GetTempArena();
     int n = 0;
-    if (s.s && s.len > 0) {
-        n = MultiByteToWideChar(CP_UTF8, 0, s.s, s.len, nullptr, 0);
+    if (s.s && len(s) > 0) {
+        n = MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), nullptr, 0);
         if (n < 0) {
             n = 0;
         }
@@ -17652,7 +17548,7 @@ WCHAR* ToCWstrTemp(Str s) {
     auto res = (WCHAR*)arena->Push((uint64_t)(n + 1) * sizeof(WCHAR),
                                    alignof(WCHAR), false);
     if (n > 0) {
-        MultiByteToWideChar(CP_UTF8, 0, s.s, s.len, res, n);
+        MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), res, n);
     }
     res[n] = 0;
     return res;

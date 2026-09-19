@@ -113,6 +113,10 @@ struct Str {
     explicit operator bool() const { return len > 0 && s; }
 };
 
+constexpr int len(Str s) noexcept {
+    return s.len;
+}
+
 float StrToFloatUnchecked(Str s);
 
 void log(Str s);
@@ -126,7 +130,6 @@ TempStr StrDupTemp(Str s);
 TempStr ReadBoundedFileTemp(Str path, int limit);
 
 #if GPUI_OS_WINDOWS
-
 WCHAR* ToCWstrTemp(Str s);
 #endif
 
@@ -134,7 +137,6 @@ uint64_t PlatPageSize();
 uint64_t PlatLargePageSize();
 
 uint64_t PlatArenaReserveSize();
-
 void* PlatMemReserve(uint64_t size);
 bool PlatMemCommit(void* base, uint64_t size, bool largePages);
 void* PlatMemReserveCommit(uint64_t size, bool largePages);
@@ -142,16 +144,12 @@ void PlatMemRelease(void* base, uint64_t size);
 
 int StrCmpI(const char* a, const char* b);
 int StrCmpNI(const char* a, const char* b, int n);
-
 void StrCopyZ(char* dst, int cap, const char* src);
 
 bool PlatDirExists(const char* path);
-
 bool PlatFileExists(const char* path);
 void PlatGetCwd(char* out, int cap);
-
 bool PlatCanonicalPath(const char* path, char* out, int cap);
-
 void PlatGetExeDir(char* out, int cap);
 
 struct DirEntry {
@@ -164,9 +162,7 @@ struct DirEntry {
 };
 
 int PlatListDir(const char* dir, DirEntry* out, int max);
-
 int PlatCoreCount();
-
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes);
 
 void* AllocZero(int count, int size);
@@ -222,7 +218,6 @@ inline Func0 MkFunc0Void(void (*fn)()) {
 
 template <typename T>
 struct Func1 {
-
     static constexpr uintptr_t kDropsArgBit = 1;
     static constexpr uintptr_t kFuncNoArg = Func0::kFuncNoArg;
 
@@ -230,7 +225,6 @@ struct Func1 {
     uintptr_t userData = 0;
 
     Func1() = default;
-
     Func1(const Func0& that) {
         this->fn = that.fn;
         this->SetData(that.userData, true);
@@ -315,7 +309,6 @@ struct CondVar {
 };
 
 bool PlatThreadRun(Func0 f);
-
 uint64_t PlatThreadId();
 void PlatSleepMs(int ms);
 
@@ -336,10 +329,7 @@ struct Arena {
     const char* name;
     bool usesExternalBuffer;
     Mutex lock;
-    uint64_t nAllocsLifetime;
-    uint64_t peakBytesLifetime;
     uint64_t nAllocsSinceReset;
-    uint64_t peakBytesSinceReset;
 
     void* Alloc(int size);
     void Reset();
@@ -356,9 +346,7 @@ void ArenaDelete(Arena* arena);
 uint64_t ArenaUsed(Arena* arena);
 
 int VarintSize(uint32_t v);
-
 int VarintPut(char* dst, uint32_t v);
-
 int VarintGet(const char* src, uint32_t* out);
 
 using ArenaStr = uint32_t;
@@ -370,11 +358,9 @@ constexpr bool ArenaStrIsSet(ArenaStr s) {
 }
 
 ArenaStr ArenaStrDup(Arena* a, Str src);
-
 uint32_t ArenaStrLen(Arena* a, ArenaStr s);
 
 ArenaStr ArenaStrAppend(Arena* a, ArenaStr s, Str more);
-
 Str ArenaStrGet(Arena* a, ArenaStr s);
 
 constexpr uint32_t kArenaPtrNone = 0;
@@ -386,7 +372,6 @@ inline void* ArenaAtOffset(Arena* a, uint32_t off) {
         return nullptr;
     }
     Arena* node = a->current;
-
     if (node && node->basePos <= (uint64_t)off) {
         return (char*)node + ((uint64_t)off - node->basePos);
     }
@@ -439,6 +424,18 @@ void* ArenaVecAlloc(struct Arena* a, int count, int elSize, int align,
 
 GPUI_NOINLINE bool VecRealloc(struct Arena* a, void** els, int len, int* cap,
                               int newCap, int elSize);
+
+inline int VecNextCap(int cap, int wanted, int elSize) {
+    if (cap == 0) {
+        int floorCap = elSize == 1 ? 8 : elSize <= 1024 ? 4 : 1;
+        return std::max(floorCap, wanted);
+    }
+    return std::max(cap * 2, wanted);
+}
+
+inline int VecAbsCap(int cap) {
+    return cap < 0 ? -cap : cap;
+}
 
 #if defined(DEBUG)
 int VecDbgBirth(const char* file, int line, const char* func, char kind,
@@ -497,84 +494,6 @@ template <typename T>
 VecNonTemplated* VecNT(Vec<T>& v);
 
 template <typename T>
-auto VecReserve(Arena* arena, T& v, int n) -> decltype(v.els);
-
-template <typename T>
-inline T* VecReserve(Vec<T>& v, int n);
-
-template <typename T>
-bool VecResize(Vec<T>& v, int newSize);
-
-template <typename T>
-T* VecInsertSpace(Vec<T>& v, int idx, int count);
-
-template <typename T>
-void VecClear(Vec<T>& v);
-
-template <typename T>
-void VecReset(Vec<T>& v);
-
-template <typename T>
-void VecFreeMembers(Vec<T>& v);
-
-template <typename T>
-T* VecTake(Vec<T>& v);
-
-template <typename T>
-T* VecData(const Vec<T>& v);
-
-template <typename T>
-bool VecAppend(Vec<T>& v, const VecIdentityT<T>& el);
-
-template <typename T>
-bool VecAppendVec(Vec<T>& v, const Vec<T>& other);
-
-template <typename T>
-bool VecAppendN(Vec<T>& v, const T* src, int count);
-
-template <typename T>
-T* VecAppendBlanks(Vec<T>& v, int count);
-
-template <typename T>
-bool VecInsertAt(Vec<T>& v, int idx, const VecIdentityT<T>& el);
-
-template <typename T, typename E>
-bool VecPush(Arena* arena, T& v, E el);
-
-template <typename T>
-void VecRemoveAtN(Vec<T>& v, int idx, int count);
-
-template <typename T>
-void VecRemoveAt(Vec<T>& v, int idx);
-
-template <typename T>
-T VecPopAt(Vec<T>& v, int idx);
-
-template <typename T>
-void VecRemoveAtFast(Vec<T>& v, int idx);
-
-template <typename T>
-void VecRemoveLast(Vec<T>& v);
-
-template <typename T>
-T VecPop(Vec<T>& v);
-
-template <typename T>
-int VecRemove(Vec<T>& v, const T& el);
-
-template <typename T>
-bool VecIsValidIndex(const Vec<T>& v, int idx);
-
-template <typename T>
-T& VecLast(const Vec<T>& v);
-
-template <typename T>
-int VecFind(const Vec<T>& v, const T& el, int startAt = 0);
-
-template <typename T>
-bool VecContains(const Vec<T>& v, const T& el);
-
-template <typename T>
 struct Vec {
     int len = 0;
 
@@ -603,7 +522,7 @@ struct Vec {
 
     ~Vec() {
 #if defined(DEBUG)
-        VecDbgDeath(dbgId, len, cap < 0 ? -cap : cap);
+        VecDbgDeath(dbgId, len, VecAbsCap(cap));
 #endif
         VecReset(*this);
     }
@@ -628,13 +547,13 @@ static_assert(sizeof(Vec<double>) == sizeof(VecNonTemplated));
 #endif
 
 template <typename T>
-inline int len(const Vec<T>& v) {
-    return v.len;
+VecNonTemplated* VecNT(Vec<T>& v) {
+    return (VecNonTemplated*)&v;
 }
 
 template <typename T>
-VecNonTemplated* VecNT(Vec<T>& v) {
-    return (VecNonTemplated*)&v;
+inline int len(const Vec<T>& v) {
+    return v.len;
 }
 
 template <typename T>
@@ -658,12 +577,10 @@ inline void VecUseExternalBuffer(Vec<T>& v, T (&buf)[N]) {
 template <typename T>
 inline T* VecReserve(Vec<T>& v, int n) {
 #if defined(DEBUG)
-    int curCap = v.cap < 0 ? -v.cap : v.cap;
+    int curCap = VecAbsCap(v.cap);
     if (n > curCap) {
-        int floorCap = sizeof(T) == 1 ? 8 : sizeof(T) <= 1024 ? 4 : 1;
-        int next =
-            curCap == 0 ? std::max(floorCap, n) : std::max(curCap * 2, n);
-        VecDbgGrow(v.dbgId, v.len, curCap, n, next);
+        VecDbgGrow(v.dbgId, len(v), curCap, n,
+                   VecNextCap(curCap, n, (int)sizeof(T)));
     }
 #endif
     return VecReserve(nullptr, v, n);
@@ -690,31 +607,18 @@ void VecReset(Vec<T>& v) {
 }
 
 template <typename T>
-void VecFreeMembers(Vec<T>& v) {
-    for (int i = 0; i < v.len; i++) {
-        free(v.els[i]);
-    }
-    VecReset(v);
-}
-
-template <typename T>
 T* VecTake(Vec<T>& v) {
     return (T*)VecTakeNT(VecNT(v), (int)sizeof(T));
 }
 
 template <typename T>
-T* VecData(const Vec<T>& v) {
-    return v.els;
-}
-
-template <typename T>
 bool VecAppend(Vec<T>& v, const VecIdentityT<T>& el) {
-    return VecInsertAt(v, v.len, el);
+    return VecInsertAt(v, len(v), el);
 }
 
 template <typename T>
 bool VecAppendVec(Vec<T>& v, const Vec<T>& other) {
-    return VecAppendN(v, other.els, other.len);
+    return VecAppendN(v, other.els, len(other));
 }
 
 template <typename T>
@@ -722,7 +626,7 @@ bool VecAppendN(Vec<T>& v, const T* src, int count) {
     if (count == 0) {
         return true;
     }
-    T* dst = VecInsertSpace(v, v.len, count);
+    T* dst = VecInsertSpace(v, len(v), count);
     if (!dst) {
         return false;
     }
@@ -732,7 +636,7 @@ bool VecAppendN(Vec<T>& v, const T* src, int count) {
 
 template <typename T>
 T* VecAppendBlanks(Vec<T>& v, int count) {
-    return VecInsertSpace(v, v.len, count);
+    return VecInsertSpace(v, len(v), count);
 }
 
 template <typename T>
@@ -778,15 +682,15 @@ void VecRemoveAtFast(Vec<T>& v, int idx) {
 
 template <typename T>
 void VecRemoveLast(Vec<T>& v) {
-    if (v.len > 0) {
-        VecRemoveAt(v, v.len - 1);
+    if (len(v) > 0) {
+        VecRemoveAt(v, len(v) - 1);
     }
 }
 
 template <typename T>
 T VecPop(Vec<T>& v) {
-    T el = v.els[v.len - 1];
-    VecRemoveAtFast(v, v.len - 1);
+    T el = v.els[len(v) - 1];
+    VecRemoveAtFast(v, len(v) - 1);
     return el;
 }
 
@@ -800,26 +704,18 @@ int VecRemove(Vec<T>& v, const T& el) {
 }
 
 template <typename T>
-inline void DeleteVecMembers(Vec<T>& v) {
-    for (T& el : v) {
-        delete el;
-    }
-    VecClear(v);
-}
-
-template <typename T>
 bool VecIsValidIndex(const Vec<T>& v, int idx) {
-    return idx >= 0 && idx < v.len;
+    return idx >= 0 && idx < len(v);
 }
 
 template <typename T>
 T& VecLast(const Vec<T>& v) {
-    return v.els[v.len - 1];
+    return v.els[len(v) - 1];
 }
 
 template <typename T>
-int VecFind(const Vec<T>& v, const T& el, int startAt) {
-    for (int i = startAt; i < v.len; i++) {
+int VecFind(const Vec<T>& v, const T& el, int startAt = 0) {
+    for (int i = startAt; i < len(v); i++) {
         if (v.els[i] == el) {
             return i;
         }
@@ -833,33 +729,10 @@ bool VecContains(const Vec<T>& v, const T& el) {
 }
 
 template <typename T>
-struct VecSortCmp {
-    using Fn = int (*)(const T* a, const T* b);
-};
-
-template <typename T>
-void VecSort(Vec<T>& v, typename VecSortCmp<T>::Fn cmpFunc) {
-    if (v.len > 0) {
-        auto cmp = (int (*)(const void*, const void*))cmpFunc;
-        qsort((void*)v.els, (size_t)v.len, sizeof(T), cmp);
-    }
-}
-
-template <typename T>
-void VecReverse(Vec<T>& v) {
-    for (int i = 0; i < v.len / 2; i++) {
-        std::swap(v.els[i], v.els[v.len - i - 1]);
-    }
-}
-
-template <typename T>
 struct ArenaVecSegment {
-
     ArenaPtr<ArenaVecSegment<T>> next;
-
     int base;
     int len;
-
     int cap;
 
     static constexpr int HeaderSize() {
@@ -886,9 +759,7 @@ struct ArenaVec {
     ArenaPtr<Segment> last = {};
     int len = 0;
 #if defined(DEBUG)
-
     int dbgId = 0;
-
     int dbgTotalCap = 0;
     int dbgSegs = 0;
 
@@ -898,7 +769,6 @@ struct ArenaVec {
 #endif
 
     T& operator[](int idx) const {
-
         Segment* seg = ArenaPtrGet(a, first);
         if (first == last) {
             return seg->Els()[idx];
@@ -910,9 +780,7 @@ struct ArenaVec {
     }
 
     struct Iter {
-
         Arena* a;
-
         Segment* seg;
         int idx;
 
@@ -945,18 +813,7 @@ struct ArenaVec {
     }
     Iter end() const { return Iter{a, nullptr, 0}; }
 
-    bool Append(Arena* arena, const T& el) {
-        Segment* seg = ArenaPtrGet(a, last);
-        if (!seg || seg->len >= seg->cap) {
-            seg = NextSegment(arena, 1);
-            if (!seg) {
-                return false;
-            }
-        }
-        seg->Els()[seg->len++] = el;
-        len++;
-        return true;
-    }
+    bool Append(Arena* arena, const T& el) { return AppendMany(arena, &el, 1); }
 
     bool AppendMany(Arena* arena, const T* src, int n) {
         while (n > 0) {
@@ -1033,20 +890,23 @@ struct ArenaVec {
     }
 
     static constexpr int CapFor(int count, int bytes) {
-        return bytes / (int)sizeof(T) < count
-                   ? (bytes / (int)sizeof(T) > 0 ? bytes / (int)sizeof(T) : 1)
-                   : count;
+        int byBytes = bytes / (int)sizeof(T);
+        if (byBytes < 1) {
+            byBytes = 1;
+        }
+        return byBytes < count ? byBytes : count;
     }
 
     static int NextCap(int prevCap) {
-        if (prevCap < CapFor(kArenaVecCap0, kArenaVecBytes0)) {
-            return CapFor(kArenaVecCap0, kArenaVecBytes0);
-        }
-        if (prevCap < CapFor(kArenaVecCap1, kArenaVecBytes1)) {
-            return CapFor(kArenaVecCap1, kArenaVecBytes1);
-        }
-        if (prevCap < CapFor(kArenaVecCap2, kArenaVecBytes2)) {
-            return CapFor(kArenaVecCap2, kArenaVecBytes2);
+        const int steps[3] = {
+            CapFor(kArenaVecCap0, kArenaVecBytes0),
+            CapFor(kArenaVecCap1, kArenaVecBytes1),
+            CapFor(kArenaVecCap2, kArenaVecBytes2),
+        };
+        for (int s : steps) {
+            if (prevCap < s) {
+                return s;
+            }
         }
         return prevCap * 2;
     }
@@ -1105,6 +965,11 @@ struct ArenaVec {
         return seg;
     }
 };
+
+template <typename T>
+inline int len(const ArenaVec<T>& v) {
+    return v.len;
+}
 
 struct PointF {
     float x = 0.0f;
@@ -1185,7 +1050,6 @@ struct LocalDate {
 };
 
 LocalDate DateToday();
-
 LocalDate DateAddDays(LocalDate base, int days);
 
 void StrFree(Str s);
@@ -1195,65 +1059,71 @@ Str StrDup(Arena*, Str str);
 Str StrDup(Str s);
 
 void StrDup2(Str s1, Str s2, Str& s1Out, Str& s2Out);
-void StrFree2(Str s);
 
 GPUI_NOINLINE bool StrEqRest(Str s1, Str s2);
 inline bool StrEq(Str s1, Str s2) {
-    if (s1.len != s2.len) {
+    if (len(s1) != len(s2)) {
         return false;
     }
     return StrEqRest(s1, s2);
 }
-bool StrEq(Str s1, const char* s2);
+inline bool StrEq(Str s1, const char* s2) {
+    return StrEq(s1, Str(s2));
+}
 int StrCmp(Str s1, Str s2);
 GPUI_NOINLINE bool StrEqIRest(Str s1, Str s2);
 inline bool StrEqI(Str s1, Str s2) {
-    if (s1.len != s2.len) {
+    if (len(s1) != len(s2)) {
         return false;
     }
     return StrEqIRest(s1, s2);
 }
-bool StrEqI(Str s1, const char* s2);
-bool StrStartsWith(Str s, Str prefix);
-bool StrStartsWith(Str s, const char* prefix);
-bool StrStartsWithAny(Str s, const char* chars);
-inline bool StrStartsWithI(Str s, Str prefix) {
-    if (prefix.len > s.len) {
-        return false;
-    }
-    return StrEqI(Str(s.s, prefix.len), prefix);
+inline bool StrEqI(Str s1, const char* s2) {
+    return StrEqI(s1, Str(s2));
 }
-bool StrStartsWithI(Str s, const char* prefix);
+bool StrStartsWith(Str s, Str prefix);
+inline bool StrStartsWith(Str s, const char* prefix) {
+    return StrStartsWith(s, Str(prefix));
+}
+bool StrStartsWithAny(Str s, const char* chars);
+bool StrStartsWithI(Str s, Str prefix);
+inline bool StrStartsWithI(Str s, const char* prefix) {
+    return StrStartsWithI(s, Str(prefix));
+}
 bool StrEndsWith(Str s, Str suffix);
-bool StrEndsWith(Str s, const char* suffix);
+inline bool StrEndsWith(Str s, const char* suffix) {
+    return StrEndsWith(s, Str(suffix));
+}
 bool StrEndsWithI(Str s, Str suffix);
-bool StrEndsWithI(Str s, const char* suffix);
+inline bool StrEndsWithI(Str s, const char* suffix) {
+    return StrEndsWithI(s, Str(suffix));
+}
 int StrFind(Str s, Str sub);
-int StrFind(Str s, const char* sub);
+inline int StrFind(Str s, const char* sub) {
+    return StrFind(s, Str(sub));
+}
 int StrFindI(Str s, Str sub);
-int StrFindI(Str s, const char* sub);
-bool StrContains(Str s, Str sub);
-bool StrContainsI(Str s, Str sub);
-
+inline int StrFindI(Str s, const char* sub) {
+    return StrFindI(s, Str(sub));
+}
+inline bool StrContains(Str s, Str sub) {
+    return StrFind(s, sub) >= 0;
+}
+inline bool StrContainsI(Str s, Str sub) {
+    return StrFindI(s, sub) >= 0;
+}
 Str StrTrimAscii(Str s);
-
 Str StrReplaceAll(Str value, Str from, Str to);
 
 using SeqStrings = const char*;
 
 Str SeqStrFirst(SeqStrings strs);
-
 Str SeqStrNext(Str s);
-
 int SeqStrIndex(SeqStrings strs, Str toFind);
 int SeqStrIndexIS(SeqStrings strs, Str toFind);
-
 bool SeqStrContainsI(SeqStrings strs, Str toFind);
-
 Str SeqStrByIndex(SeqStrings strs, int idx);
-
 int SeqStrCount(SeqStrings strs);
-
 void StrLowerAscii(char* s);
 
 struct StrBuilder : Vec<char> {
@@ -1442,6 +1312,19 @@ Node* ParseDocument(Arena* a, Str source, ParseOptions options = {});
 Node* ParseFragment(Arena* a, Str source, Str context = Str{},
                     ParseOptions options = {});
 Str Serialize(Arena* a, const Node* node, SerializeOptions options = {});
+
+struct Parser {
+    Arena* a = nullptr;
+    ParseOptions options = {};
+    void* impl = nullptr;
+};
+
+Parser* ParserNew(Arena* a, ParseOptions options = {});
+Parser* ParserNewFragment(Arena* a, Str context, ParseOptions options = {});
+void ParserProcess(Parser* parser, Str chunk);
+bool ParserIsPaused(const Parser* parser);
+void ParserResumeAfterCurrentScript(Parser* parser);
+Node* ParserFinish(Parser* parser);
 
 inline Str AttributeName(Arena* a, const Attribute* attr) {
     return attr ? ArenaStrGet(a, attr->name) : Str{};
