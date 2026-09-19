@@ -7527,6 +7527,10 @@ El* El::DeferredLayer(int layer) {
     style.deferredLayer = (uint8_t)(layer > 0 ? layer : 0);
     return this;
 }
+El* El::ZIndex(int z) {
+    style.zIndex = z;
+    return this;
+}
 El* El::AnchorBelow(float gap) {
     style.absolute = true;
     style.anchorBelow = true;
@@ -8827,6 +8831,13 @@ static void PrepareEl(PaintCtx* ctx, El* e, float inheritFont, Rgba inheritFg) {
             c->style.fontMedium = e->style.fontMedium;
         }
     }
+
+    if (e->style.lineHeight > 0) {
+        for (El* c = e->first; c; c = c->next) {
+            if (c->style.lineHeight <= 0)
+                c->style.lineHeight = e->style.lineHeight;
+        }
+    }
     e->laidFont = font;
     if (e->kind == ElKind::Icon && e->style.width == kAuto &&
         e->style.height == kAuto) {
@@ -9587,6 +9598,13 @@ Size MeasureEl(PaintCtx* ctx, El* e, float inheritFont, Rgba inheritFg) {
     LayoutCacheReset(&gMeasureCache);
     LayoutElIn(&gMeasureCache, ctx, e, 0, 0, 0, 0, true, inheritFont,
                inheritFg);
+    return Size{e->w, e->h};
+}
+
+Size MeasureElAtWidth(PaintCtx* ctx, El* e, float width) {
+    if (!e) return Size{0, 0};
+    LayoutCacheReset(&gMeasureCache);
+    LayoutElIn(&gMeasureCache, ctx, e, 0, 0, width, 0, false, 0, {});
     return Size{e->w, e->h};
 }
 
@@ -10753,24 +10771,6 @@ static bool IsOverlay(El* e) {
     return e->style.fixed || e->style.deferred;
 }
 
-static void PaintOverlays(PaintCtx* ctx, El* e) {
-    if (!e) {
-        return;
-    }
-    if (IsOverlay(e)) {
-        int previousLayer = ctx->paintLayer;
-        if (e->style.deferredLayer) {
-            ctx->paintLayer = e->style.deferredLayer;
-        }
-        PaintElNode(ctx, e, false);
-        ctx->paintLayer = previousLayer;
-        return;
-    }
-    for (El* c = e->first; c; c = c->next) {
-        PaintOverlays(ctx, c);
-    }
-}
-
 static void PaintCaretAt(PaintCtx* ctx, El* e, float font, int off,
                          bool lineEndAffinity, bool primary) {
     float x = e->x;
@@ -10834,10 +10834,36 @@ static void PaintCaret(PaintCtx* ctx, El* e, float font) {
 }
 
 void PaintEl(PaintCtx* ctx, El* e) {
+    VecClear(ctx->deferredPaint);
     PaintElNode(ctx, e, true);
+    Vec<El*>& overlays = ctx->deferredPaint;
 
-    ctx->paintLayer = kPaintLayerPopup;
-    PaintOverlays(ctx, e);
+    for (int i = 1; i < overlays.len; i++) {
+        El* item = overlays[i];
+        int layer = item->style.deferredLayer
+                        ? item->style.deferredLayer : kPaintLayerPopup;
+        int at = i;
+        while (at > 0) {
+            El* prev = overlays[at - 1];
+            int prevLayer = prev->style.deferredLayer
+                                ? prev->style.deferredLayer : kPaintLayerPopup;
+            if (prevLayer < layer ||
+                (prevLayer == layer && prev->style.zIndex <= item->style.zIndex))
+                break;
+            overlays[at] = prev;
+            at--;
+        }
+        overlays[at] = item;
+    }
+    for (El* overlay : overlays) {
+        ctx->paintLayer = overlay->style.deferredLayer
+                              ? overlay->style.deferredLayer
+                              : kPaintLayerPopup;
+        int parent = scene::ContextPush(ctx, ctx->paintLayer);
+        PaintElNode(ctx, overlay, false);
+        scene::ContextPop(ctx, parent);
+    }
+    VecClear(overlays);
     ctx->paintLayer = kPaintLayerTree;
 }
 
@@ -10847,6 +10873,13 @@ static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
     if (!e || !ctx) {
         return;
     }
+    if (skipOverlay && IsOverlay(e)) {
+        VecAppend(ctx->deferredPaint, e);
+        return;
+    }
+    int z = e->style.zIndex;
+    if (scene::CurrentContext(ctx) == 0 && z == 0) z = ctx->paintLayer;
+    int parentContext = scene::ContextPush(ctx, z);
 
     bool prevGroup = ctx->groupHovered;
     if (e->style.group) {
@@ -10862,13 +10895,11 @@ static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
         ctx->opacity = prev;
     }
     ctx->groupHovered = prevGroup;
+    scene::ContextPop(ctx, parentContext);
 }
 
 static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
     if (!e || !ctx->rt) {
-        return;
-    }
-    if (skipOverlay && IsOverlay(e)) {
         return;
     }
 
@@ -10962,6 +10993,7 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         hr.stopMouseDown = e->stopMouseDown;
         hr.suppressTextSelection = e->suppressTextSelection;
         hr.paintLayer = ctx->paintLayer;
+        hr.sceneContext = scene::CurrentContext(ctx);
         VecAppend(ctx->hits, hr);
 
         ctx->hitParent = ctx->hits.len - 1;
@@ -11353,8 +11385,27 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
     if (pushed) {
         VecAppend(ctx->window->imageCacheStack, e->imageCache);
     }
+    bool sorted = false;
     for (El* c = e->first; c; c = c->next) {
-        PaintElNode(ctx, c, skipOverlay);
+        if (c->style.zIndex != 0) { sorted = true; break; }
+    }
+    if (sorted) {
+        Vec<El*> children;
+        for (El* c = e->first; c; c = c->next) VecAppend(children, c);
+        for (int i = 1; i < children.len; i++) {
+            El* c = children[i];
+            int at = i;
+            while (at > 0 && children[at - 1]->style.zIndex > c->style.zIndex) {
+                children[at] = children[at - 1];
+                at--;
+            }
+            children[at] = c;
+        }
+        for (El* c : children) PaintElNode(ctx, c, skipOverlay);
+        VecReset(children);
+    } else {
+        for (El* c = e->first; c; c = c->next)
+            PaintElNode(ctx, c, skipOverlay);
     }
     if (pushed) {
         ctx->window->imageCacheStack.len--;
@@ -14538,6 +14589,16 @@ struct CacheEntry {
 
 static const int kCacheSlots = 2048;
 
+struct MaskEntry {
+    uint64_t hash = 0;
+    RenderImage* image = nullptr;
+    Bounds bounds = {};
+    int bytes = 0;
+    int lastFrame = 0;
+};
+static const int kMaskSlots = 128;
+static const int kMaskBudget = 8 * 1024 * 1024;
+
 struct HashBag {
     Vec<uint64_t> keys;
     Vec<int> counts;
@@ -14551,9 +14612,25 @@ struct TextRec {
     uint64_t hash = 0;
 };
 
+struct StackContext {
+    int parent = -1;
+    int first = -1;
+    int last = -1;
+    int rank = 0;
+};
+struct StackEntry {
+    int next = -1;
+    int context = -1;
+    int prim = -1;
+    int z = 0;
+};
+
 struct State {
     Vec<Prim> cur;
     Vec<Prim> prev;
+    Vec<StackContext> contexts;
+    Vec<StackEntry> entries;
+    int currentContext = 0;
     Vec<PathRec> paths;
     Vec<uint8_t> verbs;
     Vec<float> pts;
@@ -14575,6 +14652,8 @@ struct State {
     CacheEntry cache[kCacheSlots] = {};
     CacheEntry sweepBuf[kCacheSlots] = {};
     int cacheLive = 0;
+    MaskEntry masks[kMaskSlots] = {};
+    int maskBytes = 0;
     HashBag bagA;
     HashBag bagB;
 };
@@ -14583,6 +14662,8 @@ static State* gActive = nullptr;
 
 #define gCur (gActive->cur)
 #define gPrev (gActive->prev)
+#define gContexts (gActive->contexts)
+#define gEntries (gActive->entries)
 #define gPaths (gActive->paths)
 #define gVerbs (gActive->verbs)
 #define gPts (gActive->pts)
@@ -14602,6 +14683,8 @@ static State* gActive = nullptr;
 #define gCache (gActive->cache)
 #define gSweepBuf (gActive->sweepBuf)
 #define gCacheLive (gActive->cacheLive)
+#define gMasks (gActive->masks)
+#define gMaskBytes (gActive->maskBytes)
 #define gBagA (gActive->bagA)
 #define gBagB (gActive->bagB)
 
@@ -14617,6 +14700,44 @@ static State* StateFor(PaintCtx* ctx, bool create) {
 
 bool Recording() {
     return gActive && gActive->recording;
+}
+static void AppendEntry(int parent, StackEntry entry) {
+    int ix = gEntries.len;
+    VecAppend(gEntries, entry);
+    StackContext& c = gContexts[parent];
+    if (c.last >= 0) {
+        gEntries[c.last].next = ix;
+    } else {
+        c.first = ix;
+    }
+    c.last = ix;
+}
+
+int ContextPush(PaintCtx* ctx, int z) {
+    if (!Recording() || !ctx || ctx->sceneState != gActive) return -1;
+    int parent = gActive->currentContext;
+    int child = gContexts.len;
+    StackContext c;
+    c.parent = parent;
+    VecAppend(gContexts, c);
+    StackEntry e;
+    e.context = child;
+    e.z = z;
+    AppendEntry(parent, e);
+    gActive->currentContext = child;
+    return parent;
+}
+
+void ContextPop(PaintCtx* ctx, int parent) {
+    if (parent >= 0 && Recording() && ctx && ctx->sceneState == gActive) {
+        gActive->currentContext = parent;
+    }
+}
+
+int CurrentContext(PaintCtx* ctx) {
+    return Recording() && ctx && ctx->sceneState == gActive
+               ? gActive->currentContext
+               : 0;
 }
 bool SuspendBegin() {
     bool prev = Recording();
@@ -14762,6 +14883,10 @@ static Prim* gpui_scene_Emit(PaintCtx* ctx, uint8_t kind, Bounds bbox) {
     p.mask = gClip;
     p.bbox = Intersect(bbox, gClip);
     VecAppend(gCur, p);
+    StackEntry entry;
+    entry.prim = gCur.len - 1;
+    entry.z = gActive->currentContext == 0 && ctx ? ctx->paintLayer : 0;
+    AppendEntry(gActive->currentContext, entry);
     return &gCur[gCur.len - 1];
 }
 
@@ -14788,6 +14913,10 @@ void FrameBegin(PaintCtx* ctx) {
     if (gActive->textArena) gActive->textArena->Reset();
     VecClear(gActive->texts);
     VecClear(gCur);
+    VecClear(gContexts);
+    VecClear(gEntries);
+    VecAppend(gContexts, StackContext{});
+    gActive->currentContext = 0;
     VecClear(gPaths);
     VecClear(gVerbs);
     VecClear(gPts);
@@ -14802,6 +14931,8 @@ void FrameBegin(PaintCtx* ctx) {
     gStats.framePathCacheHits = 0;
     gStats.framePathCacheMisses = 0;
     gStats.framePathBuildMs = 0;
+    gStats.maskCacheHits = 0;
+    gStats.maskCacheMisses = 0;
 }
 
 void RecClear(PaintCtx* ctx, Rgba c) {
@@ -15142,34 +15273,83 @@ bool RecTextDrawSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x, float y,
     return true;
 }
 
-static void SortByLayer(Vec<Prim>& v) {
+static void FlattenContext(int context, Vec<Prim>& out, int* nextRank);
 
-    int counts[256] = {};
+static void FlattenEntry(int index, Vec<Prim>& out, int* nextRank) {
+    const StackEntry& e = gEntries[index];
+    if (e.prim >= 0) VecAppend(out, gCur[e.prim]);
+    else if (e.context >= 0) FlattenContext(e.context, out, nextRank);
+}
+
+static void FlattenContext(int context, Vec<Prim>& out, int* nextRank) {
+    gContexts[context].rank = (*nextRank)++;
     bool mixed = false;
-    for (int i = 0; i < len(v); i++) {
-        counts[v[i].layer]++;
-        if (i > 0 && v[i].layer < v[i - 1].layer) {
-            mixed = true;
-        }
+    int lastZ = 0;
+    bool first = true;
+    for (int e = gContexts[context].first; e >= 0; e = gEntries[e].next) {
+        if (!first && gEntries[e].z < lastZ) { mixed = true; break; }
+        first = false;
+        lastZ = gEntries[e].z;
     }
     if (!mixed) {
+        for (int e = gContexts[context].first; e >= 0; e = gEntries[e].next)
+            FlattenEntry(e, out, nextRank);
         return;
     }
-    int at = 0;
-    int start[256] = {};
-    for (int i = 0; i < 256; i++) {
-        start[i] = at;
-        at += counts[i];
+    Vec<int> order;
+    for (int e = gContexts[context].first; e >= 0; e = gEntries[e].next) {
+        int at = order.len;
+        VecAppend(order, e);
+        while (at > 0 && gEntries[order[at - 1]].z > gEntries[e].z) {
+            order[at] = order[at - 1];
+            at--;
+        }
+        order[at] = e;
     }
-    Vec<Prim> out;
-    VecAppendBlanks(out, len(v));
-    for (int i = 0; i < len(v); i++) {
-        out[start[v[i].layer]++] = v[i];
+    for (int i = 0; i < order.len; i++) {
+        FlattenEntry(order[i], out, nextRank);
     }
-    for (int i = 0; i < len(v); i++) {
-        v[i] = out[i];
+    VecReset(order);
+}
+
+static void OrderHits(PaintCtx* ctx) {
+    if (!ctx || ctx->hits.len < 2) return;
+    bool mixed = false;
+    for (int i = 1; i < ctx->hits.len; i++) {
+        if (gContexts[ctx->hits[i].sceneContext].rank <
+            gContexts[ctx->hits[i - 1].sceneContext].rank) {
+            mixed = true;
+            break;
+        }
     }
-    VecReset(out);
+    if (!mixed) return;
+    Vec<int> order, inverse;
+    for (int i = 0; i < ctx->hits.len; i++) {
+        int rank = gContexts[ctx->hits[i].sceneContext].rank;
+        int at = order.len;
+        VecAppend(order, i);
+        while (at > 0 &&
+               gContexts[ctx->hits[order[at - 1]].sceneContext].rank > rank) {
+            order[at] = order[at - 1];
+            at--;
+        }
+        order[at] = i;
+    }
+    VecAppendBlanks(inverse, ctx->hits.len);
+    for (int i = 0; i < order.len; i++) inverse[order[i]] = i;
+    Vec<HitRect> sorted;
+    for (int i = 0; i < order.len; i++) {
+        HitRect h = ctx->hits[order[i]];
+        if (h.parent >= 0) h.parent = inverse[h.parent];
+        VecAppend(sorted, h);
+    }
+    for (int i = 0; i < sorted.len; i++) ctx->hits[i] = sorted[i];
+    for (ScrollRect& scroll : ctx->scrolls) {
+        if (scroll.maskHit >= 0) scroll.maskHit = inverse[scroll.maskHit];
+    }
+    VecReset(sorted);
+    VecReset(order);
+    VecReset(inverse);
 }
 
 static CacheEntry* CacheFind(uint64_t hash) {
@@ -15198,6 +15378,11 @@ static void CacheClear() {
         gCache[i] = CacheEntry{};
     }
     gCacheLive = 0;
+    for (int i = 0; i < kMaskSlots; i++) {
+        if (gMasks[i].image) RenderImageRelease(gMasks[i].image);
+        gMasks[i] = MaskEntry{};
+    }
+    gMaskBytes = 0;
 }
 
 static const int kCacheAge = 120;
@@ -15283,6 +15468,8 @@ void Free(PaintCtx* ctx) {
     ArenaDelete(s->textArena);
     VecReset(s->cur);
     VecReset(s->prev);
+    VecReset(s->contexts);
+    VecReset(s->entries);
     VecReset(s->paths);
     VecReset(s->verbs);
     VecReset(s->pts);
@@ -15389,6 +15576,206 @@ static Path* PathFor(PaintCtx* ctx, const Prim& prim, bool* owned, float* dx,
     return p;
 }
 
+struct MaskEdge {
+    float x0, y0, x1, y1;
+};
+static const float kMaskPi = 3.14159265358979323846f;
+
+static void MaskLine(Vec<MaskEdge>& edges, float x0, float y0, float x1,
+                     float y1) {
+    if (x0 != x1 || y0 != y1) VecAppend(edges, MaskEdge{x0, y0, x1, y1});
+}
+
+static void MaskEdges(const PathRec& pr, bool closeOpen,
+                      Vec<MaskEdge>& edges) {
+    int vi = pr.verbFirst, pi = pr.ptFirst;
+    float x = 0, y = 0, sx = 0, sy = 0;
+    bool open = false;
+    for (int i = 0; i < pr.verbCount; i++) {
+        uint8_t v = gVerbs[vi++];
+        if ((v & 0x7f) == kVMove) {
+            if (open && closeOpen) MaskLine(edges, x, y, sx, sy);
+            x = sx = gPts[pi++];
+            y = sy = gPts[pi++];
+            open = true;
+        } else if ((v & 0x7f) == kVLine) {
+            float nx = gPts[pi++], ny = gPts[pi++];
+            if (open) MaskLine(edges, x, y, nx, ny);
+            else { sx = nx; sy = ny; open = true; }
+            x = nx; y = ny;
+        } else if ((v & 0x7f) == kVCubic) {
+            float ax = gPts[pi++], ay = gPts[pi++];
+            float bx = gPts[pi++], by = gPts[pi++];
+            float nx = gPts[pi++], ny = gPts[pi++];
+            if (!open) { x = sx = nx; y = sy = ny; open = true; continue; }
+            float extent = fabsf(ax - x) + fabsf(ay - y) +
+                           fabsf(bx - ax) + fabsf(by - ay) +
+                           fabsf(nx - bx) + fabsf(ny - by);
+            int steps = (int)(extent / 2.f) + 4;
+            if (steps > 64) steps = 64;
+            float ox = x, oy = y;
+            for (int j = 1; j <= steps; j++) {
+                float t = (float)j / steps, u = 1.f - t;
+                float px = u * u * u * x + 3.f * u * u * t * ax +
+                           3.f * u * t * t * bx + t * t * t * nx;
+                float py = u * u * u * y + 3.f * u * u * t * ay +
+                           3.f * u * t * t * by + t * t * t * ny;
+                MaskLine(edges, ox, oy, px, py);
+                ox = px; oy = py;
+            }
+            x = nx; y = ny;
+        } else if ((v & 0x7f) == kVArc) {
+            float cx = gPts[pi++], cy = gPts[pi++], r = gPts[pi++];
+            float a0 = gPts[pi++], a1 = gPts[pi++];
+            float sweep = a1 - a0;
+            if ((v & 0x80) && sweep < 0) sweep += 2.f * kMaskPi;
+            if (!(v & 0x80) && sweep > 0) sweep -= 2.f * kMaskPi;
+            int steps = (int)(fabsf(sweep) / (kMaskPi / 30.f)) + 2;
+            if (steps > 256) steps = 256;
+            float ax = cx + cosf(a0) * r, ay = cy + sinf(a0) * r;
+            if (open) MaskLine(edges, x, y, ax, ay);
+            else { sx = ax; sy = ay; open = true; }
+            x = ax; y = ay;
+            for (int j = 1; j <= steps; j++) {
+                float a = a0 + sweep * ((float)j / steps);
+                float nx = cx + cosf(a) * r, ny = cy + sinf(a) * r;
+                MaskLine(edges, x, y, nx, ny);
+                x = nx; y = ny;
+            }
+        } else if ((v & 0x7f) == kVClose && open) {
+            MaskLine(edges, x, y, sx, sy);
+            x = sx; y = sy;
+            open = false;
+        }
+    }
+    if (open && closeOpen) MaskLine(edges, x, y, sx, sy);
+}
+
+static bool MaskContains(const Vec<MaskEdge>& edges, float x, float y,
+                         bool winding) {
+    int crossings = 0;
+    for (const MaskEdge& e : edges) {
+        bool up = e.y0 <= y && e.y1 > y;
+        bool down = e.y1 <= y && e.y0 > y;
+        if (!up && !down) continue;
+        float hit = e.x0 + (y - e.y0) * (e.x1 - e.x0) / (e.y1 - e.y0);
+        if (hit > x) crossings += winding ? (up ? 1 : -1) : 1;
+    }
+    return winding ? crossings != 0 : (crossings & 1) != 0;
+}
+
+static bool MaskStrokeContains(const Vec<MaskEdge>& edges, float x, float y,
+                               float radius) {
+    float limit = radius * radius;
+    for (const MaskEdge& e : edges) {
+        float dx = e.x1 - e.x0, dy = e.y1 - e.y0;
+        float d = dx * dx + dy * dy;
+        float t = d > 0 ? ((x - e.x0) * dx + (y - e.y0) * dy) / d : 0;
+        if (t < 0) t = 0;
+        if (t > 1) t = 1;
+        float px = x - (e.x0 + t * dx), py = y - (e.y0 + t * dy);
+        if (px * px + py * py <= limit) return true;
+    }
+    return false;
+}
+
+static void MaskDrop(int slot) {
+    MaskEntry& e = gMasks[slot];
+    if (!e.image) return;
+    RenderImageRelease(e.image);
+    gMaskBytes -= e.bytes;
+    e = MaskEntry{};
+}
+
+static MaskEntry* MaskFor(PaintCtx* ctx, const Prim& prim) {
+    if (SceneLevelOn() < kSceneCache || !ctx || !ctx->pa ||
+        prim.path < 0 || prim.path >= gPaths.len ||
+        (prim.kind != kPPathFill &&
+         !(prim.kind == kPPathStroke && (prim.flags & kFRoundCaps)))) {
+        return nullptr;
+    }
+    const PathRec& pr = gPaths[prim.path];
+    float scale = ctx->dpi / 96.f;
+    if (scale <= 0 || scale > 4.f || !pr.any) return nullptr;
+    float grow = prim.kind == kPPathStroke ? prim.e1 : 1.f;
+    Bounds box = PathBox(&pr, grow);
+    int x0 = (int)floorf(box.x * scale) - 1;
+    int y0 = (int)floorf(box.y * scale) - 1;
+    int x1 = (int)ceilf(box.Right() * scale) + 1;
+    int y1 = (int)ceilf(box.Bottom() * scale) + 1;
+    int w = x1 - x0, h = y1 - y0;
+    if (w <= 0 || h <= 0 || w > 160 || h > 160) return nullptr;
+    uint64_t key = HashBytes(kHashSeed, &prim.hash, (int)sizeof(prim.hash));
+    key = HashBytes(key, &scale, (int)sizeof(scale));
+    if (!key) key = 1;
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < kMaskSlots; i++) {
+        if (gMasks[i].image && gMasks[i].hash == key) {
+            gMasks[i].lastFrame = gFrameNo;
+            gStats.maskCacheHits++;
+            return &gMasks[i];
+        }
+        if (!gMasks[i].image && slot < 0) slot = i;
+        if (gMasks[i].lastFrame < gMasks[oldest].lastFrame) oldest = i;
+    }
+    Vec<MaskEdge> edges;
+    MaskEdges(pr, prim.kind == kPPathFill, edges);
+
+    if (edges.len == 0 || (int64_t)w * h * 16 * edges.len > 4000000) {
+        VecReset(edges);
+        return nullptr;
+    }
+    gStats.maskCacheMisses++;
+    int bytes = w * h * 4;
+    uint8_t* pixels = (uint8_t*)Alloc(nullptr, bytes);
+    if (!pixels) { VecReset(edges); return nullptr; }
+    for (int py = 0; py < h; py++) {
+        for (int px = 0; px < w; px++) {
+            int cover = 0;
+            for (int sy = 0; sy < 4; sy++) {
+                for (int sx = 0; sx < 4; sx++) {
+                    float fx = (x0 + px + (sx + .5f) / 4.f) / scale;
+                    float fy = (y0 + py + (sy + .5f) / 4.f) / scale;
+                    cover += prim.kind == kPPathFill
+                        ? MaskContains(edges, fx, fy, pr.winding)
+                        : MaskStrokeContains(edges, fx, fy, prim.e1 * .5f);
+                }
+            }
+            int a = (prim.color.a * cover + 8) / 16;
+            int at = (py * w + px) * 4;
+            pixels[at] = (uint8_t)((prim.color.b * a + 127) / 255);
+            pixels[at + 1] = (uint8_t)((prim.color.g * a + 127) / 255);
+            pixels[at + 2] = (uint8_t)((prim.color.r * a + 127) / 255);
+            pixels[at + 3] = (uint8_t)a;
+        }
+    }
+    VecReset(edges);
+    RenderImage* image = RenderImageFromBgra(ctx->pa, pixels, w, h);
+    base::Free(nullptr, pixels);
+    if (!image) return nullptr;
+    while (gMaskBytes + bytes > kMaskBudget) {
+        int victim = -1;
+        for (int i = 0; i < kMaskSlots; i++) {
+            if (gMasks[i].image && (victim < 0 ||
+                gMasks[i].lastFrame < gMasks[victim].lastFrame)) victim = i;
+        }
+        if (victim < 0) break;
+        MaskDrop(victim);
+        if (victim == slot) slot = -1;
+    }
+    if (slot < 0) slot = oldest;
+    MaskDrop(slot);
+    MaskEntry& entry = gMasks[slot];
+    entry.hash = key;
+    entry.image = image;
+    entry.bounds = Bounds{(float)x0 / scale, (float)y0 / scale,
+                          (float)w / scale, (float)h / scale};
+    entry.bytes = bytes;
+    entry.lastFrame = gFrameNo;
+    gMaskBytes += bytes;
+    return &entry;
+}
+
 static void BagBuild(HashBag& b, const Vec<Prim>& v) {
     int cap = 16;
     while (cap < len(v) * 2) {
@@ -15438,7 +15825,12 @@ bool FrameEnd(PaintCtx* ctx, Bounds* damage) {
     gActive = s;
     gRecording = false;
     gFrameNo++;
-    SortByLayer(gCur);
+    Vec<Prim> ordered;
+    int rank = 0;
+    FlattenContext(0, ordered, &rank);
+    for (int i = 0; i < gCur.len; i++) gCur[i] = ordered[i];
+    VecReset(ordered);
+    OrderHits(ctx);
 
     uint64_t frameHash = kHashSeed;
     for (int i = 0; i < gCur.len; i++) {
@@ -15456,6 +15848,7 @@ bool FrameEnd(PaintCtx* ctx, Bounds* damage) {
         }
     }
     gStats.prims = gCur.len;
+    gStats.contexts = gContexts.len;
     gStats.layers = nLayers;
     gStats.pathPrims = 0;
     gStats.pathVerbs = gVerbs.len;
@@ -15639,6 +16032,11 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
             case kPPathFill:
             case kPPathGradient:
             case kPPathStroke: {
+                MaskEntry* mask = MaskFor(ctx, p);
+                if (mask) {
+                    RenderImageDraw(ctx, mask->image, mask->bounds);
+                    break;
+                }
                 bool owned = false;
                 float dx = 0, dy = 0;
                 Path* path = PathFor(ctx, p, &owned, &dx, &dy);
@@ -15669,6 +16067,10 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
     if (partial) {
         CanvasPopClip(ctx);
     }
+    gStats.maskCacheLive = 0;
+    for (int i = 0; i < kMaskSlots; i++) {
+        if (gMasks[i].image) gStats.maskCacheLive++;
+    }
     ctx->opacity = saved;
 }
 
@@ -15677,6 +16079,8 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
 
 #undef gCur
 #undef gPrev
+#undef gContexts
+#undef gEntries
 #undef gPaths
 #undef gVerbs
 #undef gPts
@@ -15696,6 +16100,8 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
 #undef gCache
 #undef gSweepBuf
 #undef gCacheLive
+#undef gMasks
+#undef gMaskBytes
 #undef gBagA
 #undef gBagB
 
@@ -50474,6 +50880,12 @@ static void VirtualListPrePaint(PaintCtx* ctx, El* e, void* user) {
             e->scrollY = offset;
     }
     const float* sizes = layout.sizes.len ? layout.sizes.els : nullptr;
+    bool hadPending = o.handle && o.handle->pending;
+    int pendingIx = hadPending ? o.handle->pendingIx : 0;
+    int pendingOffset = hadPending ? o.handle->pendingOffset : 0;
+    ScrollStrategy pendingStrategy = hadPending
+                                         ? o.handle->pendingStrategy
+                                         : ScrollStrategy::Top;
     if (o.handle) {
         o.handle->axis = axis;
         VirtualListHandleLayout(o.handle, sizes, o.count, 0, viewport);
@@ -50482,6 +50894,53 @@ static void VirtualListPrePaint(PaintCtx* ctx, El* e, void* user) {
             e->scrollX = offset;
         else
             e->scrollY = offset;
+    }
+    if (o.needsMeasure && o.sizes && o.row && o.count > 0) {
+
+        Ctx rowCx = {};
+        rowCx.app = paint->app;
+        rowCx.win = paint->win;
+        rowCx.a = paint->a;
+
+        for (int pass = 0; pass < o.count; pass++) {
+            VirtualRange range = VirtualListVisibleRangeFromLayout(
+                layout.origins.els, layout.sizes.els, o.count,
+                offset > o.overdraw ? offset - o.overdraw : 0,
+                viewport + o.overdraw * 2);
+            int anchor = VirtualListVisibleRangeFromLayout(
+                layout.origins.els, layout.sizes.els, o.count, offset, 0).first;
+            float anchorOrigin = anchor < layout.origins.len
+                                     ? layout.origins[anchor] : 0;
+            bool changed = false;
+            for (int ix = range.first; ix < range.end; ix++) {
+                if (!o.needsMeasure[ix]) continue;
+                El* row = o.row(o.user, &rowCx, ix);
+                if (!row) continue;
+                Size measured = MeasureElAtWidth(ctx, row, cross);
+                if (measured.h <= 0) continue;
+                const_cast<float*>(o.sizes)[ix] = measured.h;
+                o.needsMeasure[ix] = 0;
+                changed = true;
+            }
+            if (!changed) break;
+            ItemSizeLayoutBuild(&layout, axis, o.sizes, o.count, o.rowH,
+                                o.gap, cross);
+            if (o.handle) {
+                if (!hadPending && anchor < layout.origins.len)
+                    o.handle->offset += layout.origins[anchor] - anchorOrigin;
+                if (hadPending) {
+                    o.handle->pending = true;
+                    o.handle->pendingIx = pendingIx;
+                    o.handle->pendingOffset = pendingOffset;
+                    o.handle->pendingStrategy = pendingStrategy;
+                }
+                VirtualListHandleLayout(o.handle, layout.sizes.els, o.count,
+                                        0, viewport);
+                offset = o.handle->offset;
+                if (axis == Axis::Horizontal) e->scrollX = offset;
+                else e->scrollY = offset;
+            }
+        }
     }
     float content =
         axis == Axis::Horizontal ? layout.contentSize.w : layout.contentSize.h;
@@ -50512,7 +50971,7 @@ El* VirtualList::New(Ctx* cx, Str id, const VirtualListOpts& o) {
         offset =
             VirtualListPixelFromLogical(o.sizes, o.count, o.topItem, o.topInto);
     }
-    if (o.handle && viewport > 0) {
+    if (o.handle && viewport > 0 && !o.needsMeasure) {
         o.handle->axis = o.layoutAxis;
         ItemSizeLayout layout;
         float cross = o.layoutAxis == Axis::Horizontal ? o.viewH : o.viewW;
@@ -66649,7 +67108,7 @@ namespace component {
 
 MessageScrollerState::~MessageScrollerState() {
     VecReset(heights);
-    VecReset(probes);
+    VecReset(needsMeasure);
 }
 
 void MessageScrollerState::Init(MessageScrollerState* self, int itemCount) {
@@ -66657,10 +67116,10 @@ void MessageScrollerState::Init(MessageScrollerState* self, int itemCount) {
         return;
     }
     VecClear(self->heights);
-    VecClear(self->probes);
+    VecClear(self->needsMeasure);
     for (int i = 0; i < itemCount; i++) {
         VecAppend(self->heights, kMessageScrollerEstimatedRowHeight);
-        VecAppend(self->probes, Bounds{});
+        VecAppend(self->needsMeasure, (uint8_t)1);
     }
     self->handle = VirtualListScrollHandle{};
     self->handle.itemsCount = itemCount;
@@ -66702,20 +67161,24 @@ bool MessageScrollerState::Splice(Ctx* cx, int start, int end, int count) {
     if (!ValidRange(start, end) || count < 0) {
         return false;
     }
+    if (!followTail && start == 0 && handle.offset > 0) {
+        float removed = 0;
+        for (int i = start; i < end; i++) removed += heights[i];
+        handle.offset += count * kMessageScrollerEstimatedRowHeight - removed;
+        if (handle.offset < 0) handle.offset = 0;
+    }
     if (end > start) {
         VecRemoveAtN(heights, start, end - start);
-        VecRemoveAtN(probes, start, end - start);
+        VecRemoveAtN(needsMeasure, start, end - start);
     }
     if (count > 0) {
         float* rows = VecInsertSpace(heights, start, count);
-        Bounds* boxes = VecInsertSpace(probes, start, count);
+        uint8_t* flags = VecInsertSpace(needsMeasure, start, count);
         for (int i = 0; i < count; i++) {
             if (rows) {
                 rows[i] = kMessageScrollerEstimatedRowHeight;
             }
-            if (boxes) {
-                boxes[i] = Bounds{};
-            }
+            if (flags) flags[i] = 1;
         }
     }
     handle.itemsCount = heights.len;
@@ -66723,9 +67186,11 @@ bool MessageScrollerState::Splice(Ctx* cx, int start, int end, int count) {
     int last = heights.len - 1;
     if (last >= 0) {
         heights[last] = kMessageScrollerEstimatedRowHeight;
+        needsMeasure[last] = 1;
         int neighbor = start - 1;
         if (neighbor >= 0 && neighbor != last) {
             heights[neighbor] = kMessageScrollerEstimatedRowHeight;
+            needsMeasure[neighbor] = 1;
         }
     }
     if (cx) {
@@ -66746,6 +67211,7 @@ bool MessageScrollerState::Prepend(Ctx* cx, int count) {
 void MessageScrollerState::Remeasure(Ctx* cx) {
     for (int i = 0; i < heights.len; i++) {
         heights[i] = kMessageScrollerEstimatedRowHeight;
+        needsMeasure[i] = 1;
     }
     if (cx) {
         Notify(cx);
@@ -66758,6 +67224,7 @@ bool MessageScrollerState::RemeasureItems(Ctx* cx, int start, int end) {
     }
     for (int i = start; i < end; i++) {
         heights[i] = kMessageScrollerEstimatedRowHeight;
+        needsMeasure[i] = 1;
     }
     if (cx) {
         Notify(cx);
@@ -66881,7 +67348,6 @@ MessageScroller* MessageScroller::Refine(const Style& s, uint32_t fields) {
 
 struct MessageScrollerRowCtx {
     MessageScroller* scroller = nullptr;
-    MessageScrollerState* st = nullptr;
     int count = 0;
     float insetL = 0;
     float insetR = 0;
@@ -66894,10 +67360,11 @@ static El* MessageScrollerRow(void* user, Ctx* cx, int index) {
     Arena* a = cx->a;
     El* row = Div(a)->W(kFill)->MinW(0)->PadX(12);
     if (rc->insetL > 0) {
-        row->PadL(12 + rc->insetL);
+
+        row->PadL(rc->insetL);
     }
     if (rc->insetR > 0) {
-        row->PadR(12 + rc->insetR);
+        row->PadR(rc->insetR);
     }
 
     if (index + 1 < rc->count) {
@@ -66915,9 +67382,6 @@ static El* MessageScrollerRow(void* user, Ctx* cx, int index) {
     if (rc->scroller->renderer) {
         row->Child(rc->scroller->renderer(rc->scroller->user, cx, index));
     }
-    if (rc->st && index >= 0 && index < rc->st->probes.len) {
-        row->BoundsOut(&rc->st->probes[index]);
-    }
     return row;
 }
 
@@ -66926,18 +67390,6 @@ El* MessageScroller::IntoEl() {
     MessageScrollerState* st = state.Get(cx->app);
     if (!st) {
         return Div(a);
-    }
-
-    bool moved = false;
-    for (int i = 0; i < st->heights.len && i < st->probes.len; i++) {
-        float measured = st->probes[i].h;
-        if (measured > 0 && measured != st->heights[i]) {
-            st->heights[i] = measured;
-            moved = true;
-        }
-    }
-    if (moved && cx->win) {
-        WindowRequestAnimationFrame(cx->win);
     }
 
     int count = st->heights.len;
@@ -66958,7 +67410,6 @@ El* MessageScroller::IntoEl() {
 
     MessageScrollerRowCtx* rc = ArenaNew<MessageScrollerRowCtx>(a);
     rc->scroller = this;
-    rc->st = st;
     rc->count = count;
     rc->insetL = insetL;
     rc->insetR = insetR;
@@ -66968,6 +67419,7 @@ El* MessageScroller::IntoEl() {
     El* list = VirtualList::New(cx, count)
                    ->Id(id)
                    ->Sizes(st->heights.els)
+                   ->MeasureRows(st->needsMeasure.els)
                    ->ViewH(viewH)
                    ->Handle(&st->handle)
                    ->Axis(ScrollAxis::Vertical)
@@ -80591,7 +81043,12 @@ void ThemeSetColors(Theme* t, const Theme& colors) {
     if (!t) {
         return;
     }
-    memcpy(t, &colors, offsetof(Theme, radius));
+
+    uint8_t* dst = (uint8_t*)t;
+    const uint8_t* src = (const uint8_t*)&colors;
+    for (size_t i = 0; i < offsetof(Theme, radius); i++) {
+        dst[i] = src[i];
+    }
 }
 
 static void ThemeTokensReconcile(Theme* t, const Theme* colorsBefore,
@@ -84103,6 +84560,10 @@ VirtualList* VirtualList::Sizes(const float* v) {
     sizes = v;
     return this;
 }
+VirtualList* VirtualList::MeasureRows(uint8_t* flags) {
+    needsMeasure = flags;
+    return this;
+}
 VirtualList* VirtualList::Handle(VirtualListScrollHandle* h) {
     handle = h;
     return this;
@@ -84160,6 +84621,8 @@ El* VirtualList::IntoEl() {
     o.rowH = rowH;
     o.viewH = viewH;
     o.sizes = sizes;
+    o.needsMeasure = needsMeasure;
+    o.overdraw = needsMeasure ? 400.f : 0.f;
     o.scrollY = scrollY;
     o.scrollX = scrollX;
     o.handle = handle;
@@ -123957,7 +124420,7 @@ static bool HostArgumentsFromJs(JSContext* ctx, JSValueConst array,
         JS_ThrowRangeError(ctx, "host calls accept at most 10000 arguments");
         return false;
     }
-    if (!VecReserve(arguments->values, (int)count)) {
+    if (count > 0 && !VecReserve(arguments->values, (int)count)) {
         JS_ThrowOutOfMemory(ctx);
         return false;
     }
@@ -170189,6 +170652,33 @@ RenderImage* RenderImageDecode(PaintApp* pa, const uint8_t* bytes, int len) {
     return img;
 }
 
+RenderImage* RenderImageFromBgra(PaintApp* pa, const uint8_t* bgra, int w,
+                                 int h) {
+    (void)pa;
+    if (!bgra || w <= 0 || h <= 0 || w > 0x7fffffff / 4 / h) return nullptr;
+    cairo_surface_t* surface =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+    if (!surface || cairo_surface_status(surface) != CAIRO_STATUS_SUCCESS) {
+        if (surface) cairo_surface_destroy(surface);
+        return nullptr;
+    }
+    uint8_t* dst = cairo_image_surface_get_data(surface);
+    int stride = cairo_image_surface_get_stride(surface);
+    for (int y = 0; y < h; y++) {
+        memcpy(dst + (size_t)y * stride, bgra + (size_t)y * w * 4,
+               (size_t)w * 4);
+    }
+    cairo_surface_mark_dirty(surface);
+    auto* img = new RenderImage();
+    img->generation = PaintResourceGenerationNew();
+    LinuxImageFrame frame = {};
+    frame.surface = surface;
+    frame.w = w;
+    frame.h = h;
+    VecAppend(img->frames, frame);
+    return img;
+}
+
 RenderImage* RenderImageNewLoading() {
     auto* img = new RenderImage();
     img->generation = PaintResourceGenerationNew();
@@ -171388,6 +171878,46 @@ RenderImage* RenderImageDecode(PaintApp* pa, const uint8_t* bytes, int len) {
     return img;
 }
 
+static void ReleaseRawImageData(void*, const void* data, size_t) {
+    Free(nullptr, (void*)data);
+}
+
+RenderImage* RenderImageFromBgra(PaintApp* pa, const uint8_t* bgra, int w,
+                                 int h) {
+    (void)pa;
+    if (!bgra || w <= 0 || h <= 0 || w > 0x7fffffff / 4 / h) return nullptr;
+    size_t bytes = (size_t)w * (size_t)h * 4;
+    uint8_t* copy = (uint8_t*)Alloc(nullptr, (int)bytes);
+    if (!copy) return nullptr;
+    memcpy(copy, bgra, bytes);
+    CGDataProviderRef provider = CGDataProviderCreateWithData(
+        nullptr, copy, bytes, ReleaseRawImageData);
+    if (!provider) {
+        Free(nullptr, copy);
+        return nullptr;
+    }
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGBitmapInfo bitmapInfo =
+        (CGBitmapInfo)((uint32_t)kCGImageAlphaPremultipliedFirst |
+                       (uint32_t)kCGBitmapByteOrder32Little);
+    CGImageRef cg = space
+        ? CGImageCreate(w, h, 8, 32, (size_t)w * 4, space,
+                        bitmapInfo,
+                        provider, nullptr, false, kCGRenderingIntentDefault)
+        : nullptr;
+    if (space) CGColorSpaceRelease(space);
+    CGDataProviderRelease(provider);
+    if (!cg) return nullptr;
+    auto* img = new RenderImage();
+    img->generation = PaintResourceGenerationNew();
+    MacImageFrame frame = {};
+    frame.image = cg;
+    frame.w = w;
+    frame.h = h;
+    VecAppend(img->frames, frame);
+    return img;
+}
+
 RenderImage* RenderImageNewLoading() {
     auto* img = new RenderImage();
     img->generation = PaintResourceGenerationNew();
@@ -172411,6 +172941,30 @@ EM_JS(void, GpJsPathFree, (int id), {
     G.release(G.paths, G.pathFree, id);
 });
 
+EM_JS(int, GpJsImageFromBgra, (const uint8_t* bgra, int w, int h), {
+    const G = globalThis.__gpui;
+    const canvas = typeof OffscreenCanvas !== "undefined"
+        ? new OffscreenCanvas(w, h) : document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const c = canvas.getContext("2d");
+    if (!c) return 0;
+    const data = c.createImageData(w, h);
+    for (let i = 0; i < w * h; i++) {
+        const at = bgra + i * 4;
+        const a = HEAPU8[at + 3];
+        const out = i * 4;
+        data.data[out] = a ? Math.min(255, Math.round(HEAPU8[at + 2] * 255 / a)) : 0;
+        data.data[out + 1] = a ? Math.min(255, Math.round(HEAPU8[at + 1] * 255 / a)) : 0;
+        data.data[out + 2] = a ? Math.min(255, Math.round(HEAPU8[at] * 255 / a)) : 0;
+        data.data[out + 3] = a;
+    }
+    c.putImageData(data, 0, 0);
+    return G.alloc(G.images, G.imageFree,
+                   {img: canvas, w: w, h: h, status: 1, url: null,
+                    animated: false});
+});
+
 EM_JS(int, GpJsImageDecode, (const uint8_t* bytes, int len), {
     const G = globalThis.__gpui;
 
@@ -173182,6 +173736,18 @@ RenderImage* RenderImageDecode(PaintApp* pa, const uint8_t* bytes, int len) {
     if (!id) {
         return nullptr;
     }
+    auto* img = new RenderImage();
+    img->generation = PaintResourceGenerationNew();
+    img->js = id;
+    return img;
+}
+
+RenderImage* RenderImageFromBgra(PaintApp* pa, const uint8_t* bgra, int w,
+                                 int h) {
+    (void)pa;
+    if (!bgra || w <= 0 || h <= 0 || w > 0x7fffffff / 4 / h) return nullptr;
+    int id = GpJsImageFromBgra(bgra, w, h);
+    if (!id) return nullptr;
     auto* img = new RenderImage();
     img->generation = PaintResourceGenerationNew();
     img->js = id;
@@ -174856,6 +175422,25 @@ RenderImage* RenderImageDecode(PaintApp* pa, const uint8_t* bytes, int len) {
     gpui_paint_win_Rel(&dec);
     gpui_paint_win_Rel(&stream);
     gpui_paint_win_Rel(&wic);
+    return img;
+}
+
+RenderImage* RenderImageFromBgra(PaintApp* pa, const uint8_t* bgra, int w,
+                                 int h) {
+    (void)pa;
+    if (!bgra || w <= 0 || h <= 0 || w > 0x7fffffff / 4 / h) return nullptr;
+    auto* img = new RenderImage();
+    img->generation = PaintResourceGenerationNew();
+    WinImageFrame frame = {};
+    frame.w = w;
+    frame.h = h;
+    frame.bgra = (uint8_t*)Alloc(nullptr, w * h * 4);
+    if (!frame.bgra) {
+        delete img;
+        return nullptr;
+    }
+    memcpy(frame.bgra, bgra, (size_t)w * (size_t)h * 4);
+    VecAppend(img->frames, frame);
     return img;
 }
 
@@ -182789,7 +183374,7 @@ EM_JS(void, GpJsCanvasOrigin, (float* outX, float* outY), {
 });
 
 EM_JS(int, GpJsPageOptions, (char* slug, int cap), {
-    const q = new URLSearchParams(globalThis.location.search);
+    const q = new URLSearchParams(globalThis.location?.search || "");
     const name = q.get("story") || "";
     const bytes = new TextEncoder().encode(name);
     const n = Math.min(bytes.length, cap - 1);

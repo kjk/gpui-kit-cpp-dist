@@ -4388,6 +4388,8 @@ struct Style {
     Overflow overflowY = Overflow::Visible;
     Overflow overflowX = Overflow::Visible;
 
+    int zIndex = 0;
+
     uint8_t deferredLayer = 0;
 
     Anchor anchor = Anchor::TopLeft;
@@ -5133,6 +5135,7 @@ struct El {
     El* Fixed();
     El* Deferred();
     El* DeferredLayer(int layer);
+    El* ZIndex(int z);
     El* AnchorBelow(float gap = 0);
 
     El* AnchorFlip(bool on = true);
@@ -5249,6 +5252,8 @@ struct HitRect {
     bool suppressTextSelection = false;
 
     int paintLayer = 0;
+
+    int sceneContext = 0;
 };
 
 struct AccessibilityNode {
@@ -5464,6 +5469,8 @@ struct PaintCtx {
     int pickTier = 0;
     InspectorPick pick = {};
     Vec<HitRect> hits;
+
+    Vec<El*> deferredPaint;
     Vec<ScrollRect> scrolls;
     Vec<TextHit> texts;
 
@@ -6837,6 +6844,8 @@ void LayoutEl(PaintCtx* ctx, El* e, float x, float y, float availW,
 
 Size MeasureEl(PaintCtx* ctx, El* e, float inheritFont = 0,
                Rgba inheritFg = {});
+
+Size MeasureElAtWidth(PaintCtx* ctx, El* e, float width);
 void PaintEl(PaintCtx* ctx, El* e);
 int HitTest(PaintCtx* ctx, float x, float y);
 const HitRect* HitTestRect(PaintCtx* ctx, float x, float y);
@@ -15542,6 +15551,8 @@ struct VirtualListOpts {
     float viewW = 0;
     const float* sizes = nullptr;
 
+    uint8_t* needsMeasure = nullptr;
+
     float scrollY = 0;
     float scrollX = 0;
     VirtualListScrollHandle* handle = nullptr;
@@ -22276,8 +22287,7 @@ struct MessageScrollerState {
     VirtualListScrollHandle handle;
 
     Vec<float> heights;
-
-    Vec<Bounds> probes;
+    Vec<uint8_t> needsMeasure;
 
     bool followTail = true;
 
@@ -25523,6 +25533,7 @@ struct VirtualList {
     float scrollX = 0;
 
     const float* sizes = nullptr;
+    uint8_t* needsMeasure = nullptr;
 
     VirtualListScrollHandle* handle = nullptr;
     Listener onRenderRow;
@@ -25545,6 +25556,7 @@ struct VirtualList {
     VirtualList* ScrollY(float v);
     VirtualList* ScrollX(float v);
     VirtualList* Sizes(const float* v);
+    VirtualList* MeasureRows(uint8_t* flags);
     VirtualList* Handle(VirtualListScrollHandle* h);
     VirtualList* Scroll(int id, Listener onScroll);
     VirtualList* Axis(ScrollAxis v);
@@ -26191,6 +26203,9 @@ enum class RenderImageStatus : uint8_t {
 
 RenderImage* RenderImageDecode(PaintApp* pa, const uint8_t* bytes, int len);
 
+RenderImage* RenderImageFromBgra(PaintApp* pa, const uint8_t* bgra, int w,
+                                 int h);
+
 RenderImage* RenderImageNewLoading();
 void RenderImageComplete(RenderImage* img, RenderImage* decoded);
 
@@ -26491,6 +26506,10 @@ void Free(PaintCtx* ctx);
 
 bool Recording();
 
+int ContextPush(PaintCtx* ctx, int z);
+void ContextPop(PaintCtx* ctx, int parent);
+int CurrentContext(PaintCtx* ctx);
+
 void FrameBegin(PaintCtx* ctx);
 
 bool FrameEnd(PaintCtx* ctx, Bounds* damage);
@@ -26549,6 +26568,7 @@ void RecTextDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
 struct SceneStats {
 
     int prims = 0;
+    int contexts = 0;
     int layers = 0;
 
     int maskChanges = 0;
@@ -26566,6 +26586,9 @@ struct SceneStats {
     int framePathCacheMisses = 0;
     float framePathBuildMs = 0;
     int pathCacheLive = 0;
+    int maskCacheHits = 0;
+    int maskCacheMisses = 0;
+    int maskCacheLive = 0;
 
     int frames = 0;
     int framesUnchanged = 0;
