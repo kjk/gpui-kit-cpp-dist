@@ -4109,6 +4109,9 @@ enum class IconName : uint8_t {
     WindowRestore,
 
     X,
+    AtSign,
+    Image,
+    Sparkles,
 };
 
 struct PaintCtx;
@@ -6973,6 +6976,8 @@ struct App {
     PaintApp* paint = nullptr;
     Vec<Window*> windows;
 
+    void (*hostThemeHandler)(App*, bool dark) = nullptr;
+
     Vec<EntitySlot> entities;
     Vec<int32_t> freeSlots;
 
@@ -7629,6 +7634,9 @@ void AppQuitAll(App* app);
 void AppInvalidate(Window* win);
 
 void AppRefreshWindows(App* app);
+
+void AppSetHostThemeHandler(App* app, void (*handler)(App*, bool dark));
+void AppHostSetTheme(App* app, bool dark);
 
 void AppOnShutdown(void (*fn)());
 
@@ -21603,7 +21611,8 @@ struct InputGroup {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     Str id = {};
-    Input* input = nullptr;
+
+    ::gpui::component::Input* input = nullptr;
     Textarea* textarea = nullptr;
     ArenaVec<InputGroupAddon*> addons;
     UiSize size = UiSize::Medium;
@@ -21616,7 +21625,7 @@ struct InputGroup {
     El* controlEl = nullptr;
 
     static InputGroup* New(Ctx* cx, Str id);
-    InputGroup* Input(Input* control);
+    InputGroup* Input(::gpui::component::Input* control);
     InputGroup* Input(Textarea* control);
     InputGroup* Addon(InputGroupAddon* addon);
     InputGroup* Disabled(bool v);
