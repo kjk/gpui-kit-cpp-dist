@@ -538,36 +538,36 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "6b8581a1e5458eace91beb842376f833beaef2ff",
-  date: "2026-09-19",
-  subject: "Version 0.6.4",
+  sha: "912f8a9b70c24aa79de696f26ab0c7ef065ed134",
+  date: "2026-10-01",
+  subject: "docs: Document macOS font-kit requirement (#3339)",
   crates: {
-    "gpui-kit": "0.6.4",
-    "gpui-base": "0.6.4",
-    "gpui-component": "0.6.4",
-    "gpui-component-story": "0.6.4",
-    "gpui-wry": "0.6.4",
-    "gpui-shell": "0.6.4",
-    "gpui-component-shell": "0.6.4",
+    "gpui-kit": "0.7.0",
+    "gpui-base": "0.7.0",
+    "gpui-component": "0.7.0",
+    "gpui-component-story": "0.7.0",
+    "gpui-wry": "0.7.0",
+    "gpui-shell": "0.7.0",
+    "gpui-component-shell": "0.7.0",
   },
   dir: ".work/gpui-component",
 } as const;
 
 /**
- * Zed reference snapshot recorded in gpui-pre 0.3.5's package metadata.
+ * Zed reference snapshot recorded in gpui-pre 0.3.6's package metadata.
  * Cargo.lock now resolves registry packages rather than a Zed git source.
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "d89e9c2124b2786a390c7a451c7488601b4da2e1",
-  date: "2026-09-14",
-  subject: "agent: Fix elicitation tool-call IDs (#64086)",
+  sha: "1a28cff4b409169bac058bca40dfbfeb7621d19b",
+  date: "2026-09-27",
+  subject: "git: Stop remote operations blocking commit views (#64720)",
   crates: {
-    "gpui-pre": "0.3.5",
-    "gpui-pre-platform": "0.3.5",
-    "gpui-pre-macros": "0.3.5",
+    "gpui-pre": "0.3.7",
+    "gpui-pre-platform": "0.3.7",
+    "gpui-pre-macros": "0.3.7",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.5",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.7",
 } as const;
 
 /**
@@ -796,7 +796,6 @@ const rustExamplePkgs = new Set([
   "hello_world",
   "input",
   "markdown_table",
-  "root_borderless",
   "sidebar",
   "system_monitor",
   "table_in_scrollable",

@@ -283,6 +283,7 @@ El* ThemeColorsStory::Render(ThemeColorsStory* self, Ctx* cx) {
         {"Button", "Warning Foreground", "", th.buttonWarningFg},
         {"Button", "Warning Hover", "", th.tokens.buttonWarningHover},
         {"Chart", "Bearish", "chart_bearish", th.chartBearish},
+        {"Chart", "Grid", "chart_grid", th.chartGrid},
         {"Chart", "Bullish", "chart_bullish", th.chartBullish},
         {"Chart", "Color 1", "chart.1", th.chart1},
         {"Chart", "Color 2", "chart.2", th.chart2},
@@ -446,8 +447,7 @@ El* ThemeColorsStory::Render(ThemeColorsStory* self, Ctx* cx) {
     // Left: the search field over the category list.
     El* left = Div(a)->FlexCol()->W(300)->Gap(8);
     left->Child(component::Input::New(cx, StrL("theme-filter"), &self->filter)
-                    ->Prefix(Div(a)->PadL(10)->Child(
-                        IconEl(a, IconName::Search, 16)->Fg(th.mutedFg)))
+                    ->Prefix(IconEl(a, IconName::Search, 16)->Fg(th.mutedFg))
                     ->OnFocus(Listen(cx, &FocusFilter))
                     ->IntoEl());
     // The categories stack with nothing between them — the `gap_2` above is

@@ -15,8 +15,8 @@ enum {
     StoryBreadcrumb,
     StoryBubble,
     StoryButton,
-    StoryCarousel,
     StoryCalendar,
+    StoryCarousel,
     StoryChart,
     StoryCheckbox,
     StoryClipboard,
@@ -42,8 +42,8 @@ enum {
     StoryKbd,
     StoryLabel,
     StoryList,
-    StoryMarker,
     StoryMenu,
+    StoryMarker,
     StoryMessage,
     StoryMessageScroller,
     StoryNativeMenu,
@@ -53,6 +53,7 @@ enum {
     StoryPagination,
     StoryPopover,
     StoryProgress,
+    StoryQuestionnaire,
     StoryRadio,
     StoryRating,
     StoryResizable,
@@ -75,7 +76,10 @@ enum {
     StoryTag,
     StoryTextarea,
     StoryThemeColors,
+    StoryTimeField,
     StoryToggle,
+    // Not StoryToolbar: that is the size/options row every page draws.
+    StoryToolbarStory,
     StoryTooltip,
     StoryTree,
     StoryVirtualList,
@@ -206,6 +210,8 @@ struct StoryToolbarOpt {
     bool plain = false;
     // separator() before this row.
     bool sep = false;
+    // label(): a muted heading that is not an item.
+    bool heading = false;
 };
 
 // For a page whose toolbar is not one size button plus one Options menu: the
@@ -215,6 +221,10 @@ El* StoryToolbarDropdown(Ctx* cx, Str id, Str label, bool open, Listener onOpen,
                          const StoryToolbarOpt* rows, int nrows,
                          Listener onAct);
 El* StoryToolbarDivider(Ctx* cx);
+// StoryToolbar::child(button): a plain button in the group, an optional
+// icon before its label.
+El* StoryToolbarButton(Ctx* cx, Str id, IconName icon, Str label,
+                       Listener onClick);
 
 void StoryToolbarApply(StoryToolbarState* st, StoryAccordionOptions* opts,
                        int act);

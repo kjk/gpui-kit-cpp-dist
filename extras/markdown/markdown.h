@@ -1052,6 +1052,21 @@ struct LocalDate {
 LocalDate DateToday();
 LocalDate DateAddDays(LocalDate base, int days);
 
+struct LocalTime {
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+inline bool operator==(LocalTime a, LocalTime b) {
+    return a.hour == b.hour && a.minute == b.minute && a.second == b.second;
+}
+inline bool operator!=(LocalTime a, LocalTime b) {
+    return !(a == b);
+}
+
+LocalTime TimeOfDayNow();
+
 void StrFree(Str s);
 void StrFree(const char*) = delete;
 
@@ -1580,6 +1595,22 @@ struct ParseOptions {
 };
 
 Node* ToMdast(Arena* a, Str source, const ParseOptions& options);
+
+struct NodeSpan {
+    const Node* node = nullptr;
+    int32_t start = 0;
+    int32_t end = 0;
+};
+
+struct NodePositions {
+    base::Vec<NodeSpan> spans;
+};
+
+Node* ToMdast(Arena* a, Str source, const ParseOptions& options,
+              NodePositions* positions);
+
+bool NodePosition(const NodePositions* positions, const Node* n, int32_t* start,
+                  int32_t* end);
 
 Str DecodeNamed(Arena* a, Str name);
 
@@ -2468,7 +2499,8 @@ void DivideEvents(EditMap& map, const Vec<Event>& events, int32_t linkIndex,
 
 Vec<Event> Parse(ParseState* parseState);
 
-Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState);
+Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState,
+                     NodePositions* positions);
 
 }
 

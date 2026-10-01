@@ -78,9 +78,10 @@ static const StoryInfo kMeta[StoryCount] = {
      "A styleable chat surface for text, rich content, and reactions."},
     {"button", "Button",
      "Displays a button or a component that looks like a button."},
-    {"carousel", "Carousel",
-     "A carousel for browsing a set of related items with keyboard and pointer navigation."},
     {"calendar", "Calendar", "A calendar to select a date or date range."},
+    {"carousel", "Carousel",
+     "A carousel for browsing a set of related items with keyboard and pointer "
+     "navigation."},
     {"chart", "Chart", "Beautiful Charts & Graphs."},
     {"checkbox", "Checkbox", "Select one or more independent options."},
     {"clipboard", "Clipboard",
@@ -101,7 +102,7 @@ static const StoryInfo kMeta[StoryCount] = {
      "Present labels and values in a structured summary."},
     {"dialog", "Dialog", "Present focused content above the current view."},
     {"dock", "Dock",
-     "A dockable layout of panels that can be moved, split and resized."},
+     "Drag tabs between groups or towards an edge to split the workspace."},
     {"dropdown-button", "DropdownButton",
      "A button with an attached dropdown menu for additional "
      "options."},
@@ -123,14 +124,15 @@ static const StoryInfo kMeta[StoryCount] = {
      "Capture and validate short-form text, credentials, "
      "identifiers, and formatted values."},
     {"input-group", "Input Group",
-     "A shared frame around one text control and its addons."},
+     "Compose inputs and textareas with icons, text, actions, and toolbars "
+     "in one frame."},
     {"kbd", "Kbd", "A tag style to display keyboard shortcuts"},
     {"label", "Label",
      "Display concise text with hierarchy, highlighting, and masking."},
     {"list", "List", "A list displays a series of items."},
+    {"menu", "Menu", "Popup menu and context menu"},
     {"marker", "Marker",
      "A compact row for conversation status, notifications, and separators."},
-    {"menu", "Menu", "Popup menu and context menu"},
     {"message", "Message",
      "Compose sender identity, metadata, rich content, and message "
      "actions."},
@@ -154,6 +156,9 @@ static const StoryInfo kMeta[StoryCount] = {
     {"popover", "Popover", "Show focused content beside a trigger."},
     {"progress", "Progress",
      "Show task completion with determinate or loading indicators."},
+    {"questionnaire", "Questionnaire",
+     "Composable multi-step questions with answers, validation, progress, "
+     "and navigation."},
     {"radio", "Radio", "Choose one option from a set."},
     {"rating", "Rating", "A simple interactive star rating component."},
     {"resizable", "Resizable", "The resizable panels."},
@@ -167,7 +172,8 @@ static const StoryInfo kMeta[StoryCount] = {
      "A collection of settings groups and items for the "
      "application."},
     {"shell", "Shell",
-     "Run a ticking JavaScript quote board beside a Rust one, sharing state through a native module."},
+     "Run a ticking JavaScript quote board beside a Rust one, sharing state "
+     "through a native module."},
     {"sheet", "Sheet", "Sheet for open a popup in the edge of the window"},
     {"shimmer", "Shimmer",
      "Reusable, theme-aware text loading effects with composable timing "
@@ -200,7 +206,12 @@ static const StoryInfo kMeta[StoryCount] = {
     {"theme-colors", "Theme Colors",
      "A color theme viewer to explore colors organized by "
      "categories."},
+    {"time-field", "TimeField",
+     "Edit a time of day segment by segment, on a 24-hour or 12-hour "
+     "clock."},
     {"toggle", "Toggle", "Turn an option on or off, alone or in a group."},
+    {"toolbar", "Toolbar",
+     "Groups commands and controls into one keyboard-navigable row."},
     {"tooltip", "Tooltip", "Describe a control on hover."},
     // TreeStory has no description() in Rust, so its page has no line under
     // the title.
@@ -249,8 +260,9 @@ El* StorySection(Ctx* cx, const char* title, const char* desc) {
     // mb_6 on the GroupBox: every section carries its own bottom margin, on
     // top of whatever gap the page sets.
     El* wrap = Div(a)->FlexCol()->Gap(12)->PadB(24)->W(kFill);
-    // GroupBox draws its title with line_height(relative(1.)), which the
-    // description inherits, so the header is 16 + 4 + 12 tall.
+    // GroupBox draws its title with line_height(relative(1.25)) (upstream
+    // 0a5e0310, so descenders are not clipped), which the description
+    // inherits, so the header is 20 + 4 + 15 tall.
     // The header is a row: the title column, and whatever sub-title the page
     // adds opposite it.
     El* headRow =
@@ -258,10 +270,10 @@ El* StorySection(Ctx* cx, const char* title, const char* desc) {
     El* head = Div(a)->FlexCol()->MinW(0)->Flex1()->Gap(4);
     head->Child(StoryTxt(cx, StoryDup(cx, title), 16, th.mutedFg)
                     ->Medium()
-                    ->LineHeight(1.f));
+                    ->LineHeight(1.25f));
     if (desc && desc[0]) {
         head->Child(StoryTxt(cx, StoryDup(cx, desc), 12, th.mutedFg)
-                        ->LineHeight(1.f)
+                        ->LineHeight(1.25f)
                         ->Wrap());
     }
     // GroupBox's content pane, with StorySection's content_style on it:
@@ -351,7 +363,7 @@ static const char* StorySizeName(UiSize s) {
 // would make the row two pixels taller than every one of upstream's. It goes
 // on as the `ListActiveOverlay` ring does: an absolute child filling the
 // group, drawing the stroke and costing no layout.
-static El* ToolbarGroup(Ctx* cx) {
+static El* StoryToolbarFrame(Ctx* cx) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
     return Div(a)
@@ -417,6 +429,24 @@ static El* ToolbarCheckRow(Ctx* cx, Listener onAct, int act, const char* label,
     }
     row->Child(StoryTxt(cx, Str(label), 14, th.foreground));
     return row;
+}
+
+// One row of a page's own menu: a check row, or PopupMenu::label's
+// heading -- the same row, muted, holding the gutter but taking no click.
+static El* ToolbarOptRow(Ctx* cx, Listener onAct, const StoryToolbarOpt& row,
+                         bool gutter) {
+    if (!row.heading) {
+        return ToolbarCheckRow(cx, onAct, row.act, row.label,
+                               row.checked && !row.plain, gutter);
+    }
+    Arena* a = cx->a;
+    const Theme& th = ThemeNow(cx->app);
+    El* el =
+        Div(a)->H(26)->MinW(120)->PadX(8)->FlexRow()->Gap(4)->ItemsCenter();
+    if (gutter) {
+        el->Child(Div(a)->W(12)->H(12)->Shrink0());
+    }
+    return el->Child(StoryTxt(cx, Str(row.label), 14, th.mutedFg));
 }
 
 // popover_style, plus PopupMenu's p_1 and gap_y_0p5 around the items.
@@ -547,7 +577,7 @@ El* StoryToolbarCore(Ctx* cx, StoryToolbarState* st,
                      bool withSize) {
     Arena* a = cx->a;
     El* row = Div(a)->FlexRow()->W(kFill)->JustifyEnd()->ItemsStart();
-    El* group = ToolbarGroup(cx);
+    El* group = StoryToolbarFrame(cx);
     row->Child(group);
 
     if (withSize) {
@@ -572,9 +602,7 @@ El* StoryToolbarCore(Ctx* cx, StoryToolbarState* st,
                 if (rows[i].sep) {
                     optMenu->Child(ToolbarMenuSep(cx));
                 }
-                optMenu->Child(
-                    ToolbarCheckRow(cx, onAct, rows[i].act, rows[i].label,
-                                    rows[i].checked && !rows[i].plain, gutter));
+                optMenu->Child(ToolbarOptRow(cx, onAct, rows[i], gutter));
             }
         }
         group->Child(StoryToolbarDismissOnPressOut(
@@ -588,11 +616,33 @@ El* StoryToolbarCore(Ctx* cx, StoryToolbarState* st,
 }
 
 El* StoryToolbarGroup(Ctx* cx) {
-    return ToolbarGroup(cx);
+    return StoryToolbarFrame(cx);
 }
 
 El* StoryToolbarDivider(Ctx* cx) {
     return ToolbarSep(cx);
+}
+
+El* StoryToolbarButton(Ctx* cx, Str id, IconName icon, Str label,
+                       Listener onClick) {
+    Arena* a = cx->a;
+    const Theme& th = ThemeNow(cx->app);
+    // StoryToolbar::child: the same outline().small() button a dropdown
+    // trigger is, with its icon before the label.
+    El* button = Div(a)
+                     ->H(24)
+                     ->PadX(8)
+                     ->FlexRow()
+                     ->Gap(4)
+                     ->ItemsCenter()
+                     ->JustifyCenter()
+                     ->HoverBg(th.tokens.muted);
+    if (icon != IconName::None) {
+        button->Child(IconEl(a, icon, 14)->Fg(th.foreground));
+    }
+    button->Child(StoryTxt(cx, label, 14, th.foreground));
+    button->Click(HashClickId(id))->OnClick(onClick);
+    return button;
 }
 
 El* StoryToolbarDropdown(Ctx* cx, Str id, Str label, bool open, Listener onOpen,
@@ -610,9 +660,7 @@ El* StoryToolbarDropdown(Ctx* cx, Str id, Str label, bool open, Listener onOpen,
             if (rows[i].sep) {
                 menu->Child(ToolbarMenuSep(cx));
             }
-            menu->Child(ToolbarCheckRow(cx, onAct, rows[i].act, rows[i].label,
-                                        rows[i].checked && !rows[i].plain,
-                                        gutter));
+            menu->Child(ToolbarOptRow(cx, onAct, rows[i], gutter));
         }
     }
     return StoryToolbarDismissOnPressOut(
@@ -923,7 +971,9 @@ static const int kStoryLocaleCount =
 // which action a kind of row names, whether it is ticked, and what it reads
 // back to say so.
 enum class ApKind : uint8_t {
-    Label,
+    // Starts a submenu the value rows after it go into, up to the next row
+    // that is not one of its kind.
+    Submenu,
     Sep,
     Font,
     Radius,
@@ -943,20 +993,20 @@ struct ApRow {
     float value;
 };
 
+// Font Size, Border Radius and Scrollbar are submenus, so the sizes can be
+// compared at each base font size without scrolling the menu.
 static const ApRow kAppearance[] = {
-    {ApKind::Label, "Font Size", 0},
+    {ApKind::Submenu, "Font Size", 0},
     {ApKind::Font, "Large", 18},
     {ApKind::Font, "Medium (default)", 16},
     {ApKind::Font, "Small", 14},
-    {ApKind::Sep, nullptr, 0},
-    {ApKind::Label, "Border Radius", 0},
+    {ApKind::Submenu, "Border Radius", 0},
     {ApKind::Radius, "8px", 8},
     {ApKind::Radius, "6px (default)", 6},
     {ApKind::Radius, "4px", 4},
     {ApKind::Radius, "0px", 0},
-    {ApKind::Sep, nullptr, 0},
-    {ApKind::Label, "Scrollbar", 0},
-    {ApKind::Scroll, "Scrolling", (float)ScrollbarMode::Scrolling},
+    {ApKind::Submenu, "Scrollbar", 0},
+    {ApKind::Scroll, "Scrolling to show", (float)ScrollbarMode::Scrolling},
     {ApKind::Scroll, "Hover to show", (float)ScrollbarMode::Hover},
     {ApKind::Scroll, "Always show", (float)ScrollbarMode::Always},
     {ApKind::Sep, nullptr, 0},
@@ -1070,8 +1120,10 @@ static Window* StoryOpenWindow(App* app, int story, bool embedded = false) {
     // canvas. There is nothing to change here — `window_linux.cpp` asks X11
     // for an ordinary opaque visual and never sets an ARGB one — so this is
     // where that decision would live if the seam existed.
-    Window* win = WindowOpenView(app, embedded ? Str{} : StoryWindowTitle(),
-                                 1600, 1200, view.id, opts);
+    // gpui_kit::open_window: the window's root is a Base Root around the
+    // story, which is what draws the dialogs, sheet and notifications over it.
+    Window* win = KitOpenWindow(app, embedded ? Str{} : StoryWindowTitle(),
+                                1600, 1200, view.id, opts);
     if (!win) {
         return nullptr;
     }
@@ -1083,37 +1135,23 @@ static Window* StoryOpenWindow(App* app, int story, bool embedded = false) {
 // The About dialog, which the Help menu raises. It is an entity of its own
 // rather than something a page renders, which is what WindowExt is for: the
 // menu handler has no view that draws dialogs and does not need one, and the
-// dialog outlives whichever page happens to be showing. Rust writes the same
-// thing as `window.open_alert_dialog(cx, |alert, ..| ..)`.
+// dialog outlives whichever page happens to be showing. Rust writes it as
+// `window.open_alert_dialog(cx, |alert, ..| alert.title("About")
+// .description(markdown(..)))`.
 struct AboutDialog {
     static void OnClose(AboutDialog*, Ctx* cx, const ClickEvent*) {
         WindowCloseDialog(cx);
     }
 
     static El* Render(AboutDialog*, Ctx* cx) {
-        Arena* a = cx->a;
-        const Theme& th = ThemeNow(cx->app);
-        El* body = Div(a)->FlexCol()->Gap(8)->W(kFill);
-        body->Child(
-            StoryTxt(cx,
-                     StrL("A C++ port of longbridge/gpui-kit: the "
-                          "same components, the same theme, no Rust and "
-                          "no STL."),
-                     14, th.mutedFg)
-                ->W(kFill)
-                ->Wrap());
-        body->Child(
-            StoryTxt(cx, StrL("github.com/longbridge/gpui-kit"), 14, th.mutedFg)
-                ->W(kFill));
         Listener close = Listen(cx, &AboutDialog::OnClose);
-        return component::Dialog::New(cx)
+        return component::AlertDialog::New(cx)
             ->Open(true)
-            ->Title(StrL("GPUI Kit"))
-            ->Description(StrL("Component showcase  v0.5.1"))
-            ->Body(body)
-            ->W(420)
-            ->CloseButton()
-            ->OkText(StrL("Close"))
+            ->Title(StrL("About"))
+            ->Body(component::TextView::New(
+                       cx, StrL("GPUI Component Storybook\n\nVersion "
+                                "0.1.0\n\nhttps://gpui-kit.com"))
+                       ->IntoEl())
             ->OnOk(close)
             ->OnClose(close)
             ->OnCancel(close)
@@ -1124,22 +1162,42 @@ struct AboutDialog {
 static El* AppearanceMenu(StoryApp* app, Ctx* cx) {
     component::PopupMenu* menu =
         component::PopupMenu::New(cx, StrL("story-appearance-menu"));
+    // The submenu being filled, and the kind of row that goes into it.
+    component::PopupMenu* sub = nullptr;
+    Str subLabel = {};
+    ApKind subKind = ApKind::Sep;
+    auto closeSub = [&]() {
+        if (sub) {
+            menu->Submenu(subLabel, sub);
+            sub = nullptr;
+        }
+    };
     for (int i = 0; i < kAppearanceRows; i++) {
         const ApRow& r = kAppearance[i];
+        if (sub && r.kind != subKind) {
+            closeSub();
+        }
         switch (r.kind) {
-            case ApKind::Label:
-                menu->Label(Str(r.label));
+            case ApKind::Submenu:
+                sub = component::PopupMenu::New(
+                    cx, StrDup(cx->a, fmt("story-appearance-sub-%d", i)));
+                sub->CheckSide(Side::Right);
+                subLabel = Str(r.label);
+                subKind = kAppearance[i + 1].kind;
                 break;
             case ApKind::Sep:
                 menu->Separator();
                 break;
-            default:
-                menu->MenuWithAction(Str(r.label), ApAction(r.kind),
+            default: {
+                component::PopupMenu* into = sub ? sub : menu;
+                into->MenuWithAction(Str(r.label), ApAction(r.kind),
                                      (intptr_t)r.value);
-                menu->Checked(ApChecked(app, cx, r));
+                into->Checked(ApChecked(app, cx, r));
                 break;
+            }
         }
     }
+    closeSub();
     // check_side(Right): the tick sits on the far edge, so the labels start
     // flush.
     menu->CheckSide(Side::Right);
@@ -1262,8 +1320,8 @@ struct StoryPalette {
         for (int i = 0; i < count; i++) {
             self->items[i] = {};
             self->items[i].label = self->themes
-                ? ThemeRegistryAt(cx->app, i)->name
-                : Str(StoryMeta(i)->title);
+                                       ? ThemeRegistryAt(cx->app, i)->name
+                                       : Str(StoryMeta(i)->title);
             self->items[i].data = i;
             if (self->themes)
                 self->items[i].checked = base::StrEq(
@@ -1275,21 +1333,27 @@ struct StoryPalette {
             self->focused = true;
             InputFocus(&state->query, cx);
         }
-        El* command = component::Command::New(
-            cx, self->themes ? StrL("story-themes") : StrL("story-components"),
-            self->command)
-            ->Items(self->items.els, count)
-            ->Bordered(false)
-            ->Placeholder(self->themes ? StrL("Search themes...")
-                                       : StrL("Search components..."))
-            ->MaxH(400)
-            ->OnSelect(Listen(cx, &StoryPalette::Preview))
-            ->OnConfirm(Listen(cx, &StoryPalette::Confirm))
-            ->OnCancel(Listen(cx, &StoryPalette::Cancel))
-            ->IntoEl();
-        return component::Dialog::New(cx)->Open(true)->W(500)
-            ->CloseButton(false)->OverlayClosable(false)
-            ->Surface(command)->IntoEl(WindowSize(cx->win));
+        El* command =
+            component::Command::New(
+                cx,
+                self->themes ? StrL("story-themes") : StrL("story-components"),
+                self->command)
+                ->Items(self->items.els, count)
+                ->Bordered(false)
+                ->Placeholder(self->themes ? StrL("Search themes...")
+                                           : StrL("Search components..."))
+                ->MaxH(400)
+                ->OnSelect(Listen(cx, &StoryPalette::Preview))
+                ->OnConfirm(Listen(cx, &StoryPalette::Confirm))
+                ->OnCancel(Listen(cx, &StoryPalette::Cancel))
+                ->IntoEl();
+        return component::Dialog::New(cx)
+            ->Open(true)
+            ->W(500)
+            ->CloseButton(false)
+            ->OverlayClosable(false)
+            ->Surface(command)
+            ->IntoEl(WindowSize(cx->win));
     }
 };
 
@@ -1301,19 +1365,17 @@ static void StoryOpenPalette(Ctx* cx, bool themes) {
     state->themes = themes;
     if (themes) {
         state->beforeMode = ThemeGet(cx->app);
-        state->beforeTheme = StrDup(
-            ThemeRegistryActive(cx->app, state->beforeMode));
+        state->beforeTheme =
+            StrDup(ThemeRegistryActive(cx->app, state->beforeMode));
     }
     WindowOpenDialog(cx, palette);
 }
 
-static void OnOpenCommandPaletteAction(StoryApp*, Ctx* cx,
-                                       const ActionEvent*) {
+static void OnOpenCommandPaletteAction(StoryApp*, Ctx* cx, const ActionEvent*) {
     StoryOpenPalette(cx, false);
 }
 
-static void OnOpenThemePaletteAction(StoryApp*, Ctx* cx,
-                                     const ActionEvent*) {
+static void OnOpenThemePaletteAction(StoryApp*, Ctx* cx, const ActionEvent*) {
     StoryOpenPalette(cx, true);
 }
 
@@ -1453,8 +1515,7 @@ static El* StoryBindMenuActions(El* root, Ctx* cx) {
         ->OnAction(ActOpen(), Listen(cx, &OnOpenAction))
         ->OnAction(ActOpenCommandPalette(),
                    Listen(cx, &OnOpenCommandPaletteAction))
-        ->OnAction(ActOpenThemePalette(),
-                   Listen(cx, &OnOpenThemePaletteAction))
+        ->OnAction(ActOpenThemePalette(), Listen(cx, &OnOpenThemePaletteAction))
         ->OnAction(ActQuit(), Listen(cx, &OnQuitAction))
         ->OnAction(ActNewWindow(), Listen(cx, &OnNewWindowAction))
         ->OnAction(ActCloseWindow(), Listen(cx, &OnCloseWindowAction))
@@ -1781,27 +1842,47 @@ static El* Footer(StoryApp* app, Ctx* cx) {
                                  12, th.mutedFg))
                 ->Child(Div(a)->W(1)->H(12)->Bg(th.border))
                 ->Child(StoryTxt(cx, Str(m->title), 12, th.mutedFg)))
-        ->Child(Div(a)
-                    ->FlexRow()
-                    ->Gap(12)
-                    ->ItemsCenter()
-                    // The theme in force, which is whatever the registry
-                    // last installed for this mode rather than always one of
-                    // the two defaults.
-                    ->Child(StoryTxt(
-                        cx, ThemeRegistryActive(cx->app, ThemeGet(cx->app)), 12,
-                        th.mutedFg))
-                    ->Child(StoryTxt(cx, StrL("v0.6.4"), 12, th.mutedFg))
-                    // gallery.rs puts the repository link last in the bar's
-                    // right group, as a ghost icon button.
-                    ->Child(component::Button::New(cx, StrL("assistant"))
-                                ->Ghost()
-                                ->WithSize(UiSize::XSmall)
-                                ->Icon(IconName::Github)
-                                ->Tooltip(StrL("GPUI Component GitHub repository"))
-                                ->OnClick(Listen(cx, &OnGithub))
-                                ->IntoEl()
-                                ->Cursor(CursorKind::Pointer)));
+        ->Child(
+            Div(a)
+                ->FlexRow()
+                ->Gap(12)
+                ->ItemsCenter()
+                // The theme in force, which is whatever the registry
+                // last installed for this mode rather than always one of
+                // the two defaults.
+                ->Child(StoryTxt(
+                    cx, ThemeRegistryActive(cx->app, ThemeGet(cx->app)), 12,
+                    th.mutedFg))
+                ->Child(StoryTxt(cx, StrL("v0.7.0"), 12, th.mutedFg))
+                // gallery.rs puts the repository link last in the bar's
+                // right group, as a ghost icon button.
+                ->Child(component::Button::New(cx, StrL("assistant"))
+                            ->Ghost()
+                            ->WithSize(UiSize::XSmall)
+                            ->Icon(IconName::Github)
+                            ->Tooltip(StrL("GPUI Component GitHub repository"))
+                            ->OnClick(Listen(cx, &OnGithub))
+                            ->IntoEl()
+                            ->Cursor(CursorKind::Pointer)));
+}
+
+// StoryContainer::render: `div().size_full().p(paddings).child(story)` inside
+// the scrolling pane. Story::paddings is 16 unless a story asks for none. A
+// page that is itself size_full and hands the rest to a flex_1 child -- the
+// Dock's area, the Scrollbar page's list, the Editor -- fills the pane; the
+// others keep their own height and scroll.
+static El* StoryContainerBody(StoryApp* app, Ctx* cx, Arena* frame) {
+    if (app->story == StoryDock || app->story == StoryScrollbar ||
+        app->story == StoryEditor || app->story == StorySettings) {
+        // DockStory and SettingsStory have paddings() of 0.
+        bool unpadded = app->story == StoryDock || app->story == StorySettings;
+        return Div(frame)
+            ->FlexCol()
+            ->SizeFull()
+            ->Pad(unpadded ? 0.0f : 16.0f)
+            ->Child(StoryRenderRegistered(app, cx));
+    }
+    return Div(frame)->Pad(16)->W(kFill)->Child(StoryRenderRegistered(app, cx));
 }
 
 El* StoryApp::Render(StoryApp* app, Ctx* cx) {
@@ -1815,8 +1896,8 @@ El* StoryApp::Render(StoryApp* app, Ctx* cx) {
         app->seeded = true;
     }
     // story-web's Gallery::embedded_view and StoryRoot::embedded: a page that
-    // names one story supplies its own surrounding UI. Keep our Root layers
-    // for dialogs and notifications, but no gallery chrome or window frame.
+    // names one story supplies its own surrounding UI. The window's Root
+    // still draws the dialogs and notifications; there is no gallery chrome.
     if (app->embedded) {
         El* scroller = Div(frame)
                            ->FlexCol()
@@ -1825,14 +1906,9 @@ El* StoryApp::Render(StoryApp* app, Ctx* cx) {
                            ->ScrollY(app->scrollY)
                            ->ScrollId(PageScrollId())
                            ->OnScroll(Listen(cx, &OnPaneScroll));
-        scroller->Child(Div(frame)->Pad(16)->W(kFill)->Child(
-            StoryRenderRegistered(app, cx)));
-        return component::Root::New(cx)
-            ->Child(scroller)
-            ->IntoEl();
+        scroller->Child(StoryContainerBody(app, cx, frame));
+        return scroller;
     }
-    // The window's outermost view is a Root, which is what Rust puts under
-    // every window: the page, and over it the layers the window owns.
     El* root = Div(frame)->FlexCol()->SizeFull();
     // build_menus() once: the OS menu bar is installed from it when something
     // in it has moved, the title bar draws it, and the root answers for every
@@ -1868,8 +1944,7 @@ El* StoryApp::Render(StoryApp* app, Ctx* cx) {
                            ->ScrollId(PageScrollId())
                            ->OnScroll(Listen(cx, &OnPaneScroll))
                            ->W(kFill);
-        scroller->Child(Div(frame)->Pad(16)->W(kFill)->Child(
-            StoryRenderRegistered(app, cx)));
+        scroller->Child(StoryContainerBody(app, cx, frame));
         main->Child(scroller);
     }
     body->Child(main);
@@ -1894,12 +1969,7 @@ El* StoryApp::Render(StoryApp* app, Ctx* cx) {
                         ->Right(0)
                         ->Child(FpsMonitorEl(cx)));
     }
-    // Bordered only where the window is client-decorated; a system frame
-    // draws its own, and Rust's window_border is the Linux CSD wrapper.
-    return component::Root::New(cx)
-        ->Bordered(cx->win->opts.clientTitleBar)
-        ->Child(root)
-        ->IntoEl();
+    return root;
 }
 
 static void OnUnhandledClick(StoryApp* app, Ctx* cx, const ClickEvent* ev) {
@@ -1965,8 +2035,8 @@ int GpuiMain(int argc, char** argv) {
     // cx.set_app_identity(..): what the platform calls the application when it
     // shows one of its notifications. Windows names the notification area icon
     // with it; the other backends do not have one to name yet.
-    SysNotifySetAppIdentity(StrL("com.longbridge.gpui-kit.story"),
-                            StrL("GPUI Kit"));
+    SysNotifySetAppIdentity(StrL("com.longbridge.gpui-component.story"),
+                            StrL("GPUI Component"));
     bool dark = false;
     for (int i = 1; i < argc; i++) {
         dark |= argv[i] && base::StrEq(Str(argv[i]), StrL("--dark"));
@@ -1975,6 +2045,11 @@ int GpuiMain(int argc, char** argv) {
     AssetsClear();
     AssetsAddDefaultRoots(Str{});
     AssetsAddRoot(StrL("assets"));
+    // themes::init: ThemeRegistry::watch_dir("./themes"), so a theme file
+    // edited while the gallery is open is re-applied without a restart. Rust
+    // skips the call on wasm; here it still loads the folder there and the
+    // watch reports itself unsupported.
+    ThemeRegistryWatchDir(app, StrL("themes"));
 
     // A theme out of the registry named in the environment, so a screenshot
     // of one is reproducible the way GPUI_TODAY makes the calendar's today.
@@ -1997,11 +2072,14 @@ int GpuiMain(int argc, char** argv) {
     // Rust Gallery::set_active_story puts the launch name in the sidebar
     // search box so the list filters to matching titles.
     if (slug) {
+        const Root* root = Root::Read(win);
         Entity<StoryApp> view;
-        view.id = win->root;
+        view.id = root ? root->View() : EntityId{};
         StoryApp* self = view.Get(app);
-        const StoryInfo* m = StoryMeta(self->story);
-        InputSetValue(&self->search, Str(m->title));
+        if (self) {
+            const StoryInfo* m = StoryMeta(self->story);
+            InputSetValue(&self->search, Str(m->title));
+        }
     }
     int rc = AppRun(app);
     AppFree(app);

@@ -10,7 +10,14 @@ struct ChartStory {
     bool seeded = false;
     Size viewport = {800, 600};
     float scrollY = 0;
+    // Bumped by the replay button. The gallery is keyed on it, so every
+    // chart gets fresh element state and draws in again.
+    uint64_t appearGeneration = 0;
     static El* Render(ChartStory* self, Ctx* cx);
+    static void OnReplay(ChartStory* self, Ctx* cx, const ClickEvent*) {
+        self->appearGeneration++;
+        Notify(cx);
+    }
     static void OnScroll(ChartStory* self, Ctx* cx, const ScrollEvent* ev) {
         self->scrollY = ev->offsetY;
         Notify(cx);
@@ -47,8 +54,8 @@ static float VisitorWeekChange() {
     double latest = 0, previous = 0;
     for (int i = kDailyDeviceCount - window; i < kDailyDeviceCount; i++)
         latest += (double)kDailyDesktop[i] + kDailyMobile[i];
-    for (int i = kDailyDeviceCount - window * 2;
-         i < kDailyDeviceCount - window; i++)
+    for (int i = kDailyDeviceCount - window * 2; i < kDailyDeviceCount - window;
+         i++)
         previous += (double)kDailyDesktop[i] + kDailyMobile[i];
     return previous == 0 ? 0 : (float)((latest - previous) / previous * 100.);
 }
@@ -80,6 +87,45 @@ static const char* Money(Ctx* cx, float value) {
         return StoryFmt(cx, "-$%s", Compact(cx, -value)).s;
     }
     return StoryFmt(cx, "$%s", Compact(cx, value)).s;
+}
+
+// money, as a chart's tick format: compact with a dollar sign, the sign in
+// front of it.
+static Str MoneyTick(Arena* a, double value, void*) {
+    double mag = value < 0 ? -value : value;
+    Str sign = value < 0 ? StrL("-") : StrL("");
+    if (mag >= 1000000.0) {
+        return StrDup(a, fmt("%s$%.1fM", sign, mag / 1000000.0));
+    }
+    if (mag >= 10000.0) {
+        return StrDup(a, fmt("%s$%.0fK", sign, mag / 1000.0));
+    }
+    if (mag >= 1000.0) {
+        return StrDup(a, fmt("%s$%.1fK", sign, mag / 1000.0));
+    }
+    return StrDup(a, fmt("%s$%.0f", sign, mag));
+}
+
+// tooltip_value(|_, value| money(value)): a tooltip row's value in money.
+static Str MoneyValue(Arena* a, int, int, double value, void*) {
+    return MoneyTick(a, value, nullptr);
+}
+
+// tooltip_value(|_, _, value| format!("${value:.2}")): a price to the cent.
+static Str PriceValue(Arena* a, int, int, double value, void*) {
+    return StrDup(a, fmt("$%.2f", value));
+}
+
+// tooltip_title(|d| format!("{} 2025", d.month)).
+static Str MonthOf2025(Arena* a, int index, void*) {
+    return StrDup(a, fmt("%s 2025", Str(kMonthlyMonth[index])));
+}
+
+// tooltip_value_color: the bullish colour for a gain, the bearish one for a
+// loss; `user` is the pair.
+static Rgba SignColor(int, int, double value, void* user) {
+    const Rgba* colors = (const Rgba*)user;
+    return value >= 0 ? colors[0] : colors[1];
 }
 
 static const char* TrendLine(Ctx* cx, float percent, const char* period) {
@@ -125,15 +171,21 @@ struct ChartLegend {
     const char* label;
 };
 
+// chart_story.rs legend: it shares the heading row with the title, so it
+// yields width rather than holding its own — shrinking lets the wrap fold a
+// long series list onto another line instead of running out past the card.
+// Each swatch-and-label pair keeps its width, so a wrap never parts them.
 static El* LegendRow(Ctx* cx, const ChartLegend* legend, int n, bool center) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
-    El* row = Div(a)->FlexRow()->FlexWrap()->Gap(12)->Shrink0();
+    El* row = Div(a)->FlexRow()->FlexWrap()->Gap(12);
     if (center) {
         row->JustifyCenter();
+    } else {
+        row->JustifyEnd();
     }
     for (int i = 0; i < n; i++) {
-        El* item = Div(a)->FlexRow()->Gap(6)->ItemsCenter();
+        El* item = Div(a)->FlexRow()->Shrink0()->Gap(6)->ItemsCenter();
         item->Child(Div(a)->W(8)->H(8)->Radius(2)->Bg(legend[i].color));
         item->Child(StoryTxt(cx, Str(legend[i].label), 12, th.mutedFg));
         row->Child(item);
@@ -156,7 +208,9 @@ static El* ChartCard(Ctx* cx, const char* title, const char* period, El* chart,
                    ->Pad(16)
                    ->Radius(th.radiusLg)
                    ->Border(1, th.border);
-    El* titles = Div(a)->FlexCol();
+    // The heading holds its width; the legend beside it is what gives way
+    // and wraps.
+    El* titles = Div(a)->FlexCol()->Shrink0();
     if (center) {
         titles->ItemsCenter();
     }
@@ -184,13 +238,27 @@ static El* ChartCard(Ctx* cx, const char* title, const char* period, El* chart,
     El* foot1 = StoryTxt(cx, Str(headline), 14, th.foreground)->Semibold();
     if (StrStartsWith(Str(headline), "Trending ")) {
         bool down = StrStartsWith(Str(headline), "Trending down");
-        Str arrow = down
-            ? StrL("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M16 17h6v-6\"/><path d=\"m22 17-8.5-8.5-5 5L2 7\"/></svg>")
-            : StrL("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m22 7-8.5 8.5-5-5L2 17\"/><path d=\"M16 7h6v6\"/></svg>");
-        foot1 = Div(a)->FlexRow()->ItemsCenter()->Gap(6)
-            ->Child(foot1)
-            ->Child(component::Icon::Empty(cx)->Data(arrow)->Size(16)
-                        ->Color(down ? th.red : th.green)->IntoEl());
+        Str arrow =
+            down ? StrL(
+                       "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" "
+                       "height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" "
+                       "stroke=\"currentColor\" stroke-width=\"2\" "
+                       "stroke-linecap=\"round\" "
+                       "stroke-linejoin=\"round\"><path d=\"M16 "
+                       "17h6v-6\"/><path d=\"m22 17-8.5-8.5-5 5L2 7\"/></svg>")
+                 : StrL(
+                       "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" "
+                       "height=\"24\" viewBox=\"0 0 24 24\" fill=\"none\" "
+                       "stroke=\"currentColor\" stroke-width=\"2\" "
+                       "stroke-linecap=\"round\" "
+                       "stroke-linejoin=\"round\"><path d=\"m22 7-8.5 "
+                       "8.5-5-5L2 17\"/><path d=\"M16 7h6v6\"/></svg>");
+        foot1 = Div(a)->FlexRow()->ItemsCenter()->Gap(6)->Child(foot1)->Child(
+            component::Icon::Empty(cx)
+                ->Data(arrow)
+                ->Size(16)
+                ->Color(down ? th.red : th.green)
+                ->IntoEl());
     }
     El* foot2 = StoryTxt(cx, Str(note), 14, th.mutedFg);
     if (center) {
@@ -252,14 +320,24 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                 pie->Slice(kBrowserShare[i], c);
                 legend[i] = {c, kBrowserName[i]};
             }
-            El* donut = Div(a)->W(180)->H(180)
-                ->Child(pie->IntoEl());
-            donut->Child(Div(a)->Absolute()->Left(0)->Top(0)
-                ->W(180)->H(180)->FlexCol()->ItemsCenter()->JustifyCenter()
-                ->Child(StoryTxt(cx, StoryFmt(cx, "%.0f%%",
-                                    (double)kBrowserShare[0]), 24,
-                                 th.foreground)->Semibold())
-                ->Child(StoryTxt(cx, Str(kBrowserName[0]), 12, th.mutedFg)));
+            El* donut = Div(a)->W(180)->H(180)->Child(pie->IntoEl());
+            donut
+                ->Child(Div(a)
+                            ->Absolute()
+                            ->Left(0)
+                            ->Top(0)
+                            ->W(180)
+                            ->H(180)
+                            ->FlexCol()
+                            ->ItemsCenter()
+                            ->JustifyCenter()
+                            ->Child(StoryTxt(cx,
+                                             StoryFmt(cx, "%.0f%%",
+                                                      (double)kBrowserShare[0]),
+                                             24, th.foreground)
+                                        ->Semibold())
+                            ->Child(StoryTxt(cx, Str(kBrowserName[0]), 12,
+                                             th.mutedFg)));
             return ChartCard(
                 cx, "Browser Share", "June 2025", donut, true,
                 StoryFmt(cx, "%s leads by %.0f points", kBrowserName[0],
@@ -299,6 +377,7 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                 pie->Slice(kRegionRevenue[i],
                            Shade(color, ColorIndex(kRegionName[i])));
                 pie->Label(Str(kRegionName[i]));
+                pie->TooltipName(Str(kRegionName[i]));
             }
             return ChartCard(
                 cx, "Revenue by Region", "Q2 2025", pie->IntoEl(), true,
@@ -441,6 +520,11 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                     ->Tooltip(StrL("Revenue"))
                     ->Radius(6)
                     ->TickMargin(1)
+                    ->ValueAxis()
+                    ->ValueTickCount(3)
+                    ->ValueTickFormat(&MoneyTick)
+                    ->GridDashed(false)
+                    ->BandTickCount(6)
                     ->IntoEl()
                     ->W(kFill)
                     ->H(kFill),
@@ -456,13 +540,27 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
             // Bar Chart - Negative values: the monthly figures recentred on
             // their mean, so the bars have a mix of signs to draw around the
             // zero line, and the value axis switched on beside them.
+            // Each bar, and its label, in the bullish or bearish colour of
+            // its sign.
             const float* variations = self->variations;
+            Rgba* signs = (Rgba*)Alloc(a, sizeof(Rgba) * kMonthlyDeviceCount);
+            Rgba* signColors = (Rgba*)Alloc(a, sizeof(Rgba) * 2);
+            signColors[0] = th.chartBullish;
+            signColors[1] = th.chartBearish;
+            for (int i = 0; i < kMonthlyDeviceCount; i++) {
+                signs[i] =
+                    variations[i] >= 0 ? th.chartBullish : th.chartBearish;
+            }
             return ChartCard(
                 cx, "Bar Chart - Negative values",
                 component::BarChart::New(cx, variations, kMonthlyDeviceCount)
-                    ->Fill(th.chart1)
+                    ->Fills(signs)
+                    ->LabelColors(signs)
                     ->Labels(kMonthlyMonth)
                     ->Tooltip(StrL("Variation"))
+                    ->TooltipTitle(&MonthOf2025)
+                    ->TooltipValue(&MoneyValue)
+                    ->TooltipValueColor(&SignColor, signColors)
                     ->TickMargin(1)
                     ->LabelValues()
                     ->ValueAxis()
@@ -484,6 +582,8 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                                  ->Fills(mixed)
                                  ->Labels(kMonthlyMonth)
                                  ->TickMargin(1)
+                                 ->PaddingInner(0.6f)
+                                 ->PaddingOuter(0.1f)
                                  ->IntoEl()
                                  ->W(kFill)
                                  ->H(kFill),
@@ -515,7 +615,8 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                     component::BarChart::New(cx, tops, kStackDays)
                         ->Fill(kStackColors[k])
                         ->Base(base)
-                        ->Padding(0.4f)
+                        ->PaddingInner(0.4f)
+                        ->PaddingOuter(0.2f)
                         ->Radius(0)
                         ->TickMargin(1)
                         ->Labels(kDailyDate);
@@ -613,11 +714,15 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
             };
             const GradCard& gc = kGrads[index - 18];
             {
+                component::BarChart* bar = component::BarChart::New(
+                    cx, kMonthlyDesktop, kMonthlyDeviceCount);
+                // Rust's Downloads card labels four of its bands.
+                if (index == 18) {
+                    bar->BandTickCount(4);
+                }
                 return ChartCard(
                     cx, gc.title,
-                    component::BarChart::New(cx, kMonthlyDesktop,
-                                             kMonthlyDeviceCount)
-                        ->Labels(kMonthlyMonth)
+                    bar->Labels(kMonthlyMonth)
                         ->TickMargin(1)
                         ->Alignment(gc.align)
                         ->LabelValues()
@@ -652,6 +757,10 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                                  ->Labels(kMonthlyMonth)
                                  ->Tooltip(StrL("Desktop"))
                                  ->TickMargin(1)
+                                 ->YAxis()
+                                 ->YTickFormat(&MoneyTick)
+                                 ->XTickCount(4)
+                                 ->TooltipValue(&MoneyValue)
                                  ->IntoEl()
                                  ->W(kFill)
                                  ->H(kFill),
@@ -702,8 +811,7 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
 
         case 28:
         case 29:
-        case 30:
-        case 31: {
+        case 30: {
             // The four single-series area charts, which differ only in how the
             // run of points is joined and what is under it.
             struct AreaCard {
@@ -712,9 +820,10 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                 bool gradient;
             };
             static const AreaCard kAreas[] = {
+                // Rust's Storage Used step-after card is gone (upstream
+                // 8ed5dd50).
                 {"Area Chart", 0, false},
                 {"Area Chart - Linear", 1, false},
-                {"Area Chart - Step After", 2, false},
                 {"Area Chart - Linear Gradient", 0, true},
             };
             const AreaCard& ac = kAreas[index - 28];
@@ -741,16 +850,52 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
             }
         }
 
+        case 31: {
+            // Intraday Price: the first four fifths of a trading day's minute
+            // prices, on an axis laid out for the whole session and a y axis
+            // pinned a quarter of the range below the low.
+            const int kMinutes = kIntradayCount * 4 / 5;
+            float low = kIntradayPrice[0];
+            float high = kIntradayPrice[0];
+            for (int i = 1; i < kMinutes; i++) {
+                low = std::min(low, kIntradayPrice[i]);
+                high = std::max(high, kIntradayPrice[i]);
+            }
+            float open = kIntradayPrice[0];
+            float last = kIntradayPrice[kMinutes - 1];
+            return ChartCard(
+                cx, "Intraday Price", "Today, in progress",
+                component::AreaChart::New(cx, kIntradayPrice, kMinutes)
+                    ->Labels(kIntradayTime)
+                    ->Stroke(th.chart2)
+                    ->Fill(RgbaOpacity(th.chart2, 0.45f),
+                           RgbaOpacity(th.chart2, 0.f))
+                    ->Linear()
+                    ->YDomain(low - (high - low) / 4.f, high)
+                    ->PointCount(kIntradayCount)
+                    ->XTickCount(4)
+                    ->Tooltip(StrL("Price"))
+                    ->Id(StrL("area-chart-in-progress"))
+                    ->IntoEl()
+                    ->W(kFill)
+                    ->H(kFill),
+                false,
+                TrendLine(cx, ChangePercent(last, open), "since the open"),
+                "A pinned y axis, and room for the minutes still to come");
+        }
+
         case 32: {
-            // The candlesticks, off stock-prices.json.
+            // The candlesticks, off stock-prices.json. Forty sessions do not
+            // fit forty labels, so every card thins them.
             return ChartCard(cx, "Candlestick Chart",
                              component::CandlestickChart::New(
                                  cx, kStockOpen, kStockHigh, kStockLow,
                                  kStockClose, kStockPriceCount)
                                  ->Tooltip(StrL("Price"))
+                                 ->TooltipValue(&PriceValue)
                                  ->Colors(th.chartBullish, th.chartBearish)
                                  ->Labels(kStockDate)
-                                 ->TickMargin(1)
+                                 ->TickMargin(5)
                                  ->IntoEl()
                                  ->W(kFill)
                                  ->H(kFill),
@@ -767,9 +912,9 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                 int tickMargin;
             };
             static const CandleCard kCandles[] = {
-                {"Candlestick Chart - Narrow", 0.5f, 1},
-                {"Candlestick Chart - Wide", 1.0f, 1},
-                {"Candlestick Chart - Tick Margin", 0.8f, 2},
+                {"Candlestick Chart - Narrow", 0.5f, 5},
+                {"Candlestick Chart - Wide", 1.0f, 5},
+                {"Candlestick Chart - Tick Margin", 0.8f, 10},
             };
             const CandleCard& cc = kCandles[index - 33];
             {
@@ -778,6 +923,7 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                                      cx, kStockOpen, kStockHigh, kStockLow,
                                      kStockClose, kStockPriceCount)
                                      ->Tooltip(StrL("Price"))
+                                     ->TooltipValue(&PriceValue)
                                      ->Colors(th.chartBullish, th.chartBearish)
                                      ->Labels(kStockDate)
                                      ->TickMargin(cc.tickMargin)
@@ -814,6 +960,10 @@ static El* RenderChartCard(Ctx* cx, ChartStory* self, int index) {
                     Str value =
                         StoryFmt(cx, "$%.2fB", node.value / 1000000000.0);
                     if (st == 0) {
+                        // `labels` draws the node text but never reaches
+                        // the tooltip, so the tooltip needs its own name and
+                        // value.
+                        sk->TooltipName(Str(node.name))->TooltipValue(value);
                         sk->CustomLabel(component::SankeyLabel::New(value));
                         if (node.growth != kTslaNoGrowth) {
                             bool up = node.growth >= 0;
@@ -883,14 +1033,18 @@ El* ChartStory::Render(ChartStory* self, Ctx* cx) {
         card += sectionCounts[section];
     }
     sizes[count - 1] -= 16;
-    float total = 32 + VirtualListContentSize(sizes, count);
+    // The list's bottom inset only: the toolbar above holds the top gap.
+    float total = 16 + VirtualListContentSize(sizes, count);
     self->scrollY =
         std::max(0.f, std::min(self->scrollY, total - self->viewport.h));
     // One card's height of overscan on both sides, as upstream ListState.
     VirtualRange visible = VirtualListVisibleRange(
-        sizes, count, self->scrollY - 16 - 400, self->viewport.h + 800);
+        sizes, count, self->scrollY - 400, self->viewport.h + 800);
     El* content = Div(cx->a)->W(kFill)->H(total)->Shrink0();
-    float y = 16 + VirtualListItemOrigin(sizes, count, visible.first);
+    float y = VirtualListItemOrigin(sizes, count, visible.first);
+    // ElementId::NamedInteger("chart-gallery", appear_generation).
+    IdScope gallery(cx, StoryFmt(cx, "chart-gallery-%llu",
+                                 (unsigned long long)self->appearGeneration));
     for (int i = visible.first; i < visible.end; i++) {
         El* row = Div(cx->a)
                       ->Absolute()
@@ -914,8 +1068,9 @@ El* ChartStory::Render(ChartStory* self, Ctx* cx) {
         content->Child(row);
         y += sizes[i];
     }
-    El* root = Div(cx->a)
-                   ->SizeFull()
+    El* list = Div(cx->a)
+                   ->Flex1()
+                   ->W(kFill)
                    ->MinH(0)
                    ->ClipY()
                    ->ScrollY(self->scrollY)
@@ -924,9 +1079,17 @@ El* ChartStory::Render(ChartStory* self, Ctx* cx) {
                    ->Child(content);
     auto* owner = ArenaNew<Entity<ChartStory>>(cx->a);
     owner->id = cx->self;
-    root->customPaint = &ChartStory::Measure;
-    root->customUser = owner;
-    return root;
+    list->customPaint = &ChartStory::Measure;
+    list->customUser = owner;
+    // The toolbar stays put while the gallery scrolls under it, so the gap
+    // below it belongs to the toolbar, not to the list's padding.
+    El* group = StoryToolbarGroup(cx);
+    group->Child(StoryToolbarButton(cx, StrL("chart-replay"),
+                                    IconName::RotateCw, StrL("Replay"),
+                                    Listen(cx, &ChartStory::OnReplay)));
+    El* toolbar = Div(cx->a)->W(kFill)->PadX(16)->PadT(16)->PadB(16)->Child(
+        Div(cx->a)->FlexRow()->W(kFill)->JustifyEnd()->Child(group));
+    return Div(cx->a)->FlexCol()->SizeFull()->Child(toolbar)->Child(list);
 }
 
 STORY_PAGE(StoryChart, ChartStory);

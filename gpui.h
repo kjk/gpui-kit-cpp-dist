@@ -1060,6 +1060,21 @@ struct LocalDate {
 LocalDate DateToday();
 LocalDate DateAddDays(LocalDate base, int days);
 
+struct LocalTime {
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+inline bool operator==(LocalTime a, LocalTime b) {
+    return a.hour == b.hour && a.minute == b.minute && a.second == b.second;
+}
+inline bool operator!=(LocalTime a, LocalTime b) {
+    return !(a == b);
+}
+
+LocalTime TimeOfDayNow();
+
 void StrFree(Str s);
 void StrFree(const char*) = delete;
 
@@ -3353,6 +3368,8 @@ inline bool BackgroundIsSolid(const Background& b) {
 
 struct InputState;
 
+struct RangeDecorationsState;
+
 constexpr float kAuto = -1.f;
 constexpr float kFill = -2.f;
 constexpr float kPi = 3.14159265358979f;
@@ -3449,6 +3466,9 @@ struct KeyedSlot {
     DropFn drop = nullptr;
 
     EntityId entity = {};
+
+    uint64_t frame = 0;
+    bool frameScoped = false;
 };
 
 enum class MouseButton : uint8_t {
@@ -3496,7 +3516,9 @@ enum class TouchHostKind : uint8_t {
     LongPress,
     Scroll,
     BarDrag,
-    HandleDrag
+    HandleDrag,
+
+    SliderDrag
 };
 
 struct OngoingScroll {
@@ -3732,6 +3754,12 @@ struct KeyEvent {
 
     bool function = false;
 
+    bool held = false;
+
+    bool preferCharacterInput = false;
+
+    bool imeInProgress = false;
+
     bool propagate = true;
 };
 
@@ -3745,7 +3773,23 @@ enum class CursorKind : uint8_t {
 
     RowResize,
 
-    Crosshair
+    Crosshair,
+    ClosedHand,
+    OpenHand,
+    ResizeLeft,
+    ResizeRight,
+    ResizeLeftRight,
+    ResizeUp,
+    ResizeDown,
+    ResizeUpDown,
+    ResizeUpLeftDownRight,
+    ResizeUpRightDownLeft,
+    IBeamVertical,
+    NotAllowed,
+    DragLink,
+    DragCopy,
+    ContextMenu,
+    Count
 };
 
 struct TickEvent {
@@ -3857,7 +3901,9 @@ Bounds ObjectFitBounds(ObjectFit fit, Bounds bounds, Size imageSize);
 
 enum class Display : uint8_t {
     Block,
-    Flex
+    Flex,
+    Grid,
+    None
 };
 
 enum class FlexDir : uint8_t {
@@ -3872,14 +3918,20 @@ enum class FlexAlign : uint8_t {
     Start,
     Center,
     End,
-    Stretch
+    Stretch,
+    Baseline,
+
+    Normal
 };
 enum class Justify : uint8_t {
     Start,
     Center,
     End,
     SpaceBetween,
-    SpaceAround
+    SpaceAround,
+    SpaceEvenly,
+
+    Normal
 };
 
 enum class Overflow : uint8_t {
@@ -3899,6 +3951,8 @@ struct RuntimeStyle {
     Rgba foreground{Rgb(0x17, 0x17, 0x17)};
     Rgba mutedForeground{Rgb(0x73, 0x73, 0x73)};
     Rgba border{Rgb(0xe5, 0xe5, 0xe5)};
+
+    Rgba chartGrid{Rgba8(0xe5, 0xe5, 0xe5, 0x99)};
     Rgba ring{Rgb(0x17, 0x17, 0x17)};
     Rgba inspectorAccent{Rgb(0x3b, 0x82, 0xf6)};
     Rgba popover{Rgb(0xfa, 0xfa, 0xfa)};
@@ -4012,6 +4066,7 @@ enum class IconName : uint8_t {
     ArrowRight,
     ArrowUp,
     Asterisk,
+    Ban,
     Battery,
     BatteryCharging,
     BatteryFull,
@@ -4031,6 +4086,7 @@ enum class IconName : uint8_t {
     ChevronRight,
     ChevronUp,
     ChevronsUpDown,
+    CircleAlert,
     CircleCheck,
     CircleUser,
     CircleX,
@@ -4084,6 +4140,7 @@ enum class IconName : uint8_t {
     Plus,
     Redo,
     Redo2,
+    RefreshCw,
     Replace,
     ResizeCorner,
     RotateCw,
@@ -4128,6 +4185,36 @@ struct TextSpan {
     bool wavy = false;
 };
 
+struct TextFade {
+    int lo = 0;
+    int hi = 0;
+    float fadeOut = 0;
+};
+
+Rgba TextFadeColor(Rgba c, float fadeOut);
+
+int TextFadeSpans(Arena* a, int textLen, Rgba base, const TextSpan* spans,
+                  int nSpans, const TextFade* fades, int nFades,
+                  const TextSpan** out);
+
+struct WhitespaceMark {
+    int off = 0;
+    float x = 0;
+    float y = 0;
+    float h = 0;
+    bool tab = false;
+};
+
+typedef int (*WhitespaceRectsFn)(void* ud, int lo, int hi, Bounds* out,
+                                 int max);
+typedef void (*WhitespaceMarkFn)(void* ud, const WhitespaceMark* m);
+
+int WhitespaceMarksVisit(Str s, float spaceMarkW, WhitespaceRectsFn rects,
+                         WhitespaceMarkFn emit, void* ud);
+
+int IndentGuideXs(float indentWidth, int indentCount, int tabSize, float* out,
+                  int max);
+
 enum class ChartKind : uint8_t {
     Area,
     Line,
@@ -4158,6 +4245,41 @@ struct ChartSeriesExtra {
     Str name = {};
 };
 
+enum class AxisLabelPlacement : uint8_t {
+    Outside,
+    Inside
+};
+
+using ChartTickFormatFn = Str (*)(Arena* a, double value, void* user);
+
+using ChartTooltipTitleFn = Str (*)(Arena* a, int index, void* user);
+using ChartTooltipValueFn = Str (*)(Arena* a, int index, int row, double value,
+                                    void* user);
+using ChartTooltipValueColorFn = Rgba (*)(int index, int row, double value,
+                                          void* user);
+
+struct ChartTooltipContent {
+    ChartTooltipTitleFn title = nullptr;
+    void* titleUser = nullptr;
+    ChartTooltipValueFn value = nullptr;
+    void* valueUser = nullptr;
+    ChartTooltipValueColorFn valueColor = nullptr;
+    void* valueColorUser = nullptr;
+
+    bool TitleText(Arena* a, int index, Str fallback, bool hasFallback,
+                   Str* out) const;
+
+    Str ValueText(Arena* a, int index, int row, double value) const;
+
+    bool ValueColor(int index, int row, double value, Rgba* out) const;
+};
+
+Str ChartFormatValue(Arena* a, double value);
+
+struct ChartSeries;
+
+Rgba ChartBarTooltipColor(const ChartSeries& c, int index);
+
 struct ChartSeries {
     ChartKind kind = ChartKind::Area;
     const float* ys = nullptr;
@@ -4177,6 +4299,33 @@ struct ChartSeries {
     float domainMin = 0;
     float domainMax = 0;
 
+    bool pinnedDomain = false;
+
+    int pointCount = 0;
+
+    bool yAxis = false;
+
+    AxisLabelPlacement axisLabelPlacement = AxisLabelPlacement::Outside;
+
+    int yTickCount = 5;
+
+    ChartTickFormatFn tickFormat = nullptr;
+    void* tickFormatUser = nullptr;
+
+    int xTickCount = -1;
+
+    int gridColumns = 0;
+
+    bool gridDashed = true;
+
+    float yPaddingTop = 10;
+    float yPaddingBottom = 0;
+
+    const double* referenceLines = nullptr;
+    int nReferenceLines = 0;
+
+    int bandCount = 0;
+
     const float* opens = nullptr;
     const float* highs = nullptr;
     const float* lows = nullptr;
@@ -4184,6 +4333,9 @@ struct ChartSeries {
     Rgba down = {};
 
     float bandPadding = 0.2f;
+    float bandPaddingOuter = 0.1f;
+
+    float maxBandWidth = 30.f;
     float barRadius = 4;
     BarAlign barAlign = BarAlign::Bottom;
 
@@ -4191,9 +4343,13 @@ struct ChartSeries {
 
     bool barLabels = false;
 
+    const Rgba* barLabelColors = nullptr;
+
+    float barMinLength = 0;
+
     bool valueAxis = false;
 
-    int valueTickCount = 4;
+    int valueTickCount = 5;
 
     const Rgba* barFills = nullptr;
 
@@ -4212,9 +4368,20 @@ struct ChartSeries {
     float radarRadius = 0;
     int gridLevels = 4;
 
+    bool grid = true;
+
+    bool xAxis = true;
+
     bool tooltip = false;
 
+    uint32_t id = 0;
+
+    bool appear = false;
+    uint64_t appearGeneration = 0;
+
     Str name = {};
+
+    ChartTooltipContent tooltipContent = {};
 };
 
 struct Corners {
@@ -4236,6 +4403,17 @@ enum class FontWeight : uint16_t {
     Bold = 700,
     ExtraBold = 800,
     Black = 900
+};
+
+enum class TextAlign : uint8_t {
+    Left,
+    Center,
+    Right,
+};
+
+enum class FontFeatures : uint8_t {
+    Default,
+    TabularFigures,
 };
 
 enum class Anchor : uint8_t {
@@ -4264,6 +4442,22 @@ AnchoredPosition AnchoredCornerResolve(Anchor anchor, Point at, Size popup,
                                        Size view, float margin);
 AnchoredPosition AnchoredCornerResolve(Anchor anchor, Point at, Size popup,
                                        Size view, Edges margin);
+
+struct AnchoredPlacedHook {
+    void (*fn)(void* user, AnchoredPosition position, Bounds trigger) = nullptr;
+    void* user = nullptr;
+};
+
+Point AnchorPosition(Anchor anchor, Bounds trigger, float offset);
+
+enum class FocusLine : uint8_t {
+
+    Edge,
+
+    Inside,
+
+    Outside,
+};
 
 struct Style {
 
@@ -4316,6 +4510,7 @@ struct Style {
 
     float dashOn = 2;
     float dashOff = 1;
+
     float anchorGap = 0;
     float anchorMargin = 4;
 
@@ -4381,12 +4576,14 @@ struct Style {
     uint16_t fontWeight = 0;
     Display display = Display::Block;
     FlexDir dir = FlexDir::Row;
-    FlexAlign align = FlexAlign::Stretch;
+    FlexAlign align = FlexAlign::Normal;
 
     FlexAlign alignSelf = FlexAlign::Stretch;
-    Justify justify = Justify::Start;
+    Justify justify = Justify::Normal;
     Overflow overflowY = Overflow::Visible;
     Overflow overflowX = Overflow::Visible;
+
+    uint8_t marginAuto = 0;
 
     int zIndex = 0;
 
@@ -4400,12 +4597,75 @@ struct Style {
 
     bool focusOnPress = false;
 
-    bool focusRing = false;
+    bool focusRing : 1 = false;
+
+    uint8_t focusLine : 2 = (uint8_t)FocusLine::Edge;
+
+    uint8_t textAlign : 2 = 0;
+
+    uint8_t fontFeatures : 2 = 0;
 
     int8_t tooltipPlacement = -1;
+
+    uint8_t alignContent = 0;
+
+    uint8_t flexWrapReverse : 1 = false;
+
+    uint8_t invisible : 1 = false;
+
+    uint8_t whiteSpaceSet : 1 = false;
+
+    uint8_t flexBasisPercent : 1 = false;
+
+    uint8_t gridColStartLine : 1 = false;
+    uint8_t gridColEndLine : 1 = false;
+    uint8_t gridRowStartLine : 1 = false;
+    uint8_t gridRowEndLine : 1 = false;
+
+    uint16_t relLengths = 0;
+
+    float heightFrac = 0;
+
+    Rgba textBg = {0, 0, 0, 0};
+
+    uint8_t underlineThickness = 1;
+    uint8_t hasTextBg : 1 = false;
+
+    uint8_t underlineSet : 1 = false;
+    uint8_t underlineWavy : 1 = false;
+
+    uint8_t textOverflow : 2 = 0;
+
+    uint8_t fontFamily = 0;
 };
 
-static_assert(sizeof(Style) <= 416, "keep Style members packed by alignment");
+enum : uint8_t {
+    kMarginAutoL = 1,
+    kMarginAutoR = 2,
+    kMarginAutoT = 4,
+    kMarginAutoB = 8,
+};
+
+enum : uint16_t {
+    kRelMinW = 1 << 0,
+    kRelMinH = 1 << 1,
+    kRelMaxH = 1 << 2,
+    kRelPadL = 1 << 3,
+    kRelPadR = 1 << 4,
+    kRelPadT = 1 << 5,
+    kRelPadB = 1 << 6,
+    kRelMarginL = 1 << 7,
+    kRelMarginR = 1 << 8,
+    kRelMarginT = 1 << 9,
+    kRelMarginB = 1 << 10,
+    kRelGapX = 1 << 11,
+    kRelGapY = 1 << 12,
+    kRelPad = kRelPadL | kRelPadR | kRelPadT | kRelPadB,
+    kRelMargin = kRelMarginL | kRelMarginR | kRelMarginT | kRelMarginB,
+    kRelGap = kRelGapX | kRelGapY,
+};
+
+static_assert(sizeof(Style) <= 432, "keep Style members packed by alignment");
 
 struct ActionSlot {
     uint32_t action = 0;
@@ -4442,6 +4702,20 @@ struct SelSource {
     Str post;
 
     const SelBlock* block = nullptr;
+};
+
+struct SourceSegment {
+    int renderedStart = 0;
+    int renderedEnd = 0;
+    int sourceStart = 0;
+    int sourceEnd = 0;
+};
+
+struct SelSourceMap {
+    const SourceSegment* segments = nullptr;
+    int count = 0;
+    int offset = 0;
+    bool atomic = false;
 };
 
 struct FocusHandle {
@@ -4669,12 +4943,15 @@ enum class AccessibilityAction : uint8_t {
 struct AccessibilityInfo {
     AccessibilityRole role = AccessibilityRole::None;
 
-    Str authorId = {};
-    Str label = {};
-    Str value = {};
-    Str placeholder = {};
     AccessibilityToggled toggled = AccessibilityToggled::Unset;
     AccessibilityOrientation orientation = AccessibilityOrientation::Unset;
+
+    Str authorId = {};
+    Str label = {};
+
+    Str description = {};
+    Str value = {};
+    Str placeholder = {};
     float numericValue = 0;
     float minNumericValue = 0;
     float maxNumericValue = 0;
@@ -4706,7 +4983,7 @@ struct AccessibilityInfo {
     unsigned int disabled : 1 = false;
 };
 
-static_assert(sizeof(AccessibilityInfo) <= 128,
+static_assert(sizeof(AccessibilityInfo) <= 136,
               "keep AccessibilityInfo boolean state packed");
 
 struct ElStyleStates {
@@ -4724,6 +5001,17 @@ struct ElStyleStates {
 };
 
 struct Selection;
+struct El;
+
+struct ElRefiner {
+    void (*apply)(El* target, void* user) = nullptr;
+    void* user = nullptr;
+
+    bool IsSet() const { return apply != nullptr; }
+    void Apply(El* target) const {
+        if (apply && target) apply(target, user);
+    }
+};
 
 struct El {
 
@@ -4739,6 +5027,8 @@ struct El {
     ImageSource imageSource;
 
     EntityId imageCache = {};
+
+    uint32_t plotAppearScope = 0;
     Func0 onClick;
 
     Listener listener;
@@ -4786,6 +5076,8 @@ struct El {
 
     void (*prePaint)(PaintCtx* ctx, El* e, void* user) = nullptr;
     void* customUser = nullptr;
+
+    AnchoredPlacedHook* onPlaced = nullptr;
     El* first = nullptr;
     El* last = nullptr;
     El* next = nullptr;
@@ -4804,11 +5096,14 @@ struct El {
     float* caretOutY = nullptr;
 
     const Selection* extraSels = nullptr;
-    int nExtraSels = 0;
     const int* extraCarets = nullptr;
+
+    int nExtraSels = 0;
     int nExtraCarets = 0;
 
     const SelSource* selSrc = nullptr;
+
+    const SelSourceMap* selMap = nullptr;
 
     uint64_t layoutNode = 0;
 
@@ -4825,6 +5120,8 @@ struct El {
     int clickActionFocusId = 0;
 
     ArenaPtr<ElStyleStates> styleStates = {};
+
+    ArenaPtr<TextFade> fades = {};
     float lineSpanHeight = 0;
     float lineClampCap = 0;
 
@@ -4881,6 +5178,12 @@ struct El {
 
     int caretOff = -1;
     Rgba caretColor = {};
+
+    Rgba whitespaceColor = {0, 0, 0, 0};
+
+    Rgba indentGuideColor = {0, 0, 0, 0};
+    int16_t indentGuideCount = 0;
+    uint8_t indentGuideTab = 0;
     float caretW = 2;
     float laidFont = 0;
     float laidMaxW = 0;
@@ -4941,6 +5244,8 @@ struct El {
 
     El* Flex1();
 
+    El* Flex1Rel();
+
     El* FlexNone();
     El* Basis(float v);
 
@@ -4965,6 +5270,8 @@ struct El {
     El* WithLoading(El* loading);
     El* WithFallback(El* fallback);
     El* WithImageCache(EntityId cache);
+
+    El* WithPlotAppearScope(uint32_t key);
     El* H(float v);
     El* SizeFull();
     El* MinH(float v);
@@ -4992,6 +5299,8 @@ struct El {
     El* MarginR(float v);
     El* MarginT(float v);
     El* MarginB(float v);
+
+    El* MlAuto();
     El* ItemsCenter();
     El* ItemsStart();
     El* ItemsEnd();
@@ -5018,6 +5327,13 @@ struct El {
     El* Fg(Rgba c);
     El* Font(float px);
     El* LineHeight(float mult);
+
+    El* TextAlignment(TextAlign align);
+
+    El* FontFeatures(gpui::FontFeatures features);
+    El* TextLeft() { return TextAlignment(TextAlign::Left); }
+    El* TextCenter() { return TextAlignment(TextAlign::Center); }
+    El* TextRight() { return TextAlignment(TextAlign::Right); }
     El* Truncate();
     El* ClipY();
     El* ScrollY(float off);
@@ -5030,6 +5346,8 @@ struct El {
     El* Role(AccessibilityRole role);
     El* AccessibilityId(Str authorId);
     El* AriaLabel(Str label);
+
+    El* AriaDescription(Str description);
     El* AriaValue(Str value);
     El* AriaPlaceholder(Str placeholder);
     El* AriaDisabled(bool disabled = true);
@@ -5110,6 +5428,14 @@ struct El {
     El* RangeOut(int lo, int hi, gpui::Bounds* out);
     El* Washes(const TextSpan* runs, int n);
     El* Underlines(const TextSpan* runs, int n);
+
+    El* Fades(const TextFade* runs, int n);
+
+    const TextFade* FadesGet(int* n) const;
+
+    El* Whitespaces(Rgba color);
+
+    El* IndentGuides(Rgba color, int indentCount, int tabSize);
     El* Spans(const TextSpan* runs, int n);
 
     El* MarkRange(int lo, int hi);
@@ -5121,6 +5447,10 @@ struct El {
     El* Medium();
     El* Weight(FontWeight value);
     El* Mono();
+
+    El* FontFamily(Str name);
+
+    El* FontFamilyId(uint8_t family);
     El* Underline();
     El* Strikethrough();
     El* Italic();
@@ -5128,6 +5458,7 @@ struct El {
     El* SelectionOwner(EntityId owner);
 
     El* SelSrc(const SelSource* s, bool join);
+    El* SelMap(const SelSourceMap* m);
     El* Wrap();
     El* Dashed();
     El* DashArray(float on, float off);
@@ -5141,7 +5472,8 @@ struct El {
     El* AnchorFlip(bool on = true);
     El* AnchorAbove(float gap = 0);
     El* AnchorCenterX();
-    El* AnchorCorner(Anchor anchor, float margin = 4, float offsetY = 0);
+
+    El* AnchorCorner(Anchor anchor, float margin = 4, float offset = 0);
     El* Top(float v);
     El* Left(float v);
     El* Bottom(float v);
@@ -5172,6 +5504,8 @@ struct El {
 
     El* OnKeyDown(Listener fn);
 
+    El* CaptureKeyDown(Listener fn);
+
     El* OnKeyUp(Listener fn);
 
     El* OnScrollWheel(Listener fn);
@@ -5179,6 +5513,8 @@ struct El {
     El* TabStop(bool v);
 
     El* FocusRing(bool v = true);
+
+    El* FocusLineStyle(FocusLine line);
     El* TrapId(int v);
     El* Tip(Str s);
 
@@ -5188,7 +5524,8 @@ struct El {
 
 static_assert(sizeof(unsigned int) == 4,
               "El flags require a four-byte unsigned int");
-static_assert(sizeof(El) <= 1848,
+
+static_assert(sizeof(El) <= 1880,
               "keep El flags packed and members alignment-ordered");
 
 enum class BtnKind : uint8_t {
@@ -5208,6 +5545,9 @@ El* IconEl(Arena* a, IconName name, float size);
 El* ImageEl(Arena* a, Str src, Str alt = {});
 El* ImageEl(Arena* a, ImageSource source, Str alt = {});
 El* ProgressEl(Arena* a, float value01to100, float barW, float barH);
+
+void ChartValueDomain(const ChartSeries& c, float* outMin, float* outMax);
+
 El* ChartEl(Arena* a, const float* ys, int n, Rgba stroke, Rgba fillTop,
             Rgba fillBot, int tickMargin);
 
@@ -5328,10 +5668,14 @@ struct TextHit {
     float font = 14;
     float maxW = 0;
     bool wrap = false;
+
+    TextAlign align = TextAlign::Left;
     int docOff = 0;
     EntityId owner = {};
 
     const SelSource* src = nullptr;
+
+    const SelSourceMap* map = nullptr;
 
     bool join = false;
 
@@ -5373,7 +5717,12 @@ enum StyleField : uint32_t {
     StyleFieldBorderB = 1u << 15,
     StyleFieldBorderL = 1u << 16,
     StyleFieldBorderR = 1u << 17,
-    StyleFieldMargin = 1u << 18
+    StyleFieldMargin = 1u << 18,
+
+    StyleFieldMinWidth = 1u << 19,
+    StyleFieldMinHeight = 1u << 20,
+    StyleFieldMaxWidth = 1u << 21,
+    StyleFieldMaxHeight = 1u << 22
 };
 
 void StyleApplyFields(Style* into, const Style& over, uint32_t fields);
@@ -5628,6 +5977,8 @@ struct UndoTransaction {
 
     int lastBatchLen = 0;
 
+    int recordedChanges = 0;
+
     CursorSelection* selsBefore = nullptr;
     int nSelsBefore = 0;
     CursorSelection* selsAfter = nullptr;
@@ -5835,15 +6186,21 @@ struct FoldRange {
     int endLine = 0;
 };
 
+struct FoldHiddenRows {
+    int start = 0;
+    int end = 0;
+    int hiddenBefore = 0;
+};
+
 struct FoldMap {
 
     Vec<FoldRange> candidates;
 
     Vec<FoldRange> folded;
 
-    Vec<int> visibleLines;
+    Vec<FoldHiddenRows> hidden;
 
-    Vec<int> lineToDisplayRow;
+    int totalHidden = 0;
     bool needsRebuild = true;
 
     int cachedLineCount = 0;
@@ -5862,6 +6219,8 @@ void FoldMapAdjustForEdit(FoldMap* m, int editStartLine, int editEndLine,
                           int lineDelta);
 
 void FoldMapRebuild(FoldMap* m, int lineCount);
+
+void FoldMapSetHiddenRows(FoldMap* m, int lineCount, Selection* ranges, int n);
 
 int FoldMapDisplayRowCount(const FoldMap* m);
 
@@ -6093,8 +6452,6 @@ using ShowDocumentFn = bool (*)(void* data, Str uri, bool external,
 struct HoverDefinition {
     Selection symbolRange = {};
     Vec<DefinitionLink> locations;
-    Selection lastRange = {};
-    Vec<DefinitionLink> lastLocations;
 
     Bounds bounds = {};
 
@@ -6226,6 +6583,8 @@ struct InputState {
     Window* focusWin = nullptr;
     bool disabled = false;
     bool readonly = false;
+
+    bool enableContextMenu = true;
     bool loading = false;
 
     bool numberHasMin = false;
@@ -6279,7 +6638,7 @@ struct InputState {
     float lastFont = 0;
     float lastLineH = 0;
 
-    bool lastMono = false;
+    uint16_t lastFontWord = 0;
 
     Vec<Bounds> rowBoxes;
 
@@ -6304,6 +6663,8 @@ struct InputState {
     void* documentColorData = nullptr;
     Vec<DocumentColor> documentColors;
     bool documentColorsDirty = true;
+
+    RangeDecorationsState* rangeDecorations = nullptr;
 
     CodeActionSession codeActions;
 
@@ -6400,6 +6761,9 @@ void InputScrollToCaretWithPadding(InputState* s, float caretX, float caretY,
 
 float InputEmptyBottomHeight(bool isCodeEditor, int overrideRows,
                              float viewportH, float lineH);
+
+int InputLineNumberLen(int totalLines);
+int InputDisplayedLineNumber(int number);
 float InputCursorSurroundingPadding(bool isAutoGrow, int overrideLines,
                                     int visibleLines, float lineH);
 
@@ -6425,6 +6789,21 @@ bool InputIsMultiLine(const InputState* s);
 bool InputIsSingleLine(const InputState* s);
 bool InputIsEditable(const InputState* s);
 
+struct InputPasteTarget {
+    uint64_t documentRevision = 0;
+    Selection active = {};
+    bool reversed = false;
+    Vec<Selection> extra;
+
+    bool operator==(const InputPasteTarget& o) const;
+    bool operator!=(const InputPasteTarget& o) const { return !(*this == o); }
+};
+
+InputPasteTarget InputPasteTargetOf(const InputState* s);
+
+void InputInsertClipboard(InputState* s, App* app, Window* win,
+                          const ClipboardItem& item);
+
 bool InputIsCopyable(const InputState* s);
 
 int InputCursor(const InputState* s);
@@ -6435,11 +6814,15 @@ void InputSetValue(InputState* s, Str value);
 
 void InputReplaceAll(InputState* s, App* app, Window* win, Str value);
 void InputSetPlaceholder(InputState* s, Str value);
+
+void TextareaSetAutoGrow(InputState* s, int minRows, int maxRows);
+void TextareaSetRows(InputState* s, int rows);
 void InputSetMaskPattern(InputState* s, MaskPattern pattern);
 
 void InputClean(InputState* s, App* app, Window* win);
 
 void InputInsert(InputState* s, App* app, Window* win, Str value);
+void InputReplace(InputState* s, App* app, Window* win, Str value);
 
 int InputPreviousBoundary(const InputState* s, int offset);
 int InputNextBoundary(const InputState* s, int offset);
@@ -6613,6 +6996,7 @@ void InputFollowDefinition(InputState* s, App* app, Window* win,
 
 void InputToggleCodeActions(InputState* s, App* app, Window* win);
 void InputDismissCodeActions(InputState* s);
+void InputHideContextMenu(InputState* s);
 
 void InputPerformCodeAction(InputState* s, App* app, Window* win);
 
@@ -6794,19 +7178,20 @@ void TextMeasClear(PaintCtx* ctx);
 
 bool TextPointAt(PaintCtx* ctx, Str s, float fontSize, float maxW, bool wrap,
                  int off, float* outX, float* outY, float* outH,
-                 bool mono = false, float lineHeight = 0,
+                 uint16_t font = 0, float lineHeight = 0,
                  bool lineEndAffinity = true);
 int TextIndexAt(PaintCtx* ctx, Str s, float fontSize, float maxW, bool wrap,
-                float relX, float relY, bool mono = false,
-                float lineHeight = 0);
+                float relX, float relY, uint16_t font = 0, float lineHeight = 0,
+                TextAlign align = TextAlign::Left);
 
 void PaintTextRange(PaintCtx* ctx, Str s, float fontSize, float maxW, bool wrap,
-                    uint8_t weight, float lineH, float x, float y, int u8a,
-                    int u8b, Rgba color);
+                    uint16_t weight, float lineH, float x, float y, int u8a,
+                    int u8b, Rgba color, TextAlign align = TextAlign::Left);
 void PaintTextUnderline(PaintCtx* ctx, Str s, float fontSize, float maxW,
-                        bool wrap, uint8_t weight, float lineH, float x,
+                        bool wrap, uint16_t weight, float lineH, float x,
                         float y, int u8a, int u8b, Rgba color,
-                        bool wavy = false);
+                        bool wavy = false, TextAlign align = TextAlign::Left,
+                        float thickness = 1.f);
 
 struct LayoutCache;
 
@@ -6847,6 +7232,11 @@ Size MeasureEl(PaintCtx* ctx, El* e, float inheritFont = 0,
 
 Size MeasureElAtWidth(PaintCtx* ctx, El* e, float width);
 void PaintEl(PaintCtx* ctx, El* e);
+
+int ElTextRangeRects(PaintCtx* ctx, const El* e, int lo, int hi, Bounds* out,
+                     int cap);
+
+float ElTextSpaceWidth(PaintCtx* ctx, const El* e);
 int HitTest(PaintCtx* ctx, float x, float y);
 const HitRect* HitTestRect(PaintCtx* ctx, float x, float y);
 
@@ -7007,6 +7397,12 @@ struct PlatWindow;
 
 struct WindowSelection;
 
+struct WindowBlurSub {
+    int id = 0;
+    int focusId = 0;
+    Listener handler = {};
+};
+
 struct Window {
     App* app = nullptr;
     PlatWindow* plat = nullptr;
@@ -7023,15 +7419,23 @@ struct Window {
 
     Vec<EntityId> imageCacheStack;
 
+    Vec<uint32_t> plotAppearScopes;
+
     Vec<ScrollRect> prevScrolls;
 
     Vec<AccessibilityNode> accessibility;
 
     uint64_t accessibilityHash = 0;
+
     int hoverId = 0;
+
+    bool lastInputKeyboard = false;
     int focusId = 0;
 
     int focusGen = 0;
+
+    Vec<WindowBlurSub> blurSubs;
+    int nextBlurSubId = 1;
     float mouseX = 0;
     float mouseY = 0;
 
@@ -7114,6 +7518,10 @@ struct Window {
     bool longPressSelection = false;
 
     TouchHostKind touchHost = TouchHostKind::None;
+
+    SliderState* touchSlider = nullptr;
+    Axis touchSliderAxis = Axis::Horizontal;
+    bool touchSliderStart = false;
     Point touchHostStart = {};
     Point touchHostLast = {};
     double touchHostStartAt = 0;
@@ -7306,6 +7714,8 @@ concept EmitsEvent = requires {
     sizeof(EventEmitter<T, E>);
 };
 
+struct DismissEvent {};
+
 template <typename E>
 const void* EntityEventType() {
     static const uint8_t key = 0;
@@ -7395,14 +7805,27 @@ El* EntityRender(App* app, Window* win, Arena* a, EntityId id);
 void* WindowKeyedState(Window* win, uint32_t key, void* fresh, DropFn drop);
 void WindowKeyedFree(Window* win);
 
+void* WindowFrameKeyedState(Window* win, uint32_t key, void* fresh,
+                            DropFn drop);
+void WindowKeyedSweep(Window* win);
+
 void* WindowMotionState(Window* win, uint32_t key, int size);
 
 void WindowMotionSweep(Window* win);
+
+uint32_t* WindowPlotAppearScopeToken(Window* win, uint32_t key);
+uint32_t WindowPlotAppearScope(const Window* win);
 void WindowMotionFree(Window* win);
 
 template <typename T>
 T* KeyedState(Ctx* cx, uint32_t key) {
     void* p = WindowKeyedState(cx->win, key, new T(), &EntityDropT<T>);
+    return (T*)p;
+}
+
+template <typename T>
+T* FrameKeyedState(Ctx* cx, uint32_t key) {
+    void* p = WindowFrameKeyedState(cx->win, key, new T(), &EntityDropT<T>);
     return (T*)p;
 }
 
@@ -7435,6 +7858,23 @@ template <typename T>
 Entity<T> ElementStateEntity(Ctx* cx, Str name, Str kind) {
     return KeyedEntity<T>(cx, KeyedKey(KeyedName(cx, name), HashClickId(kind)));
 }
+
+struct LaidOutHeight {
+
+    float measured = -1;
+    float built = -1;
+
+    int chase = 0;
+
+    float inset = 0;
+    bool contentBox = false;
+};
+
+LaidOutHeight* UseLaidOutHeight(Ctx* cx, Str name, float fallback);
+
+bool TrackLaidOutHeight(Ctx* cx, El* e, LaidOutHeight* slot);
+
+bool LaidOutHeightObserve(LaidOutHeight* slot, float boxHeight);
 
 void WindowOnKey(Window* win, Listener l);
 
@@ -7553,6 +7993,10 @@ ClipboardItem ClipboardGetItem(Arena* a, Window* win);
 
 Str ClipboardGetText(Arena* a, Window* win);
 
+using ClipboardReadFn = void (*)(void* data, App* app, Window* win,
+                                 const ClipboardItem& item);
+bool ClipboardReadAsync(Window* win, ClipboardReadFn done, void* data);
+
 void WindowSetTextContentType(Window* win, Str value);
 
 void OpenUrl(Str url);
@@ -7573,6 +8017,8 @@ void AppSetTitle(Window* win, Str title);
 void AppRequestAnim(Window* win, bool on);
 
 void WindowRequestAnimationFrame(Window* win);
+
+bool WindowLastInputWasKeyboard(const Window* win);
 
 void FocusCollect(Window* win, El* root);
 void IdsCollect(El* root);
@@ -7596,6 +8042,9 @@ void FocusHandleFocus(Window* win, FocusHandle h);
 FocusHandle WindowFocused(const Window* win);
 
 bool FocusHandleRestore(Window* win, FocusHandle h);
+
+Subscription WindowOnBlur(Window* win, FocusHandle h, Listener handler);
+void WindowUnsubscribeBlur(Window* win, Subscription sub);
 
 void WindowSetFocusId(Window* win, int id);
 
@@ -7635,6 +8084,8 @@ bool WindowDispatchKeyEvent(Window* win, KeyEvent* ev);
 
 bool WindowDispatchKeyUpEvent(Window* win, KeyEvent* ev);
 
+bool WindowDispatchKeyCaptureEvent(Window* win, KeyEvent* ev);
+
 using ActionFn = void (*)(Window* win, ActionEvent* ev);
 void AppOnAction(uint32_t action, ActionFn fn);
 void AppQuit(Window* win);
@@ -7667,6 +8118,8 @@ struct MenuDef {
     Str name = {};
     const MenuRow* items = nullptr;
     int n = 0;
+
+    bool disabled = false;
 };
 
 bool AppHasMenuBar();
@@ -9772,6 +10225,274 @@ inline Edges EdgesAll(float value) {
 
 }
 
+#line 1 "src/base/resizable.h"
+
+namespace gpui {
+
+const float PANEL_MIN_SIZE = 100.f;
+const float kResizablePanelMinSize = PANEL_MIN_SIZE;
+
+bool ResizablePanelResize(float* sizes, const float* mins, const float* maxs,
+                          int n, int ix, float size, float containerSize);
+
+void ResizableAdjustToContainer(float* sizes, int n, float containerSize);
+
+const float kResizeHandleSize = 1.f;
+const float kResizeHandlePadding = 4.f;
+
+namespace base_theme {
+struct Theme;
+}
+Rgba ResizableHandleColor(const base_theme::Theme& theme, bool active);
+
+enum class ResizeHandleState : uint8_t {
+
+    Idle,
+
+    Hovered,
+
+    Pressed,
+
+    Dragging,
+};
+
+inline bool ResizeHandleStateIsActive(ResizeHandleState s) {
+    return s == ResizeHandleState::Pressed || s == ResizeHandleState::Dragging;
+}
+
+enum class HandleEdge : uint8_t {
+
+    Leading,
+
+    Trailing,
+};
+
+struct SharedHandleState {
+    ResizeHandleState state = ResizeHandleState::Idle;
+
+    Listener nextDown;
+    Listener nextUp;
+    Listener nextDrag;
+
+    ResizeHandleState Get() const { return state; }
+
+    bool Set(ResizeHandleState next) {
+        bool changed = state != next;
+        state = next;
+        return changed;
+    }
+
+    static void OnDown(SharedHandleState* self, Ctx* cx,
+                       const MouseDownEvent* ev);
+
+    static void OnHover(SharedHandleState* self, Ctx* cx, const HoverEvent* ev);
+
+    static void OnMove(SharedHandleState* self, Ctx* cx,
+                       const MouseMoveEvent* ev);
+    static void OnDragMove(SharedHandleState* self, Ctx* cx,
+                           const DragMoveEvent* ev);
+
+    static void OnUp(SharedHandleState* self, Ctx* cx, const MouseUpEvent* ev);
+
+    static void OnUpOut(SharedHandleState* self, Ctx* cx,
+                        const MouseUpEvent* ev);
+};
+
+Entity<SharedHandleState> ResizeHandleStateFor(Ctx* cx, Str name);
+
+void ResizeHandleBindState(El* handle, Entity<SharedHandleState> state);
+
+struct ResizeHandleContext {
+    Axis axis = Axis::Horizontal;
+    ResizeHandleState state = ResizeHandleState::Idle;
+    HandleEdge edge = HandleEdge::Leading;
+    bool hasEdge = false;
+
+    Axis AxisValue() const { return axis; }
+
+    bool Edge(HandleEdge* out) const {
+        if (hasEdge && out) {
+            *out = edge;
+        }
+        return hasEdge;
+    }
+
+    bool IsActive() const { return ResizeHandleStateIsActive(state); }
+
+    ResizeHandleState State() const { return state; }
+};
+
+using ResizeHandleRenderer = El* (*)(void* user,
+                                     const ResizeHandleContext* context,
+                                     Ctx* cx);
+
+struct ResizeHandle {
+    Ctx* cx = nullptr;
+    Str id = {};
+    Axis axis = Axis::Horizontal;
+    HandleEdge edge = HandleEdge::Leading;
+    bool hasEdge = false;
+    Listener onDrag = {};
+
+    Str dragKind = {};
+    int dragIx = 0;
+
+    Listener onRelease = {};
+    void* appearanceUser = nullptr;
+    ResizeHandleRenderer appearance = nullptr;
+    Rgba color = {};
+    Rgba activeColor = {};
+
+    static ResizeHandle* New(Ctx* cx, Str id, Axis axis);
+
+    ResizeHandle* Inside(HandleEdge value);
+    ResizeHandle* OnDrag(Listener listener);
+
+    ResizeHandle* OnDrag(Str kind, int ix, Listener listener);
+    ResizeHandle* OnRelease(Listener listener);
+    ResizeHandle* WithAppearance(void* user, ResizeHandleRenderer renderer);
+    ResizeHandle* Colors(Rgba rest, Rgba active);
+    El* IntoEl();
+};
+
+ResizeHandle* resize_handle(Ctx* cx, Str id, Axis axis);
+
+struct ResizableState {
+    Axis axis = Axis::Horizontal;
+
+    Vec<float> sizes;
+    Vec<float> mins;
+    Vec<float> maxs;
+
+    Vec<bool> grows;
+
+    Vec<bool> shown;
+
+    Vec<Bounds> laid;
+
+    Bounds bounds = {};
+    float lastContainer = 0;
+
+    int dragging = -1;
+
+    Listener onResized = {};
+
+    ~ResizableState() {
+        VecReset(sizes);
+        VecReset(mins);
+        VecReset(maxs);
+        VecReset(grows);
+        VecReset(shown);
+        VecReset(laid);
+    }
+
+    static void OnHandleDown(ResizableState* self, Ctx* cx,
+                             const MouseDownEvent* ev, intptr_t ix);
+    static void OnHandleDrag(ResizableState* self, Ctx* cx,
+                             const DragMoveEvent* ev);
+    static void OnHandleUp(ResizableState* self, Ctx* cx,
+                           const MouseUpEvent* ev);
+    static void OnSettled(ResizableState* self, Ctx* cx, const void*);
+
+    const Vec<float>& Sizes() const { return sizes; }
+    float ContainerSize() const {
+        return AxisIsHorizontal(axis) ? bounds.w : bounds.h;
+    }
+    bool ResizePanel(Ctx* cx, int ix, float size);
+    bool InsertPanel(Ctx* cx, float size = PANEL_MIN_SIZE, int ix = -1);
+    bool RemovePanel(Ctx* cx, int ix);
+    bool ResetPanel(Ctx* cx, int ix);
+    void Clear();
+};
+
+struct ResizablePanelEvent {
+    const float* sizes = nullptr;
+    int count = 0;
+};
+
+float ResizablePanelSize(const ResizableState* s, int ix, float declared);
+
+struct ResizablePanelGroup {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    Entity<ResizableState> state = {};
+    gpui::Axis groupAxis = gpui::Axis::Horizontal;
+    float width = kFill;
+    float height = kFill;
+
+    Rgba handleColor = {};
+    Rgba handleDragColor = {};
+
+    ArenaVec<El*> panels;
+    ArenaVec<float> sizes;
+    ArenaVec<float> mins;
+    ArenaVec<float> maxs;
+    ArenaVec<bool> grows;
+    ArenaVec<bool> shown;
+
+    ArenaVec<const struct ResizablePanel*> sources;
+    void* handleAppearanceUser = nullptr;
+    ResizeHandleRenderer handleAppearance = nullptr;
+    Listener onResize = {};
+
+    static ResizablePanelGroup* New(Ctx* cx, Str id,
+                                    Entity<ResizableState> state = {},
+                                    Axis axis = Axis::Horizontal);
+    ResizablePanelGroup* W(float v);
+    ResizablePanelGroup* H(float v);
+    ResizablePanelGroup* WithState(Entity<ResizableState> value);
+    ResizablePanelGroup* Axis(gpui::Axis value);
+    ResizablePanelGroup* Size(float v);
+    ResizablePanelGroup* HandleColors(Rgba rest, Rgba dragging);
+    ResizablePanelGroup* WithHandleAppearance(void* user,
+                                              ResizeHandleRenderer renderer);
+    ResizablePanelGroup* OnResize(Listener listener);
+
+    ResizablePanelGroup* Panel(El* content, float size,
+                               float min = kResizablePanelMinSize,
+                               float max = 0);
+
+    ResizablePanelGroup* Grow(El* content, float min = kResizablePanelMinSize);
+
+    ResizablePanelGroup* Flex();
+
+    ResizablePanelGroup* Visible(bool v);
+    ResizablePanelGroup* Child(struct ResizablePanel* panel);
+    ResizablePanelGroup* Children(struct ResizablePanel** values, int count);
+    El* IntoEl();
+};
+
+using Resizable = ResizablePanelGroup;
+
+struct ResizablePanel {
+    Ctx* cx = nullptr;
+
+    El* content = nullptr;
+    ArenaVec<El*> more;
+
+    ElRefiner refiner = {};
+    float size = 0;
+    float min = PANEL_MIN_SIZE;
+    float max = 0;
+    bool grow = true;
+    bool visible = true;
+
+    static ResizablePanel* New(Ctx* cx);
+    ResizablePanel* Child(El* value);
+    ResizablePanel* Size(float value);
+    ResizablePanel* SizeRange(float minValue, float maxValue = 0);
+    ResizablePanel* FlexNone();
+    ResizablePanel* Visible(bool value);
+};
+
+ResizablePanelGroup* h_resizable(Ctx* cx, Str id,
+                                 Entity<ResizableState> state = {});
+ResizablePanelGroup* v_resizable(Ctx* cx, Str id,
+                                 Entity<ResizableState> state = {});
+ResizablePanel* resizable_panel(Ctx* cx);
+}
+
 #line 1 "src/base/dock.h"
 
 namespace gpui {
@@ -10002,7 +10723,11 @@ struct DockSide {
     bool IsResizing() const { return resizing; }
     void SetResizing(bool value) { resizing = value; }
 
+    float LiveSize() const { return liveSize; }
+    void SetLiveSize(float value) { liveSize = value; }
+
     bool resizing = false;
+    float liveSize = -1;
 };
 
 using Dock = DockSide;
@@ -10046,6 +10771,8 @@ struct DockState {
     DockPanelStyle panelStyle = DockPanelStyle::Auto;
 
     bool toggleButtonVisible = true;
+
+    bool closeButtonVisible = false;
 
     bool hasVersion = false;
     int version = 0;
@@ -10143,7 +10870,12 @@ float DockTabScrollTo(float scrollX, Bounds strip, Bounds tab);
 void DockToggleSide(DockState* s, Ctx* cx, DockPlacement p);
 void DockResizeSide(DockState* s, Ctx* cx, DockPlacement p, float x, float y);
 
+void DockEndSideResize(DockState* s, Ctx* cx, DockPlacement p);
+
 void DockSetDockSize(DockState* s, Ctx* cx, DockPlacement p, float size);
+
+void DockSetSplitSizes(DockState* s, Ctx* cx, int node, const float* sizes,
+                       int count);
 
 void DockToggleZoom(DockState* s, Ctx* cx, int panelIx);
 
@@ -10191,6 +10923,7 @@ El* DockFrame(Ctx* cx, const DockCtx* dock, float size);
 struct DockHandleCtx {
     Axis axis = Axis::Horizontal;
     bool active = false;
+    ResizeHandleState state = ResizeHandleState::Idle;
 };
 
 struct DockTabGroup {
@@ -10269,6 +11002,10 @@ El* DockBindTitleDrag(const DockTabGroup* g, int ix, El* e);
 El* DockBindToggle(const DockTabGroup* g, DockPlacement p, El* e);
 El* DockBindZoom(const DockTabGroup* g, int panelIx, El* e);
 El* DockBindClose(const DockTabGroup* g, int ix, El* e);
+
+bool DockGroupIsPanelClosable(const DockTabGroup* g, int ix);
+
+ResizeHandle* DockBindResizeHandle(const DockCtx* d, ResizeHandle* h);
 
 El* DockBindResizeStrip(const DockCtx* d, El* e);
 
@@ -11145,6 +11882,12 @@ struct NativeMenu {
 };
 
 void InputDefaultNativeMenu(const InputState* state, NativeMenu* out);
+
+inline void InputSetContextMenuEnabled(InputState* state, bool enabled) {
+    if (state) {
+        state->enableContextMenu = enabled;
+    }
+}
 bool InputPerformNativeMenuItem(InputState* state, App* app, Window* win,
                                 const NativeMenuItem& item);
 
@@ -11239,6 +11982,123 @@ struct DecorationCollections {
 
     int BuildSpans(TextSpan* out, int cap) const;
 };
+
+enum class RangeDecorationStyle : uint8_t {
+
+    Fill,
+
+    Frame,
+};
+
+struct RangeDecoration {
+    Selection range = {};
+    RangeDecorationStyle style = RangeDecorationStyle::Frame;
+    Rgba color = {};
+    bool hasColor = false;
+
+    static RangeDecoration New(Selection range);
+    Selection Range() const { return range; }
+    RangeDecorationStyle Style() const { return style; }
+
+    bool Color(Rgba* out) const;
+    RangeDecoration WithStyle(RangeDecorationStyle value) const;
+    RangeDecoration WithColor(Rgba value) const;
+};
+
+struct DecorationIndex {
+    Vec<int> indices;
+    Vec<int> maxEnds;
+
+    void Rebuild(const RangeDecoration* decorations, int n);
+    int Build(const RangeDecoration* decorations, int lo, int hi);
+
+    int Query(const RangeDecoration* decorations, int lo, int hi,
+              Selection range, Vec<int>* matches) const;
+};
+
+struct RangeDecorationEntries {
+    uint64_t id = 0;
+    Vec<RangeDecoration> decorations;
+    DecorationIndex index;
+
+    void Reindex();
+};
+
+struct RangeDecorationCollections {
+    uint64_t nextId = 0;
+    Vec<RangeDecorationEntries*> entries;
+
+    RangeDecorationCollections() = default;
+    RangeDecorationCollections(const RangeDecorationCollections&) = delete;
+    RangeDecorationCollections& operator=(const RangeDecorationCollections&) =
+        delete;
+    ~RangeDecorationCollections();
+
+    uint64_t Create(const RangeDecoration* decorations, int n);
+    bool Set(uint64_t id, const RangeDecoration* decorations, int n);
+    bool Append(uint64_t id, const RangeDecoration* decorations, int n);
+    bool Remove(uint64_t id);
+    RangeDecorationEntries* Get(uint64_t id) const;
+    void AdjustForEdit(Selection editedRange, int insertedLen);
+    void Clear();
+
+    int Intersecting(const Selection* ranges, int nRanges,
+                     const RangeDecoration** out, int cap) const;
+};
+
+int RangeDecorationsNormalize(Str text, const RangeDecoration* in, int n,
+                              Vec<RangeDecoration>* out);
+
+struct RangeDecorationsState;
+
+struct RangeDecorationCollection {
+    RangeDecorationsState* state = nullptr;
+    uint64_t id = 0;
+
+    RangeDecorationCollection() = default;
+    RangeDecorationCollection(const RangeDecorationCollection& other);
+    RangeDecorationCollection& operator=(
+        const RangeDecorationCollection& other);
+    ~RangeDecorationCollection();
+
+    void Set(const RangeDecoration* decorations, int n);
+
+    void Append(const RangeDecoration* decorations, int n);
+    void Clear();
+    void Dispose();
+
+    int GetRanges(Selection* out, int cap) const;
+    bool IsValid() const;
+};
+
+RangeDecorationCollection InputCreateRangeDecorationsCollection(
+    InputState* s, const RangeDecoration* decorations, int n);
+
+int InputRangeDecorations(const InputState* s, const Selection* ranges,
+                          int nRanges, const RangeDecoration** out, int cap);
+
+void InputRangeDecorationsFree(InputState* s);
+void InputRangeDecorationsAdjustForEdit(InputState* s, Selection editedRange,
+                                        int insertedLen);
+
+void InputRangeDecorationsReset(InputState* s);
+
+struct RangeCorners {
+    Point topLeft = {};
+    Point topRight = {};
+    Point bottomLeft = {};
+    Point bottomRight = {};
+};
+
+int FrameOutlinePoints(const RangeCorners* corners, int n, Vec<Point>* out);
+
+void PadFrameCorners(RangeCorners* corners, int n, float horizontalPadding);
+
+float SnapFrameOutline(Point* points, int n, float strokeWidth,
+                       float scaleFactor);
+
+void ClampFrameToContentMask(Point* points, int n, float strokeWidth,
+                             Bounds contentMask);
 
 struct DiagnosticEntry {
     Selection range = {};
@@ -11724,6 +12584,8 @@ struct InputEditorStyle {
 
     bool mono = false;
 
+    uint8_t fontFamily = 0;
+
     bool mask = false;
     int align = 0;
 
@@ -11830,6 +12692,8 @@ bool KeymapBindingForAction(uint32_t action, const uint32_t* contexts,
 bool KeymapAnyBindingForAction(uint32_t action, KeyChord* out);
 
 Str KeyName(int vk);
+
+bool KeyIsPrintable(int vk);
 
 bool KeymapPending();
 
@@ -12240,6 +13104,81 @@ struct Pagination {
 };
 }
 
+#line 1 "src/base/positioner.h"
+
+namespace gpui {
+
+enum class Align : uint8_t {
+    Start,
+    Center,
+    End
+};
+using PopupAlign = Align;
+
+struct ResolvedPosition {
+    Bounds bounds;
+    gpui::Placement placement = gpui::Placement::Top;
+    bool hasPlacement = false;
+};
+using Positioned = ResolvedPosition;
+
+struct PositionerState {};
+
+using PositionerOnPositionFn = void (*)(void* user, ResolvedPosition position);
+
+struct Positioner {
+    enum class Strategy : uint8_t {
+        Side,
+        Corner
+    };
+
+    Arena* a = nullptr;
+    Strategy strategy = Strategy::Side;
+    Bounds trigger = {};
+    Anchor anchor = Anchor::TopLeft;
+    Point point = {};
+    gpui::Placement placement = gpui::Placement::Top;
+    bool hasPlacement = false;
+    gpui::Align align = gpui::Align::Center;
+    float offset = 0;
+    float margin = 4;
+    bool occlude = false;
+    PositionerOnPositionFn onPosition = nullptr;
+    void* onPositionUser = nullptr;
+    ArenaVec<El*> children;
+
+    static Positioner* Side(Ctx* cx, Bounds trigger);
+    static Positioner* Corner(Ctx* cx, Anchor anchor, Point point);
+
+    Positioner* Position(Point value);
+    Positioner* Placement(gpui::Placement value);
+    Positioner* Align(gpui::Align value);
+    Positioner* Offset(float value);
+
+    Positioner* Occlude();
+    Positioner* Margin(float value);
+
+    Positioner* OnPosition(PositionerOnPositionFn fn, void* user);
+    Positioner* Child(El* child);
+    El* IntoEl();
+};
+
+constexpr float kPopupMargin = 4.f;
+
+ResolvedPosition PositionSide(Bounds trigger, Size popup, Size view,
+                              float margin, const Placement* preferred,
+                              Align align, float offset);
+
+ResolvedPosition PositionCorner(Anchor anchor, Point at, Size popup, Size view,
+                                float margin);
+ResolvedPosition PositionCorner(Anchor anchor, Point at, Size popup, Size view,
+                                Edges margin);
+
+Edges PositionerFrameInsets(bool clientDecorated, Tiling tiling,
+                            float clientInset);
+
+}
+
 #line 1 "src/base/popup.h"
 
 namespace gpui {
@@ -12251,12 +13190,20 @@ constexpr float kPopupWindowMargin = 8.f;
 
 Point PopupResolvedCorner(PopupAnchor anchor, Bounds triggerBounds);
 
-El* PopupPlaceContent(El* content, PopupAnchor anchor, float offsetY = 0);
+El* PopupPlaceContent(El* content, PopupAnchor anchor, float offset = 0);
+
+using PopupOnPositionFn = void (*)(void* user, ResolvedPosition position,
+                                   Bounds trigger);
 
 struct Popup {
+    Arena* a = nullptr;
     El* root = nullptr;
 
     PopupAnchor anchor = PopupAnchor::TopLeft;
+
+    float offset = 0;
+    PopupOnPositionFn onPosition = nullptr;
+    void* onPositionUser = nullptr;
 
     bool contentReady = false;
 
@@ -12265,6 +13212,9 @@ struct Popup {
     Popup* Anchor(PopupAnchor a);
 
     Popup* AnchorRight(bool on = true);
+    Popup* Offset(float offset);
+
+    Popup* OnPosition(PopupOnPositionFn fn, void* user);
     Popup* Content(El* content);
     El* IntoEl();
 };
@@ -12322,9 +13272,16 @@ struct Popover {
 
     PopupAnchor anchor = PopupAnchor::TopLeft;
 
+    float offset = 0;
+    PopupOnPositionFn onPosition = nullptr;
+    void* onPositionUser = nullptr;
+
     static Popover* New(Ctx* cx, Str id, Entity<PopoverState> state = {},
                         MouseButton button = MouseButton::Left);
     Popover* Anchor(PopupAnchor v);
+    Popover* Offset(float offset);
+
+    Popover* OnPosition(PopupOnPositionFn fn, void* user);
 
     Popover* TrackedFocus(FocusHandle tracked);
     Popover* OverlayClosable(bool closable);
@@ -12335,73 +13292,6 @@ struct Popover {
     Popover* Content(El* content);
     El* IntoEl();
 };
-}
-
-#line 1 "src/base/positioner.h"
-
-namespace gpui {
-
-enum class Align : uint8_t {
-    Start,
-    Center,
-    End
-};
-using PopupAlign = Align;
-
-struct ResolvedPosition {
-    Bounds bounds;
-    gpui::Placement placement = gpui::Placement::Top;
-    bool hasPlacement = false;
-};
-using Positioned = ResolvedPosition;
-
-struct PositionerState {};
-
-struct Positioner {
-    enum class Strategy : uint8_t {
-        Side,
-        Corner
-    };
-
-    Arena* a = nullptr;
-    Strategy strategy = Strategy::Side;
-    Bounds trigger = {};
-    Anchor anchor = Anchor::TopLeft;
-    Point point = {};
-    gpui::Placement placement = gpui::Placement::Top;
-    bool hasPlacement = false;
-    gpui::Align align = gpui::Align::Center;
-    float offset = 0;
-    float margin = 4;
-    bool occlude = false;
-    ArenaVec<El*> children;
-
-    static Positioner* Side(Ctx* cx, Bounds trigger);
-    static Positioner* Corner(Ctx* cx, Anchor anchor, Point point);
-    Positioner* Placement(gpui::Placement value);
-    Positioner* Align(gpui::Align value);
-    Positioner* Offset(float value);
-
-    Positioner* Occlude();
-    Positioner* Margin(float value);
-    Positioner* Child(El* child);
-    El* IntoEl();
-};
-
-constexpr float kPopupMargin = 4.f;
-
-ResolvedPosition PositionSide(Bounds trigger, Size popup, Size view,
-                              float margin, const Placement* preferred,
-                              Align align, float offset);
-
-ResolvedPosition PositionCorner(Anchor anchor, Point at, Size popup, Size view,
-                                float margin);
-ResolvedPosition PositionCorner(Anchor anchor, Point at, Size popup, Size view,
-                                Edges margin);
-
-Edges PositionerFrameInsets(bool clientDecorated, Tiling tiling,
-                            float clientInset);
-
 }
 
 #line 1 "src/base/progress.h"
@@ -12422,6 +13312,438 @@ struct ProgressTrack {
 struct ProgressIndicator {
     static El* New(Ctx* cx);
 };
+}
+
+#line 1 "src/base/questionnaire.h"
+
+namespace gpui {
+
+struct QuestionnaireValidationContext;
+
+using QuestionnaireValidator =
+    bool (*)(const QuestionnaireValidationContext* context, Str* error);
+
+struct QuestionnaireChoiceDefinition {
+    Str value = {};
+    Str accessibilityLabel = {};
+
+    Str description = {};
+    bool disabled = false;
+    bool defaultSelected = false;
+
+    static QuestionnaireChoiceDefinition New(Str value, Str accessibilityLabel);
+    QuestionnaireChoiceDefinition WithDescription(Str description) const;
+    QuestionnaireChoiceDefinition WithDisabled(bool disabled) const;
+    QuestionnaireChoiceDefinition WithDefaultSelected(bool selected) const;
+
+    Str Value() const { return value; }
+    Str AccessibilityLabel() const { return accessibilityLabel; }
+    Str Description() const { return description; }
+    bool IsDisabled() const { return disabled; }
+    bool IsDefaultSelected() const { return defaultSelected; }
+};
+
+struct QuestionnaireInputDefinition {
+    InputState* state = nullptr;
+    Str accessibilityLabel = {};
+    bool disabled = false;
+
+    static QuestionnaireInputDefinition New(InputState* state,
+                                            Str accessibilityLabel);
+    QuestionnaireInputDefinition WithDisabled(bool disabled) const;
+
+    InputState* State() const { return state; }
+    Str AccessibilityLabel() const { return accessibilityLabel; }
+    bool IsDisabled() const { return disabled; }
+};
+
+struct QuestionnaireItemDefinition {
+    Str name = {};
+    Str accessibilityLabel = {};
+    Str description = {};
+    bool required = false;
+    bool multiple = false;
+    bool disabled = false;
+    Vec<QuestionnaireChoiceDefinition> choices;
+    QuestionnaireInputDefinition input = {};
+    bool hasInput = false;
+    QuestionnaireValidator validator = nullptr;
+
+    static QuestionnaireItemDefinition New(Str name, Str accessibilityLabel);
+    QuestionnaireItemDefinition WithDescription(Str description) const;
+    QuestionnaireItemDefinition WithRequired(bool required) const;
+    QuestionnaireItemDefinition WithMultiple(bool multiple) const;
+    QuestionnaireItemDefinition WithDisabled(bool disabled) const;
+    QuestionnaireItemDefinition WithChoices(
+        const QuestionnaireChoiceDefinition* values, int n) const;
+    QuestionnaireItemDefinition WithChoice(
+        const QuestionnaireChoiceDefinition& choice) const;
+    QuestionnaireItemDefinition WithInput(
+        const QuestionnaireInputDefinition& input) const;
+    QuestionnaireItemDefinition WithValidator(
+        QuestionnaireValidator validator) const;
+
+    Str Name() const { return name; }
+    Str AccessibilityLabel() const { return accessibilityLabel; }
+    Str Description() const { return description; }
+    bool IsRequired() const { return required; }
+    bool IsMultiple() const { return multiple; }
+    bool IsDisabled() const { return disabled; }
+    const Vec<QuestionnaireChoiceDefinition>& Choices() const {
+        return choices;
+    }
+
+    const QuestionnaireInputDefinition* Input() const {
+        return hasInput ? &input : nullptr;
+    }
+    QuestionnaireValidator Validator() const { return validator; }
+};
+
+enum class QuestionnaireItemStatus : uint8_t {
+    Unanswered,
+    Answered,
+    Skipped
+};
+
+enum class QuestionnaireShortcutMode : uint8_t {
+    Letters,
+    Numbers
+};
+
+struct QuestionnaireAnswer {
+    const Str* choices = nullptr;
+    int nChoices = 0;
+    Str freeform = {};
+
+    static QuestionnaireAnswer New() { return {}; }
+
+    QuestionnaireAnswer WithChoices(Arena* a, const Str* values, int n) const;
+
+    QuestionnaireAnswer WithFreeform(Str value) const;
+
+    int ChoicesLen() const { return nChoices; }
+    Str ChoiceAt(int i) const { return choices[i]; }
+    Str Freeform() const { return freeform; }
+    bool HasFreeform() const { return len(freeform) > 0; }
+    bool IsEmpty() const { return nChoices == 0 && !HasFreeform(); }
+    bool HasChoice(Str value) const;
+};
+
+bool operator==(const QuestionnaireAnswer& a, const QuestionnaireAnswer& b);
+inline bool operator!=(const QuestionnaireAnswer& a,
+                       const QuestionnaireAnswer& b) {
+    return !(a == b);
+}
+
+struct QuestionnaireAnswerEntry {
+    Str name = {};
+    QuestionnaireAnswer answer = {};
+};
+
+struct QuestionnaireAnswers {
+    const QuestionnaireAnswerEntry* entries = nullptr;
+    int n = 0;
+
+    const QuestionnaireAnswer* Get(Str name) const;
+    int Len() const { return n; }
+    bool IsEmpty() const { return n == 0; }
+};
+
+struct QuestionnaireProgressState {
+    int current = 0;
+    int total = 0;
+
+    int Current() const { return current; }
+    int Total() const { return total; }
+};
+
+struct QuestionnaireItemState {
+    Str name = {};
+    QuestionnaireItemStatus status = QuestionnaireItemStatus::Unanswered;
+    bool required = false;
+    bool multiple = false;
+    bool disabled = false;
+    bool invalid = false;
+    bool hasInput = false;
+
+    Str Name() const { return name; }
+    QuestionnaireItemStatus Status() const { return status; }
+    bool IsRequired() const { return required; }
+    bool IsMultiple() const { return multiple; }
+    bool IsDisabled() const { return disabled; }
+    bool IsInvalid() const { return invalid; }
+    bool HasInput() const { return hasInput; }
+};
+
+struct QuestionnaireChoiceState {
+    Str value = {};
+    bool selected = false;
+    bool disabled = false;
+    bool invalid = false;
+
+    Str shortcut = {};
+
+    Str Value() const { return value; }
+    bool IsSelected() const { return selected; }
+    bool IsDisabled() const { return disabled; }
+    bool IsInvalid() const { return invalid; }
+    Str Shortcut() const { return shortcut; }
+};
+
+struct QuestionnaireNavigationState {
+    bool previousVisible = false;
+    bool nextVisible = false;
+    bool skipVisible = false;
+    bool submitVisible = false;
+    bool confirmable = false;
+
+    bool IsPreviousVisible() const { return previousVisible; }
+    bool IsNextVisible() const { return nextVisible; }
+    bool IsSkipVisible() const { return skipVisible; }
+    bool IsSubmitVisible() const { return submitVisible; }
+    bool IsConfirmable() const { return confirmable; }
+};
+
+struct QuestionnaireValidationContext {
+    Str item = {};
+    QuestionnaireAnswer answer = {};
+    QuestionnaireAnswers answers = {};
+
+    Str Item() const { return item; }
+    const QuestionnaireAnswer& Answer() const { return answer; }
+    const QuestionnaireAnswers& Answers() const { return answers; }
+};
+
+struct QuestionnaireAnswerChange {
+    Str item = {};
+    QuestionnaireAnswer answer = {};
+    QuestionnaireItemStatus status = QuestionnaireItemStatus::Unanswered;
+
+    Str Item() const { return item; }
+    const QuestionnaireAnswer& Answer() const { return answer; }
+    QuestionnaireItemStatus Status() const { return status; }
+};
+
+struct QuestionnaireSubmissionItem {
+    Str name = {};
+    QuestionnaireItemStatus status = QuestionnaireItemStatus::Unanswered;
+    QuestionnaireAnswer answer = {};
+
+    Str Name() const { return name; }
+    QuestionnaireItemStatus Status() const { return status; }
+    const QuestionnaireAnswer& Answer() const { return answer; }
+};
+
+struct QuestionnaireSubmission {
+    const QuestionnaireSubmissionItem* items = nullptr;
+    int n = 0;
+
+    const QuestionnaireSubmissionItem* Items() const { return items; }
+    int Len() const { return n; }
+
+    const QuestionnaireAnswer* Answer(Str name) const;
+};
+
+enum class QuestionnaireEventKind : uint8_t {
+    CurrentItemChanged,
+    AnswerChanged,
+    Completed,
+    Submit
+};
+
+struct QuestionnaireEvent {
+    QuestionnaireEventKind kind = QuestionnaireEventKind::CurrentItemChanged;
+
+    Str previous = {};
+    Str current = {};
+
+    QuestionnaireAnswerChange change = {};
+
+    QuestionnaireSubmission submission = {};
+};
+
+enum class QuestionnaireValidationErrorKind : uint8_t {
+    Required,
+    Unanswered,
+    Message
+};
+
+struct QuestionnaireValidationError {
+    QuestionnaireValidationErrorKind kind =
+        QuestionnaireValidationErrorKind::Required;
+    Str message = {};
+
+    static QuestionnaireValidationError Required() {
+        return {QuestionnaireValidationErrorKind::Required, {}};
+    }
+    static QuestionnaireValidationError Unanswered() {
+        return {QuestionnaireValidationErrorKind::Unanswered, {}};
+    }
+    static QuestionnaireValidationError Message(Str message) {
+        return {QuestionnaireValidationErrorKind::Message, message};
+    }
+
+    Str MessageText() const {
+        return kind == QuestionnaireValidationErrorKind::Message ? message
+                                                                 : Str{};
+    }
+};
+
+bool operator==(const QuestionnaireValidationError& a,
+                const QuestionnaireValidationError& b);
+
+enum class QuestionnaireSchemaErrorKind : uint8_t {
+    Ok,
+    DuplicateItem,
+    DuplicateChoice,
+    MultipleDefaultsForSingleItem,
+    UnknownItem,
+    UnknownChoice,
+    AnswerDoesNotMatchItem
+};
+
+struct QuestionnaireSchemaError {
+    QuestionnaireSchemaErrorKind kind = QuestionnaireSchemaErrorKind::Ok;
+    Str item = {};
+    Str choice = {};
+
+    bool IsOk() const { return kind == QuestionnaireSchemaErrorKind::Ok; }
+    bool IsError() const { return !IsOk(); }
+};
+
+bool operator==(const QuestionnaireSchemaError& a,
+                const QuestionnaireSchemaError& b);
+
+TempStr QuestionnaireSchemaErrorMessageTemp(const QuestionnaireSchemaError& e);
+
+struct QuestionnaireItemRuntime {
+    bool disabled = false;
+    bool* choiceDisabled = nullptr;
+    bool inputDisabled = true;
+
+    bool* selected = nullptr;
+    Str freeform = {};
+    bool* initialSelected = nullptr;
+    Str initialFreeform = {};
+    Str initialInputValue = {};
+    bool hasInitialInputValue = false;
+    bool skipped = false;
+    bool validationAttempted = false;
+    QuestionnaireValidationError internalError = {};
+    bool hasInternalError = false;
+    QuestionnaireValidationError externalError = {};
+    bool hasExternalError = false;
+    FocusHandle focus = {};
+    FocusHandle* choiceFocus = nullptr;
+    FocusHandle inputFocus = {};
+};
+
+struct QuestionnaireState {
+    Arena* arena = nullptr;
+    QuestionnaireItemDefinition* items = nullptr;
+    QuestionnaireItemRuntime* runtime = nullptr;
+    int nItems = 0;
+    int current = -1;
+    Str initialCurrent = {};
+    QuestionnaireShortcutMode shortcutMode = QuestionnaireShortcutMode::Letters;
+    bool hasShortcutMode = false;
+    bool complete = false;
+    FocusHandle focus = {};
+
+    Entity<QuestionnaireState> self = {};
+
+    ~QuestionnaireState();
+
+    static QuestionnaireSchemaError ValidateSchema(
+        const QuestionnaireItemDefinition* items, int n);
+
+    QuestionnaireSchemaError WithCurrentItem(Str name);
+    void WithShortcuts(QuestionnaireShortcutMode mode);
+
+    Str CurrentItem() const;
+
+    int CurrentIx() const;
+    int Total() const;
+    QuestionnaireProgressState Progress() const;
+    const QuestionnaireItemDefinition* ItemDefinition(Str name) const;
+    const QuestionnaireChoiceDefinition* ChoiceDefinition(Str item,
+                                                          Str value) const;
+    bool ItemState(Str name, QuestionnaireItemState* out) const;
+    bool ChoiceState(Str item, Str value, QuestionnaireChoiceState* out) const;
+
+    bool ChoicePosition(Str item, Str value, int* position, int* total) const;
+    QuestionnaireNavigationState NavigationState() const;
+    bool Answer(Str name, Arena* a, QuestionnaireAnswer* out) const;
+    QuestionnaireAnswers Answers(Arena* a) const;
+
+    const QuestionnaireValidationError* Error(Str name) const;
+    bool IsComplete() const { return complete; }
+    InputState* InputStateOf(Str name) const;
+    FocusHandle GetFocusHandle() const { return focus; }
+    const FocusHandle* ItemFocusHandle(Str name) const;
+    const FocusHandle* ChoiceFocusHandle(Str item, Str value) const;
+    bool IsCurrentInputFocused(const Window* win) const;
+
+    bool CurrentInputHasText() const;
+
+    Str FocusedCurrentChoice(const Window* win) const;
+    bool ShortcutMode(QuestionnaireShortcutMode* out) const;
+
+    Str ShortcutForChoice(Str item, Str value) const;
+    Str ChoiceForShortcut(Str item, Str key) const;
+    bool ActivateShortcut(Str key, Ctx* cx);
+
+    QuestionnaireSchemaError SetCurrentItem(Str name, Ctx* cx);
+    QuestionnaireSchemaError SetAnswer(Str item,
+                                       const QuestionnaireAnswer& answer,
+                                       Ctx* cx);
+    QuestionnaireSchemaError SetInputValue(Str item, Str value, Ctx* cx);
+    QuestionnaireSchemaError SetItemDisabled(Str name, bool disabled, Ctx* cx);
+    QuestionnaireSchemaError SetChoiceDisabled(Str item, Str value,
+                                               bool disabled, Ctx* cx);
+    QuestionnaireSchemaError SetExternalError(Str item, Str error, Ctx* cx);
+    QuestionnaireSchemaError ClearExternalError(Str item, Ctx* cx);
+    void Reset(Ctx* cx);
+    QuestionnaireSchemaError ActivateChoice(Str item, Str value, Ctx* cx);
+    bool ConfirmCurrent(Ctx* cx);
+    bool GoPrevious(Ctx* cx);
+    bool GoNext(Ctx* cx);
+    bool SkipCurrent(Ctx* cx);
+    bool Submit(Ctx* cx);
+    bool FocusCurrentItem(Ctx* cx) const;
+    bool FocusInvalidItem(Str item, Ctx* cx) const;
+    bool FocusChoice(Str item, Str value, Ctx* cx) const;
+    bool FocusInput(Str item, Ctx* cx) const;
+    bool FocusPreviousAnswer(Ctx* cx);
+    bool FocusNextAnswer(Ctx* cx);
+    bool MoveCurrentRadio(int direction, Ctx* cx);
+
+    static void OnInputChange(QuestionnaireState* self, Ctx* cx,
+                              const InputEvent* ev, intptr_t itemIx);
+};
+
+QuestionnaireSchemaError QuestionnaireStateNew(
+    App* app, const QuestionnaireItemDefinition* items, int n,
+    Entity<QuestionnaireState>* out);
+
+template <>
+struct EventEmitter<QuestionnaireState, QuestionnaireEvent> {};
+
+struct QuestionnaireChoiceControl {
+    enum class Kind : uint8_t {
+        Checkbox,
+        Radio
+    };
+    Kind kind = Kind::Radio;
+    El* el = nullptr;
+
+    static bool New(Ctx* cx, Entity<QuestionnaireState> state, Str item,
+                    Str value, Str id, QuestionnaireChoiceControl* out);
+};
+
+void QuestionnaireHandleKeyDown(Entity<QuestionnaireState> state, KeyEvent* ev,
+                                Ctx* cx);
+
 }
 
 #line 1 "src/base/radio.h"
@@ -12452,201 +13774,65 @@ struct RadioGroup {
 };
 }
 
-#line 1 "src/base/resizable.h"
+#line 1 "src/base/root.h"
 
 namespace gpui {
 
-const float PANEL_MIN_SIZE = 100.f;
-const float kResizablePanelMinSize = PANEL_MIN_SIZE;
+struct Root;
 
-bool ResizablePanelResize(float* sizes, const float* mins, const float* maxs,
-                          int n, int ix, float size, float containerSize);
+struct RootPlugin {
 
-void ResizableAdjustToContainer(float* sizes, int n, float containerSize);
+    void* (*build)(Window* window, App* app) = nullptr;
+    void (*drop)(void* state) = nullptr;
 
-const float kResizeHandleSize = 1.f;
-const float kResizeHandlePadding = 4.f;
+    void (*prepare)(void* state, Ctx* cx) = nullptr;
 
-namespace base_theme {
-struct Theme;
-}
-Rgba ResizableHandleColor(const base_theme::Theme& theme, bool active);
+    void (*style)(void* state, El* surface, Ctx* cx) = nullptr;
 
-struct ResizeHandleState {
-    bool active = false;
+    El* (*decorate)(void* state, El* surface, const Root* root,
+                    Ctx* cx) = nullptr;
 
-    Listener nextDown;
-    Listener nextUp;
-
-    static void OnDown(ResizeHandleState* self, Ctx* cx,
-                       const MouseDownEvent* ev);
-    static void OnUp(ResizeHandleState* self, Ctx* cx, const MouseUpEvent* ev);
+    El* (*render)(void* state, Ctx* cx) = nullptr;
 };
 
-Entity<ResizeHandleState> ResizeHandleStateFor(Ctx* cx, Str name);
-
-struct ResizeHandleContext {
-    Axis axis = Axis::Horizontal;
-    bool active = false;
-
-    Axis AxisValue() const { return axis; }
-    bool IsActive() const { return active; }
+struct RootPluginInstance {
+    const RootPlugin* type = nullptr;
+    void* state = nullptr;
 };
 
-using ResizeHandleRenderer = El* (*)(void* user,
-                                     const ResizeHandleContext* context,
-                                     Ctx* cx);
+struct Root {
+    App* app = nullptr;
 
-struct ResizeHandle {
-    Ctx* cx = nullptr;
-    Str id = {};
-    Axis axis = Axis::Horizontal;
-    Side placement = Side::Right;
-    bool hasPlacement = false;
-    Listener onDrag = {};
-    void* appearanceUser = nullptr;
-    ResizeHandleRenderer appearance = nullptr;
-    Rgba color = {};
-    Rgba activeColor = {};
+    EntityId view = {};
 
-    static ResizeHandle* New(Ctx* cx, Str id, Axis axis);
-    ResizeHandle* Placement(Side value);
-    ResizeHandle* OnDrag(Listener listener);
-    ResizeHandle* WithAppearance(void* user, ResizeHandleRenderer renderer);
-    ResizeHandle* Colors(Rgba rest, Rgba active);
-    El* IntoEl();
+    Style style = {};
+    uint32_t styleFields = 0;
+
+    static void RegisterPlugin(App* app, const RootPlugin* plugin);
+
+    static Entity<Root> New(App* app, Window* window, EntityId view);
+
+    EntityId View() const { return view; }
+
+    static void* Plugin(Window* window, const RootPlugin* type);
+
+    static Root* Read(Window* window);
+
+    Root* Refine(const Style& s, uint32_t fields);
+
+    static El* Render(Root* self, Ctx* cx);
 };
 
-ResizeHandle* resize_handle(Ctx* cx, Str id, Axis axis);
+const RootPluginInstance* RootPlugins(Window* window, int* n);
 
-struct ResizableState {
-    Axis axis = Axis::Horizontal;
+El* RootSurface(Ctx* cx, const Root* root, El* content);
 
-    Vec<float> sizes;
-    Vec<float> mins;
-    Vec<float> maxs;
+Window* KitOpenWindow(App* app, Str title, int dipW, int dipH, EntityId content,
+                      WinOpts opts);
 
-    Vec<bool> grows;
+int KitRunView(Str title, int dipW, int dipH, EntityId content, App* app,
+               WinOpts opts);
 
-    Vec<bool> shown;
-
-    Vec<Bounds> laid;
-
-    Bounds bounds = {};
-    float lastContainer = 0;
-
-    int dragging = -1;
-
-    Listener onResized = {};
-
-    ~ResizableState() {
-        VecReset(sizes);
-        VecReset(mins);
-        VecReset(maxs);
-        VecReset(grows);
-        VecReset(shown);
-        VecReset(laid);
-    }
-
-    static void OnHandleDown(ResizableState* self, Ctx* cx,
-                             const MouseDownEvent* ev, intptr_t ix);
-    static void OnHandleDrag(ResizableState* self, Ctx* cx,
-                             const DragMoveEvent* ev);
-    static void OnHandleUp(ResizableState* self, Ctx* cx,
-                           const MouseUpEvent* ev);
-    static void OnSettled(ResizableState* self, Ctx* cx, const void*);
-
-    const Vec<float>& Sizes() const { return sizes; }
-    float ContainerSize() const {
-        return AxisIsHorizontal(axis) ? bounds.w : bounds.h;
-    }
-    bool ResizePanel(Ctx* cx, int ix, float size);
-    bool InsertPanel(Ctx* cx, float size = PANEL_MIN_SIZE, int ix = -1);
-    bool RemovePanel(Ctx* cx, int ix);
-    bool ResetPanel(Ctx* cx, int ix);
-    void Clear();
-};
-
-struct ResizablePanelEvent {
-    const float* sizes = nullptr;
-    int count = 0;
-};
-
-float ResizablePanelSize(const ResizableState* s, int ix, float declared);
-
-struct ResizablePanelGroup {
-    Arena* a = nullptr;
-    Ctx* cx = nullptr;
-    Str id = {};
-    Entity<ResizableState> state = {};
-    gpui::Axis groupAxis = gpui::Axis::Horizontal;
-    float width = kFill;
-    float height = kFill;
-
-    Rgba handleColor = {};
-    Rgba handleDragColor = {};
-
-    ArenaVec<El*> panels;
-    ArenaVec<float> sizes;
-    ArenaVec<float> mins;
-    ArenaVec<float> maxs;
-    ArenaVec<bool> grows;
-    ArenaVec<bool> shown;
-    void* handleAppearanceUser = nullptr;
-    ResizeHandleRenderer handleAppearance = nullptr;
-    Listener onResize = {};
-
-    static ResizablePanelGroup* New(Ctx* cx, Str id,
-                                    Entity<ResizableState> state = {},
-                                    Axis axis = Axis::Horizontal);
-    ResizablePanelGroup* W(float v);
-    ResizablePanelGroup* H(float v);
-    ResizablePanelGroup* WithState(Entity<ResizableState> value);
-    ResizablePanelGroup* Axis(gpui::Axis value);
-    ResizablePanelGroup* Size(float v);
-    ResizablePanelGroup* HandleColors(Rgba rest, Rgba dragging);
-    ResizablePanelGroup* WithHandleAppearance(void* user,
-                                              ResizeHandleRenderer renderer);
-    ResizablePanelGroup* OnResize(Listener listener);
-
-    ResizablePanelGroup* Panel(El* content, float size,
-                               float min = kResizablePanelMinSize,
-                               float max = 0);
-
-    ResizablePanelGroup* Grow(El* content, float min = kResizablePanelMinSize);
-
-    ResizablePanelGroup* Flex();
-
-    ResizablePanelGroup* Visible(bool v);
-    ResizablePanelGroup* Child(struct ResizablePanel* panel);
-    ResizablePanelGroup* Children(struct ResizablePanel** values, int count);
-    El* IntoEl();
-};
-
-using Resizable = ResizablePanelGroup;
-
-struct ResizablePanel {
-    Ctx* cx = nullptr;
-    El* content = nullptr;
-    float size = 0;
-    float min = PANEL_MIN_SIZE;
-    float max = 0;
-    bool grow = true;
-    bool visible = true;
-
-    static ResizablePanel* New(Ctx* cx);
-    ResizablePanel* Child(El* value);
-    ResizablePanel* Size(float value);
-    ResizablePanel* SizeRange(float minValue, float maxValue = 0);
-    ResizablePanel* FlexNone();
-    ResizablePanel* Visible(bool value);
-};
-
-ResizablePanelGroup* h_resizable(Ctx* cx, Str id,
-                                 Entity<ResizableState> state = {});
-ResizablePanelGroup* v_resizable(Ctx* cx, Str id,
-                                 Entity<ResizableState> state = {});
-ResizablePanel* resizable_panel(Ctx* cx);
 }
 
 #line 1 "src/base/scrollable_mask.h"
@@ -12963,6 +14149,28 @@ struct ScrollBouncePhysics {
     bool Step(float seconds);
 };
 
+const float kCatchDragSlop = 8.f;
+
+struct ScrollBounceCatch {
+    float distance = 0;
+    bool tracking = false;
+
+    bool Observe(TouchPhase phase, float deltaY);
+};
+
+const double kMomentumGapSeconds = 0.25;
+
+struct ScrollBounceSuppression {
+
+    double lastWheelAt = -1;
+
+    float direction = 0;
+
+    void Release(ScrollBouncePhysics* physics, bool fromRest);
+
+    bool Lifts(double now, float deltaY);
+};
+
 struct ScrollBounce {
     Ctx* cx = nullptr;
     Str id = {};
@@ -13165,6 +14373,15 @@ struct TextSelectionRange {
     int end = 0;
     bool selected = false;
 };
+
+enum class TextSelectionBand {
+    Misses,
+    Covers,
+    Partial
+};
+TextSelectionBand TextSelectionBandFor(float rowsTop, float rowsBottom,
+                                       Point selectionStart,
+                                       Point selectionEnd);
 
 struct TextSelectionProjection {
     Vec<TextSelectionRange> ranges;
@@ -13898,6 +15115,663 @@ struct Tab {
 };
 }
 
+#line 1 "src/base/sankey.h"
+
+namespace gpui {
+
+enum class SankeyAlign : uint8_t {
+    Left,
+    Right,
+    Center,
+    Justify
+};
+
+enum class SankeyValueScale : uint8_t {
+    Linear,
+    Sqrt
+};
+
+enum class SankeyError : uint8_t {
+    None,
+
+    MissingNode,
+    CircularLink
+};
+
+struct SankeyLink {
+    int source = 0;
+    int target = 0;
+    double value = 0;
+};
+
+struct SankeyNodeLayout {
+    int index = 0;
+
+    double value = 0;
+
+    int depth = 0;
+    int height = 0;
+
+    int layer = 0;
+    float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
+
+    int srcStart = 0, srcCount = 0;
+    int tgtStart = 0, tgtCount = 0;
+};
+
+struct SankeyLinkLayout {
+    int index = 0;
+    int source = 0;
+    int target = 0;
+    double value = 0;
+    float y0 = 0, y1 = 0;
+
+    float width = 0;
+    float sourceWidth = 0;
+    float targetWidth = 0;
+};
+
+struct SankeyGraph {
+    Vec<SankeyNodeLayout> nodes;
+    Vec<SankeyLinkLayout> links;
+
+    Vec<int> srcLinks;
+    Vec<int> tgtLinks;
+
+    int errNode = 0;
+
+    void Reset() {
+        VecReset(nodes);
+        VecReset(links);
+        VecReset(srcLinks);
+        VecReset(tgtLinks);
+    }
+};
+
+int SankeyLayerCount(const SankeyGraph* g);
+
+struct Sankey {
+    float nodeWidth = 24.f;
+    float nodePadding = 8.f;
+    SankeyAlign align = SankeyAlign::Justify;
+    int iterations = 6;
+    SankeyValueScale valueScale = SankeyValueScale::Linear;
+
+    float x0 = 0, y0 = 0, x1 = 1, y1 = 1;
+};
+
+SankeyError SankeyTopology(const Sankey* s, int nodeCount,
+                           const SankeyLink* links, int nLinks,
+                           SankeyGraph* out);
+
+void SankeyLayoutFrom(const Sankey* s, SankeyGraph* g);
+
+SankeyError SankeyLayout(const Sankey* s, int nodeCount,
+                         const SankeyLink* links, int nLinks, SankeyGraph* out);
+
+}
+
+#line 1 "src/base/plot.h"
+
+namespace gpui {
+
+struct Path;
+
+namespace plot {
+
+struct PathCache {
+    uint64_t key = 0;
+    bool hasKey = false;
+
+    bool Touch(uint64_t value) {
+        bool warm = hasKey && key == value;
+        key = value;
+        hasKey = true;
+        return warm;
+    }
+    bool IsWarm() const { return hasKey; }
+};
+
+struct PathCaches {
+    Vec<PathCache> slots;
+
+    ~PathCaches() { VecReset(slots); }
+    PathCache* Slot(int index);
+    void SlotPair(int index, PathCache** first, PathCache** second);
+};
+
+struct ShapeKey {
+    uint64_t value = 1469598103934665603ull;
+
+    static ShapeKey New(uint64_t extra = 0) {
+        ShapeKey key;
+        key.U64(extra);
+        return key;
+    }
+    ShapeKey& U64(uint64_t v);
+    ShapeKey& PointValue(Point point);
+    ShapeKey& Float(float v);
+    uint64_t Finish() const { return value; }
+};
+
+struct ScaleLinear {
+    float domainStart = 0;
+    float domainDiff = 0;
+    float rangeStart = 0;
+    float rangeDiff = 0;
+
+    static ScaleLinear New(const float* domain, int domainN, const float* range,
+                           int rangeN);
+
+    bool Tick(float value, float* out) const;
+};
+
+struct ScalePoint {
+    const float* domain = nullptr;
+    int domainLen = 0;
+    float rangeStart = 0;
+    float rangeTick = 0;
+
+    static ScalePoint New(const float* domain, int domainN, const float* range,
+                          int rangeN);
+
+    bool Tick(float value, float* out) const;
+
+    bool TickAt(int index, float* out) const;
+
+    int NearestIndex(float tick) const;
+};
+
+struct ScaleBand {
+    int domainLen = 0;
+
+    float rangeStart = 0;
+    float rangeDiff = 0;
+    float avgWidth = 0;
+    float paddingInner = 0;
+    float paddingOuter = 0;
+
+    float maxBandWidth = -1;
+
+    static ScaleBand New(int domainN, const float* range, int rangeN);
+
+    float BandWidth() const;
+
+    ScaleBand MaxBandWidth(float width) const;
+
+    float Step() const;
+
+    ScaleBand BandCount(int count) const;
+
+    bool Tick(int index, float* out) const;
+
+    int NearestIndex(float tick) const;
+};
+
+struct ScaleOrdinal {
+    int rangeLen = 0;
+
+    int unknown = -1;
+
+    int Map(int domainIndex) const;
+};
+
+const float kPlotTextSize = 10;
+const float kPlotTextGap = 2;
+const float kPlotTextHeight = kPlotTextSize + kPlotTextGap;
+
+const float kPlotAxisGap = 18;
+
+inline float AxisGutter(float fontSize) {
+    return fontSize + kPlotTextGap * 4.f;
+}
+
+using Curve = ChartStroke;
+using ::gpui::AxisLabelPlacement;
+
+inline Point OriginPoint(float x, float y, Point origin) {
+    return Point{x + origin.x, y + origin.y};
+}
+
+Path* Polygon(PaintCtx* ctx, const Point* points, int count, Bounds bounds);
+
+enum class PlotTextAlign : uint8_t {
+    Left,
+    Center,
+    Right
+};
+
+struct Text {
+    Str text = {};
+    Point origin = {};
+    Rgba color = {};
+    float fontSize = kPlotTextSize;
+    FontWeight fontWeight = FontWeight::Normal;
+    PlotTextAlign align = PlotTextAlign::Left;
+
+    static Text New(Str text, Point origin, Rgba color);
+    Text* FontSize(float value);
+    Text* Weight(FontWeight value);
+    Text* Align(PlotTextAlign value);
+};
+
+float MeasureTextWidth(PaintCtx* ctx, Str text, float fontSize);
+
+Str TruncateTextToWidth(PaintCtx* ctx, Arena* arena, Str text, float fontSize,
+                        float maxWidth);
+
+struct PlotLabel {
+    Arena* a = nullptr;
+    ArenaVec<Text> items;
+
+    static PlotLabel New(Arena* arena);
+    PlotLabel* Add(const Text& text);
+    PlotLabel* AddMany(const Text* text, int count);
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+enum class AxisLabelSide : uint8_t {
+    End,
+    Start
+};
+
+struct AxisText {
+    Str text = {};
+    float tick = 0;
+    Rgba color = {};
+    float fontSize = kPlotTextSize;
+    PlotTextAlign align = PlotTextAlign::Left;
+
+    static AxisText New(Str text, float tick, Rgba color);
+    AxisText* FontSize(float value);
+    AxisText* Align(PlotTextAlign value);
+};
+
+struct PlotAxis {
+    Arena* a = nullptr;
+    bool hasX = false;
+    float x = 0;
+    ArenaVec<AxisText> xLabels;
+    bool xAxis = true;
+    AxisLabelSide xLabelSide = AxisLabelSide::End;
+    bool hasY = false;
+    float y = 0;
+    ArenaVec<AxisText> yLabels;
+    bool yAxis = false;
+    AxisLabelSide yLabelSide = AxisLabelSide::End;
+    Background stroke = {};
+
+    static PlotAxis New(Arena* arena);
+
+    PlotAxis* X(float value);
+
+    PlotAxis* ShowXAxis(bool value);
+
+    PlotAxis* XLabel(const AxisText* labels, int count);
+    PlotAxis* XLabelSide(AxisLabelSide value);
+    PlotAxis* Y(float value);
+
+    PlotAxis* ShowYAxis(bool value);
+    PlotAxis* YLabel(const AxisText* labels, int count);
+    PlotAxis* YLabelSide(AxisLabelSide value);
+
+    PlotAxis* Stroke(Background value);
+
+    ArenaVec<Text> XTexts(Arena* arena, float at) const;
+    ArenaVec<Text> YTexts(Arena* arena, float at) const;
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+struct Grid {
+    const float* x = nullptr;
+    int xCount = 0;
+    const float* y = nullptr;
+    int yCount = 0;
+    Background stroke = {};
+    const float* dashArray = nullptr;
+    int dashCount = 0;
+
+    static Grid New();
+    Grid* X(const float* values, int count);
+    Grid* Y(const float* values, int count);
+
+    Grid* Stroke(Background value);
+    Grid* DashArray(const float* values, int count);
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+struct PlotItems {
+    const void* data = nullptr;
+    int count = 0;
+    int stride = 0;
+
+    const void* At(int index) const;
+};
+
+typedef bool (*PlotValueFn)(const void* item, int index, void* user,
+                            float* out);
+
+struct Line {
+    PlotItems items = {};
+    PlotValueFn x = nullptr;
+    void* xUser = nullptr;
+    PlotValueFn y = nullptr;
+    void* yUser = nullptr;
+    Background stroke = {};
+    float strokeWidth = 1;
+    ::gpui::plot::Curve curve = ::gpui::plot::Curve::Natural;
+    bool dot = false;
+    float dotSize = 4;
+    Background dotFill = Background(RgbaTransparent());
+    bool hasDotStroke = false;
+    Rgba dotStroke = {};
+
+    static Line New();
+    Line* Data(const void* values, int count, int stride);
+    Line* X(PlotValueFn fn, void* user = nullptr);
+    Line* Y(PlotValueFn fn, void* user = nullptr);
+    Line* Stroke(Background value);
+    Line* StrokeWidth(float value);
+
+    Line* Curve(::gpui::plot::Curve value);
+
+    Line* Dots(bool value = true);
+    Line* DotSize(float value);
+
+    Line* DotFill(Background value);
+
+    Line* DotStroke(Rgba value);
+    int Points(Bounds bounds, Point* out, int capacity) const;
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+struct Area {
+    PlotItems items = {};
+    PlotValueFn x = nullptr;
+    void* xUser = nullptr;
+    bool hasY0 = false;
+    float y0 = 0;
+    PlotValueFn y1 = nullptr;
+    void* y1User = nullptr;
+    Background fill = {};
+    Background stroke = {};
+    ::gpui::plot::Curve curve = ::gpui::plot::Curve::Natural;
+
+    static Area New();
+    Area* Data(const void* values, int count, int stride);
+    Area* X(PlotValueFn fn, void* user = nullptr);
+    Area* Y0(float value);
+    Area* Y1(PlotValueFn fn, void* user = nullptr);
+    Area* Fill(Background value);
+    Area* Stroke(Background value);
+
+    Area* Curve(::gpui::plot::Curve value);
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+enum class BarAlignment : uint8_t {
+    Bottom,
+    Top,
+    Left,
+    Right
+};
+
+bool BarAlignmentIsHorizontal(BarAlignment value);
+float BarAlignmentGradientAngle(BarAlignment value);
+Point BarLabelOrigin(BarAlignment alignment, float cross, float base,
+                     float value, float bandWidth);
+
+typedef Background (*PlotBarFillFn)(const void* item, int index, Bounds frame,
+                                    BarAlignment alignment, void* user);
+typedef void (*PlotBarLabelFn)(const void* item, int index, Point origin,
+                               void* user, Vec<Text>* out);
+
+struct Bar {
+    PlotItems items = {};
+    BarAlignment alignment = BarAlignment::Bottom;
+    PlotValueFn cross = nullptr;
+    void* crossUser = nullptr;
+    float bandWidth = 0;
+    PlotValueFn base = nullptr;
+    void* baseUser = nullptr;
+    PlotValueFn value = nullptr;
+    void* valueUser = nullptr;
+    PlotBarFillFn fill = nullptr;
+    void* fillUser = nullptr;
+    PlotBarLabelFn label = nullptr;
+    void* labelUser = nullptr;
+    Corners cornerRadii = {};
+
+    static Bar New();
+    Bar* Data(const void* values, int count, int stride);
+    Bar* Alignment(BarAlignment value);
+    Bar* Cross(PlotValueFn fn, void* user = nullptr);
+    Bar* BandWidth(float value);
+    Bar* Base(PlotValueFn fn, void* user = nullptr);
+    Bar* Value(PlotValueFn fn, void* user = nullptr);
+    Bar* Fill(PlotBarFillFn fn, void* user = nullptr);
+    Bar* Label(PlotBarLabelFn fn, void* user = nullptr);
+    Bar* CornerRadii(Corners value);
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+struct ArcData {
+    const void* data = nullptr;
+    int index = 0;
+    float value = 0;
+    float startAngle = 0;
+    float endAngle = 0;
+    float padAngle = 0;
+
+    static ArcData New(const void* data, int index, float value,
+                       float startAngle, float endAngle) {
+        ArcData out;
+        out.data = data;
+        out.index = index;
+        out.value = value;
+        out.startAngle = startAngle;
+        out.endAngle = endAngle;
+        return out;
+    }
+};
+
+struct Arc {
+    float innerRadius = 0;
+    float outerRadius = 0;
+
+    static Arc New();
+    Arc* InnerRadius(float value);
+    Arc* OuterRadius(float value);
+    Point Centroid(const ArcData& arc) const;
+    Path* PathFor(PaintCtx* ctx, const ArcData& arc, Bounds bounds) const;
+
+    bool Contains(const ArcData& arc, Point position, Bounds bounds) const;
+    void Paint(PaintCtx* ctx, const ArcData& arc, Background fill,
+               Bounds bounds) const;
+
+    void PaintCached(PaintCtx* ctx, const ArcData& arc, Background fill,
+                     Bounds bounds, PathCache* cache) const;
+};
+
+struct Pie {
+    PlotValueFn value = nullptr;
+    void* valueUser = nullptr;
+    float startAngle = 0;
+    float endAngle = 2 * kPi;
+    float padAngle = 0;
+
+    static Pie New();
+    Pie* Value(PlotValueFn fn, void* user = nullptr);
+    Pie* StartAngle(float value);
+    Pie* EndAngle(float value);
+    Pie* PadAngle(float value);
+    void Arcs(Arena* arena, PlotItems items, ArenaVec<ArcData>* out) const;
+};
+
+struct RadialLine {
+    PlotItems items = {};
+    PlotValueFn angle = nullptr;
+    void* angleUser = nullptr;
+    PlotValueFn radius = nullptr;
+    void* radiusUser = nullptr;
+    bool closed = false;
+    bool hasFill = false;
+    Background fill = {};
+    Background stroke = {};
+    float strokeWidth = 1;
+    bool dot = false;
+    float dotSize = 4;
+    Background dotFill = Background(RgbaTransparent());
+    bool hasDotStroke = false;
+    Rgba dotStroke = {};
+
+    static RadialLine New();
+    RadialLine* Data(const void* values, int count, int stride);
+    RadialLine* Angle(PlotValueFn fn, void* user = nullptr);
+    RadialLine* Radius(PlotValueFn fn, void* user = nullptr);
+    RadialLine* Closed(bool value = true);
+    RadialLine* Fill(Background value);
+    RadialLine* Stroke(Background value);
+    RadialLine* StrokeWidth(float value);
+    RadialLine* Dots(bool value = true);
+    RadialLine* DotSize(float value);
+
+    RadialLine* DotFill(Background value);
+    RadialLine* DotStroke(Rgba value);
+    int Points(Bounds bounds, Point* out, int capacity) const;
+    void Paint(PaintCtx* ctx, Bounds bounds) const;
+};
+
+struct StackPoint {
+    float y0 = 0;
+    float y1 = 0;
+    const void* data = nullptr;
+};
+
+struct StackSeries {
+    Str key = {};
+    int index = 0;
+    ArenaVec<StackPoint> points;
+};
+
+typedef bool (*PlotStackValueFn)(const void* item, int index, Str key,
+                                 void* user, float* out);
+
+struct Stack {
+    PlotItems items = {};
+    const Str* keys = nullptr;
+    int keyCount = 0;
+    PlotStackValueFn value = nullptr;
+    void* valueUser = nullptr;
+
+    static Stack New();
+    Stack* Data(const void* values, int count, int stride);
+    Stack* Keys(const Str* values, int count);
+    Stack* Value(PlotStackValueFn fn, void* user = nullptr);
+    void Series(Arena* arena, ArenaVec<StackSeries>* out) const;
+};
+
+Path* SankeyLinkPath(PaintCtx* ctx, const SankeyNodeLayout& source,
+                     const SankeyNodeLayout& target,
+                     const SankeyLinkLayout& link, float minWidth,
+                     Point origin);
+
+struct TooltipState {
+
+    int index = 0;
+
+    Point crossLine = {};
+
+    const Point* dots = nullptr;
+    int dotCount = 0;
+
+    static TooltipState New(int index, Point crossLine, const Point* dots,
+                            int dotCount);
+};
+
+struct PlotHover {
+    TooltipState state = {};
+    float progress = 0;
+    bool hovered = false;
+
+    const TooltipState& State() const { return state; }
+
+    float Progress() const { return progress; }
+
+    float Focus() const { return progress; }
+    bool IsHovered() const { return hovered; }
+
+    bool IsEntering() const { return hovered && progress == 0.f; }
+
+    float Glide(Ctx* cx, motion::TransitionId id, float target) const;
+};
+
+struct PlotMotion {
+    Spring pointer = Spring::New(0);
+    motion::Transition enter = motion::Transition::New(0);
+    motion::Transition exit = motion::Transition::New(0);
+    motion::Transition appear = motion::Transition::New(0);
+
+    PlotMotion WithPointer(Spring value) const {
+        PlotMotion copy = *this;
+        copy.pointer = value;
+        return copy;
+    }
+    PlotMotion WithEnter(motion::Transition value) const {
+        PlotMotion copy = *this;
+        copy.enter = value;
+        return copy;
+    }
+    PlotMotion WithExit(motion::Transition value) const {
+        PlotMotion copy = *this;
+        copy.exit = value;
+        return copy;
+    }
+
+    PlotMotion WithAppear(motion::Transition value) const {
+        PlotMotion copy = *this;
+        copy.appear = value;
+        return copy;
+    }
+    Spring Pointer() const { return pointer; }
+    const motion::Transition& Enter() const { return enter; }
+    const motion::Transition& Exit() const { return exit; }
+    const motion::Transition& Appear() const { return appear; }
+};
+
+struct PlotAppear {
+
+    float time = 1.f;
+    Easing easing = Easing::Linear();
+
+    static PlotAppear Complete() { return {}; }
+
+    float Progress() const;
+
+    bool IsAppearing() const { return time < 1.f; }
+
+    float Staggered(int index, int count, float spread) const;
+};
+
+struct PlotAppearScope {
+
+    static El* New(Ctx* cx, Str id, El* child);
+};
+
+PlotAppear TrackAppear(Ctx* cx, uint64_t generation);
+
+Spring PointerSpring(const App* app);
+
+bool TrackHover(Ctx* cx, const TooltipState* live, const Point* cursor,
+                PlotHover* outHover, Point* outCursor);
+
+float HoverProgress(Ctx* cx);
+
+bool IsHoverEntering(Ctx* cx);
+
+}
+}
+
 #line 1 "src/base/theme.h"
 
 namespace gpui {
@@ -13942,11 +15816,24 @@ struct ResizableTheme {
     bool hasActiveHandle = false;
 };
 
+struct PlotTheme {
+    plot::PlotMotion motion = {};
+
+    static PlotTheme New() { return {}; }
+    PlotTheme WithMotion(const plot::PlotMotion& value) const {
+        PlotTheme copy = *this;
+        copy.motion = value;
+        return copy;
+    }
+    const plot::PlotMotion& Motion() const { return motion; }
+};
+
 struct Theme {
     ThemeAppearance appearance = ThemeAppearance::Light;
     SemanticThemeTokens tokens;
     ScrollbarTheme scrollbar = {};
     ResizableTheme resizable = {};
+    PlotTheme plot = {};
 
     static Theme Global(const App* app);
     static Theme* GlobalMut(App* app);
@@ -14273,6 +16160,22 @@ struct ParseOptions {
 
 Node* ToMdast(Arena* a, Str source, const ParseOptions& options);
 
+struct NodeSpan {
+    const Node* node = nullptr;
+    int32_t start = 0;
+    int32_t end = 0;
+};
+
+struct NodePositions {
+    base::Vec<NodeSpan> spans;
+};
+
+Node* ToMdast(Arena* a, Str source, const ParseOptions& options,
+              NodePositions* positions);
+
+bool NodePosition(const NodePositions* positions, const Node* n, int32_t* start,
+                  int32_t* end);
+
 Str DecodeNamed(Arena* a, Str name);
 
 Str DecodeNumeric(Arena* a, Str value, int radix);
@@ -14333,10 +16236,11 @@ struct MarkdownParseContext {
     Arena* arena = nullptr;
     Str source = {};
     int offset = 0;
+    const markdown::NodePositions* positions = nullptr;
 
     Str Source() const { return source; }
     int Offset() const { return offset; }
-    Str NodeSource(const markdown::Node*) const { return {}; }
+    Str NodeSource(const markdown::Node* node) const;
     Str Value(const markdown::Node* node, markdown::NodeStrKind kind) const;
     Str Copy(Str value) const;
 };
@@ -14458,6 +16362,12 @@ enum MdMark : uint8_t {
 struct MdRun {
     Str text = {};
 
+    const SourceSegment* segments = nullptr;
+    int segmentCount = 0;
+
+    Span imgSpan = {};
+    bool hasImgSpan = false;
+
     Str href = {};
 
     Str imgSrc = {};
@@ -14522,6 +16432,9 @@ struct MdNode {
 
     bool hasCheck = false;
     bool checked = false;
+
+    int leafStart = -1;
+    int leafOrdinal = 0;
     MarkdownNode custom = {};
 };
 
@@ -14560,7 +16473,10 @@ struct TableData {
 
 using TableActionsFn = El* (*)(Ctx * cx, void* data, const TableData* table);
 
-using HeadingFontSizeFn = float (*)(uint8_t level, float base, void* data);
+using ImageSourceFn = gpui::ImageSource (*)(Str uri, void* data);
+
+using HeadingStyleFn = uint32_t (*)(uint8_t level, gpui::Style* style,
+                                    void* data);
 
 struct TextViewStyle {
 
@@ -14574,9 +16490,9 @@ struct TextViewStyle {
 
     Rgba border = {};
     float paragraphGap = 16;
-    float headingBaseFontSize = 14;
-    HeadingFontSizeFn headingFontSize = nullptr;
-    void* headingFontSizeData = nullptr;
+
+    HeadingStyleFn heading = nullptr;
+    void* headingData = nullptr;
     gpui::Style codeBlock = {};
     uint32_t codeBlockFields = 0;
     gpui::Style table = {};
@@ -14593,9 +16509,8 @@ struct TextViewStyle {
 
     static TextViewStyle FromTheme(const base_theme::Theme& theme);
     static TextViewStyle FromColors(const ColorTokens& colors, bool isDark);
-    float HeadingSize(uint8_t level) const;
 
-    bool HasHeadingFontSize() const { return headingFontSize != nullptr; }
+    uint32_t Heading(uint8_t level, gpui::Style* out) const;
 
     Rgba InlineCodeBackground() const;
     TextViewStyle& WithForeground(Rgba color);
@@ -14605,9 +16520,8 @@ struct TextViewStyle {
     TextViewStyle& WithCodeBackground(Rgba color);
     TextViewStyle& WithBorder(Rgba color);
     TextViewStyle& WithParagraphGap(float gap);
-    TextViewStyle& WithHeadingBaseFontSize(float size);
-    TextViewStyle& WithHeadingFontSize(HeadingFontSizeFn fn,
-                                       void* data = nullptr);
+
+    TextViewStyle& WithHeading(HeadingStyleFn fn, void* data = nullptr);
     TextViewStyle& WithCodeBlock(const gpui::Style& style, uint32_t fields);
     TextViewStyle& WithTable(const gpui::Style& style, uint32_t fields);
     TextViewStyle& WithTableHead(const gpui::Style& style, uint32_t fields);
@@ -14677,7 +16591,170 @@ struct TextViewMotion {
         out.streamFadeEasing = easing;
         return out;
     }
+
+    float StaggerStepMs(int words) const {
+        if (words < 2) {
+            return 0;
+        }
+        if (streamFadeStaggerMs * (float)(words - 1) > streamFadeMs) {
+            return 0;
+        }
+        return streamFadeStaggerMs;
+    }
 };
+
+struct TextLeafKey {
+    int blockStart = 0;
+    int ordinal = 0;
+
+    static TextLeafKey Block(int start) { return TextLeafKey{start, 0}; }
+    static TextLeafKey TableCell(int start, int ordinal) {
+        return TextLeafKey{start, ordinal + 1};
+    }
+    int BlockStart() const { return blockStart; }
+
+    int CellIx() const { return ordinal - 1; }
+
+    TextLeafKey MovedTo(int start) const { return TextLeafKey{start, ordinal}; }
+};
+inline bool operator==(TextLeafKey a, TextLeafKey b) {
+    return a.blockStart == b.blockStart && a.ordinal == b.ordinal;
+}
+inline bool operator<(TextLeafKey a, TextLeafKey b) {
+    return a.blockStart != b.blockStart ? a.blockStart < b.blockStart
+                                        : a.ordinal < b.ordinal;
+}
+
+struct StreamFadeSegment {
+    TextLeafKey key = {};
+    Span range = {};
+    double startedAt = 0;
+};
+
+struct StreamFadeRange {
+    TextLeafKey key = {};
+    Span range = {};
+    float fadeOut = 0;
+};
+
+void StreamFadeUnits(Str text, int start, int end, Vec<Span>* out);
+
+struct RangeHighlight {
+    Span range = {};
+    Rgba background = {0, 0, 0, 0};
+
+    static RangeHighlight New(Span range, Rgba background) {
+        RangeHighlight out;
+        out.range = range;
+        out.background = background;
+        return out;
+    }
+    static RangeHighlight New(Span range, Hsla background) {
+        return New(range, HslaToRgba(background));
+    }
+    Span Range() const { return range; }
+    Rgba Background() const { return background; }
+};
+
+enum class RangeHighlightErrorKind : uint8_t {
+    None,
+
+    Unsupported,
+
+    InvalidRange,
+};
+
+struct RangeHighlightError {
+    RangeHighlightErrorKind kind = RangeHighlightErrorKind::None;
+    int index = 0;
+
+    static RangeHighlightError Unsupported() {
+        return RangeHighlightError{RangeHighlightErrorKind::Unsupported, 0};
+    }
+    static RangeHighlightError InvalidRange(int index) {
+        return RangeHighlightError{RangeHighlightErrorKind::InvalidRange,
+                                   index};
+    }
+    bool IsOk() const { return kind == RangeHighlightErrorKind::None; }
+
+    Str Display(Arena* a) const;
+};
+inline bool operator==(RangeHighlightError a, RangeHighlightError b) {
+    return a.kind == b.kind && a.index == b.index;
+}
+
+struct RenderedText {
+    EntityId owner = {};
+    uint64_t revision = 0;
+    Str text = {};
+
+    Str AsStr() const { return text; }
+    int Len() const { return len(text); }
+    bool IsEmpty() const { return len(text) == 0; }
+};
+inline bool operator==(const RenderedText& a, const RenderedText& b) {
+    return a.owner == b.owner && a.revision == b.revision;
+}
+inline bool operator!=(const RenderedText& a, const RenderedText& b) {
+    return !(a == b);
+}
+
+struct RangeBackground {
+    Span range = {};
+    Rgba color = {0, 0, 0, 0};
+};
+
+struct RangeHighlightFrame {
+    struct Leaf {
+        TextLeafKey key = {};
+        int first = 0;
+        int count = 0;
+    };
+
+    Vec<Leaf> leaves;
+    Vec<RangeBackground> backgrounds;
+
+    const RangeBackground* Backgrounds(TextLeafKey key, int* count) const;
+};
+
+struct RenderedIndex;
+
+RenderedIndex* RenderedIndexNew(const MdNode* doc, Str source);
+void RenderedIndexFree(RenderedIndex* index);
+Str RenderedIndexText(const RenderedIndex* index);
+
+RangeHighlightError RangeHighlightFrameNew(const RenderedIndex* index,
+                                           const RangeHighlight* highlights,
+                                           int count,
+                                           RangeHighlightFrame** out);
+
+RangeHighlightFrame* RangeHighlightFrameRemap(const RangeHighlightFrame* frame,
+                                              const RenderedIndex* prev,
+                                              const RenderedIndex* next);
+void RangeHighlightFrameFree(RangeHighlightFrame* frame);
+
+struct TextViewReveal {
+    bool pending = false;
+
+    bool block = false;
+    TextLeafKey key = {};
+    int offset = 0;
+    int blockIx = 0;
+
+    double requestedAt = 0;
+    int attempts = 0;
+
+    Bounds line = {};
+
+    Bounds view = {};
+};
+
+struct TextViewRevealEvent {
+    Bounds line = {};
+};
+
+bool RenderedIndexLocate(const RenderedIndex* index, Span range,
+                         TextViewReveal* out);
 
 struct TextViewState {
     EntityId self = {};
@@ -14699,11 +16776,22 @@ struct TextViewState {
     gpui::SelectionFormat selectionFormat = gpui::SelectionFormat::Plain;
     TextViewMotion motion = {};
 
-    Str streamRenderedText = {};
+    Vec<StreamFadeSegment> fadeSegments;
+
+    int selectAllAnchor = -1;
+    int selectAllCursor = -1;
     bool streamFadePending = false;
     bool streamFadeReplace = false;
-    int streamFadeFrom = -1;
-    double streamFadeStartedAt = 0;
+
+    int fadeTick = 0;
+
+    RenderedIndex* renderedIndex = nullptr;
+    uint64_t renderedRevision = 0;
+    uint64_t indexedRevision = ~(uint64_t)0;
+    uint64_t indexedExtensions = 0;
+    RangeHighlightFrame* rangeHighlights = nullptr;
+
+    TextViewReveal reveal = {};
 
     ~TextViewState();
     static Entity<TextViewState> Markdown(App* app, Str text);
@@ -14722,15 +16810,38 @@ struct TextViewState {
     void SetSelectionFormat(gpui::SelectionFormat value, App* app,
                             Window* window = nullptr);
     int SelectedText(Window* window, char* out, int cap) const;
+
+    bool SelectedSourceRange(const Window* window, Span* out) const;
     bool HasSelection(const Window* window) const;
     void ClearSelection(Window* window, App* app);
     void SelectAll(Window* window, App* app);
+
+    gpui::RenderedText RenderedText() const;
+
+    RangeHighlightError SetRangeHighlights(const RangeHighlight* highlights,
+                                           int count, App* app,
+                                           Window* window = nullptr);
+
+    void ClearRangeHighlights(App* app, Window* window = nullptr);
+
+    RangeHighlightError RevealRange(Span range, App* app,
+                                    Window* window = nullptr);
+
+    void ReconcileRangeHighlights(const MdNode* doc, uint64_t extensions,
+                                  double now = 0);
+
+    void RecordStreamFade(const RenderedIndex* prev, const RenderedIndex* next,
+                          double now);
+
+    int StreamFadeFrame(Arena* a, double now, StreamFadeRange** out);
     static void OnAction(TextViewState* self, Ctx* cx,
                          const ActionEvent* event);
     static void OnScroll(TextViewState* self, Ctx* cx,
                          const ScrollEvent* event);
     static void OnLineClamp(TextViewState* self, Ctx* cx,
                             const LineClampEvent* event);
+    static void OnFadeTick(TextViewState* self, Ctx* cx,
+                           const TickEvent* event);
 
   private:
     void Changed(App* app, Window* window, bool selectionCompatible);
@@ -14742,6 +16853,10 @@ struct TextViewLayoutState {
 };
 
 Str MdTableToMarkdown(Arena* a, MdNode* table);
+
+int OrderedListOrdinal(int start, int ix);
+
+Str ListItemPrefix(Arena* a, int ix, int start, bool ordered, int depth);
 
 struct TextViewLinkBinding {
     intptr_t context = 0;
@@ -14777,6 +16892,9 @@ struct TextView {
     void* tableActionsData = nullptr;
     void* codeActionsData = nullptr;
 
+    ImageSourceFn imageSource = nullptr;
+    void* imageSourceData = nullptr;
+
     ArenaVec<MdPlugin> plugins{};
 
     float tableColW = 64;
@@ -14798,10 +16916,18 @@ struct TextView {
     uint32_t outerStyleFields = 0;
     TextViewMotion motion = {};
     bool motionSet = false;
-    int streamBlockDepth = 0;
-    int streamRenderedOffset = 0;
-    int streamFadeFrom = -1;
-    float streamFadeOpacity = 1;
+
+    int blockDepth = 0;
+
+    const StreamFadeRange* streamFades = nullptr;
+    int nStreamFades = 0;
+
+    const RangeHighlightFrame* rangeHighlights = nullptr;
+
+    const TextViewReveal* revealTarget = nullptr;
+    Bounds* revealOut = nullptr;
+
+    Listener onReveal;
 
     static TextView* New(Ctx* cx, Str source);
     static TextView* NewHtml(Ctx* cx, Str source);
@@ -14826,6 +16952,8 @@ struct TextView {
 
     TextView* OnLink(Listener fn);
 
+    TextView* OnReveal(Listener fn);
+
     TextView* OnLinkWithContext(Listener fn, intptr_t context);
 
     TextView* CodeBlockActions(CodeBlockActionsFn fn, void* data = nullptr);
@@ -14834,6 +16962,8 @@ struct TextView {
                                    void* data = nullptr);
 
     TextView* TableActions(TableActionsFn fn, void* data = nullptr);
+
+    TextView* ImageSource(ImageSourceFn fn, void* data = nullptr);
 
     TextView* Plugin(Str name, MdPluginParseFn parse, MdPluginRenderFn render,
                      void* data = nullptr);
@@ -14878,6 +17008,9 @@ struct TextView {
     void SrcBreak();
 
     El* SrcImage(El* e, MdRun* r);
+
+    El* SrcMap(El* t, const SourceSegment* segments, int count, int offset,
+               bool atomic = false);
     Listener LinkListener(Str href);
 
     Str BlockText(MdNode* n);
@@ -14893,7 +17026,9 @@ struct TextView {
     El* TableActionsRow(MdNode* n, int nCols, const uint8_t* colAlign);
     El* CodeBlock(MdNode* n);
 
-    El* CodeLines(Str code, const ArenaVec<CodeHighlight>& spans);
+    El* CodeLines(Str code, const ArenaVec<CodeHighlight>& spans,
+                  const SourceSegment* segments, int segmentCount,
+                  const MdNode* leaf = nullptr);
 
     El* ImageRun(MdRun* r, float font, Rgba color, bool inFlow);
 
@@ -14902,9 +17037,55 @@ struct TextView {
 
     El* Inline(MdNode* n, float font, Rgba color, int weight,
                uint8_t align = MdAlignDefault);
+
+    El* RangeWashes(El* t, const MdNode* leaf, int lo, int hi,
+                    bool markOver = false);
+
+    void RevealFrame(TextViewState* managed);
+
+    bool RevealIn(const MdNode* leaf, int* offset) const;
+
+    void RevealMark(El* t, int lo, int offset);
 };
 
 MdNode* MdParse(Arena* a, Str source);
+
+struct SourceRangeSelection {
+    enum Kind : uint8_t {
+        Unselected,
+        Mapped,
+        Unmapped,
+    };
+    Kind kind = Unselected;
+    Span range = {};
+
+    static SourceRangeSelection MappedRange(int start, int end);
+    void Merge(const SourceRangeSelection& other);
+    bool IntoRange(Span* out) const;
+};
+
+bool SourceRangeForSegments(const SourceSegment* segments, int count, int start,
+                            int end, Span* out);
+
+struct SourceCharPos {
+    uint32_t key = 0;
+    int offset = 0;
+};
+struct SourceCharIndex {
+    Vec<SourceCharPos> pos;
+    bool built = false;
+};
+
+int SourceCharOffset(Str raw, int rawCursor, const char* ch, int cl,
+                     SourceCharIndex* positions);
+
+void AlignedSourceSegments(Arena* a, Str raw, Str rendered, int sourceOffset,
+                           bool decodeEntities, Vec<SourceSegment>& out);
+
+SourceRangeSelection MdSelectedSourceRange(const MdNode* n, int start, int end);
+
+SourceRangeSelection TextHitsSourceRange(const PaintCtx* ctx, int selA,
+                                         int selB, int scope, EntityId owner);
 
 MdNode* MdParseCachedForTest(Ctx* cx, Arena* frame, Str source,
                              const MarkdownExtensions* extensions);
@@ -14988,6 +17169,158 @@ struct HtmlInlineTag {
 HtmlInlineTag HtmlParseInlineTag(Arena* a, Str tag);
 
 Str HtmlAttrValue(Arena* a, Str attrs, const char* name);
+
+}
+
+#line 1 "src/base/time_field.h"
+
+namespace gpui {
+
+enum class TimePrecision : uint8_t {
+
+    Minute,
+
+    Second,
+};
+
+enum class HourCycle : uint8_t {
+
+    H23,
+
+    H12,
+};
+
+enum class TimeSegment : uint8_t {
+    Hour,
+    Minute,
+    Second,
+
+    Period,
+};
+
+Str TimePrecisionFormat(TimePrecision precision, HourCycle hourCycle);
+
+LocalTime TimePrecisionTruncate(TimePrecision precision, LocalTime time);
+
+Str TimeFormat(Arena* a, Str pattern, LocalTime time);
+
+enum class TimeFieldEventKind : uint8_t {
+
+    Change,
+};
+
+struct TimeFieldEvent {
+    TimeFieldEventKind kind = TimeFieldEventKind::Change;
+    LocalTime time = {};
+};
+
+struct SegmentEditor {
+    LocalTime time = {};
+    TimePrecision precision = TimePrecision::Minute;
+    HourCycle hourCycle = HourCycle::H23;
+    TimeSegment segment = TimeSegment::Hour;
+
+    int pendingDigit = -1;
+
+    int Segments(TimeSegment out[4]) const;
+    bool HasSegment(TimeSegment s) const;
+
+    void Bounds(TimeSegment s, int* min, int* max) const;
+
+    int Value(TimeSegment s) const;
+
+    Str Label(Arena* a, TimeSegment s) const;
+    LocalTime WithValue(TimeSegment s, int value) const;
+    void SetPrecision(TimePrecision value);
+    void SetHourCycle(HourCycle value);
+    void ResetSegment();
+
+    bool SetTime(LocalTime value);
+    bool SelectSegment(TimeSegment s);
+
+    bool MoveSegment(int offset);
+
+    bool Step(int delta);
+    bool InputDigit(int digit);
+
+    bool InputPeriod(bool pm);
+
+    bool ClearSegment();
+    bool ReplaceSegment(int value);
+};
+
+struct TimeFieldState {
+    Entity<TimeFieldState> self = {};
+    FocusHandle focus = {};
+    SegmentEditor editor = {};
+
+    LocalTime Time() const { return editor.time; }
+
+    TimeSegment SelectedSegment() const { return editor.segment; }
+
+    static void OnAction(TimeFieldState* self, Ctx* cx, const ActionEvent* ev);
+    static void OnKeyDown(TimeFieldState* self, Ctx* cx, const KeyEvent* ev);
+
+    static void OnSegmentDown(TimeFieldState* self, Ctx* cx,
+                              const MouseDownEvent* ev, intptr_t segment);
+};
+
+Entity<TimeFieldState> TimeFieldStateNew(
+    Ctx* cx, TimePrecision precision = TimePrecision::Minute,
+    HourCycle hourCycle = HourCycle::H23);
+
+void TimeFieldStateSetPrecision(TimeFieldState* s, TimePrecision precision,
+                                Ctx* cx = nullptr);
+void TimeFieldStateSetHourCycle(TimeFieldState* s, HourCycle hourCycle,
+                                Ctx* cx = nullptr);
+void TimeFieldStateSetTime(TimeFieldState* s, LocalTime time,
+                           Ctx* cx = nullptr);
+void TimeFieldStateFocus(TimeFieldState* s, Window* win);
+
+void TimeFieldInitKeys();
+Str TimeFieldContext();
+uint32_t TimeFieldIncrement();
+uint32_t TimeFieldDecrement();
+
+struct TimeFieldSegmentState {
+    TimeSegment segment = TimeSegment::Hour;
+    int value = 0;
+    bool selected = false;
+    bool disabled = false;
+
+    TimeSegment Segment() const { return segment; }
+
+    int Value() const { return value; }
+
+    bool IsSelected() const { return selected; }
+    bool IsDisabled() const { return disabled; }
+};
+
+using TimeFieldSegmentRenderer = El* (*)(void* user, El* segment,
+                                         const TimeFieldSegmentState* state,
+                                         Ctx* cx);
+void TimeFieldSegmentClearChildren(El* segment);
+
+struct TimeField {
+    Ctx* cx = nullptr;
+    Str id = {};
+    Entity<TimeFieldState> state = {};
+    bool disabled = false;
+    Style style = {};
+    uint32_t styleSet = 0;
+    TimeFieldSegmentRenderer segment = nullptr;
+    void* segmentUser = nullptr;
+
+    static TimeField* New(Ctx* cx, Str id, Entity<TimeFieldState> state);
+    TimeField* Disabled(bool v = true);
+
+    TimeField* RenderSegment(TimeFieldSegmentRenderer fn, void* user = nullptr);
+    TimeField* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+template <>
+struct EventEmitter<TimeFieldState, TimeFieldEvent> {};
 
 }
 
@@ -15345,6 +17678,49 @@ namespace gpui {
 struct ToggleGroup {
     static El* New(Ctx* cx, Str id, Axis axis = Axis::Horizontal);
 };
+}
+
+#line 1 "src/base/toolbar.h"
+
+namespace gpui {
+
+const int kToolbarMaxFocusAttempts = 100;
+
+struct ToolbarState {
+    Bounds bounds = {};
+    bool disabled = false;
+
+    static void OnKeyDown(ToolbarState* self, Ctx* cx, const KeyEvent* ev);
+};
+
+bool ToolbarMoveFocus(Window* win, Bounds container, bool forward);
+
+struct Toolbar {
+    Ctx* cx = nullptr;
+    Str id = {};
+    bool disabled = false;
+
+    El* root = nullptr;
+
+    static Toolbar* New(Ctx* cx, Str id);
+
+    Toolbar* Disabled(bool value);
+    Toolbar* Child(El* child);
+    El* IntoEl();
+};
+
+struct ToolbarGroup {
+    Ctx* cx = nullptr;
+    Str label = {};
+    El* root = nullptr;
+
+    static ToolbarGroup* New(Ctx* cx, Str id);
+
+    ToolbarGroup* Label(Str value);
+    ToolbarGroup* Child(El* child);
+    El* IntoEl();
+};
+
 }
 
 #line 1 "src/base/tooltip.h"
@@ -15987,6 +18363,7 @@ struct Theme {
     Rgba chart5;
     Rgba chartBullish;
     Rgba chartBearish;
+    Rgba chartGrid;
     Rgba danger;
     Rgba dangerFg;
 
@@ -16408,10 +18785,16 @@ bool ThemeConfigNames(const ThemeConfig* cfg, const char* key);
 void ThemeConfigResolve(Theme* out, const ThemeConfig* cfg, const Theme& base);
 
 struct ThemeRegistry {
+
     Arena* arena = nullptr;
+
+    Arena* names = nullptr;
+    Vec<Str> interned;
     Vec<ThemeConfig> themes;
     Vec<Str> loadedDirs;
     Str active[2] = {};
+
+    int watch = 0;
     bool initialized = false;
 
     ~ThemeRegistry();
@@ -16427,6 +18810,10 @@ void ThemeSyncBase(App* app);
 int ThemeRegistryLoadStr(App* app, Str json);
 
 int ThemeRegistryLoadDir(App* app, Str dir);
+
+bool ThemeRegistryWatchDir(App* app, Str dir, Func0 onLoad = Func0{});
+
+int ThemeRegistryReload(App* app);
 
 bool ThemeApplySemanticConfigStr(App* app, ThemeMode mode, Str json,
                                  SemanticThemeTokens* out = nullptr);
@@ -16756,8 +19143,10 @@ inline float UiInputHeight(UiSize s) {
     }
 }
 
+constexpr float kDropdownListPadding = 4.f;
+
 inline float UiListPadX(UiSize s) {
-    return s == UiSize::Small ? 8.f : 12.f;
+    return UiInputPadX(s) + 1.f - kDropdownListPadding;
 }
 
 inline float UiListPadY(UiSize s) {
@@ -16820,17 +19209,41 @@ inline El* UiSizeWith(El* e, UiSize s) {
     float px = UiSizeWithPx(s);
     return e->W(px)->H(px);
 }
+
+inline float UiTableCellFontPx(UiSize s) {
+    switch (s) {
+        case UiSize::XSmall:
+            return 12;
+        case UiSize::Small:
+        case UiSize::Medium:
+            return 14;
+        case UiSize::Large:
+            return 16;
+        default:
+            return 0;
+    }
+}
 inline El* UiTableCellSize(El* e, UiSize s) {
     Edges pad = UiTableCellPadding(s);
-    if (s == UiSize::XSmall || s == UiSize::Small) {
-        e->Font(14);
+    if (float font = UiTableCellFontPx(s)) {
+        e->Font(font);
     }
     return e->PadL(pad.left)->PadR(pad.right)->PadT(pad.top)->PadB(pad.bottom);
 }
+
+inline float UiButtonTextPx(UiSize s) {
+    switch (s) {
+        case UiSize::XSmall:
+            return 12;
+        case UiSize::Small:
+        case UiSize::Medium:
+            return 14;
+        default:
+            return 16;
+    }
+}
 inline El* UiButtonTextSize(El* e, UiSize s) {
-    float font =
-        s == UiSize::XSmall ? 12.f : (s == UiSize::Small ? 14.f : 16.f);
-    return e->Font(font);
+    return e->Font(UiButtonTextPx(s));
 }
 
 namespace component {
@@ -16870,21 +19283,35 @@ struct AccordionStyle {
 struct AccordionItem {
     Ctx* cx = nullptr;
     El* title = nullptr;
-    El* content = nullptr;
+
+    ArenaVec<El*> children;
     bool open = false;
+    bool disabled = false;
     IconName icon = IconName::None;
     AccordionStyle titleStyle = {};
     AccordionStyle contentStyle = {};
+
+    ElRefiner refiner = {};
+
+    int index = 0;
+    bool last = false;
+    UiSize size = UiSize::Medium;
+
+    Listener onToggle;
 
     static AccordionItem* New(Ctx* cx);
     AccordionItem* Title(El* t);
     AccordionItem* Title(Str s);
     AccordionItem* Icon(IconName i);
     AccordionItem* Open(bool v);
+    AccordionItem* Disabled(bool v);
     AccordionItem* Child(El* c);
     AccordionItem* Child(Str s);
     AccordionItem* TitleStyle(const AccordionStyle& s);
     AccordionItem* ContentStyle(const AccordionStyle& s);
+    AccordionItem* WithSize(UiSize s);
+
+    El* IntoEl();
 };
 
 struct Accordion {
@@ -17097,14 +19524,35 @@ inline bool AttachmentStatusIsInProgress(AttachmentStatus s) {
            s == AttachmentStatus::Processing;
 }
 
+struct AttachmentSlotLayout {
+    UiSize size = UiSize::Medium;
+    AttachmentStatus status = AttachmentStatus::Complete;
+    Axis axis = Axis::Horizontal;
+
+    bool flush = false;
+
+    Listener retry;
+
+    float progress = -1;
+
+    Str id = {};
+    bool hasId = false;
+};
+
 struct AttachmentMedia {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     ArenaVec<El*> children;
+    ArenaVec<El*> overlays;
     UiSize size = UiSize::Medium;
     bool hasSize = false;
     AttachmentStatus status = AttachmentStatus::Complete;
     Axis axis = Axis::Horizontal;
+    bool flush = false;
+    Listener retry;
+    float progress = -1;
+    Str id = {};
+    bool hasId = false;
     Str source = {};
     bool hasSource = false;
     Style style = {};
@@ -17118,7 +19566,7 @@ struct AttachmentMedia {
     AttachmentMedia* WithSize(UiSize value);
     AttachmentMedia* Refine(const Style& s, uint32_t fields);
 
-    AttachmentMedia* Layout(UiSize value, AttachmentStatus st, Axis ax);
+    AttachmentMedia* Layout(const AttachmentSlotLayout& layout);
     El* IntoEl();
 };
 
@@ -17146,6 +19594,9 @@ struct AttachmentDescription {
     Str text = {};
     AttachmentStatus status = AttachmentStatus::Complete;
     bool hasStatus = false;
+
+    UiSize size = UiSize::Medium;
+    bool hasSize = false;
     Style style = {};
     uint32_t styleSet = 0;
 
@@ -17166,6 +19617,12 @@ struct AttachmentContent {
     Ctx* cx = nullptr;
     ArenaVec<AttachmentContentChild> children;
     bool verticalLayout = false;
+    AttachmentStatus status = AttachmentStatus::Complete;
+
+    Listener retry;
+    Str retryId = {};
+
+    float progress = -1;
     Style style = {};
     uint32_t styleSet = 0;
 
@@ -17174,7 +19631,7 @@ struct AttachmentContent {
     AttachmentContent* Description(AttachmentDescription* value);
     AttachmentContent* Child(El* e);
     AttachmentContent* Refine(const Style& s, uint32_t fields);
-    AttachmentContent* Layout(Axis axis, AttachmentStatus status);
+    AttachmentContent* Layout(const AttachmentSlotLayout& layout);
     El* IntoEl();
 };
 
@@ -17207,12 +19664,26 @@ struct Attachment {
     AttachmentContent* content = nullptr;
     AttachmentActions* actions = nullptr;
     Listener onClick;
+    Listener onRemove;
+    Listener onRetry;
+
+    float progress = -1;
+    Str tooltip = {};
+    bool hasTooltip = false;
 
     static Attachment* New(Ctx* cx);
 
     Attachment* Id(Str value);
 
     Attachment* OnClick(Listener handler);
+
+    Attachment* OnRemove(Listener handler);
+
+    Attachment* OnRetry(Listener handler);
+
+    Attachment* Progress(float percent);
+
+    Attachment* Tooltip(Str text);
     Attachment* Status(AttachmentStatus value);
     Attachment* WithAxis(Axis value);
     Attachment* Media(AttachmentMedia* value);
@@ -17220,6 +19691,8 @@ struct Attachment {
     Attachment* Actions(AttachmentActions* value);
     Attachment* WithSize(UiSize value);
     Attachment* Refine(const Style& s, uint32_t fields);
+
+    Listener RetryControl() const;
 
     void LayoutSlots();
     El* IntoEl();
@@ -17232,19 +19705,46 @@ struct AttachmentGroup {
     ArenaVec<El*> children;
     float scrollX = 0;
     Listener onScroll;
+    Rgba edgeFade = {};
+    bool hasEdgeFade = false;
     Style style = {};
     uint32_t styleSet = 0;
 
     static AttachmentGroup* New(Ctx* cx, Str id);
     AttachmentGroup* Child(El* e);
+
+    AttachmentGroup* TrackScroll(float value, Listener onScroll);
     AttachmentGroup* ScrollX(float value);
     AttachmentGroup* OnScroll(Listener fn);
+
+    AttachmentGroup* WithEdgeFade(Rgba color);
     AttachmentGroup* Refine(const Style& s, uint32_t fields);
     El* IntoEl();
 };
 
-El* AttachmentSizeStyle(El* element, UiSize size, bool hasMedia,
-                        bool hasContent);
+struct AttachmentCardMetrics {
+
+    float height = 0;
+
+    float chipWidth = 0;
+
+    float media = 0;
+
+    float mediaGlyph = 0;
+    float paddingStart = 0;
+    float paddingEnd = 0;
+
+    float cardPadding = 0;
+    float gap = 0;
+    float text = 0;
+    float description = 0;
+};
+
+AttachmentCardMetrics AttachmentMetrics(UiSize size);
+
+const int kAttachmentUploadBarPoints = 15;
+int AttachmentUploadBarPath(float w, float h, float percent, float radius,
+                            Point* out);
 
 }
 }
@@ -17268,6 +19768,8 @@ struct Avatar {
     float size = 48;
 
     float textPx = -1;
+
+    bool textSemibold = false;
     float radius = -1;
     float borderW = 1;
     Rgba borderC = {};
@@ -17331,7 +19833,8 @@ struct Badge {
     Rgba color = {};
     bool hasColor = false;
     UiSize size = UiSize::Medium;
-    El* child = nullptr;
+
+    ArenaVec<El*> children;
 
     static Badge* New(Ctx* cx);
     Badge* Count(int n);
@@ -17445,6 +19948,10 @@ struct MessageFooter {
 struct Message {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
+
+    Str id = {};
+    bool hasId = false;
+    RoleOverride role = {};
     Style style = {};
     uint32_t styleSet = 0;
     Style stackStyle = {};
@@ -17456,6 +19963,10 @@ struct Message {
     MessageFooter* footer = nullptr;
 
     static Message* New(Ctx* cx);
+
+    Message* Id(Str value);
+
+    Message* Role(RoleOverride value);
     Message* Alignment(MessageAlignment value);
     Message* WithStackStyle(const Style& s, uint32_t fields);
 
@@ -17775,6 +20286,11 @@ struct Button {
     ArenaVec<El*> children;
 
     float sizePx = 0;
+
+    float contentTextPx = 0;
+    float contentLineH = 0;
+    float contentGap = 0;
+    float contentIconPx = 0;
     IconName loadingIcon = IconName::None;
 
     bool joined = false;
@@ -17949,6 +20465,7 @@ struct DropdownButton {
     UiSize size = UiSize::Medium;
 
     bool anchorRight = true;
+    bool anchorAbove = false;
 
     static DropdownButton* New(Ctx* cx, Str id);
     DropdownButton* Button_(component::Button* b);
@@ -18190,6 +20707,8 @@ struct Carousel {
     Style style = {};
     uint32_t styleSet = 0;
 
+    ElRefiner refiner = {};
+
     static Carousel* New(Ctx* cx, Str id, Entity<CarouselState> state);
     Carousel* AccessibilityLabel(Str value);
     Carousel* FocusRing(bool enabled);
@@ -18205,6 +20724,8 @@ struct CarouselContent {
     ArenaVec<El*> children;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
     Style trackStyle = {};
     uint32_t trackStyleSet = 0;
 
@@ -18226,6 +20747,8 @@ struct CarouselItem {
     Style style = {};
     uint32_t styleSet = 0;
 
+    ElRefiner refiner = {};
+
     static CarouselItem* New(Ctx* cx, Str id, int index,
                              Entity<CarouselState> state);
     CarouselItem* AccessibilityLabel(Str value);
@@ -18243,6 +20766,8 @@ struct CarouselControl {
     ArenaVec<El*> children;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
     bool next = false;
 
     CarouselControl* WithSize(UiSize value);
@@ -18267,6 +20792,8 @@ struct CarouselPagination {
     Style style = {};
     uint32_t styleSet = 0;
 
+    ElRefiner refiner = {};
+
     static CarouselPagination* New(Ctx* cx);
     CarouselPagination* AccessibilityLabel(Str value);
     CarouselPagination* Child(El* child);
@@ -18286,6 +20813,8 @@ struct CarouselPaginationItem {
     Style style = {};
     uint32_t styleSet = 0;
 
+    ElRefiner refiner = {};
+
     static CarouselPaginationItem* New(Ctx* cx, Str id, int index,
                                        Entity<CarouselState> state);
     CarouselPaginationItem* WithSize(UiSize value);
@@ -18302,102 +20831,6 @@ struct EventEmitter<component::CarouselState, component::CarouselEvent> {};
 
 }
 
-#line 1 "src/base/sankey.h"
-
-namespace gpui {
-
-enum class SankeyAlign : uint8_t {
-    Left,
-    Right,
-    Center,
-    Justify
-};
-
-enum class SankeyValueScale : uint8_t {
-    Linear,
-    Sqrt
-};
-
-enum class SankeyError : uint8_t {
-    None,
-
-    MissingNode,
-    CircularLink
-};
-
-struct SankeyLink {
-    int source = 0;
-    int target = 0;
-    double value = 0;
-};
-
-struct SankeyNodeLayout {
-    int index = 0;
-
-    double value = 0;
-
-    int depth = 0;
-    int height = 0;
-
-    int layer = 0;
-    float x0 = 0, x1 = 0, y0 = 0, y1 = 0;
-
-    int srcStart = 0, srcCount = 0;
-    int tgtStart = 0, tgtCount = 0;
-};
-
-struct SankeyLinkLayout {
-    int index = 0;
-    int source = 0;
-    int target = 0;
-    double value = 0;
-    float y0 = 0, y1 = 0;
-
-    float width = 0;
-    float sourceWidth = 0;
-    float targetWidth = 0;
-};
-
-struct SankeyGraph {
-    Vec<SankeyNodeLayout> nodes;
-    Vec<SankeyLinkLayout> links;
-
-    Vec<int> srcLinks;
-    Vec<int> tgtLinks;
-
-    int errNode = 0;
-
-    void Reset() {
-        VecReset(nodes);
-        VecReset(links);
-        VecReset(srcLinks);
-        VecReset(tgtLinks);
-    }
-};
-
-int SankeyLayerCount(const SankeyGraph* g);
-
-struct Sankey {
-    float nodeWidth = 24.f;
-    float nodePadding = 8.f;
-    SankeyAlign align = SankeyAlign::Justify;
-    int iterations = 6;
-    SankeyValueScale valueScale = SankeyValueScale::Linear;
-
-    float x0 = 0, y0 = 0, x1 = 1, y1 = 1;
-};
-
-SankeyError SankeyTopology(const Sankey* s, int nodeCount,
-                           const SankeyLink* links, int nLinks,
-                           SankeyGraph* out);
-
-void SankeyLayoutFrom(const Sankey* s, SankeyGraph* g);
-
-SankeyError SankeyLayout(const Sankey* s, int nodeCount,
-                         const SankeyLink* links, int nLinks, SankeyGraph* out);
-
-}
-
 #line 1 "src/ui/sankey.h"
 
 #line 1 "src/ui/chart.h"
@@ -18406,11 +20839,45 @@ namespace gpui {
 
 namespace component {
 
-Spring ChartPointerSpring(const App* app);
+namespace plot {
+struct Tooltip;
+}
+
+struct ChartTooltipSeriesRow {
+    Rgba swatch = {};
+    Str name = {};
+    double value = 0;
+};
+
+plot::Tooltip* ChartTooltipApply(const ChartTooltipContent& content,
+                                 plot::Tooltip* tooltip, int index, Str title,
+                                 bool hasTitle,
+                                 const ChartTooltipSeriesRow* rows, int count);
+
+const float kChartMaxBandWidth = 30;
 
 const float kChartHoverDotSize = 8;
 
-float ChartHoverHaloSize(float focus);
+const float kChartHoverHaloSize = 20;
+
+uint32_t ChartCallerId(const Ctx* cx, const char* file, int line);
+
+struct ChartAppear {
+    bool enabled = true;
+    uint64_t generation = 0;
+
+    void SetEnabled(bool v) { enabled = v; }
+
+    void SetKey(Str key);
+    void SetKey(uint64_t key) { generation = key; }
+
+    bool Generation(uint64_t* out) const {
+        if (enabled && out) {
+            *out = generation;
+        }
+        return enabled;
+    }
+};
 
 struct PieSlice {
     float value = 0;
@@ -18418,6 +20885,9 @@ struct PieSlice {
 
     float outerInset = 0;
     Str label = {};
+
+    Str tooltipName = {};
+    Str tooltipValue = {};
 };
 
 struct PieChart {
@@ -18435,9 +20905,15 @@ struct PieChart {
     bool hasLabelColor = false;
     Rgba labelColor = {};
     Str tooltipName = {};
-    bool tooltip = false;
 
-    static PieChart* New(Ctx* cx);
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
+
+    static PieChart* New(Ctx* cx, const char* file = __builtin_FILE(),
+                         int line = __builtin_LINE());
     PieChart* Slice(float value, Rgba color, float outerInset = 0);
     PieChart* Label(Str text);
     PieChart* OuterRadius(float r);
@@ -18448,19 +20924,65 @@ struct PieChart {
 
     PieChart* Tooltip(Str name);
 
+    PieChart* TooltipName(Str name);
+
+    PieChart* TooltipValue(Str value);
+
+    PieChart* Id(Str name);
+
+    PieChart* Interactive(bool v);
+
+    PieChart* Appear(bool v);
+
+    PieChart* AppearKey(Str key);
+    PieChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
+
     float ResolveOuterRadius(float height) const;
     El* IntoEl();
+};
+
+struct PointAxes {
+    bool yAxis = false;
+    AxisLabelPlacement placement = AxisLabelPlacement::Outside;
+    int yTickCount = 5;
+    ChartTickFormatFn tickFormat = nullptr;
+    void* tickFormatUser = nullptr;
+
+    int xTickCount = -1;
+    int gridColumns = 0;
+    bool gridDashed = true;
+    float yPaddingTop = 10;
+    float yPaddingBottom = 0;
+    ArenaVec<double> referenceLines;
+
+    void ApplyTo(Arena* a, ChartSeries* chart) const;
 };
 
 struct AreaChart {
     Arena* a = nullptr;
     Str tooltipName = {};
-    bool tooltip = false;
+
+    ChartTooltipContent tooltipContent = {};
+
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
     Ctx* cx = nullptr;
     const float* ys = nullptr;
     int n = 0;
     const char* const* labels = nullptr;
-    int tickMargin = 15;
+
+    int tickMargin = 1;
 
     bool overlay = false;
     Rgba stroke = {};
@@ -18470,12 +20992,46 @@ struct AreaChart {
     ChartStroke strokeStyle = ChartStroke::Natural;
 
     ArenaVec<ChartSeriesExtra> more;
+    bool hasYDomain = false;
+    float yDomainMin = 0;
+    float yDomainMax = 0;
+    int pointCount = 0;
+    PointAxes axes;
 
-    static AreaChart* New(Ctx* cx, const float* ys, int n);
+    bool xAxis = true;
+    bool grid = true;
+
+    static AreaChart* New(Ctx* cx, const float* ys, int n,
+                          const char* file = __builtin_FILE(),
+                          int line = __builtin_LINE());
 
     AreaChart* Y(const float* ys);
 
     AreaChart* Tooltip(Str name);
+
+    AreaChart* TooltipTitle(ChartTooltipTitleFn fn, void* user = nullptr);
+
+    AreaChart* TooltipValue(ChartTooltipValueFn fn, void* user = nullptr);
+
+    AreaChart* TooltipValueColor(ChartTooltipValueColorFn fn,
+                                 void* user = nullptr);
+
+    AreaChart* Id(Str name);
+
+    AreaChart* Interactive(bool v);
+
+    AreaChart* Appear(bool v);
+
+    AreaChart* AppearKey(Str key);
+    AreaChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
     AreaChart* Stroke(Rgba c);
     AreaChart* Fill(Rgba c);
 
@@ -18484,43 +21040,143 @@ struct AreaChart {
     AreaChart* TickMargin(int n);
     AreaChart* Overlay(bool v = true);
 
+    AreaChart* Natural();
     AreaChart* Linear();
+
+    AreaChart* XAxis(bool v);
+
+    AreaChart* Grid(bool v);
     AreaChart* StepAfter();
+
+    AreaChart* YDomain(float min, float max);
+
+    AreaChart* PointCount(int count);
+
+    AreaChart* YAxis(bool v = true);
+
+    AreaChart* YAxisLabelPlacement(AxisLabelPlacement placement);
+
+    AreaChart* YTickCount(int count);
+
+    AreaChart* YTickFormat(ChartTickFormatFn format, void* user = nullptr);
+
+    AreaChart* XTickCount(int count);
+
+    AreaChart* GridColumns(int count);
+
+    AreaChart* GridDashed(bool dashed);
+
+    AreaChart* ReferenceLine(double value);
+
+    AreaChart* YPadding(float top, float bottom);
     El* IntoEl();
 };
 
 struct LineChart {
     Arena* a = nullptr;
     Str tooltipName = {};
-    bool tooltip = false;
+
+    ChartTooltipContent tooltipContent = {};
+
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
     Ctx* cx = nullptr;
     const float* ys = nullptr;
     int n = 0;
     const char* const* labels = nullptr;
-    int tickMargin = 15;
+
+    int tickMargin = 1;
     Rgba stroke = {};
-    float domainMin = 0;
-    float domainMax = 0;
+    bool hasYDomain = false;
+    float yDomainMin = 0;
+    float yDomainMax = 0;
+    int pointCount = 0;
+    PointAxes axes;
     ChartStroke strokeStyle = ChartStroke::Natural;
     bool dot = false;
 
-    static LineChart* New(Ctx* cx, const float* ys, int n);
+    bool xAxis = true;
+    bool grid = true;
+
+    static LineChart* New(Ctx* cx, const float* ys, int n,
+                          const char* file = __builtin_FILE(),
+                          int line = __builtin_LINE());
 
     LineChart* Tooltip(Str name);
+
+    LineChart* TooltipTitle(ChartTooltipTitleFn fn, void* user = nullptr);
+
+    LineChart* TooltipValue(ChartTooltipValueFn fn, void* user = nullptr);
+
+    LineChart* TooltipValueColor(ChartTooltipValueColorFn fn,
+                                 void* user = nullptr);
+
+    LineChart* Id(Str name);
+
+    LineChart* Interactive(bool v);
+
+    LineChart* Appear(bool v);
+
+    LineChart* AppearKey(Str key);
+    LineChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
     LineChart* Stroke(Rgba c);
     LineChart* Labels(const char* const* l);
     LineChart* TickMargin(int n);
-    LineChart* Domain(float lo, float hi);
+
+    LineChart* YDomain(float min, float max);
+
+    LineChart* PointCount(int count);
+
+    LineChart* YAxis(bool v = true);
+
+    LineChart* YAxisLabelPlacement(AxisLabelPlacement placement);
+
+    LineChart* YTickCount(int count);
+
+    LineChart* YTickFormat(ChartTickFormatFn format, void* user = nullptr);
+
+    LineChart* XTickCount(int count);
+
+    LineChart* GridColumns(int count);
+
+    LineChart* GridDashed(bool dashed);
+
+    LineChart* ReferenceLine(double value);
+
+    LineChart* YPadding(float top, float bottom);
+    LineChart* Natural();
     LineChart* Linear();
     LineChart* StepAfter();
     LineChart* Dot(bool v = true);
+
+    LineChart* XAxis(bool v);
+
+    LineChart* Grid(bool v);
     El* IntoEl();
 };
 
 struct BarChart {
     Arena* a = nullptr;
     Str tooltipName = {};
-    bool tooltip = false;
+
+    ChartTooltipContent tooltipContent = {};
+
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
     Ctx* cx = nullptr;
     const float* ys = nullptr;
     int n = 0;
@@ -18528,8 +21184,14 @@ struct BarChart {
     int tickMargin = 1;
     Rgba fill = {};
 
-    float padding = 0.2f;
-    float radius = 4;
+    float paddingInner = 0.4f;
+    float paddingOuter = 0.2f;
+
+    float maxBandWidth = kChartMaxBandWidth;
+    float minLength = 0;
+    const Rgba* labelColors = nullptr;
+
+    float radius = 0;
     float domainMin = 0;
     float domainMax = 0;
     BarAlign align = BarAlign::Bottom;
@@ -18540,7 +21202,13 @@ struct BarChart {
     bool labelValues = false;
 
     bool valueAxis = false;
-    int valueTickCount = 4;
+    int valueTickCount = 5;
+    AxisLabelPlacement valueAxisLabelPlacement = AxisLabelPlacement::Outside;
+    ChartTickFormatFn valueTickFormat = nullptr;
+    void* valueTickFormatUser = nullptr;
+    int bandCount = 0;
+    int bandTickCount = -1;
+    bool gridDashed = true;
 
     const Rgba* fills = nullptr;
     bool gradient = false;
@@ -18549,9 +21217,38 @@ struct BarChart {
     Rgba gradientFrom = {};
     Rgba gradientTo = {};
 
-    static BarChart* New(Ctx* cx, const float* ys, int n);
+    bool labelAxis = true;
+    bool grid = true;
+
+    static BarChart* New(Ctx* cx, const float* ys, int n,
+                         const char* file = __builtin_FILE(),
+                         int line = __builtin_LINE());
 
     BarChart* Tooltip(Str name);
+
+    BarChart* TooltipTitle(ChartTooltipTitleFn fn, void* user = nullptr);
+
+    BarChart* TooltipValue(ChartTooltipValueFn fn, void* user = nullptr);
+
+    BarChart* TooltipValueColor(ChartTooltipValueColorFn fn,
+                                void* user = nullptr);
+
+    BarChart* Id(Str name);
+
+    BarChart* Interactive(bool v);
+
+    BarChart* Appear(bool v);
+
+    BarChart* AppearKey(Str key);
+    BarChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
     BarChart* Fill(Rgba c);
     BarChart* Labels(const char* const* l);
     BarChart* TickMargin(int n);
@@ -18559,7 +21256,28 @@ struct BarChart {
     BarChart* ValueAxis(bool on = true);
 
     BarChart* ValueTickCount(int count);
-    BarChart* Padding(float v);
+
+    BarChart* ValueAxisLabelPlacement(AxisLabelPlacement placement);
+
+    BarChart* ValueTickFormat(ChartTickFormatFn format, void* user = nullptr);
+
+    BarChart* BandCount(int count);
+
+    BarChart* BandTickCount(int count);
+
+    BarChart* GridDashed(bool dashed);
+
+    BarChart* LabelAxis(bool v);
+
+    BarChart* Grid(bool v);
+
+    BarChart* PaddingInner(float v);
+
+    BarChart* PaddingOuter(float v);
+
+    BarChart* MaxBandWidth(float width);
+
+    BarChart* MinLength(float length);
     BarChart* Radius(float v);
     BarChart* Domain(float lo, float hi);
     BarChart* Alignment(BarAlign v);
@@ -18567,6 +21285,8 @@ struct BarChart {
     BarChart* Overlay(bool v = true);
 
     BarChart* LabelValues(bool v = true);
+
+    BarChart* LabelColors(const Rgba* colors);
     BarChart* Fills(const Rgba* colors);
 
     BarChart* FillGradient(Rgba from, Rgba to, bool perBar = false);
@@ -18589,18 +21309,57 @@ struct CandlestickChart {
     Rgba down = {};
     float padding = 0.3f;
     float bodyWidthRatio = 0.8f;
+
+    float maxBandWidth = kChartMaxBandWidth;
     Str tooltipName = {};
-    bool tooltip = false;
+
+    ChartTooltipContent tooltipContent = {};
+
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
 
     static CandlestickChart* New(Ctx* cx, const float* opens,
                                  const float* highs, const float* lows,
-                                 const float* closes, int n);
+                                 const float* closes, int n,
+                                 const char* file = __builtin_FILE(),
+                                 int line = __builtin_LINE());
     CandlestickChart* Tooltip(Str name);
+
+    CandlestickChart* TooltipTitle(ChartTooltipTitleFn fn,
+                                   void* user = nullptr);
+
+    CandlestickChart* TooltipValue(ChartTooltipValueFn fn,
+                                   void* user = nullptr);
+
+    CandlestickChart* TooltipValueColor(ChartTooltipValueColorFn fn,
+                                        void* user = nullptr);
+
+    CandlestickChart* Id(Str name);
+
+    CandlestickChart* Interactive(bool v);
+
+    CandlestickChart* Appear(bool v);
+
+    CandlestickChart* AppearKey(Str key);
+    CandlestickChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
     CandlestickChart* Colors(Rgba up, Rgba down);
     CandlestickChart* Labels(const char* const* l);
     CandlestickChart* TickMargin(int n);
     CandlestickChart* Padding(float v);
     CandlestickChart* BodyWidthRatio(float v);
+
+    CandlestickChart* MaxBandWidth(float width);
     El* IntoEl();
 };
 
@@ -18633,14 +21392,40 @@ struct RadarChart {
     bool dot = false;
     float outerRadius = 0;
     int gridLevels = 4;
+
+    bool grid = true;
     float labelGap = 10;
     Rgba labelColor = {};
     bool hasLabelColor = false;
     Str tooltipName = {};
-    bool tooltip = false;
 
-    static RadarChart* New(Ctx* cx, const float* values, int n);
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
+
+    static RadarChart* New(Ctx* cx, const float* values, int n,
+                           const char* file = __builtin_FILE(),
+                           int line = __builtin_LINE());
     RadarChart* Tooltip(Str name);
+
+    RadarChart* Id(Str name);
+
+    RadarChart* Interactive(bool v);
+
+    RadarChart* Appear(bool v);
+
+    RadarChart* AppearKey(Str key);
+    RadarChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
     RadarChart* Stroke(Rgba c);
     RadarChart* Fill(Rgba c);
     RadarChart* Labels(const char* const* l);
@@ -18652,6 +21437,8 @@ struct RadarChart {
     RadarChart* Dot(bool v = true);
     RadarChart* OuterRadius(float v);
     RadarChart* GridLevels(int v);
+
+    RadarChart* Grid(bool v);
     El* IntoEl();
 };
 
@@ -18688,6 +21475,9 @@ struct SankeyChartNode {
 
     ArenaVec<SankeyLabel> labels;
     bool hasCustomLabels = false;
+
+    Str tooltipName = {};
+    Str tooltipValue = {};
 };
 
 struct SankeyChart {
@@ -18708,10 +21498,36 @@ struct SankeyChart {
 
     bool showValues = false;
     Str tooltipName = {};
-    bool tooltip = false;
 
-    static SankeyChart* New(Ctx* cx);
+    uint32_t id = 0;
+
+    bool interactive = true;
+
+    ChartAppear appear = {};
+
+    static SankeyChart* New(Ctx* cx, const char* file = __builtin_FILE(),
+                            int line = __builtin_LINE());
     SankeyChart* Tooltip(Str name);
+
+    SankeyChart* TooltipName(Str name);
+    SankeyChart* TooltipValue(Str value);
+
+    SankeyChart* Id(Str name);
+
+    SankeyChart* Interactive(bool v);
+
+    SankeyChart* Appear(bool v);
+
+    SankeyChart* AppearKey(Str key);
+    SankeyChart* AppearKey(uint64_t key);
+
+    uint32_t PlotId() const { return id; }
+
+    bool PlotInteractive() const { return interactive; }
+
+    bool AppearGeneration(uint64_t* out) const {
+        return appear.Generation(out);
+    }
 
     SankeyChart* Node(Str label);
     SankeyChart* NodeColored(Str label, Rgba color);
@@ -18847,7 +21663,11 @@ struct Collapsible {
     Str motionId = {};
     bool hasMotion = false;
     El* trigger = nullptr;
+
+    ArenaVec<El*> children;
     El* content = nullptr;
+
+    int contentAt = 0;
 
     float width = 0;
     float gap = 0;
@@ -18858,6 +21678,7 @@ struct Collapsible {
     Collapsible* Open(bool v);
     Collapsible* MotionId(Str id);
     Collapsible* Trigger(El* e);
+    Collapsible* Child(El* e);
     Collapsible* Content(El* e);
     El* IntoEl();
 };
@@ -18890,6 +21711,12 @@ struct ColorPicker {
     Listener onChange;
     Entity<ColorPickerState> state = {};
 
+    bool field = false;
+    Str placeholder = {};
+
+    Style style = {};
+    uint32_t styleSet = 0;
+
     static ColorPicker* New(Ctx* cx, Str id);
     static ColorPicker* New(Ctx* cx, Entity<ColorPickerState> state);
     ColorPicker* Label(Str s);
@@ -18899,6 +21726,25 @@ struct ColorPicker {
     ColorPicker* WithSize(UiSize s);
     ColorPicker* FeaturedColors(const uint32_t* colors, int n);
     ColorPicker* OnChange(Listener fn);
+    ColorPicker* Refine(const Style& s, uint32_t fields);
+
+    FocusHandle FocusHandleOf(Ctx* cx) const;
+    El* IntoEl();
+};
+
+struct ColorSelect {
+    ColorPicker* picker = nullptr;
+
+    static ColorSelect* New(Ctx* cx, Entity<ColorPickerState> state);
+
+    ColorSelect* FeaturedColors(const uint32_t* colors, int n);
+
+    ColorSelect* Placeholder(Str s);
+
+    ColorSelect* AccessibilityLabel(Str s);
+    ColorSelect* WithSize(UiSize s);
+    ColorSelect* Refine(const Style& s, uint32_t fields);
+    FocusHandle FocusHandleOf(Ctx* cx) const;
     El* IntoEl();
 };
 
@@ -19104,12 +21950,15 @@ struct ListItem {
 
     StateStyle style = {};
 
+    Str accessibilityLabel = {};
+
     static ListItem* New(Ctx* cx, El* child);
     ListItem* Selected(bool v);
     ListItem* SecondarySelected(bool v);
     ListItem* Confirmed(bool v);
     ListItem* Disabled(bool v);
     ListItem* Style(const StateStyle& s);
+    ListItem* AccessibilityLabel(Str label);
     El* IntoEl(Str id, Listener onClick, Listener onMouseDown);
 };
 
@@ -19228,6 +22077,9 @@ struct SearchableListDelegate {
     El* (*renderItem)(void* user, Ctx* cx, IndexPath path,
                       const SearchableListItem* item, bool checked) = nullptr;
     El* (*renderSectionHeader)(void* user, Ctx* cx, int section) = nullptr;
+
+    El* (*renderItemContent)(void* user, Ctx* cx, IndexPath path,
+                             const SearchableListItem* item) = nullptr;
     bool (*isItemEnabled)(void* user, IndexPath path,
                           const SearchableListItem* item,
                           const App* app) = nullptr;
@@ -19271,12 +22123,14 @@ struct SearchableGroup {
     SearchableGroup* Item(const SearchableListItem& item);
     SearchableGroup* Items(const SearchableListItem* items, int nItems);
     bool Matches(Str query) const;
+
+    bool MatchedRows(Str query, Vec<int>* rows) const;
     ~SearchableGroup() { VecReset(items); }
 };
 
 struct SearchableVec {
     Vec<SearchableListItem> items;
-    Vec<SearchableListItem> matchedItems;
+    Vec<int> matched;
 
     static SearchableVec* New(const SearchableListItem* items, int nItems);
     SearchableVec* Push(const SearchableListItem& item);
@@ -19286,8 +22140,30 @@ struct SearchableVec {
     bool Position(Str value, IndexPath* out) const;
     ~SearchableVec() {
         VecReset(items);
-        VecReset(matchedItems);
+        VecReset(matched);
     }
+};
+
+struct SearchableGroupMatch {
+    int ix = 0;
+
+    int rowsStart = -1;
+    int rowsLen = 0;
+};
+
+struct SearchableGroupVec {
+    Vec<SearchableGroup*> groups;
+    Vec<SearchableGroupMatch> matched;
+    Vec<int> rows;
+
+    static SearchableGroupVec* New(SearchableGroup* const* groups, int nGroups);
+    void PerformSearch(Str query);
+    int SectionsCount() const;
+    Str SectionTitle(int section) const;
+    int ItemsCount(int section) const;
+    const SearchableListItem* Item(IndexPath path) const;
+    bool Position(Str value, IndexPath* out) const;
+    ~SearchableGroupVec();
 };
 
 struct SearchableListItemElement {
@@ -19338,6 +22214,8 @@ struct SearchableListState {
 
     Vec<int> selected;
     bool open = false;
+
+    bool closedByConfirm = false;
 
     bool closeOnSelect = true;
 
@@ -19488,6 +22366,9 @@ struct SelectState {
     bool focusRingEnabled = true;
     Entity<SelectState> self = {};
 
+    Window* blurWin = nullptr;
+    int blurQueryFocus = 0;
+
     static Entity<SelectState> New(App* app);
     SearchableListState* List() { return &state; }
     const SearchableListState* List() const { return &state; }
@@ -19503,12 +22384,15 @@ struct SelectState {
     void ToggleMenu(Ctx* cx);
     void ClearQueryAndRestore(Ctx* cx);
     void Clean(Ctx* cx);
+    void WatchBlur(Window* win);
 
+    static void OnToggle(SelectState* self, Ctx* cx, const ClickEvent* event);
     static void OnListClose(SelectState* self, Ctx* cx, const TickEvent* event);
     static void OnListChange(SelectState* self, Ctx* cx,
                              const ListEvent* event);
     static void OnMouseDownOut(SelectState* self, Ctx* cx,
                                const MouseDownEvent* event);
+    static void OnBlur(SelectState* self, Ctx* cx, const FocusHandle* lost);
 };
 
 Entity<SearchableListState> SelectListEntity(Entity<SelectState> state);
@@ -19557,6 +22441,8 @@ struct Select {
     Style triggerStyle = {};
     uint32_t triggerStyleSet = 0;
 
+    ElRefiner triggerRefiner = {};
+
     static Select* New(Ctx* cx, Str id, Entity<SearchableListState> state);
     static Select* New(Ctx* cx, Str id, Entity<SelectState> state);
     Select* Items(const SearchableItem* items, int n);
@@ -19589,6 +22475,7 @@ struct Select {
     Select* OnMouseDownOut(Listener fn);
     Select* TriggerBoundsOut(Bounds* bounds);
     Select* TriggerRefine(const Style& style, uint32_t fields);
+    Select* TriggerRefiner(ElRefiner value);
     El* IntoEl();
 };
 
@@ -19606,6 +22493,9 @@ void SelectClear(SelectState* s, Ctx* cx);
 
 template <>
 struct EventEmitter<component::SelectState, component::SelectEvent> {};
+
+template <>
+struct EventEmitter<component::SelectState, DismissEvent> {};
 
 }
 
@@ -19733,6 +22623,8 @@ struct Combobox {
     bool hasDelegate = false;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
     Listener onToggle;
     Listener onClear;
 
@@ -19765,6 +22657,7 @@ struct Combobox {
     Combobox* RenderEmpty(void* data, El* (*fn)(Ctx* cx, void* data));
     Combobox* Delegate(const SearchableListDelegate& value);
     Combobox* Refine(const Style& value, uint32_t fields);
+    Combobox* Refiner(ElRefiner value);
 
     Combobox* MaxSelected(int n);
     Combobox* OnQueryFocus(Listener fn);
@@ -19798,6 +22691,9 @@ struct Keystroke {
 int KbdFormat(Keystroke stroke, char* out, int cap);
 
 Str KbdFormatStr(Ctx* cx, Keystroke stroke);
+
+bool KeystrokeParse(Arena* a, Str source, Keystroke* out);
+TempStr KeystrokeParseErrorTemp(Str source);
 
 bool KeystrokeForAction(uint32_t action, const char* context, Keystroke* out);
 
@@ -19989,9 +22885,14 @@ struct Command {
     El* empty = nullptr;
     El* header = nullptr;
     El* footer = nullptr;
+
+    El* (*headerFn)(Ctx* cx, const CommandState* s) = nullptr;
     float maxH = 300;
     bool bordered = true;
     float w = kFill;
+
+    Style style = {};
+    uint32_t styleSet = 0;
     Listener onQuery = {};
     Listener onSelect = {};
     Listener onConfirm = {};
@@ -20007,10 +22908,12 @@ struct Command {
     Command* Placeholder(Str s);
     Command* Empty(El* e);
     Command* Header(El* e);
+    Command* Header(El* (*build)(Ctx* cx, const CommandState* s));
     Command* Footer(El* e);
     Command* MaxH(float v);
     Command* Bordered(bool v);
     Command* W(float v);
+    Command* Refine(const Style& s, uint32_t fields);
     Command* OnQuery(Listener fn);
     Command* OnSelect(Listener fn);
     Command* OnConfirm(Listener fn);
@@ -20087,18 +22990,71 @@ struct Calendar {
     El* IntoEl();
 };
 
+using ::gpui::HourCycle;
+using ::gpui::TimeFieldEvent;
+using ::gpui::TimeFieldState;
+using ::gpui::TimePrecision;
+using ::gpui::TimeSegment;
+
+struct TimeField {
+    Ctx* cx = nullptr;
+    Str id = {};
+    Entity<TimeFieldState> state = {};
+    UiSize size = UiSize::Medium;
+    Style style = {};
+    uint32_t styleSet = 0;
+    bool disabled = false;
+    bool invalid = false;
+
+    static TimeField* New(Ctx* cx, Entity<TimeFieldState> state);
+
+    TimeField* WithId(Str id);
+
+    TimeField* Invalid(bool v = true);
+    TimeField* WithSize(UiSize s);
+    TimeField* Disabled(bool v = true);
+    TimeField* Refine(const Style& value, uint32_t fields);
+    El* IntoEl();
+};
+
+struct LocalDateTime {
+    LocalDate date = {};
+    LocalTime time = {};
+};
+
+struct DateTime {
+    DateKind kind = DateKind::Single;
+    LocalDate startDate = {};
+    LocalTime startTime = {};
+    LocalDate endDate = {};
+    LocalTime endTime = {};
+
+    static DateTime Single(LocalDateTime value);
+    static DateTime Single();
+    static DateTime Range(LocalDateTime start, LocalDateTime end);
+    bool IsSome() const;
+    bool IsComplete() const;
+    bool Start(LocalDateTime* out) const;
+    bool End(LocalDateTime* out) const;
+
+    Date DateValue() const;
+
+    Str Format(Arena* a, Str pattern) const;
+};
+
 enum class DatePickerEventKind : uint8_t {
     Change
 };
 
 struct DatePickerEvent {
     DatePickerEventKind kind = DatePickerEventKind::Change;
-    Date date = {};
+    DateTime value = {};
 };
 
 enum class DateRangePresetValueKind : uint8_t {
     Single,
-    Range
+    Range,
+    DateTime
 };
 
 struct DateRangePresetValue {
@@ -20106,8 +23062,11 @@ struct DateRangePresetValue {
     LocalDate start = {};
     LocalDate end = {};
 
+    ::gpui::component::DateTime dateTime = {};
+
     static DateRangePresetValue Single(LocalDate date);
     static DateRangePresetValue Range(LocalDate start, LocalDate end);
+    static DateRangePresetValue WithDateTime(::gpui::component::DateTime value);
     Date IntoDate() const;
 };
 
@@ -20122,6 +23081,9 @@ struct DateRangePreset {
     static DateRangePreset Single(Str label, LocalDate date, intptr_t arg = 0);
     static DateRangePreset Range(Str label, LocalDate start, LocalDate end,
                                  intptr_t arg = 0);
+
+    static DateRangePreset WithDateTime(Str label,
+                                        ::gpui::component::DateTime value);
 };
 
 enum class DateFormat : uint8_t {
@@ -20137,6 +23099,17 @@ struct DatePickerState {
     Entity<CalendarState> calendar = {};
 
     Str dateFormat = {};
+
+    bool hasTimePrecision = false;
+    TimePrecision timePrecision = TimePrecision::Minute;
+    HourCycle hourCycle = HourCycle::H23;
+    LocalTime defaultTime = {};
+    LocalTime startTime = {};
+
+    LocalTime endTime = {};
+    Entity<TimeFieldState> timeField = {};
+    bool timeFieldPushed = false;
+    Subscription timeFieldSubscription = {};
     int numberOfMonths = 1;
     Matcher disabledMatcher = {};
     Subscription calendarSubscription = {};
@@ -20147,6 +23120,8 @@ struct DatePickerState {
 
     static void OnCalendar(DatePickerState* self, Ctx* cx,
                            const CalendarEvent* ev);
+    static void OnTimeField(DatePickerState* self, Ctx* cx,
+                            const TimeFieldEvent* ev);
     static void OnToggle(DatePickerState* self, Ctx* cx, const ClickEvent* ev);
     static void OnOpenChange(DatePickerState* self, Ctx* cx,
                              const ClickEvent* ev, intptr_t open);
@@ -20175,7 +23150,22 @@ void DatePickerStateSelectPreset(DatePickerState* state,
                                  const DateRangePreset& preset, Ctx* cx,
                                  bool emit = true);
 
-Str DatePickerFormatDate(Arena* a, Str pattern, LocalDate date);
+void DatePickerStateSetTimePrecision(DatePickerState* state,
+                                     TimePrecision precision);
+
+void DatePickerStateSetHourCycle(DatePickerState* state, HourCycle hourCycle);
+
+void DatePickerStateSetDefaultTime(DatePickerState* state, LocalTime time);
+
+DateTime DatePickerStateDateTime(const DatePickerState* state);
+
+void DatePickerStateSetDateTime(DatePickerState* state, DateTime value,
+                                Ctx* cx);
+
+Str DatePickerStateDisplayFormat(Arena* a, const DatePickerState* state);
+
+Str DatePickerFormatDate(Arena* a, Str pattern, LocalDate date,
+                         LocalTime time = {});
 Str DatePickerFormatValue(Arena* a, Str pattern, Date date);
 
 struct DatePicker {
@@ -20353,9 +23343,12 @@ constexpr float ANIMATION_DURATION = 250.f;
 struct DialogButtonProps {
     Str okText = {};
     ButtonVariant okVariant = ButtonVariant::Primary;
+    bool hasOkVariant = false;
     Str cancelText = {};
     ButtonVariant cancelVariant = ButtonVariant::Default;
+    bool hasCancelVariant = false;
     bool showCancel = false;
+    bool hasShowCancel = false;
     Listener onOk = {};
     Listener onCancel = {};
     Listener onClose = {};
@@ -20368,6 +23361,10 @@ struct DialogButtonProps {
     DialogButtonProps* OnOk(Listener value);
     DialogButtonProps* OnCancel(Listener value);
     DialogButtonProps* OnClose(Listener value);
+
+    void Merge(const DialogButtonProps& other);
+
+    bool IsCancelShown() const;
     El* RenderOk(Ctx* cx, Str id, bool outline = false) const;
     El* RenderCancel(Ctx* cx, Str id) const;
 };
@@ -20501,6 +23498,7 @@ struct Dialog {
     Dialog* CancelVariant(ButtonVariant v);
     Dialog* OkVariant(ButtonVariant v, bool outline = false);
     Dialog* ShowCancel(bool v);
+
     Dialog* ButtonProps(const DialogButtonProps& value);
 
     Dialog* Confirm();
@@ -20541,6 +23539,7 @@ struct AlertDialog {
     AlertDialog* Fg(Rgba value);
     AlertDialog* Icon(IconName value, Rgba color, float size = 16);
     AlertDialog* HeaderCentered(bool value = true);
+
     AlertDialog* ButtonProps(const DialogButtonProps& value);
     AlertDialog* OkText(Str value);
     AlertDialog* CancelText(Str value);
@@ -20607,6 +23606,9 @@ struct DockSkin {
     void SetPanelStyle(App* app, Window* win, PanelStyle style);
     bool IsToggleButtonVisible(App* app) const;
     void SetToggleButtonVisible(App* app, Window* win, bool visible);
+
+    bool IsCloseButtonVisible(App* app) const;
+    void SetCloseButtonVisible(App* app, Window* win, bool visible);
     const DockRenderer* Renderer() const;
 };
 
@@ -20647,6 +23649,8 @@ struct EmptyMedia {
     Style style = {};
     uint32_t styleSet = 0;
 
+    ElRefiner refiner = {};
+
     static EmptyMedia* New(Ctx* cx);
     EmptyMedia* WithVariant(EmptyMediaVariant value);
     EmptyMedia* Child(El* child);
@@ -20659,6 +23663,8 @@ struct EmptyTitle {
     ArenaVec<El*> children;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static EmptyTitle* New(Ctx* cx);
     EmptyTitle* Child(El* child);
@@ -20673,6 +23679,8 @@ struct EmptyDescription {
     Style style = {};
     uint32_t styleSet = 0;
 
+    ElRefiner refiner = {};
+
     static EmptyDescription* New(Ctx* cx);
     EmptyDescription* Child(El* child);
     EmptyDescription* Refine(const Style& value, uint32_t fields);
@@ -20684,6 +23692,8 @@ struct EmptyContent {
     ArenaVec<El*> children;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static EmptyContent* New(Ctx* cx);
     EmptyContent* Child(El* child);
@@ -20698,6 +23708,8 @@ struct EmptyHeader {
     EmptyDescription* description = nullptr;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static EmptyHeader* New(Ctx* cx);
     EmptyHeader* Media(EmptyMedia* value);
@@ -20715,6 +23727,8 @@ struct Empty {
     ArenaVec<El*> children;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static Empty* New(Ctx* cx);
     Empty* Header(EmptyHeader* value);
@@ -20814,6 +23828,11 @@ struct Field {
     bool labelIndent = true;
     FieldAlign align = FieldAlign::Center;
 
+    El* const* children = nullptr;
+    int childCount = 0;
+
+    ElRefiner refiner = {};
+
     static Field New(El* control = nullptr);
     Field& Label(Str value);
     Field& Label(El* value);
@@ -20826,6 +23845,9 @@ struct Field {
     Field& ColSpan(int value);
     Field& ColStart(int value);
     Field& ColEnd(int value);
+    Field& Children(El* const* elements, int count);
+
+    El* IntoEl(Ctx* cx) const;
 };
 
 using FormField = Field;
@@ -20929,6 +23951,8 @@ struct GroupBox {
     El* titleEl = nullptr;
     bool hasTitle = false;
     ArenaVec<El*> children;
+
+    El* footer = nullptr;
     GroupBoxVariant variant = GroupBoxVariant::Normal;
 
     Style rootStyle = {};
@@ -20951,6 +23975,8 @@ struct GroupBox {
     GroupBox* Id(Str value);
     GroupBox* Title(El* e);
     GroupBox* Child(El* e);
+
+    GroupBox* Footer(El* e);
     GroupBox* WithVariant(GroupBoxVariant value);
     GroupBox* Normal();
     GroupBox* Fill();
@@ -21041,7 +24067,11 @@ struct Highlighter {
 
     float h = 0;
 
+    Edges editorPad = {};
+
     float fontSize = 0;
+
+    Str fontFamily = {};
 
     SyntaxLang lang = SyntaxLangNone;
 
@@ -21062,6 +24092,7 @@ struct Highlighter {
     Highlighter* H(float v);
 
     Highlighter* Font(float px);
+    Highlighter* FontFamily(Str family);
     Highlighter* Language(Str name);
     Highlighter* Decorations(const TextSpan* runs, int n);
     Highlighter* ActiveLine(bool v = true);
@@ -21095,6 +24126,9 @@ struct HoverCard {
     El* trigger = nullptr;
     El* content = nullptr;
 
+    El* (*contentFn)(void* user, Ctx* cx) = nullptr;
+    void* contentUser = nullptr;
+
     bool controlled = false;
     bool open = false;
     int openDelayMs = 600;
@@ -21107,6 +24141,7 @@ struct HoverCard {
     static HoverCard* New(Ctx* cx, Str id);
     HoverCard* Trigger(El* e);
     HoverCard* Content(El* e);
+    HoverCard* ContentBuilder(El* (*fn)(void* user, Ctx* cx), void* user);
     HoverCard* Open(bool v);
     HoverCard* OpenDelay(int ms);
     HoverCard* CloseDelay(int ms);
@@ -21302,6 +24337,11 @@ enum class InputContentType : uint8_t {
     CellularImei
 };
 
+struct NativeMenu;
+
+using EditorContextMenuFn = NativeMenu* (*)(Ctx * cx, NativeMenu* empty,
+                                            void* data);
+
 struct Input {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
@@ -21339,8 +24379,14 @@ struct Input {
     void* tokenRendererUser = nullptr;
     InlineTokenClickListener tokenClick = nullptr;
     void* tokenClickUser = nullptr;
+    EditorContextMenuFn contextMenu = nullptr;
+    void* contextMenuData = nullptr;
+
+    ElRefiner refiner = {};
 
     static Input* New(Ctx* cx, Str id, InputState* state);
+
+    Input* ContextMenu(EditorContextMenuFn fn, void* data = nullptr);
     Input* Label(Str s);
     Input* WithSize(UiSize s);
     Input* Align(InputAlign v);
@@ -21396,10 +24442,6 @@ struct SearchPanel {
     El* IntoEl();
 };
 
-struct NativeMenu;
-using EditorContextMenuFn = NativeMenu* (*)(Ctx * cx, NativeMenu* empty,
-                                            void* data);
-
 struct Editor {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
@@ -21407,6 +24449,7 @@ struct Editor {
     InputState* state = nullptr;
     float height = 0;
     float fontSize = 0;
+    Str fontFamily = {};
     bool appearance = true;
     bool bordered = true;
     bool disabled = false;
@@ -21422,10 +24465,11 @@ struct Editor {
     Str language = {};
     const TextSpan* decorations = nullptr;
     int nDecorations = 0;
-    bool activeLine = false;
-    bool indentGuides = false;
+
+    bool activeLine = true;
+    bool indentGuides = true;
     bool searchable = true;
-    bool folding = false;
+    bool folding = true;
     const Diagnostic* diagnostics = nullptr;
     int nDiagnostics = 0;
     gpui::Style style = {};
@@ -21435,6 +24479,8 @@ struct Editor {
     static Editor* New(Ctx* cx, Str id, InputState* state);
     Editor* H(float value);
     Editor* Font(float value);
+
+    Editor* FontFamily(Str family);
     Editor* Appearance(bool value);
     Editor* Bordered(bool value);
     Editor* Disabled(bool value);
@@ -21511,12 +24557,16 @@ struct Textarea {
     InputState* state = nullptr;
     int rows = 0;
 
+    UiSize size = UiSize::Medium;
+
     float height = 0;
     bool softWrap = true;
     AccessibilityRole accessibilityRole = AccessibilityRole::MultilineTextInput;
     Str ariaLabel = {};
     Str accessibilityId = {};
     bool appearance = true;
+
+    bool bordered = true;
     bool disabled = false;
     bool readonly = false;
     bool focusRing = true;
@@ -21527,10 +24577,17 @@ struct Textarea {
     void* tokenRendererUser = nullptr;
     InlineTokenClickListener tokenClick = nullptr;
     void* tokenClickUser = nullptr;
+    EditorContextMenuFn contextMenu = nullptr;
+    void* contextMenuData = nullptr;
+
+    ElRefiner refiner = {};
 
     static Textarea* New(Ctx* cx, Str id, InputState* state);
 
+    Textarea* ContextMenu(EditorContextMenuFn fn, void* data = nullptr);
+
     Textarea* Rows(int n);
+    Textarea* WithSize(UiSize s);
     Textarea* H(float px);
     Textarea* SoftWrap(bool v);
     Textarea* Role(AccessibilityRole role);
@@ -21539,6 +24596,7 @@ struct Textarea {
     Textarea* Disabled(bool v);
     Textarea* Readonly(bool v = true);
     Textarea* Appearance(bool v);
+    Textarea* Bordered(bool v);
     Textarea* FocusRing(bool v);
     Textarea* OnFocus(Listener fn);
     Textarea* OnPaste(InputPasteFn fn, void* data = nullptr);
@@ -21569,6 +24627,7 @@ struct InputGroupButton {
     Ctx* cx = nullptr;
     Button* button = nullptr;
     UiSize size = UiSize::XSmall;
+    ElRefiner refiner = {};
 
     static InputGroupButton* New(Ctx* cx, Str id);
     InputGroupButton* Label(Str s);
@@ -21583,6 +24642,8 @@ struct InputGroupButton {
     InputGroupButton* Outline();
     InputGroupButton* OnClick(Listener fn);
     InputGroupButton* Child(El* el);
+
+    El* RenderInGroup(bool disabled);
     El* IntoEl();
 };
 
@@ -21590,10 +24651,16 @@ struct InputGroupText {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     ArenaVec<El*> children;
+    ElRefiner refiner = {};
 
     static InputGroupText* New(Ctx* cx);
     InputGroupText* Child(El* el);
     El* IntoEl();
+};
+
+struct InputGroupAddonChild {
+    El* el = nullptr;
+    InputGroupButton* button = nullptr;
 };
 
 struct InputGroupAddon {
@@ -21602,11 +24669,15 @@ struct InputGroupAddon {
     Str id = {};
     InputGroupAddonAlignment alignment = InputGroupAddonAlignment::InlineStart;
     UiSize size = UiSize::Medium;
-    ArenaVec<El*> children;
+    ArenaVec<InputGroupAddonChild> children;
+    ElRefiner refiner = {};
 
     static InputGroupAddon* New(Ctx* cx, Str id);
     InputGroupAddon* Align(InputGroupAddonAlignment v);
     InputGroupAddon* Child(El* el);
+    InputGroupAddon* Child(InputGroupButton* button);
+
+    El* RenderInGroup(bool disabled);
     El* IntoEl();
 };
 
@@ -21632,6 +24703,8 @@ struct InputGroup {
     bool invalid = false;
     bool focusRing = true;
     Str ariaLabel = {};
+
+    ElRefiner refiner = {};
 
     El* controlEl = nullptr;
 
@@ -21804,14 +24877,18 @@ struct Link {
     Str id = {};
     Str href = {};
     Str text = {};
+
     bool disabled = false;
     Listener onOpen;
+
+    ArenaVec<El*> children;
 
     static Link* New(Ctx* cx, Str id);
     Link* Href(Str s);
     Link* Text(Str s);
     Link* Disabled(bool v);
     Link* OnOpen(Listener fn);
+    Link* Child(El* e);
     El* IntoEl();
 };
 
@@ -21838,6 +24915,15 @@ enum class MarkerLoadingStyle : uint8_t {
     Spinner,
 
     Shimmer
+};
+
+enum class MarkerAlignment : uint8_t {
+
+    Start,
+
+    Center,
+
+    End
 };
 
 struct MarkerIcon {
@@ -21867,6 +24953,7 @@ struct MarkerContent {
     bool shimmer = false;
     ShimmerStyle shimmerStyle = {};
     bool separator = false;
+    MarkerAlignment alignment = MarkerAlignment::Start;
 
     Rgba fg = {};
     bool hasFg = false;
@@ -21897,6 +24984,9 @@ struct Marker {
     Style separatorStyle = {};
     uint32_t separatorStyleSet = 0;
     MarkerVariant variant = MarkerVariant::Plain;
+
+    MarkerAlignment alignment = MarkerAlignment::Start;
+    bool hasAlignment = false;
     bool loading = false;
     MarkerLoadingStyle loadingStyle = MarkerLoadingStyle::Spinner;
     ShimmerStyle shimmerStyle = {};
@@ -21909,6 +24999,9 @@ struct Marker {
 
     Marker* Role(RoleOverride value);
     Marker* WithVariant(MarkerVariant value);
+
+    Marker* Alignment(MarkerAlignment value);
+    MarkerAlignment ResolvedAlignment() const;
     Marker* Loading(bool value);
     Marker* WithLoadingStyle(MarkerLoadingStyle value);
     Marker* WithShimmerStyle(const ShimmerStyle& value);
@@ -21952,6 +25045,8 @@ struct PopupMenuRow {
     bool submenu = false;
     bool link = false;
     Str href = {};
+
+    Listener handler = {};
 };
 
 struct PopupMenuState {
@@ -22052,6 +25147,8 @@ struct MenuItem {
 
     uint32_t action = 0;
     intptr_t actionArg = 0;
+
+    Listener onClick = {};
     bool checked = false;
     bool disabled = false;
     bool isLink = false;
@@ -22090,6 +25187,8 @@ struct PopupMenu {
     PopupMenu* MenuWithAction(Str label, uint32_t action, intptr_t arg = 0);
 
     PopupMenu* Action(uint32_t action, intptr_t arg = 0);
+
+    PopupMenu* OnClick(Listener l);
     PopupMenu* Link(Str label, Str href, IconName icon = IconName::None);
     PopupMenu* Separator();
     PopupMenu* Label(Str label);
@@ -22120,12 +25219,15 @@ struct DropdownMenu {
     PopupMenu* menu = nullptr;
 
     bool anchorRight = false;
+
+    bool anchorAbove = false;
     float gap = 4;
 
     static DropdownMenu* New(Ctx* cx, Str id);
     DropdownMenu* Trigger(El* e);
     DropdownMenu* Menu(PopupMenu* m);
     DropdownMenu* AnchorRight(bool v = true);
+    DropdownMenu* AnchorAbove(bool v = true);
     El* IntoEl();
 };
 
@@ -22433,6 +25535,29 @@ struct NativeMenu {
     PopupMenu* IntoPopupMenu(Str id) const;
 };
 
+struct NativeMenuFallback {
+    Arena* a = nullptr;
+    ArenaVec<const NativeMenu*> menus;
+    Entity<PopupMenuState>* states = nullptr;
+    int nStates = 0;
+    Listener onSelect = {};
+    Point position = {};
+
+    double openedPress = -1;
+    bool open = false;
+
+    ~NativeMenuFallback();
+};
+
+NativeMenuFallback* NativeMenuFallbackOf(Window* win);
+
+bool NativeMenuShowFallback(Ctx* cx, const NativeMenu* m, float x, float y);
+
+const NativeMenuItem* NativeMenuFallbackRow(const NativeMenuFallback* f,
+                                            EntityId state, int row);
+
+El* NativeMenuFallbackOverlay(Ctx* cx);
+
 int NativeMenuSelectable(const NativeMenu* m, const NativeMenuItem** out,
                          int cap);
 
@@ -22604,6 +25729,8 @@ void NotificationStartAdvancing(NotificationListState* s, Ctx* cx);
 
 void NotificationStopAdvancing(NotificationListState* s);
 
+bool NotificationNeedsClock(const NotificationListState* s);
+
 bool NotificationAdvance(NotificationListState* s, int deltaMs);
 bool NotificationAdvance(NotificationListState* s, Ctx* cx, int deltaMs);
 
@@ -22667,6 +25794,11 @@ struct PaginationMenuState {
                        intptr_t ix);
 };
 
+constexpr int kMaxEllipsisMenuPages = 100;
+
+void PaginationEllipsisMenuPages(int hiddenStart, int hiddenEnd,
+                                 int currentPage, int* start, int* end);
+
 struct Pagination {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
@@ -22682,6 +25814,10 @@ struct Pagination {
 
     static Pagination* New(Ctx* cx, int page, int total);
     Pagination* Id(Str s);
+
+    Pagination* CurrentPage(int page);
+
+    Pagination* TotalPages(int pages);
     Pagination* VisiblePages(int n);
     Pagination* Compact(bool v = true);
     Pagination* Disabled(bool v);
@@ -22701,437 +25837,23 @@ struct Path;
 
 namespace component {
 
-struct PathCache {
-    uint64_t key = 0;
-    bool hasKey = false;
-
-    bool Touch(uint64_t value) {
-        bool warm = hasKey && key == value;
-        key = value;
-        hasKey = true;
-        return warm;
-    }
-    bool IsWarm() const { return hasKey; }
-};
-
-struct PathCaches {
-    Vec<PathCache> slots;
-
-    ~PathCaches() { VecReset(slots); }
-    PathCache* Slot(int index);
-    void SlotPair(int index, PathCache** first, PathCache** second);
-};
-
-struct ShapeKey {
-    uint64_t value = 1469598103934665603ull;
-
-    static ShapeKey New(uint64_t extra = 0) {
-        ShapeKey key;
-        key.U64(extra);
-        return key;
-    }
-    ShapeKey& U64(uint64_t v);
-    ShapeKey& PointValue(Point point);
-    ShapeKey& Float(float v);
-    uint64_t Finish() const { return value; }
-};
-
-struct ScaleLinear {
-    int domainLen = 0;
-    float domainStart = 0;
-    float domainDiff = 0;
-    float rangeStart = 0;
-    float rangeDiff = 0;
-
-    static ScaleLinear New(const float* domain, int domainN, const float* range,
-                           int rangeN);
-
-    bool Tick(float value, float* out) const;
-
-    void LeastIndexWithDomain(float tick, const float* domain, int domainN,
-                              int* outIndex, float* outTick) const;
-};
-
-struct ScalePoint {
-    const float* domain = nullptr;
-    int domainLen = 0;
-    float rangeStart = 0;
-    float rangeTick = 0;
-
-    static ScalePoint New(const float* domain, int domainN, const float* range,
-                          int rangeN);
-
-    bool Tick(float value, float* out) const;
-
-    int LeastIndex(float tick) const;
-};
-
-struct ScaleBand {
-    int domainLen = 0;
-    float rangeDiff = 0;
-    float avgWidth = 0;
-    float paddingInner = 0;
-    float paddingOuter = 0;
-
-    static ScaleBand New(int domainN, const float* range, int rangeN);
-
-    float BandWidth() const;
-
-    float Step() const;
-
-    bool Tick(int index, float* out) const;
-
-    int LeastIndex(float tick) const;
-};
-
-struct ScaleOrdinal {
-    int rangeLen = 0;
-
-    int unknown = -1;
-
-    int Map(int domainIndex) const;
-};
+using ::gpui::plot::kPlotAxisGap;
+using ::gpui::plot::kPlotTextGap;
+using ::gpui::plot::kPlotTextHeight;
+using ::gpui::plot::kPlotTextSize;
+using ::gpui::plot::PathCache;
+using ::gpui::plot::PathCaches;
+using ::gpui::plot::ScaleBand;
+using ::gpui::plot::ScaleLinear;
+using ::gpui::plot::ScaleOrdinal;
+using ::gpui::plot::ScalePoint;
+using ::gpui::plot::ShapeKey;
 
 Point PlotTooltipPlace(Point cursor, Size within, Size box, float gap);
 
-const float kPlotAxisGap = 18;
-
-const float kPlotTextSize = 10;
-const float kPlotTextGap = 2;
-const float kPlotTextHeight = kPlotTextSize + kPlotTextGap;
-
 namespace plot {
 
-using ::gpui::component::ScaleBand;
-using ::gpui::component::ScaleLinear;
-using ::gpui::component::ScaleOrdinal;
-using ::gpui::component::ScalePoint;
-
-using StrokeStyle = ChartStroke;
-
-inline Point OriginPoint(float x, float y, Point origin) {
-    return Point{x + origin.x, y + origin.y};
-}
-
-Path* Polygon(PaintCtx* ctx, const Point* points, int count, Bounds bounds);
-
-enum class PlotTextAlign : uint8_t {
-    Left,
-    Center,
-    Right
-};
-
-struct Text {
-    Str text = {};
-    Point origin = {};
-    Rgba color = {};
-    float fontSize = kPlotTextSize;
-    FontWeight fontWeight = FontWeight::Normal;
-    PlotTextAlign align = PlotTextAlign::Left;
-
-    static Text New(Str text, Point origin, Rgba color);
-    Text* FontSize(float value);
-    Text* Weight(FontWeight value);
-    Text* Align(PlotTextAlign value);
-};
-
-float MeasureTextWidth(PaintCtx* ctx, Str text, float fontSize);
-
-Str TruncateTextToWidth(PaintCtx* ctx, Arena* arena, Str text, float fontSize,
-                        float maxWidth);
-
-struct PlotLabel {
-    Arena* a = nullptr;
-    ArenaVec<Text> items;
-
-    static PlotLabel New(Arena* arena);
-    PlotLabel* Add(const Text& text);
-    PlotLabel* AddMany(const Text* text, int count);
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-enum class AxisLabelSide : uint8_t {
-    End,
-    Start
-};
-
-struct AxisText {
-    Str text = {};
-    float tick = 0;
-    Rgba color = {};
-    float fontSize = kPlotTextSize;
-    PlotTextAlign align = PlotTextAlign::Left;
-
-    static AxisText New(Str text, float tick, Rgba color);
-    AxisText* FontSize(float value);
-    AxisText* Align(PlotTextAlign value);
-};
-
-struct PlotAxis {
-    Arena* a = nullptr;
-    bool hasX = false;
-    float x = 0;
-    PlotLabel xLabel;
-    bool xAxis = false;
-    AxisLabelSide xLabelSide = AxisLabelSide::End;
-    bool hasY = false;
-    float y = 0;
-    PlotLabel yLabel;
-    bool yAxis = false;
-    AxisLabelSide yLabelSide = AxisLabelSide::End;
-    Rgba stroke = {};
-
-    static PlotAxis New(Arena* arena);
-    PlotAxis* X(float value);
-    PlotAxis* ShowXAxis(bool value);
-    PlotAxis* XLabel(const AxisText* labels, int count);
-    PlotAxis* XLabelSide(AxisLabelSide value);
-    PlotAxis* Y(float value);
-    PlotAxis* ShowYAxis(bool value);
-    PlotAxis* YLabel(const AxisText* labels, int count);
-    PlotAxis* YLabelSide(AxisLabelSide value);
-    PlotAxis* Stroke(Rgba value);
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-struct Grid {
-    const float* x = nullptr;
-    int xCount = 0;
-    const float* y = nullptr;
-    int yCount = 0;
-    Rgba stroke = {};
-    const float* dashArray = nullptr;
-    int dashCount = 0;
-
-    static Grid New();
-    Grid* X(const float* values, int count);
-    Grid* Y(const float* values, int count);
-    Grid* Stroke(Rgba value);
-    Grid* DashArray(const float* values, int count);
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-struct PlotItems {
-    const void* data = nullptr;
-    int count = 0;
-    int stride = 0;
-
-    const void* At(int index) const;
-};
-
-typedef bool (*PlotValueFn)(const void* item, int index, void* user,
-                            float* out);
-
-struct Line {
-    PlotItems items = {};
-    PlotValueFn x = nullptr;
-    void* xUser = nullptr;
-    PlotValueFn y = nullptr;
-    void* yUser = nullptr;
-    Background stroke = {};
-    float strokeWidth = 1;
-    StrokeStyle strokeStyle = StrokeStyle::Natural;
-    bool dot = false;
-    float dotSize = 4;
-    Rgba dotFillColor = RgbaTransparent();
-    bool hasDotStrokeColor = false;
-    Rgba dotStrokeColor = {};
-
-    static Line New();
-    Line* Data(const void* values, int count, int stride);
-    Line* X(PlotValueFn fn, void* user = nullptr);
-    Line* Y(PlotValueFn fn, void* user = nullptr);
-    Line* Stroke(Background value);
-    Line* StrokeWidth(float value);
-    Line* Style(StrokeStyle value);
-    Line* Dots(bool value = true);
-    Line* DotSize(float value);
-    Line* DotFill(Rgba value);
-    Line* DotStroke(Rgba value);
-    int Points(Bounds bounds, Point* out, int capacity) const;
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-struct Area {
-    PlotItems items = {};
-    PlotValueFn x = nullptr;
-    void* xUser = nullptr;
-    bool hasY0 = false;
-    float y0 = 0;
-    PlotValueFn y1 = nullptr;
-    void* y1User = nullptr;
-    Background fill = {};
-    Background stroke = {};
-    StrokeStyle strokeStyle = StrokeStyle::Natural;
-
-    static Area New();
-    Area* Data(const void* values, int count, int stride);
-    Area* X(PlotValueFn fn, void* user = nullptr);
-    Area* Y0(float value);
-    Area* Y1(PlotValueFn fn, void* user = nullptr);
-    Area* Fill(Background value);
-    Area* Stroke(Background value);
-    Area* Style(StrokeStyle value);
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-enum class BarAlignment : uint8_t {
-    Bottom,
-    Top,
-    Left,
-    Right
-};
-
-bool BarAlignmentIsHorizontal(BarAlignment value);
-float BarAlignmentGradientAngle(BarAlignment value);
-Point BarLabelOrigin(BarAlignment alignment, float cross, float base,
-                     float value, float bandWidth);
-
-typedef Background (*PlotBarFillFn)(const void* item, int index, Bounds frame,
-                                    BarAlignment alignment, void* user);
-typedef void (*PlotBarLabelFn)(const void* item, int index, Point origin,
-                               void* user, Vec<Text>* out);
-
-struct Bar {
-    PlotItems items = {};
-    BarAlignment alignment = BarAlignment::Bottom;
-    PlotValueFn cross = nullptr;
-    void* crossUser = nullptr;
-    float bandWidth = 0;
-    PlotValueFn base = nullptr;
-    void* baseUser = nullptr;
-    PlotValueFn value = nullptr;
-    void* valueUser = nullptr;
-    PlotBarFillFn fill = nullptr;
-    void* fillUser = nullptr;
-    PlotBarLabelFn label = nullptr;
-    void* labelUser = nullptr;
-    Corners cornerRadii = {};
-
-    static Bar New();
-    Bar* Data(const void* values, int count, int stride);
-    Bar* Alignment(BarAlignment value);
-    Bar* Cross(PlotValueFn fn, void* user = nullptr);
-    Bar* BandWidth(float value);
-    Bar* Base(PlotValueFn fn, void* user = nullptr);
-    Bar* Value(PlotValueFn fn, void* user = nullptr);
-    Bar* Fill(PlotBarFillFn fn, void* user = nullptr);
-    Bar* Label(PlotBarLabelFn fn, void* user = nullptr);
-    Bar* CornerRadii(Corners value);
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-struct ArcData {
-    const void* data = nullptr;
-    int index = 0;
-    float value = 0;
-    float startAngle = 0;
-    float endAngle = 0;
-    float padAngle = 0;
-};
-
-struct Arc {
-    float innerRadius = 0;
-    float outerRadius = 0;
-
-    static Arc New();
-    Arc* InnerRadius(float value);
-    Arc* OuterRadius(float value);
-    Point Centroid(const ArcData& arc) const;
-    Path* PathFor(PaintCtx* ctx, const ArcData& arc, Bounds bounds,
-                  float innerOverride = -1, float outerOverride = -1) const;
-
-    bool Contains(const ArcData& arc, Point position, Bounds bounds,
-                  float innerOverride = -1, float outerOverride = -1) const;
-    void Paint(PaintCtx* ctx, const ArcData& arc, Rgba color, Bounds bounds,
-               float innerOverride = -1, float outerOverride = -1) const;
-
-    void PaintCached(PaintCtx* ctx, const ArcData& arc, Rgba color,
-                     Bounds bounds, PathCache* cache, float innerOverride = -1,
-                     float outerOverride = -1) const;
-};
-
-struct Pie {
-    PlotValueFn value = nullptr;
-    void* valueUser = nullptr;
-    float startAngle = 0;
-    float endAngle = 2 * kPi;
-    float padAngle = 0;
-
-    static Pie New();
-    Pie* Value(PlotValueFn fn, void* user = nullptr);
-    Pie* StartAngle(float value);
-    Pie* EndAngle(float value);
-    Pie* PadAngle(float value);
-    void Arcs(Arena* arena, PlotItems items, ArenaVec<ArcData>* out) const;
-};
-
-struct RadialLine {
-    PlotItems items = {};
-    PlotValueFn angle = nullptr;
-    void* angleUser = nullptr;
-    PlotValueFn radius = nullptr;
-    void* radiusUser = nullptr;
-    bool closed = false;
-    bool hasFill = false;
-    Background fill = {};
-    Background stroke = {};
-    float strokeWidth = 1;
-    bool dot = false;
-    float dotSize = 4;
-    Rgba dotFillColor = RgbaTransparent();
-    bool hasDotStrokeColor = false;
-    Rgba dotStrokeColor = {};
-
-    static RadialLine New();
-    RadialLine* Data(const void* values, int count, int stride);
-    RadialLine* Angle(PlotValueFn fn, void* user = nullptr);
-    RadialLine* Radius(PlotValueFn fn, void* user = nullptr);
-    RadialLine* Closed(bool value = true);
-    RadialLine* Fill(Background value);
-    RadialLine* Stroke(Background value);
-    RadialLine* StrokeWidth(float value);
-    RadialLine* Dots(bool value = true);
-    RadialLine* DotSize(float value);
-    RadialLine* DotFill(Rgba value);
-    RadialLine* DotStroke(Rgba value);
-    int Points(Bounds bounds, Point* out, int capacity) const;
-    void Paint(PaintCtx* ctx, Bounds bounds) const;
-};
-
-struct StackPoint {
-    float y0 = 0;
-    float y1 = 0;
-    const void* data = nullptr;
-};
-
-struct StackSeries {
-    Str key = {};
-    int index = 0;
-    ArenaVec<StackPoint> points;
-};
-
-typedef bool (*PlotStackValueFn)(const void* item, int index, Str key,
-                                 void* user, float* out);
-
-struct Stack {
-    PlotItems items = {};
-    const Str* keys = nullptr;
-    int keyCount = 0;
-    PlotStackValueFn value = nullptr;
-    void* valueUser = nullptr;
-
-    static Stack New();
-    Stack* Data(const void* values, int count, int stride);
-    Stack* Keys(const Str* values, int count);
-    Stack* Value(PlotStackValueFn fn, void* user = nullptr);
-    void Series(Arena* arena, ArenaVec<StackSeries>* out) const;
-};
-
-Path* SankeyLinkPath(PaintCtx* ctx, const SankeyNodeLayout& source,
-                     const SankeyNodeLayout& target,
-                     const SankeyLinkLayout& link, float minWidth,
-                     Point origin);
+using namespace ::gpui::plot;
 
 enum class CrossLineAxis : uint8_t {
     Vertical,
@@ -23180,35 +25902,16 @@ struct Dot {
     El* IntoEl(Ctx* cx) const;
 };
 
-struct TooltipState {
-    int index = 0;
-    Point crossLine = {};
-    const Point* dots = nullptr;
-    int dotCount = 0;
-
-    static TooltipState New(int index, Point crossLine, const Point* dots,
-                            int dotCount);
-};
-
-struct PlotHover {
-    TooltipState state = {};
-    float focus = 0;
-    bool hovered = false;
-
-    const TooltipState& State() const { return state; }
-    float Focus() const { return focus; }
-    bool IsHovered() const { return hovered; }
-    bool IsEntering() const { return hovered && focus == 0.f; }
-};
-
-bool TrackHover(Ctx* cx, const TooltipState* live, const Point* cursor,
-                PlotHover* outHover, Point* outCursor);
-
 struct TooltipRow {
     Rgba color = {};
     Str label = {};
     Str value = {};
+    Rgba valueColor = {};
+    bool hasColor = false;
+    bool hasValueColor = false;
 };
+
+bool TooltipHasSwatches(const ArenaVec<TooltipRow>& rows);
 
 struct Tooltip {
     Arena* a = nullptr;
@@ -23225,21 +25928,74 @@ struct Tooltip {
     Point cursor = {};
     Size within = {};
 
-    float focus = -1.f;
+    float progress = -1.f;
+
+    bool glide = true;
 
     static Tooltip* New(Ctx* cx, Point cursor, Size within);
     Tooltip* Title(Str value);
     Tooltip* Row(Rgba color, Str label, Str value);
+
+    Tooltip* PlainRow(Str label, Str value);
+
+    Tooltip* ValueColor(Rgba color);
     Tooltip* Gap(float value);
     Tooltip* Cross(const CrossLine& value);
     Tooltip* Dots(const Dot* values, int count);
     Tooltip* Appearance(bool value);
     Tooltip* Child(El* value);
+
+    Tooltip* Progress(float value);
+
     Tooltip* Focus(float value);
+
+    Tooltip* Glide(bool value);
     El* IntoEl();
 };
 
 }
+
+int ChartAxisPointCount(int pointCount, int dataLen);
+
+void ChartPointRange(float start, float width, int dataLen, int pointCount,
+                     float out[2]);
+
+struct ChartValueExtent {
+    double lo = 0;
+    double hi = 0;
+    float bottom = 0;
+    float top = 0;
+
+    double ValueAt(float y) const;
+
+    bool PositionOf(double value, float* out) const;
+};
+
+ScaleLinear ChartPointValueScale(const ChartSeries& chart, float height,
+                                 ChartValueExtent* extent = nullptr);
+
+const float kChartValueAxisGap = 32;
+
+Str ChartFormatTick(Arena* a, double value);
+
+Str ChartTickLabel(Arena* a, const ChartSeries& chart, double value);
+
+void ChartLabeledItems(int len, int labelCount, int tickMargin, bool* out);
+
+int ChartTickPositions(int count, float height, float* out, int cap);
+
+int ChartBarValueTickLabels(Arena* a, const ChartSeries& chart, Str* out,
+                            int cap);
+
+float ChartBarValueAxisGap(const ChartSeries& chart, float measured);
+
+plot::PlotTextAlign ChartPointLabelAlign(int index, int pointCount);
+
+float BarExtendToMinLength(float tick, float zero, bool negative,
+                           BarAlign alignment, float min);
+
+int ChartValueTickPositions(float farEdge, float baseline, int count,
+                            float* out, int cap);
 
 }
 }
@@ -23260,12 +26016,34 @@ El* DropdownOpen(Ctx* cx, El* surface, uint32_t key);
 
 El* DropdownPlaceContent(El* content, float gap = 4);
 
+const float kPopoverOffset = 4.f;
+const float kPopoverArrowSize = 6.f;
+
+struct PopoverArrowAnchor {
+    gpui::Placement side = gpui::Placement::Bottom;
+    Point target = {};
+};
+PopoverArrowAnchor ArrowAnchor(PopupAnchor anchor, Bounds trigger);
+
+void ArrowPoints(Bounds surface, Bounds trigger, gpui::Placement side,
+                 float depth, float radius, Point out[3]);
+
+Bounds ArrowJoinBounds(const Point points[3], gpui::Placement side,
+                       float stroke);
+
+struct Button;
+
 struct Popover {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     Str id = {};
     El* trigger = nullptr;
+
+    component::Button* triggerButton = nullptr;
     El* content = nullptr;
+
+    El* (*contentFn)(void* user, Ctx* cx) = nullptr;
+    void* contentUser = nullptr;
 
     bool controlled = false;
     bool open = false;
@@ -23273,28 +26051,46 @@ struct Popover {
 
     PopupAnchor anchor = PopupAnchor::TopLeft;
 
+    float offset = 0;
+    bool hasOffset = false;
+
+    bool arrow = false;
+
     MouseButton button = MouseButton::Left;
     bool overlayClosable = true;
     Listener onOpenChange;
     Listener onClose;
 
+    Style triggerStyle = {};
+    uint32_t triggerStyleSet = 0;
+
     static Popover* New(Ctx* cx);
     static Popover* New(Ctx* cx, Str id);
     Popover* Trigger(El* e);
+    Popover* Trigger(component::Button* triggerBtn);
     Popover* Content(El* e);
+    Popover* ContentBuilder(El* (*fn)(void* user, Ctx* cx), void* user);
     Popover* Open(bool v);
     Popover* DefaultOpen(bool v);
     Popover* Button(MouseButton b);
     Popover* Anchor(PopupAnchor v);
+
+    Popover* Offset(float v);
+
+    Popover* Arrow(bool v);
     Popover* OverlayClosable(bool v);
 
     Popover* OnOpenChange(Listener fn);
 
     Popover* OnClose(Listener fn);
+
+    Popover* TriggerStyle(const Style& style, uint32_t fields);
     El* IntoEl();
 };
 
 bool PopoverOpen(Ctx* cx, Str id);
+
+Entity<PopoverState> PopoverStateOf(Ctx* cx, Str id);
 
 }
 }
@@ -23309,7 +26105,8 @@ struct Progress {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     float value = 0;
-    float w = 200;
+
+    float w = kFill;
     float h = 8;
 
     bool loading = false;
@@ -23326,6 +26123,8 @@ struct Progress {
     Progress* Id(Str v);
 
     Progress* AccessibilityLabel(Str s);
+
+    Progress* WithSize(UiSize s);
     El* IntoEl();
 };
 
@@ -23359,6 +26158,146 @@ struct ProgressCircle {
 }
 }
 
+#line 1 "src/ui/questionnaire.h"
+
+namespace gpui {
+
+namespace component {
+
+struct QuestionnairePart {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Entity<QuestionnaireState> state = {};
+    Str item = {};
+    UiSize size = UiSize::Medium;
+    bool hasSize = false;
+    ArenaVec<El*> children;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
+};
+
+#define GPUI_QUESTIONNAIRE_PART(T)                       \
+    T* WithSize(UiSize s);                               \
+    T* Child(El* e);                                     \
+    T* Refine(const Style& refinement, uint32_t fields); \
+    El* IntoEl();
+
+struct Questionnaire : QuestionnairePart {
+    static Questionnaire* New(Ctx* cx, Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(Questionnaire)
+};
+
+struct QuestionnaireProgress : QuestionnairePart {
+    static QuestionnaireProgress* New(Ctx* cx,
+                                      Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireProgress)
+};
+
+struct QuestionnaireTitle : QuestionnairePart {
+    static QuestionnaireTitle* New(Ctx* cx, Entity<QuestionnaireState> state,
+                                   Str item);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireTitle)
+};
+
+struct QuestionnaireDescription : QuestionnairePart {
+    static QuestionnaireDescription* New(Ctx* cx,
+                                         Entity<QuestionnaireState> state,
+                                         Str item);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireDescription)
+};
+
+struct QuestionnaireItem : QuestionnairePart {
+    static QuestionnaireItem* New(Ctx* cx, Entity<QuestionnaireState> state,
+                                  Str item);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireItem)
+};
+
+struct QuestionnaireChoices : QuestionnairePart {
+    static QuestionnaireChoices* New(Ctx* cx, Entity<QuestionnaireState> state,
+                                     Str item);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireChoices)
+};
+
+using QuestionnaireChoiceRenderer =
+    El* (*)(Ctx * cx, const QuestionnaireChoiceState* choice);
+
+struct QuestionnaireChoice : QuestionnairePart {
+    Str value = {};
+    Style indicatorStyle = {};
+    uint32_t indicatorStyleSet = 0;
+    Style contentStyle = {};
+    uint32_t contentStyleSet = 0;
+    Style shortcutStyle = {};
+    uint32_t shortcutStyleSet = 0;
+    QuestionnaireChoiceRenderer indicatorRenderer = nullptr;
+    QuestionnaireChoiceRenderer shortcutRenderer = nullptr;
+
+    static QuestionnaireChoice* New(Ctx* cx, Entity<QuestionnaireState> state,
+                                    Str item, Str value);
+    QuestionnaireChoice* IndicatorStyle(const Style& value, uint32_t fields);
+    QuestionnaireChoice* ContentStyle(const Style& value, uint32_t fields);
+    QuestionnaireChoice* ShortcutStyle(const Style& value, uint32_t fields);
+    QuestionnaireChoice* RenderIndicator(QuestionnaireChoiceRenderer fn);
+    QuestionnaireChoice* RenderShortcut(QuestionnaireChoiceRenderer fn);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireChoice)
+};
+
+struct QuestionnaireChoiceDescription : QuestionnairePart {
+    static QuestionnaireChoiceDescription* New(Ctx* cx);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireChoiceDescription)
+};
+
+struct QuestionnaireInput : QuestionnairePart {
+    static QuestionnaireInput* New(Ctx* cx, Entity<QuestionnaireState> state,
+                                   Str item);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireInput)
+};
+
+struct QuestionnaireError : QuestionnairePart {
+    static QuestionnaireError* New(Ctx* cx, Entity<QuestionnaireState> state,
+                                   Str item);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireError)
+};
+
+struct QuestionnaireActions : QuestionnairePart {
+    static QuestionnaireActions* New(Ctx* cx, Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireActions)
+};
+
+struct QuestionnairePrevious : QuestionnairePart {
+    static QuestionnairePrevious* New(Ctx* cx,
+                                      Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(QuestionnairePrevious)
+};
+
+struct QuestionnaireSkip : QuestionnairePart {
+    static QuestionnaireSkip* New(Ctx* cx, Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireSkip)
+};
+
+struct QuestionnaireNext : QuestionnairePart {
+    static QuestionnaireNext* New(Ctx* cx, Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireNext)
+};
+
+struct QuestionnaireSubmit : QuestionnairePart {
+    static QuestionnaireSubmit* New(Ctx* cx, Entity<QuestionnaireState> state);
+    GPUI_QUESTIONNAIRE_PART(QuestionnaireSubmit)
+};
+
+#undef GPUI_QUESTIONNAIRE_PART
+
+Str QuestionnaireErrorText(const QuestionnaireValidationError& error);
+
+UiSize QuestionnaireResolveSize(App* app, const QuestionnairePart* part);
+void QuestionnairePublishSize(App* app, Entity<QuestionnaireState> state,
+                              UiSize size);
+
+}
+}
+
 #line 1 "src/ui/radio.h"
 
 namespace gpui {
@@ -23381,7 +26320,12 @@ struct Radio {
     bool tabStop = true;
     Listener onClick;
 
+    ArenaVec<El*> children;
+
+    ElRefiner refiner = {};
+
     static Radio* New(Ctx* cx, Str id);
+    Radio* Child(El* child);
     Radio* Label(Str s);
 
     Radio* AccessibilityLabel(Str s);
@@ -23408,6 +26352,8 @@ struct RadioGroup {
     int selected = -1;
     bool disabled = false;
     UiSize size = UiSize::Medium;
+
+    bool hasSize = false;
     Listener onClick;
 
     static RadioGroup* New(Ctx* cx, Str id);
@@ -23479,6 +26425,20 @@ namespace gpui {
 namespace component {
 
 using ResizableState = gpui::ResizableState;
+
+const float kResizeIndicatorThickness = 3.f;
+
+struct ResizeIndicator {
+    float length = 0;
+    float opacity = 0;
+};
+ResizeIndicator ResizeHandleIndicator(ResizeHandleState state);
+
+El* RenderResizeHandle(void* user, const ResizeHandleContext* handle, Ctx* cx);
+
+inline ResizeHandleRenderer ResizeHandleAppearance() {
+    return &RenderResizeHandle;
+}
 
 struct Resizable {
 
@@ -23704,11 +26664,6 @@ inline void WindowRemoveNotification1(Ctx* cx, Str key) {
 InputState* WindowFocusedInput(Ctx* cx);
 bool WindowHasFocusedInput(Ctx* cx);
 
-int WindowSelectedText(Ctx* cx, char* out, int cap);
-bool WindowHasTextSelection(Ctx* cx);
-void WindowClearTextSelection(Ctx* cx);
-void WindowEndTextSelection(Ctx* cx);
-
 }
 
 #line 1 "src/ui/root.h"
@@ -23717,43 +26672,18 @@ namespace gpui {
 
 namespace component {
 
+using Root = gpui::Root;
+
 int RootDialogOverlayIndex(const bool* wantsOverlay, int n);
 
 Edges RootNotificationInsets(bool hasSheet, SheetPlacement placement,
                              float size);
 
-struct Root {
-    Arena* a = nullptr;
-    Ctx* cx = nullptr;
-    El* child = nullptr;
-    bool bordered = true;
+extern const RootPlugin kWindowStatePlugin;
 
-    float shadowSize = kWindowShadowSize;
+void RootInit(App* app);
 
-    El* notifications = nullptr;
-    El* sheet = nullptr;
-    bool hasSheet = false;
-    SheetPlacement sheetPlacement = SheetPlacement::Right;
-    float sheetSize = 0;
-
-    ArenaVec<El*> dialogs;
-    ArenaVec<bool> dialogOverlay;
-
-    bool windowLayers = true;
-
-    static Root* New(Ctx* cx);
-    Root* Bordered(bool v);
-    Root* ShadowSize(float v);
-    Root* Child(El* e);
-
-    Root* Notifications(El* e);
-
-    Root* Sheet(El* e, SheetPlacement placement, float size);
-
-    Root* Dialog(El* e, bool overlay = true);
-    Root* UseWindowLayers(bool v);
-    El* IntoEl();
-};
+El* WindowStateLayers(Ctx* cx);
 
 }
 }
@@ -23962,6 +26892,10 @@ struct SelectIndex {
 struct SettingItem {
     Str title = {};
     Str description = {};
+
+    El* descriptionEl = nullptr;
+
+    bool isElement = false;
     El* control = nullptr;
     SettingFieldElement fieldElement = {};
     ArenaVec<Str> keywords;
@@ -23995,7 +26929,16 @@ struct SettingGroup {
     Str title = {};
     Str description = {};
     ArenaVec<SettingItem> items;
+
+    El* footer = nullptr;
+
+    GroupBoxVariant variant = GroupBoxVariant::Normal;
+    bool hasVariant = false;
+
+    ElRefiner refiner = {};
 };
+
+using SettingTitleSuffixFn = El* (*)(void* user, Ctx* cx);
 
 struct SettingPage {
     Str title = {};
@@ -24004,6 +26947,10 @@ struct SettingPage {
     ArenaVec<SettingGroup> groups;
 
     El* titleSuffix = nullptr;
+    SettingTitleSuffixFn titleSuffixFn = nullptr;
+    void* titleSuffixUser = nullptr;
+
+    bool defaultOpen = false;
 
     bool resettable = true;
 };
@@ -24026,7 +26973,13 @@ struct SettingBinding {
     NumberFieldOptions num = {};
     Entity<SearchableListState> list = {};
     int defIndex = 0;
+
+    bool hasDefault = false;
+
+    Listener onReset = {};
 };
+
+const intptr_t kDropdownOptionsMax = 4096;
 
 struct SettingFieldInput {
     InputState input;
@@ -24038,6 +26991,15 @@ struct SettingsState {
     int group = -1;
     bool selectionInitialized = false;
 
+    int deferredScrollGroup = -1;
+
+    int listPage = -1;
+    uint32_t listQuery = 0;
+    float scrollY = 0;
+    int pendingScrollGroup = -1;
+
+    float containerWidth = -1;
+
     InputState search;
     Vec<SettingBinding> fields;
 
@@ -24048,10 +27010,16 @@ struct SettingsState {
     static void OnGroupClick(SettingsState* self, Ctx* cx, const ClickEvent* ev,
                              intptr_t packed);
 
+    static void OnPageScroll(SettingsState* self, Ctx* cx,
+                             const ScrollEvent* ev);
+
     static void OnFieldClick(SettingsState* self, Ctx* cx, const ClickEvent* ev,
                              intptr_t ix);
     static void OnFieldReset(SettingsState* self, Ctx* cx, const ClickEvent* ev,
                              intptr_t ix);
+
+    static void OnDropdownPick(SettingsState* self, Ctx* cx,
+                               const ClickEvent* ev, intptr_t packed);
 
     static void OnResetPage(SettingsState* self, Ctx* cx, const ClickEvent* ev,
                             intptr_t unused);
@@ -24067,20 +27035,30 @@ struct Settings {
     Entity<SettingsState> state = {};
 
     ArenaVec<SettingPage> pages;
+
     float sidebarWidth = 250;
     float sidebarMinWidth = 160;
     float sidebarMaxWidth = 360;
-    float h = 480;
+
+    float h = kFill;
     UiSize size = UiSize::Medium;
     SelectIndex defaultSelectedIndex = {};
 
-    bool bordered = true;
+    GroupBoxVariant groupVariant = GroupBoxVariant::Normal;
 
     static Settings* New(Ctx* cx, Str id, Entity<SettingsState> state = {});
     Settings* Page(Str title, IconName icon = IconName::None,
                    Str description = {});
     Settings* Group(Str title, Str description = {});
+
+    Settings* GroupFooter(El* footer);
+
+    Settings* GroupVariant(GroupBoxVariant variant);
     Settings* Item(Str title, Str description, El* control = nullptr);
+
+    Settings* ElementItem(El* content);
+
+    Settings* DescriptionEl(El* e);
     Settings* FieldElement(SettingFieldElement element);
 
     Settings* SwitchField(bool* value, bool defValue = false,
@@ -24098,6 +27076,8 @@ struct Settings {
 
     Settings* PageResettable(bool v);
 
+    Settings* PageDefaultOpen(bool v);
+
     Settings* PageTitleSuffix(El* e);
 
     Settings* Keywords(Str a1, Str a2 = {}, Str a3 = {});
@@ -24110,6 +27090,8 @@ struct Settings {
     Settings* WithSize(UiSize value);
     Settings* DefaultSelectedIndex(SelectIndex value);
     Settings* H(float v);
+    Settings* WithGroupVariant(GroupBoxVariant v);
+
     Settings* Bordered(bool v);
     El* IntoEl();
 };
@@ -24189,6 +27171,8 @@ struct SidebarMenuItem {
     Ctx* cx = nullptr;
     IconName icon = IconName::None;
     Str label = {};
+
+    Str accessibilityLabel = {};
     Listener onClick;
     bool active = false;
     bool disabled = false;
@@ -24211,6 +27195,7 @@ struct SidebarMenuItem {
     SidebarMenuItem* Icon(IconName v);
     SidebarMenuItem* Refine(const Style& v, uint32_t fields);
     SidebarMenuItem* LabelStyle(const Style& v, uint32_t fields);
+    SidebarMenuItem* AccessibilityLabel(Str v);
     SidebarMenuItem* Active(bool v);
     SidebarMenuItem* Disabled(bool v);
     SidebarMenuItem* DefaultOpen(bool v);
@@ -24232,6 +27217,8 @@ struct SidebarMenu {
     bool collapsed = false;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static SidebarMenu* New(Ctx* cx);
     SidebarMenu* Child(SidebarMenuItem* item);
@@ -24264,6 +27251,7 @@ struct SidebarHeader {
     bool selected = false;
     bool collapsed = false;
     Listener onClick = {};
+    ElRefiner refiner = {};
 
     static SidebarHeader* New(Ctx* cx);
     SidebarHeader* Child(El* child);
@@ -24283,6 +27271,7 @@ struct SidebarFooter {
     bool selected = false;
     bool collapsed = false;
     Listener onClick = {};
+    ElRefiner refiner = {};
 
     static SidebarFooter* New(Ctx* cx);
     SidebarFooter* Child(El* child);
@@ -24300,10 +27289,13 @@ struct SidebarToggleButton {
     Side side = Side::Left;
     Listener onClick;
 
+    Str accessibilityLabel = {};
+
     static SidebarToggleButton* New(Ctx* cx);
     SidebarToggleButton* Collapsed(bool v);
     SidebarToggleButton* WithSide(Side v);
     SidebarToggleButton* OnClick(Listener fn);
+    SidebarToggleButton* AccessibilityLabel(Str v);
     El* IntoEl();
 };
 
@@ -24323,6 +27315,8 @@ struct Sidebar {
     float width = 255;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static Sidebar* New(Ctx* cx, Str id);
     Sidebar* WithSide(Side v);
@@ -24387,7 +27381,7 @@ struct Slider {
 
     Axis axis = Axis::Horizontal;
 
-    float width = 224;
+    float width = kAuto;
 
     Rgba bar = {};
     bool hasBar = false;
@@ -24503,8 +27497,10 @@ struct StepperItem {
     Ctx* cx = nullptr;
     IconName icon = IconName::None;
 
-    El* child = nullptr;
+    ArenaVec<El*> children;
     bool disabled = false;
+
+    ElRefiner refiner = {};
 
     int step = 0;
     int checkedStep = 0;
@@ -24571,6 +27567,8 @@ struct Switch {
     bool disabled = false;
     UiSize size = UiSize::Medium;
     Rgba color = {};
+
+    Str tooltip = {};
     bool hasColor = false;
     bool focusRing = true;
     int tabIndex = 0;
@@ -24585,6 +27583,7 @@ struct Switch {
     Switch* Disabled(bool v);
     Switch* WithSize(UiSize s);
     Switch* Color(Rgba c);
+    Switch* Tooltip(Str s);
 
     Switch* FocusRing(bool v);
     Switch* TabIndex(int v);
@@ -24648,6 +27647,8 @@ struct Tab {
     Listener onClick;
     Style style = {};
     uint32_t styleSet = 0;
+
+    ElRefiner refiner = {};
 
     static Tab* New(Ctx* cx);
     static Tab* New(Ctx* cx, Str label);
@@ -24958,6 +27959,8 @@ bool TableVisibleColsChanged(TableState* s, int first, int end);
 
 void TableVisibleCols(const TableState* s, int* first, int* end);
 
+int TableExtraRowsNeeded(float totalH, float actualH, float rowH);
+
 bool TableShouldLoadMore(const TableState* s, int visibleEnd);
 
 void TableScrollToRow(TableState* s, int row, ScrollStrategy strategy);
@@ -24982,6 +27985,35 @@ ColumnSort TableNextSort(ColumnSort s);
 ColumnSort TableSortOf(const TableState* s, int col);
 
 void TablePerformSort(TableState* s, Ctx* cx, int col);
+
+enum class TableSelectionKind : uint8_t {
+    None,
+    Row,
+    Column,
+    Cell
+};
+
+struct TableSelection {
+    TableSelectionKind kind = TableSelectionKind::None;
+    int row = -1;
+    int col = -1;
+};
+
+inline bool operator==(const TableSelection& a, const TableSelection& b) {
+    return a.kind == b.kind && a.row == b.row && a.col == b.col;
+}
+inline bool operator!=(const TableSelection& a, const TableSelection& b) {
+    return !(a == b);
+}
+
+TableSelection TableSelectionOf(const TableState* s);
+
+void TableSetSelection(TableState* s, Ctx* cx, TableSelection selection);
+
+int TableSelectedRow(const TableState* s);
+int TableSelectedCol(const TableState* s);
+bool TableSelectedCell(const TableState* s, int* row, int* col);
+
 void TableSetSelectedRow(TableState* s, Ctx* cx, int row);
 void TableSetSelectedCol(TableState* s, Ctx* cx, int col);
 void TableSetSelectedCell(TableState* s, Ctx* cx, int row, int col);
@@ -25116,6 +28148,11 @@ struct DataTable {
     int nRows = 0;
     bool stripe = false;
 
+    bool bordered = true;
+
+    bool scrollbarV = true;
+    bool scrollbarH = true;
+
     ArenaVec<TableGroupHeader> groupHeaders;
 
     float h = 0;
@@ -25146,6 +28183,8 @@ struct DataTable {
     DataTable* Rows(int n, void* data,
                     El* (*cell)(Ctx* cx, void* data, int row, int col));
     DataTable* Stripe(bool v);
+    DataTable* Bordered(bool v);
+    DataTable* ScrollbarVisible(bool vertical, bool horizontal);
     DataTable* WithSize(UiSize s);
 
     DataTable* RowHeight(float px);
@@ -25189,6 +28228,8 @@ struct TableCellEl {
     float width = kAuto;
     ArenaVec<El*> children;
 
+    ElRefiner refiner = {};
+
     TableCellEl* ColSpan(int n);
     TableCellEl* TextCenter();
     TableCellEl* TextRight();
@@ -25213,6 +28254,7 @@ struct TableRow {
     bool hasBg = false;
     Background bg = {};
     ArenaVec<TableCellEl*> cells;
+    ElRefiner refiner = {};
 
     static TableRow* New(Ctx* cx);
     TableRow* Bg(Background c);
@@ -25233,6 +28275,7 @@ struct TableGroup {
     int ix = 0;
     UiSize size = UiSize::Medium;
     ArenaVec<TableRow*> rows;
+    ElRefiner refiner = {};
 
     TableGroup* Child(TableRow* r);
     El* IntoEl();
@@ -25251,12 +28294,20 @@ struct TableFooter {
 struct TableCaption {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
+
+    int ix = 0;
     UiSize size = UiSize::Medium;
     ArenaVec<El*> children;
+    ElRefiner refiner = {};
 
     static TableCaption* New(Ctx* cx);
     TableCaption* Child(El* e);
     El* IntoEl();
+};
+
+struct TablePart {
+    TableGroup* group = nullptr;
+    TableCaption* caption = nullptr;
 };
 
 struct Table {
@@ -25264,8 +28315,7 @@ struct Table {
     Ctx* cx = nullptr;
     UiSize size = UiSize::Medium;
     bool bordered = false;
-    ArenaVec<TableGroup*> groups;
-    TableCaption* caption = nullptr;
+    ArenaVec<TablePart> parts;
 
     Str id = {};
 
@@ -25313,6 +28363,8 @@ struct Tag {
     Rgba customBorder = {};
     bool hasCustom = false;
 
+    ArenaVec<El*> children;
+
     static Tag* New(Ctx* cx, Str text);
     Tag* Primary();
     Tag* Secondary();
@@ -25323,6 +28375,7 @@ struct Tag {
     Tag* Outline();
     Tag* WithSize(UiSize s);
     Tag* Radius(float v);
+    Tag* Child(El* e);
 
     Tag* Custom(Rgba bg, Rgba fg, Rgba border = {});
     El* IntoEl();
@@ -25364,7 +28417,20 @@ using CodeBlockHighlighterFn = gpui::CodeBlockHighlighterFn;
 using CodeBlockActionsFn = gpui::CodeBlockActionsFn;
 using TableActionsFn = gpui::TableActionsFn;
 using TableData = gpui::TableData;
-using HeadingFontSizeFn = gpui::HeadingFontSizeFn;
+using RangeHighlight = gpui::RangeHighlight;
+using RangeHighlightError = gpui::RangeHighlightError;
+using RangeHighlightErrorKind = gpui::RangeHighlightErrorKind;
+using RenderedText = gpui::RenderedText;
+using HeadingStyleFn = gpui::HeadingStyleFn;
+
+using HeadingFontSizeFn = float (*)(uint8_t level, float base, void* data);
+struct TextViewHeadingCompat {
+    float headingBaseFontSize = 14;
+    HeadingFontSizeFn headingFontSize = nullptr;
+    void* data = nullptr;
+};
+
+uint32_t TextViewHeadingCompatRefine(uint8_t level, Style* out, void* data);
 using TextViewStyle = gpui::TextViewStyle;
 using TextViewDefaults = gpui::TextViewDefaults;
 using TextViewFormat = gpui::TextViewFormat;
@@ -25425,6 +28491,101 @@ struct TitleBar {
 
     static TitleBar* New(Ctx* cx);
     TitleBar* Child(El* e);
+    El* IntoEl();
+};
+
+}
+}
+
+#line 1 "src/ui/toolbar.h"
+
+namespace gpui {
+
+namespace component {
+
+template <typename T>
+inline T* PrepareForToolbar(T* control) {
+    return control;
+}
+inline Button* PrepareForToolbar(Button* button) {
+    return button->Ghost()->Compact();
+}
+
+inline UiSize ToolbarSize(UiSize size) {
+    return size == UiSize::Large ? UiSize(UiSize::Medium) : size;
+}
+
+struct ToolbarItem {
+    void* control = nullptr;
+    El* (*build)(void* control, UiSize size) = nullptr;
+    El* content = nullptr;
+
+    El* IntoEl(Ctx* cx, UiSize size) const;
+};
+
+template <typename T>
+El* ToolbarBuildSized(void* control, UiSize size) {
+    return PrepareForToolbar((T*)control)->WithSize(size)->IntoEl();
+}
+
+template <typename T>
+inline ToolbarItem ToolbarSized(T* control) {
+    ToolbarItem item;
+    item.control = control;
+    item.build = &ToolbarBuildSized<T>;
+    return item;
+}
+
+struct ToolbarGroup {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    UiSize size = UiSize::Small;
+    Str label = {};
+    float gap = 0;
+    ArenaVec<ToolbarItem> items;
+
+    static ToolbarGroup* New(Ctx* cx, Str id);
+    ToolbarGroup* Label(Str value);
+
+    ToolbarGroup* Gap(float value);
+    template <typename T>
+    ToolbarGroup* Child(T* control) {
+        if (control) {
+            items.Append(a, ToolbarSized(control));
+        }
+        return this;
+    }
+
+    ToolbarGroup* Content(El* content);
+    ToolbarGroup* WithSize(UiSize value);
+    El* IntoEl();
+};
+
+struct Toolbar {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    UiSize size = UiSize::Small;
+    bool disabled = false;
+    ArenaVec<ToolbarItem> items;
+
+    static Toolbar* New(Ctx* cx, Str id);
+
+    Toolbar* Disabled(bool value);
+
+    template <typename T>
+    Toolbar* Child(T* control) {
+        if (control) {
+            items.Append(a, ToolbarSized(control));
+        }
+        return this;
+    }
+
+    Toolbar* Content(El* content);
+    Toolbar* Contents(El* const* contents, int count);
+
+    Toolbar* WithSize(UiSize value);
     El* IntoEl();
 };
 
@@ -25497,6 +28658,12 @@ namespace gpui {
 
 namespace component {
 
+struct PopupMenu;
+
+using TreeContextMenuFn = PopupMenu* (*)(void* user, Ctx* cx, int ix,
+                                         const TreeEntry& entry,
+                                         PopupMenu* menu);
+
 struct Tree {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
@@ -25505,10 +28672,13 @@ struct Tree {
     float h = 320;
 
     bool icons = true;
+    TreeContextMenuFn contextMenu = nullptr;
+    void* contextMenuUser = nullptr;
 
     static Tree* New(Ctx* cx, Str id, Entity<TreeState> state);
     Tree* H(float v);
     Tree* Icons(bool v);
+    Tree* ContextMenu(TreeContextMenuFn fn, void* user = nullptr);
     El* IntoEl();
 };
 
@@ -25655,6 +28825,1849 @@ TempStr FormatBytesTemp(uint64_t bytes);
 TempStr FormatPctTemp(float v, int decimals);
 
 bool SysSelfPrivateMemory(uint64_t* bytes);
+}
+
+#line 1 "src/shell/error.h"
+
+namespace gpui {
+
+struct ShellError {
+    Str message;
+
+    bool IsSet() const { return len(message) > 0; }
+};
+
+void ShellErrorClear(ShellError* error);
+void ShellErrorSet(ShellError* error, Str message);
+
+}
+
+#line 1 "src/shell/value.h"
+
+namespace gpui::shell {
+
+enum class BridgedKind : uint8_t {
+    Nil,
+    Bool,
+    Number,
+    String,
+};
+
+struct Bridged {
+    BridgedKind kind = BridgedKind::Nil;
+    bool boolean = false;
+    double number = 0;
+    Str string;
+
+    static Bridged Nil();
+    static Bridged Bool(bool value);
+    static Bridged Number(double value);
+    static Bridged String(Str value);
+};
+
+bool BridgedAsF32(const Bridged& value, float* out,
+                  ShellError* error = nullptr);
+bool BridgedAsString(const Bridged& value, Str* out,
+                     ShellError* error = nullptr);
+bool BridgedAsPixels(const Bridged& value, float* out,
+                     ShellError* error = nullptr);
+bool BridgedAsColor(const Bridged& value, Hsla* out,
+                    ShellError* error = nullptr);
+bool BridgedIsTruthy(const Bridged& value);
+Str BridgedDescribe(Arena* arena, const Bridged& value);
+bool BridgedArg(const Bridged* args, int count, int index, Str method,
+                Bridged* out, ShellError* error = nullptr);
+
+}
+
+#line 1 "src/shell/spec.h"
+
+namespace gpui {
+struct Policy;
+}
+
+namespace gpui::shell {
+
+using SpecId = uint32_t;
+using CallbackId = uint64_t;
+
+struct StructureFingerprint {
+    uint64_t value = 0;
+
+    bool operator==(const StructureFingerprint& other) const {
+        return value == other.value;
+    }
+    bool operator!=(const StructureFingerprint& other) const {
+        return value != other.value;
+    }
+};
+
+uint64_t StructureMix(uint64_t state, uint64_t value);
+
+enum class BackgroundKind : uint8_t {
+    Solid,
+    LinearGradient,
+    PatternSlash,
+    Checkerboard,
+};
+
+struct BackgroundSpec {
+    BackgroundKind kind = BackgroundKind::Solid;
+    Str color;
+    float opacity = 1;
+    float angle = 0;
+    Str fromColor;
+    float fromPosition = 0;
+    Str toColor;
+    float toPosition = 1;
+    Str colorSpace;
+    float width = 0;
+    float interval = 0;
+    float size = 0;
+};
+
+enum class ComponentKind : uint8_t {
+    Div,
+    HFlex,
+    VFlex,
+    ChildView,
+    Text,
+    TextView,
+    Button,
+    Link,
+    Checkbox,
+    Switch,
+    Scrollbar,
+    Input,
+    Textarea,
+    NumberInput,
+    OtpInput,
+    Svg,
+
+    Accordion,
+
+    AccordionItem,
+    AccordionHeader,
+
+    AccordionPanel,
+    AccordionTrigger,
+
+    Pagination,
+
+    Avatar,
+
+    AvatarImage,
+    AvatarFallback,
+    Image,
+    PathFill,
+    PathStroke,
+    Tabs,
+    Tab,
+    Progress,
+    ProgressTrack,
+    ProgressIndicator,
+    FpsMonitor,
+    Slider,
+    SliderTrack,
+    SliderIndicator,
+    SliderThumb,
+    Radio,
+    Toggle,
+    RadioGroup,
+    ToggleGroup,
+    Table,
+    TableHeader,
+    TableBody,
+    TableRow,
+    TableHead,
+    TableCell,
+    TableCaption,
+    HResizable,
+    VResizable,
+    ResizablePanel,
+    Collapsible,
+    Popover,
+    HoverCard,
+    Popup,
+    Select,
+    Combobox,
+    DatePicker,
+
+    DockArea,
+
+    DockContent,
+    VVirtualList,
+    HVirtualList,
+
+    List,
+    UniformList,
+
+    Registered,
+};
+
+enum class TextViewFormat : uint8_t {
+    Html,
+    Markdown,
+};
+
+struct VirtualListSpec {
+    Str id;
+    Axis axis = Axis::Vertical;
+    Size* sizes = nullptr;
+    int sizeCount = 0;
+    CallbackId getKey = 0;
+    CallbackId renderItems = 0;
+};
+
+struct ListSpec {
+
+    Str id;
+
+    int itemCount = 0;
+
+    CallbackId getKey = 0;
+
+    CallbackId renderItems = 0;
+};
+
+struct ComponentPayload {
+    const void* data = nullptr;
+    const void* type = nullptr;
+};
+
+struct Component {
+    ComponentKind kind = ComponentKind::Div;
+    Str text;
+
+    Str value;
+    TextViewFormat textViewFormat = TextViewFormat::Markdown;
+
+    Policy* policy = nullptr;
+    uint64_t handle = 0;
+    uint32_t index = 0;
+    BackgroundSpec background;
+    float strokeWidth = 0;
+    VirtualListSpec* virtualList = nullptr;
+    ListSpec* list = nullptr;
+    ComponentPayload payload;
+};
+
+const char* ComponentName(const Component& component);
+
+enum class SpecOpKind : uint8_t {
+    NullaryStyle,
+    ParamStyle,
+    Method,
+    Callback,
+
+    ActionCallback,
+    StateStyle,
+    Slot,
+
+    RegisteredMethod,
+};
+
+struct SpecOp {
+    SpecOpKind kind = SpecOpKind::Method;
+    Str name;
+    uint16_t styleIndex = 0;
+    CallbackId callback = 0;
+    SpecId node = 0;
+    Bridged* args = nullptr;
+    int argCount = 0;
+    ComponentPayload payload;
+};
+
+struct SpecNode {
+    Component component;
+    ArenaVec<SpecOp> ops;
+    ArenaVec<SpecId> children;
+};
+
+enum class SpecErrorKind : uint8_t {
+    None,
+    Claimed,
+    Expired,
+    AlreadyParented,
+    SelfParent,
+    DuplicateChildView,
+};
+
+struct SpecError {
+    SpecErrorKind kind = SpecErrorKind::None;
+    Str component;
+};
+
+Str SpecErrorMessage(Arena* arena, const SpecError& error);
+
+enum class SlotSiteKind : uint8_t {
+
+    Text,
+
+    Argument,
+
+    Handler,
+};
+
+struct SlotSite {
+    SlotSiteKind kind = SlotSiteKind::Text;
+    uint16_t op = 0;
+    uint8_t argument = 0;
+
+    bool operator==(const SlotSite& other) const {
+        return kind == other.kind && op == other.op &&
+               argument == other.argument;
+    }
+};
+
+struct Slot {
+    SpecId node = 0;
+    SlotSite site;
+
+    uint16_t argument = 0;
+};
+
+enum class SlotValueKind : uint8_t {
+    Text,
+    Value,
+    Handler
+};
+
+struct SlotValue {
+    SlotValueKind kind = SlotValueKind::Text;
+    Str text;
+    Bridged value;
+    CallbackId handler = 0;
+};
+
+class SpecArena;
+
+struct Template {
+    SpecArena* arena = nullptr;
+    SpecId root = 0;
+    Vec<Slot> slots;
+    int arity = 0;
+
+    void* application = nullptr;
+
+    ~Template();
+};
+
+class SpecArena {
+  public:
+    SpecArena();
+
+    explicit SpecArena(Arena* borrowed);
+    SpecArena(const SpecArena&) = delete;
+    SpecArena& operator=(const SpecArena&) = delete;
+    ~SpecArena();
+
+    void Reset();
+    int Len() const { return nodes.len; }
+    bool IsEmpty() const { return nodes.len == 0; }
+    SpecId Push(const Component& component);
+    bool PushChildView(const Component& component, SpecId* out,
+                       SpecError* error = nullptr);
+
+    bool PushDockArea(uint64_t handle, SpecId* out, SpecError* error = nullptr);
+    const SpecNode* Node(SpecId id) const;
+    bool PushOp(SpecId id, const SpecOp& op, SpecError* error = nullptr);
+    bool Claim(SpecId id, SpecError* error = nullptr);
+
+    bool CanClaim(SpecId id, SpecError* error = nullptr) const;
+
+    bool IsLive(SpecId id, SpecError* error = nullptr) const {
+        return CheckLive(id, error);
+    }
+    bool Attach(SpecId parent, SpecId child, SpecError* error = nullptr);
+    bool ClaimVirtualItems(uint64_t count, uint64_t limit);
+    Str DebugTree(Arena* into, SpecId root) const;
+
+    StructureFingerprint Structure() const { return {structure}; }
+
+    SpecId Graft(const Template& tmpl);
+
+    bool WriteSlot(SpecId base, const Slot& slot, const SlotValue& value,
+                   SpecError* error = nullptr);
+
+    bool MountsAnEntity() const { return mountedViews.len > 0; }
+
+    bool HasRegistered() const;
+
+    Arena* Storage() const { return arena; }
+
+  private:
+    Arena* arena = nullptr;
+    bool ownsArena = true;
+    Vec<SpecNode*> nodes;
+    Vec<uint8_t> parented;
+    Vec<uint8_t> claimed;
+    Vec<uint64_t> mountedViews;
+
+    Vec<Policy*> policies;
+    uint64_t virtualItems = 0;
+
+    uint64_t structure = 0;
+
+    bool CheckLive(SpecId id, SpecError* error) const;
+    void ReleasePolicies();
+    Component CopyComponent(const Component& component);
+    SpecOp CopyOp(const SpecOp& op);
+    void WriteTree(StrBuilder* out, SpecId id, int depth) const;
+};
+
+}
+
+#line 1 "src/shell/component_registry.h"
+
+namespace gpui {
+class ShellRuntime;
+struct ScriptView;
+}
+
+namespace gpui::shell {
+
+constexpr uint32_t kComponentRegistryApiVersion = 1;
+
+extern const char kDefaultComponentModule[];
+
+template <class T>
+struct Slice {
+    const T* items = nullptr;
+    int count = 0;
+
+    constexpr Slice() = default;
+    constexpr Slice(const T* items, int count) : items(items), count(count) {}
+    template <int N>
+    constexpr Slice(const T (&array)[N]) : items(array), count(N) {}
+
+    const T* begin() const { return items; }
+    const T* end() const { return items + count; }
+    const T& operator[](int at) const { return items[at]; }
+};
+
+enum class SchemaKind : uint8_t {
+    String,
+    Number,
+    Boolean,
+    Element,
+    Entity,
+    Callback,
+    Enum,
+    Array,
+    Optional,
+};
+
+struct ArgumentSchema {
+    SchemaKind kind = SchemaKind::String;
+    const char* text = nullptr;
+    Slice<const char*> values = {};
+    const ArgumentSchema* item = nullptr;
+};
+
+constexpr ArgumentSchema SchemaString() {
+    return {SchemaKind::String, nullptr, {}, nullptr};
+}
+constexpr ArgumentSchema SchemaNumber() {
+    return {SchemaKind::Number, nullptr, {}, nullptr};
+}
+constexpr ArgumentSchema SchemaBoolean() {
+    return {SchemaKind::Boolean, nullptr, {}, nullptr};
+}
+constexpr ArgumentSchema SchemaElement() {
+    return {SchemaKind::Element, nullptr, {}, nullptr};
+}
+constexpr ArgumentSchema SchemaEntity(const char* kind) {
+    return {SchemaKind::Entity, kind, {}, nullptr};
+}
+constexpr ArgumentSchema SchemaCallback(const char* signature) {
+    return {SchemaKind::Callback, signature, {}, nullptr};
+}
+constexpr ArgumentSchema SchemaEnum(Slice<const char*> values) {
+    return {SchemaKind::Enum, nullptr, values, nullptr};
+}
+constexpr ArgumentSchema SchemaArray(const ArgumentSchema* item) {
+    return {SchemaKind::Array, nullptr, {}, item};
+}
+constexpr ArgumentSchema SchemaOptional(const ArgumentSchema* item) {
+    return {SchemaKind::Optional, nullptr, {}, item};
+}
+
+struct ArgumentDescriptor {
+    const char* name = nullptr;
+    ArgumentSchema schema = {};
+};
+
+enum class ComponentArgumentKind : uint8_t {
+    String,
+    Number,
+    Boolean,
+    Element,
+    Entity,
+    Callback,
+    Enum,
+    Array,
+    Optional,
+};
+
+struct ComponentArgument {
+    ComponentArgumentKind kind = ComponentArgumentKind::String;
+    Str string;
+    double number = 0;
+    bool boolean = false;
+    SpecId element = 0;
+    const char* entityKind = nullptr;
+    uint64_t handle = 0;
+    CallbackId callback = 0;
+    const ComponentArgument* items = nullptr;
+    int count = 0;
+
+    const ComponentArgument* Some() const;
+};
+
+enum class DataKind : uint8_t {
+    Null,
+    Boolean,
+    Number,
+    String,
+    Array,
+    Object,
+};
+
+struct ComponentDataValue {
+    DataKind kind = DataKind::Null;
+    bool boolean = false;
+    double number = 0;
+    Str string;
+    const ComponentDataValue* items = nullptr;
+
+    const Str* keys = nullptr;
+    int count = 0;
+
+    static ComponentDataValue Null();
+    static ComponentDataValue Boolean(bool value);
+    static ComponentDataValue Number(double value);
+    static ComponentDataValue String(Str value);
+    static ComponentDataValue Array(const ComponentDataValue* items, int count);
+
+    const ComponentDataValue* Get(Str key) const;
+};
+
+using ComponentCallbackArgument = ComponentDataValue;
+using ComponentCallbackValue = ComponentDataValue;
+
+template <class T>
+const void* PayloadTag() {
+    static const char tag = 0;
+    return &tag;
+}
+
+struct EmptyPayload {};
+
+struct PayloadBuild;
+
+using PayloadFactory = bool (*)(PayloadBuild* build,
+                                const ComponentArgument* arguments, int count);
+
+struct PayloadBuild {
+    Arena* a = nullptr;
+    ComponentPayload out = {};
+    Str error;
+
+    template <class T>
+    T* New() {
+        T* value = ArenaNew<T>(a);
+        out.data = value;
+        out.type = PayloadTag<T>();
+        return value;
+    }
+
+    template <class T>
+    bool Mark() {
+        out.data = nullptr;
+        out.type = PayloadTag<T>();
+        return true;
+    }
+    bool Fail(Str message);
+    Str Dup(Str value) const { return StrDup(a, value); }
+};
+
+template <class T>
+const T* PayloadAs(const ComponentPayload& payload) {
+    return payload.type == PayloadTag<T>() ? (const T*)payload.data : nullptr;
+}
+template <class T>
+bool PayloadIs(const ComponentPayload& payload) {
+    return payload.type == PayloadTag<T>();
+}
+
+struct ConstructorDescriptor {
+    const char* exportName = nullptr;
+    Slice<ArgumentDescriptor> arguments = {};
+    PayloadFactory factory = nullptr;
+
+    const char* deprecationReplacement = nullptr;
+    const char* deprecationMessage = nullptr;
+};
+
+struct MethodDescriptor {
+    const char* name = nullptr;
+    Slice<ArgumentDescriptor> arguments = {};
+    const char* documentation = nullptr;
+    PayloadFactory recorder = nullptr;
+};
+
+struct MaterializeRequest;
+
+using ComponentMaterializer = El* (*)(MaterializeRequest * request);
+
+struct ComponentDescriptor {
+    const char* name = nullptr;
+    Slice<ConstructorDescriptor> constructors = {};
+    Slice<MethodDescriptor> methods = {};
+    const char* documentation = nullptr;
+    ComponentMaterializer materialize = nullptr;
+};
+
+struct StateBuild {
+    Window* window = nullptr;
+    App* app = nullptr;
+
+    Arena* a = nullptr;
+    void* value = nullptr;
+    void (*destroy)(void* value) = nullptr;
+    Str error;
+
+    template <class T>
+    T* New() {
+        T* state = new T();
+        value = state;
+        destroy = [](void* held) { delete (T*)held; };
+        return state;
+    }
+    bool Fail(Str message);
+};
+
+using StateFactory = bool (*)(StateBuild* build,
+                              const ComponentArgument* arguments, int count);
+
+struct StateCall {
+    Window* window = nullptr;
+    App* app = nullptr;
+    Arena* a = nullptr;
+    ComponentDataValue out = {};
+    Str error;
+
+    Str code;
+
+    bool Fail(Str message);
+};
+
+using StateMethod = bool (*)(StateCall* call, void* state,
+                             const ComponentDataValue* arguments, int count);
+
+struct StateMethodDescriptor {
+    const char* name = nullptr;
+
+    const char* signature = nullptr;
+    bool readonly = false;
+    StateMethod call = nullptr;
+};
+
+struct StateDescriptor {
+    const char* exportName = nullptr;
+    const char* kind = nullptr;
+    Slice<ArgumentDescriptor> arguments = {};
+    const char* documentation = nullptr;
+    StateFactory factory = nullptr;
+    Slice<StateMethodDescriptor> methods = {};
+};
+
+enum class RegistryErrorKind : uint8_t {
+    None,
+    IncompatibleApiVersion,
+    DuplicateComponent,
+    InvalidComponent,
+    DuplicateExport,
+    InvalidExport,
+    InvalidMethod,
+    InvalidArgument,
+    DuplicateArgument,
+    InvalidArgumentSchema,
+    RequiredArgumentAfterOptional,
+    DuplicateMethod,
+    UndocumentedMethod,
+    UnreachableMethodVocabulary,
+    InvalidDeprecationReplacement,
+    EmptyConstructorList,
+    InvalidStateKind,
+    DuplicateStateKind,
+    InvalidModuleSpecifier,
+};
+
+struct RegistryError {
+    RegistryErrorKind kind = RegistryErrorKind::None;
+    uint32_t expected = 0;
+    uint32_t actual = 0;
+    const char* component = nullptr;
+    const char* callable = nullptr;
+    const char* argument = nullptr;
+    const char* reason = nullptr;
+    const char* literal = nullptr;
+
+    bool IsSet() const { return kind != RegistryErrorKind::None; }
+    bool operator==(const RegistryError& other) const;
+};
+
+Str RegistryErrorMessage(Arena* into, const RegistryError& error);
+
+using ComponentInitializer = void (*)(App* app);
+
+class FrozenComponentRegistry;
+
+class ComponentRegistry {
+  public:
+    ComponentRegistry() = default;
+    ComponentRegistry(const ComponentRegistry&) = delete;
+    ComponentRegistry& operator=(const ComponentRegistry&) = delete;
+    ~ComponentRegistry();
+
+    bool Open(uint32_t apiVersion, const char* moduleSpecifier,
+              RegistryError* error);
+    void WithInitializer(ComponentInitializer initializer);
+
+    bool Register(const ComponentDescriptor* descriptor, RegistryError* error,
+                  uint32_t* id = nullptr);
+    bool RegisterState(const StateDescriptor* descriptor, RegistryError* error);
+
+    void Freeze(FrozenComponentRegistry* out);
+
+  private:
+    const char* moduleSpecifier = nullptr;
+    ComponentInitializer initializer = nullptr;
+    Vec<const ComponentDescriptor*> descriptors;
+    Vec<const StateDescriptor*> states;
+    Vec<const char*> exports;
+    Vec<const char*> stateKinds;
+
+    bool HasExport(const char* name) const;
+};
+
+class FrozenComponentRegistry {
+  public:
+    FrozenComponentRegistry() = default;
+    FrozenComponentRegistry(const FrozenComponentRegistry&) = delete;
+    FrozenComponentRegistry& operator=(const FrozenComponentRegistry&) = delete;
+    ~FrozenComponentRegistry();
+
+    const char* ModuleSpecifier() const { return moduleSpecifier; }
+    ComponentInitializer Initializer() const { return initializer; }
+    int DescriptorCount() const { return len(descriptors); }
+    const ComponentDescriptor* Descriptor(uint32_t id) const;
+    int StateCount() const { return len(states); }
+    const StateDescriptor* State(int at) const;
+    const StateDescriptor* StateOfKind(Str kind) const;
+
+    const ComponentDescriptor* Find(Str name, uint32_t* id = nullptr) const;
+    const MethodDescriptor* Method(uint32_t component, Str name) const;
+
+    Str JavaScriptModuleSource(Str stateProof) const;
+
+  private:
+    friend class ComponentRegistry;
+    const char* moduleSpecifier = nullptr;
+    ComponentInitializer initializer = nullptr;
+    Vec<const ComponentDescriptor*> descriptors;
+    Vec<const StateDescriptor*> states;
+};
+
+bool IsJavaScriptIdentifier(Str name);
+
+void AppendComponentDeclarations(StrBuilder* out,
+                                 const FrozenComponentRegistry* components,
+                                 Str inlineTokenTypes);
+void AppendComponentElementUnion(StrBuilder* out,
+                                 const FrozenComponentRegistry* components);
+
+extern const char* const kRegisteredCommonBehaviors[3];
+
+bool IsRegisteredCommonSlot(Str name);
+
+struct CheckedVocabulary {
+    const char* method;
+    Slice<const char*> accepted;
+};
+Slice<CheckedVocabulary> PreludeCheckedVocabularies();
+
+constexpr int kMaxRetainedComponentStates = 4096;
+
+class ComponentStateStore {
+  public:
+    ComponentStateStore() = default;
+    ComponentStateStore(const ComponentStateStore&) = delete;
+    ComponentStateStore& operator=(const ComponentStateStore&) = delete;
+    ~ComponentStateStore();
+
+    int Len() const { return len(entries); }
+
+    bool Insert(const char* kind, void* owner, void* value,
+                void (*destroy)(void*), uint64_t* handle, Str* error, Arena* a);
+    const char* Kind(uint64_t handle) const;
+
+    void* Get(uint64_t handle, const char* kind, Str* error, Arena* a) const;
+    void ReleaseApplication(void* application);
+    void Clear();
+
+  private:
+    struct Entry {
+        uint64_t handle = 0;
+        const char* kind = nullptr;
+        void* owner = nullptr;
+        void* value = nullptr;
+        void (*destroy)(void*) = nullptr;
+    };
+    uint64_t nextHandle = 0;
+    Vec<Entry> entries;
+};
+
+struct ComponentWindowEffects;
+
+struct ComponentCallback {
+    CallbackId id = 0;
+
+    bool IsSet() const { return id != 0; }
+
+    bool InvokeWith(ShellRuntime* runtime, const ComponentDataValue* arguments,
+                    int count, Window* window, App* app,
+                    ComponentDataValue* result = nullptr, Str* error = nullptr,
+                    Arena* a = nullptr) const;
+
+    void InvokeAndReport(ShellRuntime* runtime, const char* context,
+                         const ComponentDataValue* arguments, int count,
+                         Window* window, App* app) const;
+
+    bool SnapshotWith(ShellRuntime* runtime,
+                      const ComponentDataValue* arguments, int count, Ctx* cx,
+                      ComponentDataValue* out, Arena* a,
+                      Str* error = nullptr) const;
+
+    bool SnapshotRowsWith(ShellRuntime* runtime,
+                          const ComponentDataValue* arguments, int count,
+                          Ctx* cx, const ComponentDataValue** rows,
+                          int* rowCount, Arena* a, Str* error = nullptr) const;
+
+    El* BuildWith(ShellRuntime* runtime, const ComponentDataValue* arguments,
+                  int count, Ctx* cx, Str* error = nullptr) const;
+
+    El* BuildInteractiveWith(ShellRuntime* runtime,
+                             const ComponentDataValue* arguments, int count,
+                             Ctx* cx, Str* error = nullptr) const;
+
+    ComponentWindowEffects WindowEffects(ShellRuntime* runtime, Arena* a) const;
+};
+
+using ComponentEffectBody = bool (*)(void* user, Window* window, App* app,
+                                     Str* error, Arena* a);
+
+struct ComponentEventEffects {
+    Window* window = nullptr;
+    App* app = nullptr;
+    Arena* a = nullptr;
+    Vec<Str> completed;
+    Vec<Str> inProgress;
+
+    ComponentEventEffects() = default;
+    ComponentEventEffects(const ComponentEventEffects&) = delete;
+    ComponentEventEffects& operator=(const ComponentEventEffects&) = delete;
+    ~ComponentEventEffects();
+
+    bool RunOnce(Str key, ComponentEffectBody body, void* user, bool* executed,
+                 Str* error);
+};
+
+using ComponentEventBody = bool (*)(ComponentEventEffects* effects, void* user,
+                                    Str* error);
+
+struct ComponentWindowEffects {
+    ShellRuntime* runtime = nullptr;
+    ComponentCallback reporter = {};
+    bool* active = nullptr;
+
+    bool IsActive() const { return active && *active; }
+
+    bool Event(Window* window, App* app, ComponentEventBody body, void* user,
+               Str* error, Arena* a) const;
+};
+
+struct ComponentAppEffectCleanup {
+    void (*run)(App* app, void* user) = nullptr;
+    void (*drop)(void* user) = nullptr;
+    void* user = nullptr;
+};
+
+struct ComponentAppEffectInstall {
+    ComponentAppEffectCleanup (*run)(App* app, void* user) = nullptr;
+    void (*drop)(void* user) = nullptr;
+    void* user = nullptr;
+};
+
+struct ComponentAppEffects {
+    ShellRuntime* runtime = nullptr;
+
+    void* application = nullptr;
+    EntityId view = {};
+
+    bool Replace(Str key, Str revision, Window* window, App* app,
+                 ComponentAppEffectInstall install, Str* error, Arena* a) const;
+};
+
+struct PendingAppEffect {
+    Str key;
+    Str revision;
+};
+struct InstalledAppEffect {
+    Str key;
+    Str revision;
+    ComponentAppEffectCleanup cleanup = {};
+};
+struct ComponentAppEffectQueue {
+    Vec<PendingAppEffect> pending;
+    Vec<InstalledAppEffect> installed;
+
+    ComponentAppEffectQueue() = default;
+    ComponentAppEffectQueue(const ComponentAppEffectQueue&) = delete;
+    ComponentAppEffectQueue& operator=(const ComponentAppEffectQueue&) = delete;
+
+    ~ComponentAppEffectQueue();
+
+    const Str* Pending(Str key) const;
+    InstalledAppEffect* Installed(Str key);
+    void RemovePending(Str key);
+};
+
+bool QueueComponentAppEffect(ComponentAppEffectQueue* queue, Str key,
+                             Str revision);
+
+struct ComponentEventBinding;
+using ComponentEventRun = void (*)(const ComponentEventBinding* binding,
+                                   ScriptView* view, Ctx* cx,
+                                   const void* event);
+struct ComponentEventBinding {
+    ComponentEventRun run = nullptr;
+    ComponentCallback callback = {};
+    void* user = nullptr;
+    intptr_t value = 0;
+};
+
+Listener ComponentListener(Ctx* cx, ComponentEventRun run,
+                           ComponentCallback callback, void* user = nullptr,
+                           intptr_t value = 0);
+
+Listener ComponentValueListener(Ctx* cx, Str key, ComponentEventRun run,
+                                ComponentCallback callback,
+                                void* user = nullptr);
+
+struct ComponentChild {
+    SpecId id = 0;
+
+    const char* componentName = nullptr;
+    const ComponentPayload* payload = nullptr;
+    bool consumed = false;
+};
+
+struct ComponentElementFactory {
+    SpecId id = 0;
+    bool IsSet() const { return id != 0 || set; }
+    bool set = false;
+};
+
+struct RecordedComponentMethod {
+    Str name;
+    ComponentPayload payload;
+};
+
+struct MaterializeRequest {
+    Ctx* cx = nullptr;
+    ShellRuntime* runtime = nullptr;
+    const SpecArena* specs = nullptr;
+    const SpecNode* node = nullptr;
+    SpecId id = 0;
+    const ComponentDescriptor* descriptor = nullptr;
+    ComponentPayload payload = {};
+
+    Str elementId;
+    bool disabled = false;
+    bool selected = false;
+    CallbackId onClick = 0;
+    ShellError* error = nullptr;
+
+    const char* ComponentName() const {
+        return descriptor ? descriptor->name : "";
+    }
+    template <class T>
+    const T* PayloadAs() const {
+        return shell::PayloadAs<T>(payload);
+    }
+
+    int MethodCount() const;
+    RecordedComponentMethod Method(int at) const;
+
+    bool HasStyle() const;
+
+    El* ApplyStyle(El* target);
+
+    ElRefiner TakeStyle();
+
+    int ChildrenLen() const;
+
+    bool TakeChildren(El*** out, int* count);
+
+    bool AppendChildren(El* parent);
+    bool TakeTypedChildren(ComponentChild** out, int* count);
+    El* MaterializeChild(ComponentChild* child);
+
+    El* TakeSlot(const char* name);
+
+    int TakeSlots(const char* name, El*** out);
+    ComponentElementFactory TakeSlotFactory(const char* name);
+    El* BuildFactory(ComponentElementFactory factory);
+
+    El* Finish(El* element);
+
+    El* ResolveElement(const ComponentArgument& argument);
+    ComponentCallback ResolveCallback(const ComponentArgument& argument) const;
+
+    void* State(const ComponentArgument& argument, const char* kind);
+    template <class T>
+    T* StateAs(const ComponentArgument& argument, const char* kind) {
+        return (T*)State(argument, kind);
+    }
+    ComponentCallback OnClick() const { return {onClick}; }
+
+    bool AppEffects(ComponentAppEffects* out);
+
+    El* Fail(Str message);
+
+    bool styleTaken = false;
+    uint8_t lane = 0;
+    int childrenTaken = 0;
+    ComponentChild* typed = nullptr;
+    int typedCount = 0;
+
+    bool* slotTaken = nullptr;
+    Str failure;
+};
+
+}
+
+#line 1 "src/component_shell/lib.h"
+
+namespace gpui::component_shell {
+
+void Init(App* app);
+
+const shell::FrozenComponentRegistry* Components();
+
+bool Register(shell::ComponentRegistry* registry, shell::RegistryError* error);
+
+}
+
+#line 1 "src/component_shell/support.h"
+
+namespace gpui::component_shell {
+
+using shell::ArgumentDescriptor;
+using shell::ArgumentSchema;
+using shell::ComponentArgument;
+using shell::ComponentDescriptor;
+using shell::ComponentPayload;
+using shell::ConstructorDescriptor;
+using shell::MaterializeRequest;
+using shell::MethodDescriptor;
+using shell::PayloadBuild;
+using shell::SchemaArray;
+using shell::SchemaBoolean;
+using shell::SchemaCallback;
+using shell::SchemaElement;
+using shell::SchemaEntity;
+using shell::SchemaEnum;
+using shell::SchemaNumber;
+using shell::SchemaOptional;
+using shell::SchemaString;
+using shell::Slice;
+
+struct Empty {};
+
+struct CommonBehavior {};
+
+bool RecordEmpty(PayloadBuild* build, const ComponentArgument*, int);
+bool RecordCommonBehavior(PayloadBuild* build, const ComponentArgument*, int);
+
+inline constexpr ArgumentDescriptor kOnClickArguments[] = {
+    {"callback", SchemaCallback("(event: ClickEvent, cx: Context) => void")}};
+inline constexpr ArgumentDescriptor kDisabledArguments[] = {
+    {"disabled", SchemaBoolean()}};
+inline constexpr ArgumentDescriptor kSelectedArguments[] = {
+    {"selected", SchemaBoolean()}};
+
+inline constexpr MethodDescriptor kOnClickMethod = {
+    "on_click", kOnClickArguments,
+    "Invokes the callback when this component is activated.",
+    &RecordCommonBehavior};
+
+inline constexpr MethodDescriptor kDisabledMethod = {
+    "disabled", kDisabledArguments,
+    "Controls whether this component accepts interaction.",
+    &RecordCommonBehavior};
+
+inline constexpr MethodDescriptor kSelectedMethod = {
+    "selected", kSelectedArguments,
+    "Marks this component as the selected one among its siblings.",
+    &RecordCommonBehavior};
+
+inline constexpr const char* kSizeLiterals[] = {"xsmall", "small", "medium",
+                                                "large"};
+
+UiSize SizeOfLiteral(Str literal);
+
+bool RejectStyle(MaterializeRequest* request, const char* name);
+
+bool RequireChild(MaterializeRequest* request, const char* parent,
+                  const char* actual, Slice<const char*> allowed);
+
+El* Carrier(Ctx* cx, const void* tag, void* value);
+
+void* TakeCarried(MaterializeRequest* request, El* element, const void* tag,
+                  const char* name);
+
+template <class T>
+El* CarrierOf(Ctx* cx, T* value) {
+    return Carrier(cx, shell::PayloadTag<T>(), value);
+}
+template <class T>
+T* TakeCarriedAs(MaterializeRequest* request, El* element, const char* name) {
+    return (T*)TakeCarried(request, element, shell::PayloadTag<T>(), name);
+}
+
+template <class T>
+struct EntityState {
+    App* app = nullptr;
+    Entity<T> entity = {};
+
+    ~EntityState() {
+        if (app && entity.IsValid()) EntityDrop(app, entity.id);
+    }
+};
+
+template <class T>
+Entity<T> UseKeyedState(Ctx* cx, Str key, Str kind) {
+    return KeyedEntity<T>(
+        cx, KeyedKey((uint32_t)HashClickId(key), (uint32_t)HashClickId(kind)));
+}
+
+struct DeferredSlot {
+    ShellRuntime* runtime = nullptr;
+    const shell::SpecArena* specs = nullptr;
+    ShellError* error = nullptr;
+    shell::ComponentElementFactory factory = {};
+
+    const char* failure = nullptr;
+};
+DeferredSlot* NewDeferredSlot(MaterializeRequest* request,
+                              shell::ComponentElementFactory factory,
+                              const char* failure);
+
+El* BuildDeferredSlot(const DeferredSlot* slot, Ctx* cx);
+
+template <class T, class F>
+void EachMethod(const MaterializeRequest* request, F&& visit) {
+    for (const shell::SpecOp& op : request->node->ops) {
+        if (op.kind != shell::SpecOpKind::RegisteredMethod) continue;
+        if (const T* value = shell::PayloadAs<T>(op.payload)) visit(*value);
+    }
+}
+
+bool ParseColorArgument(PayloadBuild* build, const char* component, Str text,
+                        Rgba* out);
+
+TempStr F64DisplayTemp(double value);
+
+}
+
+#line 1 "src/component_shell/compound/common.h"
+
+namespace gpui::component_shell::compound::common {
+
+bool NonemptyId(Str id, const char* component, Str* error);
+
+bool NonnegativeUsize(double value, Str label, uint64_t* out, Str* error);
+
+bool FiniteF32(double value, Str label, float* out, Str* error);
+
+int UsizeInt(uint64_t value);
+
+}
+
+#line 1 "src/component_shell/controls/support.h"
+
+namespace gpui::component_shell::controls::support {
+
+struct CommonOp {
+    enum Kind : uint8_t {
+        Size,
+        Label,
+        Tooltip,
+        Checked,
+        Outline,
+        Change,
+    } kind = Size;
+    UiSize size = UiSize::Medium;
+    Str text;
+    bool checked = false;
+
+    shell::ComponentArgument change = {};
+};
+
+bool RecordLabel(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordTooltip(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordChecked(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordSize(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordOutline(PayloadBuild* build, const ComponentArgument*, int);
+bool RecordChange(PayloadBuild* build, const ComponentArgument* args, int);
+
+inline constexpr ArgumentDescriptor kChangeArguments[] = {
+    {"on_change", SchemaCallback("(checked: boolean, cx: Context) => void")}};
+inline constexpr ArgumentDescriptor kSizeArguments[] = {
+    {"size", SchemaEnum(kSizeLiterals)}};
+
+inline constexpr MethodDescriptor kChangeMethod = {
+    "on_change", kChangeArguments,
+    "Reports the new checked state after a click.", &RecordChange};
+inline constexpr MethodDescriptor kSizeMethod = {
+    "size", kSizeArguments, "Sets the semantic control size.", &RecordSize};
+inline constexpr MethodDescriptor kOutlineMethod = {
+    "outline",
+    {},
+    "Uses the component's outline presentation.",
+    &RecordOutline};
+
+}
+
+#line 1 "src/component_shell/display/common.h"
+
+namespace gpui::component_shell::display::common {
+
+bool NonEmptyId(PayloadBuild* build, const char* component, Str id);
+
+bool EnsureNoChildren(MaterializeRequest* request, const char* component);
+
+}
+
+#line 1 "src/component_shell/families.h"
+
+namespace gpui {
+struct QuestionnaireState;
+}
+namespace gpui::component {
+struct NativeMenu;
+}
+
+namespace gpui::component_shell {
+
+using RegisterFamily = bool (*)(shell::ComponentRegistry* registry,
+                                shell::RegistryError* error);
+
+bool RegisterSpinner(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterSeparator(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterSkeleton(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterChat(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterEmpty(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterInputGroup(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterControls(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDelegateCollections(shell::ComponentRegistry*,
+                                 shell::RegistryError*);
+bool RegisterDelegateCombobox(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDelegateSelect(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDataTable(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplay(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCompound(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterTypedCompound(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterLifecycle(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCollections(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCommand(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterWindowEffects(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterOverlays(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterRetainedForms(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterLayout(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterMedia(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterScroll(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterSettings(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterStructured(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterNavigation(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterBasic(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterChart(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCarousel(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterQuestionnaire(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterControlsAction(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterControlsDisplay(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterControlsText(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterDelegateCollectionsList(shell::ComponentRegistry*,
+                                     shell::RegistryError*);
+
+using ListRowProbe = void (*)(Str id);
+void SetListRowProbe(ListRowProbe probe);
+
+using ComboboxEventProbe = void (*)(bool confirm, const Str* values, int count);
+void SetComboboxEventProbe(ComboboxEventProbe probe);
+
+using SelectProbe = void (*)(Str value);
+void SetSelectProbe(SelectProbe probe);
+
+using DataTableProbe = void (*)(bool built);
+void SetDataTableProbe(DataTableProbe probe);
+
+bool RegisterDisplayAlert(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplayBreadcrumb(shell::ComponentRegistry*,
+                               shell::RegistryError*);
+bool RegisterDisplayClipboard(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplayGroupBox(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplayRating(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplayStatusBar(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplayToolbar(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterCompoundAvatar(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCompoundCollapsible(shell::ComponentRegistry*,
+                                 shell::RegistryError*);
+bool RegisterCompoundPagination(shell::ComponentRegistry*,
+                                shell::RegistryError*);
+bool RegisterCompoundProgress(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCompoundRadio(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterLifecycleTooltip(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterLifecycleMenu(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterCollectionsTree(shell::ComponentRegistry*, shell::RegistryError*);
+
+using TreeRowProbe = void (*)(Str id, Str label, bool selected);
+void SetTreeRowProbe(TreeRowProbe probe);
+
+bool RegisterCommandCommand(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterCommandNativeMenu(shell::ComponentRegistry*,
+                               shell::RegistryError*);
+
+using NativeMenuShowProbe = bool (*)(const component::NativeMenu* menu,
+                                     Str* error, Arena* a);
+void SetNativeMenuShowProbe(NativeMenuShowProbe probe);
+
+using WindowEffectsReporterFailureProbe = void (*)(Str diagnosis);
+void SetWindowEffectsReporterFailureProbe(
+    WindowEffectsReporterFailureProbe probe);
+
+bool RegisterOverlaysHoverCard(shell::ComponentRegistry*,
+                               shell::RegistryError*);
+bool RegisterOverlaysPopover(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterOverlaysDropdownMenu(shell::ComponentRegistry*,
+                                  shell::RegistryError*);
+
+bool RegisterLayoutTextarea(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterLayoutResizable(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterMediaImage(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterMediaEditor(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterScrollScroll(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterStructuredDescriptionList(shell::ComponentRegistry*,
+                                       shell::RegistryError*);
+bool RegisterStructuredForm(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterStructuredTable(shell::ComponentRegistry*, shell::RegistryError*);
+
+bool RegisterNavigationIcon(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterNavigationSidebar(shell::ComponentRegistry*,
+                               shell::RegistryError*);
+
+bool RegisterBasicText(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterBasicDropdownButton(shell::ComponentRegistry*,
+                                 shell::RegistryError*);
+
+using ChartErrorProbe = void (*)(Str error);
+void SetChartErrorProbe(ChartErrorProbe probe);
+
+bool CarouselNonnegativeUsize(const shell::ComponentArgument& argument,
+                              double* out);
+bool CarouselNonemptyId(const shell::ComponentArgument& argument);
+
+Entity<QuestionnaireState> QuestionnaireStateFor(Ctx* cx, Str id);
+
+}
+
+#line 1 "src/component_shell/input_group/mod.h"
+
+namespace gpui::component_shell::input_group {
+
+struct TextareaLayout {
+    bool autoGrow = false;
+    int rows = 0;
+    int minRows = 0;
+    int maxRows = 0;
+
+    bool operator==(const TextareaLayout& other) const {
+        return autoGrow == other.autoGrow && rows == other.rows &&
+               minRows == other.minRows && maxRows == other.maxRows;
+    }
+    bool operator!=(const TextareaLayout& other) const {
+        return !(*this == other);
+    }
+};
+
+struct Op {
+    enum Kind : uint8_t {
+        Addon,
+        Align,
+        Size,
+        Variant,
+        Outline,
+        Readonly,
+        Invalid,
+        FocusRing,
+        Masked,
+        Loading,
+        Label,
+        Icon,
+        AriaLabel,
+        AccessibilityId,
+        Tooltip,
+        Value,
+        Placeholder,
+        ContentType,
+        Layout,
+        OnChange,
+    } kind = Addon;
+
+    ComponentArgument argument = {};
+    Str text;
+    bool flag = false;
+    UiSize size = UiSize::Medium;
+    component::ButtonVariant variant = component::ButtonVariant::Default;
+    component::InputGroupAddonAlignment align =
+        component::InputGroupAddonAlignment::InlineStart;
+    component::InputContentType contentType = component::InputContentType::Name;
+    TextareaLayout layout = {};
+};
+
+}
+
+namespace gpui::component_shell::input_group::binding {
+
+bool RecordRows(PayloadBuild* build, const ComponentArgument* args, int count);
+bool RecordAutoGrow(PayloadBuild* build, const ComponentArgument* args,
+                    int count);
+
+bool Rows(const ComponentArgument& argument, int* out, Str* error);
+
+inline constexpr ArgumentDescriptor kRowsArguments[] = {
+    {"rows", SchemaNumber()}};
+inline constexpr ArgumentDescriptor kAutoGrowArguments[] = {
+    {"min_rows", SchemaNumber()},
+    {"max_rows", SchemaNumber()}};
+
+inline constexpr MethodDescriptor kRowsMethod = {
+    "rows", kRowsArguments,
+    "Sets a fixed row count on TextareaState. Use h(...) for an explicit "
+    "viewport height.",
+    &RecordRows};
+inline constexpr MethodDescriptor kAutoGrowMethod = {
+    "auto_grow", kAutoGrowArguments,
+    "Grows the native textarea between the minimum and maximum row counts.",
+    &RecordAutoGrow};
+
+struct Binding {
+    InputState* state = nullptr;
+    uint64_t handle = 0;
+
+    Str elementId;
+    bool textarea = false;
+    shell::ComponentCallback change = {};
+    bool hasValue = false;
+    Str value;
+    bool hasPlaceholder = false;
+    Str placeholder;
+    bool hasLayout = false;
+    TextareaLayout layout = {};
+    bool hasMasked = false;
+    bool masked = false;
+};
+
+bool Prepare(MaterializeRequest* request, InputState* state, uint64_t handle,
+             bool textarea, Binding* out);
+
+void Apply(const Binding& binding, Ctx* cx);
+
+}
+
+namespace gpui::component_shell::input_group::content_type {
+
+bool Record(PayloadBuild* build, const ComponentArgument* args, int count);
+
+extern const char* const kLiterals[45];
+
+inline constexpr ArgumentDescriptor kArguments[] = {
+    {"content_type", SchemaEnum(kLiterals)}};
+
+inline constexpr MethodDescriptor kMethod = {
+    "content_type", kArguments,
+    "Sets the native content type; names follow InputContentType in "
+    "snake_case.",
+    &Record};
+
+}
+
+#line 1 "src/shell/input_tokens.h"
+
+namespace gpui::shell {
+
+struct TextStateEntity {
+    App* app = nullptr;
+    InputState input;
+
+    TextStateEntity() = default;
+    TextStateEntity(const TextStateEntity&) = delete;
+    TextStateEntity& operator=(const TextStateEntity&) = delete;
+    ~TextStateEntity();
+};
+
+void TextStateInit(TextStateEntity* state, App* app, bool textarea,
+                   Str placeholder, Str value);
+
+ComponentDataValue InlineTokenContextData(Arena* a,
+                                          const InlineTokenContext& token,
+                                          Str text);
+ComponentDataValue InlineTokenClickData(Arena* a,
+                                        const InlineTokenClickEvent& event,
+                                        Str text);
+
+extern const StateMethodDescriptor kInputTokenStateMethods[8];
+extern const StateMethodDescriptor kTextareaTokenStateMethods[8];
+
+struct InlineTokenCallbacks {
+    ShellRuntime* runtime = nullptr;
+    InputState* state = nullptr;
+    ComponentCallback renderer = {};
+    ComponentCallback listener = {};
+
+    static InlineTokenCallbacks* New(Ctx* cx, ShellRuntime* runtime,
+                                     InputState* state,
+                                     ComponentCallback renderer,
+                                     ComponentCallback listener);
+
+    InlineTokenRenderer Renderer() const;
+    InlineTokenClickListener Listener() const;
+};
+
+}
+
+#line 1 "src/component_shell/input_tokens.h"
+
+namespace gpui::component_shell::input_tokens {
+
+struct Op {
+    enum Kind : uint8_t {
+        Render,
+        Click,
+        Change,
+    } kind = Render;
+    ComponentArgument argument = {};
+};
+
+bool RecordRender(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordClick(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordChange(PayloadBuild* build, const ComponentArgument* args, int);
+
+inline constexpr ArgumentDescriptor kRenderArguments[] = {
+    {"render", SchemaCallback("(token: InlineTokenContext, cx: Context) => "
+                              "Element | null")}};
+inline constexpr ArgumentDescriptor kClickArguments[] = {
+    {"listener",
+     SchemaCallback("(event: InlineTokenClickEvent, cx: Context) => void")}};
+inline constexpr ArgumentDescriptor kChangeArguments[] = {
+    {"listener", SchemaCallback("(text: string, cx: Context) => void")}};
+
+inline constexpr MethodDescriptor kTokenMethod = {
+    "token", kRenderArguments,
+    "Renders an atomic token from its current UTF-16 range and read-only "
+    "context.",
+    &RecordRender};
+inline constexpr MethodDescriptor kTokenClickMethod = {
+    "on_token_click", kClickArguments,
+    "Activates a reference after a completed unconsumed click, outside the "
+    "editing borrow.",
+    &RecordClick};
+inline constexpr MethodDescriptor kChangeMethod = {
+    "on_change", kChangeArguments,
+    "Reports user text or token identity changes; explicit draft restoration "
+    "remains silent.",
+    &RecordChange};
+
+struct Binding {
+    InputState* state = nullptr;
+
+    uint64_t handle = 0;
+
+    Str elementId;
+    shell::InlineTokenCallbacks* callbacks = nullptr;
+    shell::ComponentCallback change = {};
+};
+
+void SubscribeChange(Ctx* cx, InputState* state, uint64_t handle, Str key,
+                     shell::ComponentEventRun run,
+                     shell::ComponentCallback callback);
+
+bool Prepare(MaterializeRequest* request, InputState* state, uint64_t handle,
+             Binding* out);
+
+void ApplyInput(const Binding& binding, component::Input* input);
+void ApplyTextarea(const Binding& binding, component::Textarea* textarea);
+
+El* Wrap(const Binding& binding, Ctx* cx, El* element);
+
+}
+
+#line 1 "src/component_shell/layout/mod.h"
+
+namespace gpui::component_shell::layout::textarea {
+
+bool RequireLeaf(int children, Str* error);
+
+}
+
+namespace gpui::component_shell::layout::resizable {
+
+bool FinitePositive(double value, const char* label, float* out, Str* error);
+
+bool RequireGroupStyle(bool styled, Str* error);
+
+bool RequirePanelChild(const char* actual, Str* error);
+
+}
+
+#line 1 "src/component_shell/media/mod.h"
+
+namespace gpui::component_shell::media::image {
+
+bool AssetPath(Str path, Str* out, Str* error);
+
+}
+
+namespace gpui::component_shell::media::editor {
+
+struct EditorStateValue {
+    shell::TextStateEntity text;
+
+    const char* language = nullptr;
+};
+
+bool RequireLeaf(int children, Str* error);
+
+}
+
+#line 1 "src/component_shell/navigation/mod.h"
+
+namespace gpui::component_shell::navigation {
+
+bool IconSize(Str value, UiSize* out, Str* error);
+
+bool IconRotation(double value, float* out, Str* error);
+
+bool IconPath(Str path, Str* error);
+
+bool RequireRegisteredChild(const char* parent, const char* expected,
+                            const char* actual, Str* error);
+
+bool RequireDefaultItemStyle(bool styled, Str* error);
+
+}
+
+#line 1 "src/component_shell/retained_forms/mod.h"
+
+namespace gpui::component_shell::retained_forms {
+
+bool PositiveUsize(const ComponentArgument* args, int count,
+                   const char* callable, uint64_t* out, Str* error);
+
+bool EnsureLeaf(int childrenLen, const char* component, Str* error);
+
+}
+
+#line 1 "src/component_shell/scroll/mod.h"
+
+namespace gpui::component_shell::scroll::scroll {
+
+struct ScrollHandleState {
+    float offsetX = 0;
+    float offsetY = 0;
+
+    int renders = 0;
+    int barAt = -2;
+    ScrollbarAxis barAxis = ScrollbarAxis::Vertical;
+    bool hasBarAxis = false;
+    ScrollbarMode barMode = ScrollbarMode::Scrolling;
+    bool hasBarMode = false;
+
+    static void OnScroll(ScrollHandleState* self, Ctx* cx,
+                         const ScrollEvent* event);
+};
+
+struct Op {
+    enum Kind : uint8_t {
+        Axis,
+        Mode,
+        ViewportFromLayout,
+    } kind = Axis;
+    ScrollbarAxis axis = ScrollbarAxis::Vertical;
+    ScrollbarMode mode = ScrollbarMode::Scrolling;
+    bool flag = false;
+};
+
+struct ResolvedOps {
+    bool hasAxis = false;
+    ScrollbarAxis axis = ScrollbarAxis::Vertical;
+    bool hasMode = false;
+    ScrollbarMode mode = ScrollbarMode::Scrolling;
+    bool viewportFromLayout = false;
+
+    void Fold(const Op& op);
+};
+
+bool RequireLeaf(int children, bool styled, Str* error);
+
+}
+
+#line 1 "src/component_shell/settings/mod.h"
+
+namespace gpui::component_shell::settings {
+
+bool Positive(double value, const char* label, float* out, Str* error);
+
+}
+
+#line 1 "src/component_shell/structured/mod.h"
+
+namespace gpui::component_shell::structured {
+
+bool PositiveUsize(double value, Str label, uint64_t* out, Str* error);
+
+bool PositiveU16(double value, Str label, uint16_t* out, Str* error);
+
+bool NonnegativeF32(double value, Str label, float* out, Str* error);
+
+struct ListOp {
+    enum Kind : uint8_t {
+        Vertical,
+        Bordered,
+        Columns,
+        Size,
+    } kind = Vertical;
+    bool bordered = false;
+    int columns = 0;
+    UiSize size = UiSize::Medium;
+};
+
+struct ListConfig {
+    bool vertical = false;
+    bool bordered = true;
+    int columns = 3;
+    UiSize size = UiSize::Medium;
+
+    void Apply(const ListOp& op);
+};
+
+bool RecordItemSpan(PayloadBuild* build, const ComponentArgument* args,
+                    int count);
+bool RecordListColumns(PayloadBuild* build, const ComponentArgument* args,
+                       int count);
+
+bool EnsureItemSurface(int children, bool styled, Str* error);
+
+bool RecordFormColumns(PayloadBuild* build, const ComponentArgument* args,
+                       int count);
+
+struct TableHeaderPart {};
+struct TableBodyPart {};
+struct TableFooterPart {};
+struct TableHeadPart {};
+struct TableCellPart {};
+
+bool RecordCellSpan(PayloadBuild* build, const ComponentArgument* args,
+                    int count);
+
+}
+
+#line 1 "src/component_shell/typed_compound/mod.h"
+
+namespace gpui::component_shell::typed_compound {
+
+El* TypedChildElement(Ctx* cx, const void* tag, void* value, El* rendered);
+
+void* TakeElement(MaterializeRequest* request, El* element, const void* tag,
+                  const char* name);
+
+bool IsTypedElement(El* element, const void* tag);
+
+template <class T>
+bool IsTypedElementOf(El* element) {
+    return IsTypedElement(element, shell::PayloadTag<T>());
+}
+
+template <class T>
+El* TypedChildElementOf(Ctx* cx, T* value) {
+    return TypedChildElement(cx, shell::PayloadTag<T>(), value,
+                             value->IntoEl());
+}
+
+template <class T>
+T* TakeElementAs(MaterializeRequest* request, El* element, const char* name) {
+    return (T*)TakeElement(request, element, shell::PayloadTag<T>(), name);
+}
+
+template <class T>
+El* FinishPart(MaterializeRequest* request, T* element) {
+    element->refiner = request->TakeStyle();
+    El** children = nullptr;
+    int count = 0;
+    if (!request->TakeChildren(&children, &count)) return nullptr;
+    for (int i = 0; i < count; i++) {
+        if (children[i]) element->Child(children[i]);
+    }
+    return TypedChildElementOf(request->cx, element);
+}
+
+template <class T>
+El* FinishTypedChildren(MaterializeRequest* request, T* element,
+                        const char* parent, Slice<const char*> allowed) {
+    shell::ComponentChild* children = nullptr;
+    int count = 0;
+    if (!request->TakeTypedChildren(&children, &count)) return nullptr;
+    for (int i = 0; i < count; i++) {
+        if (!RequireChild(request, parent, children[i].componentName, allowed))
+            return nullptr;
+    }
+    for (int i = 0; i < count; i++) {
+        El* child = request->MaterializeChild(&children[i]);
+        if (!child) return nullptr;
+        element->Child(child);
+    }
+    element->refiner = request->TakeStyle();
+    return TypedChildElementOf(request->cx, element);
+}
+
+bool IndexCallbackPayload(PayloadBuild* build, const ComponentArgument* args,
+                          int count, const char* component);
+
+bool RadioGroupOnChangeCallback(const ComponentPayload& payload,
+                                shell::CallbackId* callback);
+
 }
 
 #line 1 "src/fps/fps.h"
@@ -25971,6 +30984,8 @@ struct ImageCache {
     bool Empty() const { return Len() == 0; }
 };
 
+bool ImageDropEncoded(App* app, const uint8_t* bytes, int len);
+
 ImageStore* ImageStoreNew();
 void ImageStoreFree(ImageStore* s);
 
@@ -26112,6 +31127,25 @@ enum : uint8_t {
     kFontStrike = 128
 };
 
+enum : uint16_t {
+    kFontTabularNums = 256
+};
+
+enum : uint16_t {
+    kFontFamilyShift = 9,
+    kFontFamilyMask = 0xFE00
+};
+
+uint8_t FontFamilyIntern(Str name);
+
+Str FontFamilyName(uint8_t id);
+inline uint16_t FontFamilyBits(uint8_t id) {
+    return (uint16_t)((uint16_t)(id & 0x7F) << kFontFamilyShift);
+}
+inline uint8_t FontFamilyOf(uint16_t weight) {
+    return (uint8_t)((weight & kFontFamilyMask) >> kFontFamilyShift);
+}
+
 const float kLineHeight = 1.618034f;
 
 PaintApp* PaintAppNew();
@@ -26230,8 +31264,8 @@ inline void RenderImageDraw(PaintCtx* ctx, RenderImage* img, Bounds bounds,
 struct TextLayout;
 
 TextLayout* TextLayoutNew(PaintCtx* ctx, Str s, float fontSize, float maxW,
-                          bool wrap, uint8_t weight, float lineH,
-                          Size* outSize);
+                          bool wrap, uint16_t weight, float lineH,
+                          Size* outSize, TextAlign align = TextAlign::Left);
 
 Size TextLayoutSize(TextLayout* tl);
 void TextLayoutAddRef(TextLayout* tl);
@@ -26369,8 +31403,14 @@ bool PlatReduceMotionKnown(bool* out);
 void PlatReduceMotionFollow(void (*onChange)(bool reduce));
 #endif
 
+struct KeyDownFlags {
+    bool held = false;
+    bool preferCharacterInput = false;
+    bool imeInProgress = false;
+};
 bool WindowKeyDown(Window* win, int key, bool shift, bool ctrl, bool alt,
-                   bool platform = false, bool function = false);
+                   bool platform = false, bool function = false,
+                   KeyDownFlags flags = {});
 
 void WindowKeyUp(Window* win, int key, bool shift, bool ctrl, bool alt,
                  bool platform = false, bool function = false);
@@ -26466,10 +31506,20 @@ struct PlatMenuItem {
     Modifiers keyMods = {};
 };
 
+#if GPUI_OS_IOS || GPUI_OS_ANDROID
+inline bool PlatHasMenu() {
+    return false;
+}
+inline int PlatShowMenu(Window* win, const PlatMenuItem* items, int n, float x,
+                        float y, bool dark) {
+    (void)win, (void)items, (void)n, (void)x, (void)y, (void)dark;
+    return 0;
+}
+#else
 bool PlatHasMenu();
-
 int PlatShowMenu(Window* win, const PlatMenuItem* items, int n, float x,
                  float y, bool dark);
+#endif
 
 bool PlatHasAppMenu();
 
@@ -27725,7 +32775,8 @@ void DivideEvents(EditMap& map, const Vec<Event>& events, int32_t linkIndex,
 
 Vec<Event> Parse(ParseState* parseState);
 
-Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState);
+Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState,
+                     NodePositions* positions);
 
 }
 
@@ -28372,21 +33423,6 @@ void MetricsRecordStructure(Metrics* metrics, bool repeated);
 }
 }
 
-#line 1 "src/shell/error.h"
-
-namespace gpui {
-
-struct ShellError {
-    Str message;
-
-    bool IsSet() const { return len(message) > 0; }
-};
-
-void ShellErrorClear(ShellError* error);
-void ShellErrorSet(ShellError* error, Str message);
-
-}
-
 #line 1 "src/shell/host_modules.h"
 
 namespace gpui {
@@ -28637,359 +33673,6 @@ void PolicyClearHostModules(Policy* policy);
 
 }
 
-#line 1 "src/shell/value.h"
-
-namespace gpui::shell {
-
-enum class BridgedKind : uint8_t {
-    Nil,
-    Bool,
-    Number,
-    String,
-};
-
-struct Bridged {
-    BridgedKind kind = BridgedKind::Nil;
-    bool boolean = false;
-    double number = 0;
-    Str string;
-
-    static Bridged Nil();
-    static Bridged Bool(bool value);
-    static Bridged Number(double value);
-    static Bridged String(Str value);
-};
-
-bool BridgedAsF32(const Bridged& value, float* out,
-                  ShellError* error = nullptr);
-bool BridgedAsString(const Bridged& value, Str* out,
-                     ShellError* error = nullptr);
-bool BridgedAsPixels(const Bridged& value, float* out,
-                     ShellError* error = nullptr);
-bool BridgedAsColor(const Bridged& value, Hsla* out,
-                    ShellError* error = nullptr);
-bool BridgedIsTruthy(const Bridged& value);
-Str BridgedDescribe(Arena* arena, const Bridged& value);
-bool BridgedArg(const Bridged* args, int count, int index, Str method,
-                Bridged* out, ShellError* error = nullptr);
-
-}
-
-#line 1 "src/shell/spec.h"
-
-namespace gpui::shell {
-
-using SpecId = uint32_t;
-using CallbackId = uint64_t;
-
-struct StructureFingerprint {
-    uint64_t value = 0;
-
-    bool operator==(const StructureFingerprint& other) const {
-        return value == other.value;
-    }
-    bool operator!=(const StructureFingerprint& other) const {
-        return value != other.value;
-    }
-};
-
-uint64_t StructureMix(uint64_t state, uint64_t value);
-
-enum class BackgroundKind : uint8_t {
-    Solid,
-    LinearGradient,
-    PatternSlash,
-    Checkerboard,
-};
-
-struct BackgroundSpec {
-    BackgroundKind kind = BackgroundKind::Solid;
-    Str color;
-    float opacity = 1;
-    float angle = 0;
-    Str fromColor;
-    float fromPosition = 0;
-    Str toColor;
-    float toPosition = 1;
-    Str colorSpace;
-    float width = 0;
-    float interval = 0;
-    float size = 0;
-};
-
-enum class ComponentKind : uint8_t {
-    Div,
-    HFlex,
-    VFlex,
-    ChildView,
-    Text,
-    TextView,
-    Button,
-    Link,
-    Checkbox,
-    Switch,
-    Scrollbar,
-    Input,
-    Textarea,
-    NumberInput,
-    OtpInput,
-    Svg,
-
-    Accordion,
-
-    AccordionItem,
-    AccordionHeader,
-
-    AccordionPanel,
-    AccordionTrigger,
-
-    Pagination,
-
-    Avatar,
-
-    AvatarImage,
-    AvatarFallback,
-    Image,
-    PathFill,
-    PathStroke,
-    Tabs,
-    Tab,
-    Progress,
-    ProgressTrack,
-    ProgressIndicator,
-    FpsMonitor,
-    Slider,
-    SliderTrack,
-    SliderIndicator,
-    SliderThumb,
-    Radio,
-    Toggle,
-    RadioGroup,
-    ToggleGroup,
-    Table,
-    TableHeader,
-    TableBody,
-    TableRow,
-    TableHead,
-    TableCell,
-    TableCaption,
-    HResizable,
-    VResizable,
-    ResizablePanel,
-    Collapsible,
-    Popover,
-    HoverCard,
-    Popup,
-    Select,
-    Combobox,
-    DatePicker,
-
-    DockArea,
-
-    DockContent,
-    VVirtualList,
-    HVirtualList,
-
-    List,
-    UniformList,
-
-    InputGroup,
-    InputGroupAddon,
-    InputGroupButton,
-    InputGroupInput,
-    InputGroupTextarea,
-    InputGroupText,
-};
-
-enum class TextViewFormat : uint8_t {
-    Html,
-    Markdown,
-};
-
-struct VirtualListSpec {
-    Str id;
-    Axis axis = Axis::Vertical;
-    Size* sizes = nullptr;
-    int sizeCount = 0;
-    CallbackId getKey = 0;
-    CallbackId renderItems = 0;
-};
-
-struct ListSpec {
-
-    Str id;
-
-    int itemCount = 0;
-
-    CallbackId getKey = 0;
-
-    CallbackId renderItems = 0;
-};
-
-struct Component {
-    ComponentKind kind = ComponentKind::Div;
-    Str text;
-
-    Str value;
-    TextViewFormat textViewFormat = TextViewFormat::Markdown;
-    uint64_t handle = 0;
-    uint32_t index = 0;
-    BackgroundSpec background;
-    float strokeWidth = 0;
-    VirtualListSpec* virtualList = nullptr;
-    ListSpec* list = nullptr;
-};
-
-const char* ComponentName(const Component& component);
-
-enum class SpecOpKind : uint8_t {
-    NullaryStyle,
-    ParamStyle,
-    Method,
-    Callback,
-
-    ActionCallback,
-    StateStyle,
-    Slot,
-};
-
-struct SpecOp {
-    SpecOpKind kind = SpecOpKind::Method;
-    Str name;
-    uint16_t styleIndex = 0;
-    CallbackId callback = 0;
-    SpecId node = 0;
-    Bridged* args = nullptr;
-    int argCount = 0;
-};
-
-struct SpecNode {
-    Component component;
-    ArenaVec<SpecOp> ops;
-    ArenaVec<SpecId> children;
-};
-
-enum class SpecErrorKind : uint8_t {
-    None,
-    Claimed,
-    Expired,
-    AlreadyParented,
-    SelfParent,
-    DuplicateChildView,
-};
-
-struct SpecError {
-    SpecErrorKind kind = SpecErrorKind::None;
-    Str component;
-};
-
-Str SpecErrorMessage(Arena* arena, const SpecError& error);
-
-enum class SlotSiteKind : uint8_t {
-
-    Text,
-
-    Argument,
-
-    Handler,
-};
-
-struct SlotSite {
-    SlotSiteKind kind = SlotSiteKind::Text;
-    uint16_t op = 0;
-    uint8_t argument = 0;
-
-    bool operator==(const SlotSite& other) const {
-        return kind == other.kind && op == other.op &&
-               argument == other.argument;
-    }
-};
-
-struct Slot {
-    SpecId node = 0;
-    SlotSite site;
-
-    uint16_t argument = 0;
-};
-
-enum class SlotValueKind : uint8_t {
-    Text,
-    Value,
-    Handler
-};
-
-struct SlotValue {
-    SlotValueKind kind = SlotValueKind::Text;
-    Str text;
-    Bridged value;
-    CallbackId handler = 0;
-};
-
-class SpecArena;
-
-struct Template {
-    SpecArena* arena = nullptr;
-    SpecId root = 0;
-    Vec<Slot> slots;
-    int arity = 0;
-
-    void* application = nullptr;
-
-    ~Template();
-};
-
-class SpecArena {
-  public:
-    SpecArena();
-
-    explicit SpecArena(Arena* borrowed);
-    SpecArena(const SpecArena&) = delete;
-    SpecArena& operator=(const SpecArena&) = delete;
-    ~SpecArena();
-
-    void Reset();
-    int Len() const { return nodes.len; }
-    bool IsEmpty() const { return nodes.len == 0; }
-    SpecId Push(const Component& component);
-    bool PushChildView(const Component& component, SpecId* out,
-                       SpecError* error = nullptr);
-
-    bool PushDockArea(uint64_t handle, SpecId* out, SpecError* error = nullptr);
-    const SpecNode* Node(SpecId id) const;
-    bool PushOp(SpecId id, const SpecOp& op, SpecError* error = nullptr);
-    bool Claim(SpecId id, SpecError* error = nullptr);
-    bool Attach(SpecId parent, SpecId child, SpecError* error = nullptr);
-    bool ClaimVirtualItems(uint64_t count, uint64_t limit);
-    Str DebugTree(Arena* into, SpecId root) const;
-
-    StructureFingerprint Structure() const { return {structure}; }
-
-    SpecId Graft(const Template& tmpl);
-
-    bool WriteSlot(SpecId base, const Slot& slot, const SlotValue& value,
-                   SpecError* error = nullptr);
-
-    bool MountsAnEntity() const { return mountedViews.len > 0; }
-
-  private:
-    Arena* arena = nullptr;
-    bool ownsArena = true;
-    Vec<SpecNode*> nodes;
-    Vec<uint8_t> parented;
-    Vec<uint8_t> claimed;
-    Vec<uint64_t> mountedViews;
-    uint64_t virtualItems = 0;
-
-    uint64_t structure = 0;
-
-    bool CheckLive(SpecId id, SpecError* error) const;
-    Component CopyComponent(const Component& component);
-    SpecOp CopyOp(const SpecOp& op);
-    void WriteTree(StrBuilder* out, SpecId id, int depth) const;
-};
-
-}
-
 #line 1 "src/shell/retained.h"
 
 namespace gpui::shell {
@@ -29181,6 +33864,8 @@ struct ShellRuntimeAccess;
 }
 namespace gpui::shell {
 struct MaterializedDependencies;
+class FrozenComponentRegistry;
+struct ComponentAppEffectInstall;
 }
 namespace gpui {
 struct ShellTaskDriver;
@@ -29189,7 +33874,19 @@ struct InlineTokenClickEvent;
 
 class ShellRuntime {
   public:
-    static ShellRuntime* New(App* app = nullptr, ShellError* error = nullptr);
+
+    static ShellRuntime* New(
+        App* app = nullptr, ShellError* error = nullptr,
+        const shell::FrozenComponentRegistry* components = nullptr);
+    const shell::FrozenComponentRegistry* Components() const;
+
+    void* ComponentState(uint64_t handle, const char* kind,
+                         Str* error = nullptr, Arena* a = nullptr) const;
+
+    Str LastComponentFailure() const;
+    void NoteComponentFailure(Str message);
+
+    uint64_t ComponentFailureCount() const;
     ShellRuntime* Retain();
     void Release();
 
@@ -29235,6 +33932,16 @@ class ShellRuntime {
     void InvalidateScriptView(EntityId view);
     void ReleaseOwnedEntities(EntityId view);
     void ReleaseApplicationState(ViewObject* object);
+
+    void* ScriptViewApplication(EntityId view, App* app) const;
+    bool ScheduleComponentAppEffect(
+        void* application, EntityId view, Str key, Str revision, Window* window,
+        App* app, const shell::ComponentAppEffectInstall& install, Str* error,
+        Arena* a);
+
+    void ApplyComponentAppEffect(uint64_t token, App* app);
+
+    void CleanupComponentAppEffects(EntityId view);
 
     void DispatchClick(shell::CallbackId callback, const ClickEvent& event,
                        Window* window, App* app);
@@ -29320,6 +34027,11 @@ struct ShellExitRequest {
 using ShellExitHandler = void (*)(const ShellExitRequest&, Ctx*);
 void ShellOnExitRequest(ShellExitHandler handler);
 
+void ShellInit(App* app);
+
+void ShellInitWithComponents(App* app,
+                             const shell::FrozenComponentRegistry* components);
+
 }
 
 #line 1 "src/shell/materialize.h"
@@ -29333,6 +34045,32 @@ El* ShellMaterializeSpec(Ctx* cx, ShellRuntime* runtime,
                          const shell::SpecArena* specs, shell::SpecId root,
                          ShellError* error = nullptr);
 
+El* ShellTryMaterialize(Ctx* cx, ShellRuntime* runtime,
+                        const RenderSnapshot* snapshot, ShellError* error);
+
+void ShellApplyNodeStyle(Ctx* cx, const shell::SpecArena* specs,
+                         shell::SpecId id, El* target,
+                         ShellError* error = nullptr);
+
+namespace shell {
+
+bool TextViewImageUrl(const Capabilities& capabilities, Str url);
+
+struct TextViewImageResponse {
+    bool ok = false;
+
+    Str bytes = {};
+};
+
+constexpr double kTextViewImageTimeoutSecs = 30;
+
+bool TextViewImageRequest(const Capabilities& capabilities, Str url,
+                          Func1<TextViewImageResponse> done,
+                          double deadline = 0);
+
+bool TextViewSvgReferencesFile(Str bytes);
+
+}
 }
 
 #line 1 "src/shell/view.h"
@@ -29373,12 +34111,6 @@ struct ShellNumberBinding {
     shell::CallbackId onStep = 0;
 };
 
-struct ShellInputGroupBinding {
-    shell::EntityHandle handle = 0;
-    shell::CallbackId onChange = 0;
-    InputState* state = nullptr;
-};
-
 struct ShellMouseButtonBinding {
     shell::CallbackId left = 0;
     shell::CallbackId right = 0;
@@ -29388,6 +34120,11 @@ struct ShellMouseButtonBinding {
 struct ShellActionBinding {
     uint32_t action = 0;
     shell::CallbackId callback = 0;
+};
+
+struct ShellScrollPosition {
+    float x = 0;
+    float y = 0;
 };
 
 struct ScriptView {
@@ -29415,6 +34152,9 @@ struct ScriptView {
                         intptr_t callback);
     static void OnTextLink(ScriptView* self, Ctx* cx, const ClickEvent* event,
                            intptr_t binding);
+
+    static void OnImageDeadline(ScriptView* self, Ctx* cx,
+                                const TickEvent* event);
     static void OnChange(ScriptView* self, Ctx* cx, const ClickEvent* event,
                          intptr_t value);
     static void OnHover(ScriptView* self, Ctx* cx, const HoverEvent* event,
@@ -29444,8 +34184,6 @@ struct ScriptView {
                             intptr_t binding);
     static void OnInputEvent(ScriptView* self, Ctx* cx, const InputEvent* event,
                              intptr_t handle);
-    static void OnInputGroupEvent(ScriptView* self, Ctx* cx,
-                                  const InputEvent* event, intptr_t binding);
     static void OnSliderEvent(ScriptView* self, Ctx* cx,
                               const SliderEvent* event, intptr_t handle);
     static void OnOtpEvent(ScriptView* self, Ctx* cx, const OtpEvent* event,
@@ -29467,11 +34205,23 @@ struct ScriptView {
     static void OnScriptMouseDownOut(ScriptView* self, Ctx* cx,
                                      const MouseDownEvent* event,
                                      intptr_t callback);
+
+    static void OnScrollPosition(ScriptView* self, Ctx* cx,
+                                 const ScrollEvent* event, intptr_t position);
     static void OnScriptScrollWheel(ScriptView* self, Ctx* cx,
                                     const ScrollWheelEvent* event,
                                     intptr_t callback);
     static void OnScriptAction(ScriptView* self, Ctx* cx,
                                const ActionEvent* event, intptr_t binding);
+
+    static void OnComponentEvent(ScriptView* self, Ctx* cx, const void* event,
+                                 intptr_t binding);
+
+    static void OnComponentAppEffect(ScriptView* self, Ctx* cx,
+                                     const void* event, intptr_t token);
+
+    static void OnDispatchAction(ScriptView* self, Ctx* cx,
+                                 const ClickEvent* event, intptr_t action);
 };
 
 }
@@ -29966,6 +34716,8 @@ struct FetchRequest {
     Vec<FetchHeader> headers;
     Str body;
 
+    double deadline = 0;
+
     void Free();
 };
 
@@ -30000,6 +34752,32 @@ bool FetchAuthorizeRedirect(const Capabilities& capabilities, Str method,
 
 using FetchHttpSend = bool (*)(const HttpReq& req, HttpRsp* out);
 void FetchSetHttpSendForTests(FetchHttpSend send);
+
+}
+
+#line 1 "src/shell/host.h"
+
+namespace gpui::shell {
+
+enum class InvocationKind : uint8_t {
+    Run,
+    Check,
+    Types,
+    Help,
+    Version,
+};
+
+struct Invocation {
+    InvocationKind kind = InvocationKind::Run;
+
+    Str directory;
+    bool watch = false;
+    bool development = false;
+    bool printSpec = false;
+};
+
+bool ShellParseInvocation(const char* const* arguments, int count,
+                          Invocation* out, Str* error);
 
 }
 
@@ -30212,6 +34990,26 @@ bool ZlibInflate(Str input, bool gzip, Str* output, Str* error = nullptr);
 
 }
 
+#line 1 "src/shell/style.h"
+
+namespace gpui::shell {
+
+bool IsParamStyleName(Str name);
+
+bool IsNullaryStyleName(Str name);
+
+bool ApplyNullaryStyle(El* element, Str name);
+
+bool ApplyParamStyle(El* element, const SpecOp& op, ShellError* error);
+
+uint32_t StyleFieldsOf(Str name);
+
+TempStr StyleSuggestTemp(Str name);
+
+TempStr UnknownElementMethodTemp(Str name);
+
+}
+
 #line 1 "src/shell/theme_tokens.h"
 
 namespace gpui {
@@ -30244,15 +35042,69 @@ constexpr const char* kShellTypeScriptConfigFile = "tsconfig.json";
 constexpr int kShellTypesMaxDepth = 8;
 constexpr int kShellTypesMaxFiles = 4096;
 
+class FrozenComponentRegistry;
+
 void AppendBuiltinTypeDeclarations(StrBuilder* out);
 
 void ShellTypeDeclarations(StrBuilder* out,
-                           const HostModules* modules = nullptr);
+                           const HostModules* modules = nullptr,
+                           const FrozenComponentRegistry* components = nullptr);
 
-bool ShellWriteTypeDeclarations(Str directory,
-                                const HostModules* modules = nullptr,
-                                int* written = nullptr,
-                                ShellError* error = nullptr);
+bool ShellWriteTypeDeclarations(
+    Str directory, const HostModules* modules = nullptr, int* written = nullptr,
+    ShellError* error = nullptr,
+    const FrozenComponentRegistry* components = nullptr);
+
+}
+
+#line 1 "src/sys/dir_watch.h"
+
+namespace gpui {
+
+using DirWatchId = int;
+
+enum class DirWatchError {
+    None = 0,
+
+    Unsupported,
+
+    Failed,
+
+    Limit,
+};
+
+const char* DirWatchErrorName(DirWatchError err);
+
+DirWatchId DirWatchStart(Str dir, Func0 onChange, bool create = false,
+                         DirWatchError* err = nullptr);
+
+void DirWatchStop(DirWatchId id);
+
+int DirWatchCount();
+
+DirWatchId DirWatchAdd(Func0 onChange);
+
+void DirWatchSignal(DirWatchId id);
+
+struct DirWatchPlat;
+
+#if GPUI_OS_IOS || GPUI_OS_ANDROID
+
+inline DirWatchPlat* DirWatchPlatOpen(DirWatchId, const char*, bool,
+                                      DirWatchError* err) {
+    if (err) {
+        *err = DirWatchError::Unsupported;
+    }
+    return nullptr;
+}
+inline void DirWatchPlatClose(DirWatchPlat*) {}
+#else
+
+DirWatchPlat* DirWatchPlatOpen(DirWatchId id, const char* dir, bool create,
+                               DirWatchError* err);
+
+void DirWatchPlatClose(DirWatchPlat* plat);
+#endif
 
 }
 

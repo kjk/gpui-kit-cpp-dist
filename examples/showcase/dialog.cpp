@@ -36,8 +36,10 @@ El* ShowcaseDialog(ShowcaseApp* app, Ctx* cx) {
     if (!app->dialogOpen) {
         return root;
     }
-    El* panel =
-        Div(a)
+    // The popup is the panel itself: the dialog host centers it, and it keeps
+    // presses on itself from reaching the backdrop.
+    El* popup =
+        DialogPopup::New(cx)
             ->W(288)
             ->Pad(12)
             ->FlexCol()
@@ -57,15 +59,16 @@ El* ShowcaseDialog(ShowcaseApp* app, Ctx* cx) {
             ->Child(Div(a)->PadT(12)->Child(TextEl(a, StrL("Display name"))
                                                 ->Font(14)
                                                 ->Fg(ExampleRgb(0x171717))))
-            ->Child(InputBase::New(cx, StrL("dialog-name"), true)
-                        ->OnClick(Listen(cx, &FocusDlgField))
-                        ->FocusId(0)
-                        ->W(264)
-                        ->H(28)
-                        ->PadX(8)
-                        ->ItemsCenter()
-                        ->Border(1, ExampleRgb(0xd4d4d4))
-                        ->Child(Input::New(cx, &app->input)))
+            ->Child(
+                InputBase::New(cx, StrL("dialog-name"), true)
+                    ->OnClick(Listen(cx, &FocusDlgField))
+                    ->FocusId(0)
+                    ->W(264)
+                    ->H(28)
+                    ->PadX(8)
+                    ->ItemsCenter()
+                    ->Border(1, ExampleRgb(0xd4d4d4))
+                    ->Child(Input::New(cx, &app->input, ShowcaseEditorStyle())))
             ->Child(
                 Div(a)
                     ->PadT(12)
@@ -107,15 +110,6 @@ El* ShowcaseDialog(ShowcaseApp* app, Ctx* cx) {
                        ->Bg(Rgba8(0, 0, 0, 51))
                        ->Click(HashClickId(StrL("dialog-backdrop")))
                        ->OnClick(Listen(cx, &CloseDlg));
-    El* popup = DialogPopup::New(cx)
-                    ->Absolute()
-                    ->Top(0)
-                    ->Left(0)
-                    ->W(kFill)
-                    ->H(kFill)
-                    ->ItemsCenter()
-                    ->JustifyCenter()
-                    ->Child(panel);
     root->Child(Dialog::New(cx)->Backdrop(backdrop)->Popup(popup)->IntoEl());
     return root;
 }

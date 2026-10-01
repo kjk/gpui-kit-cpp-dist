@@ -21,17 +21,17 @@ El* ShowcaseRenderRegistered(ShowcaseApp* app, Ctx* cx, WinSize size) {
 }
 
 static const char* kSlugs[CompCount] = {
-    "accordion",   "alert-dialog",   "avatar",       "button",
-    "calendar",    "checkbox",       "collapsible",  "color-picker",
-    "combobox",    "date-picker",    "dialog",       "dock",
-    "editor",      "hover-card",     "input",        "link",
-    "nav-stack",   "number-input",   "otp-input",    "pagination",
-    "popover",     "popup",          "progress",     "radio",
-    "radio-group", "resizable",      "scrollbar",    "select",
-    "sheet",       "slider",         "switch",       "table",
-    "tabs",        "text-selection", "text-view",    "textarea",
-    "toast",       "toggle",         "toggle-group", "tooltip",
-    "tree",        "virtual-list",
+    "accordion",   "alert-dialog",   "avatar",      "button",
+    "calendar",    "checkbox",       "collapsible", "color-picker",
+    "combobox",    "date-picker",    "dialog",      "dock",
+    "editor",      "hover-card",     "input",       "link",
+    "nav-stack",   "number-input",   "otp-input",   "pagination",
+    "popover",     "popup",          "progress",    "radio",
+    "radio-group", "resizable",      "scrollbar",   "select",
+    "sheet",       "slider",         "switch",      "table",
+    "tabs",        "text-selection", "text-view",   "textarea",
+    "time-field",  "toast",          "toggle",      "toggle-group",
+    "toolbar",     "tooltip",        "tree",        "virtual-list",
 };
 
 const char* CompSlug(int i) {
@@ -61,6 +61,44 @@ Str DupA(Ctx* cx, const char* s) {
 El* ScTxt(Ctx* cx, Str s, float px, Rgba c) {
     Arena* a = cx->a;
     return TextEl(a, s)->Font(px)->Fg(c);
+}
+
+struct ScChevronPaint {
+    bool up = false;
+    Rgba color = {};
+};
+
+static void PaintScChevron(PaintCtx* ctx, El* e, void* user) {
+    const ScChevronPaint* c = (const ScChevronPaint*)user;
+    float cx = e->x + e->w / 2;
+    float cy = e->y + e->h / 2;
+    const float halfWidth = 3.5f;
+    const float halfHeight = 1.75f;
+    float tip = c->up ? -halfHeight : halfHeight;
+    Path* path = PathNew(ctx, false);
+    if (!path) {
+        return;
+    }
+    PathMoveTo(path, cx - halfWidth, cy - tip);
+    PathLineTo(path, cx, cy + tip);
+    PathLineTo(path, cx + halfWidth, cy - tip);
+    PathStroke(ctx, path, 1.25f, c->color);
+    PathFree(path);
+}
+
+// components/mod.rs chevron: a disclosure chevron drawn as a path. The `⌄`
+// and `⌃` glyphs sit at the baseline and cap height, so a centered row still
+// shows them off center; a path is centered in its own box. Rust strokes in
+// the current text color; here the caller names it.
+El* ScChevron(Ctx* cx, bool up, Rgba color) {
+    Arena* a = cx->a;
+    ScChevronPaint* paint = ArenaNew<ScChevronPaint>(a);
+    paint->up = up;
+    paint->color = color;
+    El* e = Div(a)->W(12)->H(12)->FlexNone();
+    e->customPaint = PaintScChevron;
+    e->customUser = paint;
+    return e;
 }
 
 El* ScBtnGhost(Ctx* cx, int id, Listener onClick, Str label) {

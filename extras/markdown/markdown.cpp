@@ -981,6 +981,23 @@ LocalDate DateToday() {
     return out;
 }
 
+LocalTime TimeOfDayNow() {
+    LocalTime out;
+    (void)DateToday();
+    if (gTodayPinned.year != 0) {
+        return out;
+    }
+    time_t now = time(nullptr);
+    struct tm* lt = localtime(&now);
+    if (!lt) {
+        return out;
+    }
+    out.hour = lt->tm_hour;
+    out.minute = lt->tm_min;
+    out.second = lt->tm_sec > 59 ? 59 : lt->tm_sec;
+    return out;
+}
+
 LocalDate DateAddDays(LocalDate base, int days) {
     struct tm t = {};
     t.tm_year = base.year - 1900;
@@ -13942,6 +13959,11 @@ ParseOptions ParseOptions::Gfm() {
 }
 
 Node* ToMdast(Arena* a, Str source, const ParseOptions& options) {
+    return ToMdast(a, source, options, nullptr);
+}
+
+Node* ToMdast(Arena* a, Str source, const ParseOptions& options,
+              NodePositions* positions) {
     ParseState parseState;
     parseState.a = a;
 
@@ -13950,10 +13972,43 @@ Node* ToMdast(Arena* a, Str source, const ParseOptions& options) {
     parseState.bytes = source;
 
     Vec<Event> events = Parse(&parseState);
-    Node* tree = ToMdastCompile(events, &parseState);
+    Node* tree = ToMdastCompile(events, &parseState, positions);
 
     base::ArenaDelete(parseState.scratch);
+    if (positions && positions->spans.len > 1) {
+
+        qsort(positions->spans.els, (size_t)positions->spans.len,
+              sizeof(NodeSpan), [](const void* l, const void* r) -> int {
+                  uintptr_t a = (uintptr_t)((const NodeSpan*)l)->node;
+                  uintptr_t b = (uintptr_t)((const NodeSpan*)r)->node;
+                  return a < b ? -1 : (a > b ? 1 : 0);
+              });
+    }
     return tree;
+}
+
+bool NodePosition(const NodePositions* positions, const Node* n, int32_t* start,
+                  int32_t* end) {
+    if (!positions || !n) {
+        return false;
+    }
+    int32_t lo = 0;
+    int32_t hi = positions->spans.len;
+    while (lo < hi) {
+        int32_t mid = lo + (hi - lo) / 2;
+        const NodeSpan& span = positions->spans[mid];
+        if ((uintptr_t)span.node < (uintptr_t)n) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= positions->spans.len || positions->spans[lo].node != n) {
+        return false;
+    }
+    *start = positions->spans[lo].start;
+    *end = positions->spans[lo].end;
+    return true;
 }
 
 }
@@ -14909,6 +14964,8 @@ struct TreeFrame {
 
     ArenaVec<Node*> stack{};
     ArenaVec<int32_t> eventStack{};
+
+    ArenaVec<int32_t> spanStack{};
 };
 
 struct CompileContext {
@@ -14923,6 +14980,7 @@ struct CompileContext {
     bool rawFlowFenceSeen = false;
     Vec<TreeFrame> trees;
     int32_t index = 0;
+    NodePositions* positions = nullptr;
 };
 
 static Str IdentifierFrom(Arena* a, Str value) {
@@ -14998,24 +15056,55 @@ static Node* Resume(CompileContext* c) {
     return frame.tree;
 }
 
+static int32_t SpanIndexOf(CompileContext* c, const Node* n) {
+    NodePositions* p = c->positions;
+    for (int32_t i = p->spans.len - 1; i >= 0; i--) {
+        if (p->spans[i].node == n) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void TailPush(CompileContext* c, Node* child) {
     Node* node = TailMut(c);
     NodeAddChild(c->a, node, child);
     TreeFrame& frame = TreeTail(c);
     frame.stack.Append(c->a, child);
     frame.eventStack.Append(c->a, c->index);
+    if (c->positions) {
+
+        int32_t at = (*c->events)[c->index].point.index;
+        NodeSpan span;
+        span.node = child;
+        span.start = at;
+        span.end = at;
+        frame.spanStack.Append(c->a, c->positions->spans.len);
+        VecAppend(c->positions->spans, span);
+    }
 }
 
 static void TailPushAgain(CompileContext* c, Node* child) {
     TreeFrame& frame = TreeTail(c);
     frame.stack.Append(c->a, child);
     frame.eventStack.Append(c->a, c->index);
+    if (c->positions) {
+        frame.spanStack.Append(c->a, SpanIndexOf(c, child));
+    }
 }
 
 static void TailPop(CompileContext* c) {
     TreeFrame& frame = TreeTail(c);
     frame.stack.Pop();
     frame.eventStack.Pop();
+    if (c->positions && frame.spanStack.len > 0) {
+
+        int32_t ix = frame.spanStack[frame.spanStack.len - 1];
+        frame.spanStack.Pop();
+        if (ix >= 0) {
+            c->positions->spans[ix].end = (*c->events)[c->index].point.index;
+        }
+    }
 }
 
 static void OnEnterBuffer(CompileContext* c) {
@@ -15386,6 +15475,15 @@ static void OnExitLineEnding(CompileContext* c) {
         return;
     }
     if (c->hardBreakAfter) {
+
+        if (c->positions) {
+            Node* tail = NodeLastChild(c->a, TailMut(c));
+            int32_t ix = tail ? SpanIndexOf(c, tail) : -1;
+            if (ix >= 0) {
+                c->positions->spans[ix].end = (*c->events)[c->index]
+                                                  .point.index;
+            }
+        }
         c->hardBreakAfter = false;
         return;
     }
@@ -15465,6 +15563,11 @@ static void OnExitListItem(CompileContext* c) {
             } else {
                 Keep(c, text, NodeStrKind::Value,
                      Str(value.s + start, len(value) - start));
+
+                int32_t ix = c->positions ? SpanIndexOf(c, text) : -1;
+                if (ix >= 0) {
+                    c->positions->spans[ix].start += start;
+                }
             }
         }
     }
@@ -15664,9 +15767,11 @@ static void Exit(CompileContext* c) {
     }
 }
 
-Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState) {
+Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState,
+                     NodePositions* positions) {
     CompileContext context;
     context.a = parseState->a;
+    context.positions = positions;
     context.events = &events;
     context.bytes = parseState->bytes;
 

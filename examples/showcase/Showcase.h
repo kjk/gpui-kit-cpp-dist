@@ -43,9 +43,11 @@ enum {
     CompTextSelection,
     CompTextView,
     CompTextarea,
+    CompTimeField,
     CompToast,
     CompToggle,
     CompToggleGroup,
+    CompToolbar,
     CompTooltip,
     CompTree,
     CompVirtualList,
@@ -141,10 +143,18 @@ struct ShowcaseApp {
     char otp[8] = "12";
     int otpLen = 2;
     bool otpOn = false;
+    // The time-field page's state: `self.time_field`, made on the page's
+    // first frame.
+    Entity<TimeFieldState> timeField = {};
     int radioSel = 0;
     bool switchOn = true;
     bool toggleOn = true;
     uint8_t toggleGroup = 0;
+    // The toolbar page: the last command pressed (-1 for none) and the
+    // trailing search field.
+    int toolbarAction = -1;
+    InputState toolbarSearch;
+    bool toolbarSeeded = false;
     int tab = 0;
     bool selectOpen = false;
     int selectIx = 0;
@@ -193,6 +203,7 @@ inline Str DupFmt(Ctx* cx, const char* format, const TArgs&... args) {
 El* ScTxt(Ctx* cx, Str s, float px, Rgba c);
 El* ScBtnGhost(Ctx* cx, int id, Listener onClick, Str label);
 El* ScComingSoon(Ctx* cx, const char* name);
+El* ScChevron(Ctx* cx, bool up, Rgba color);
 
 El* ShowcaseOverview(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseCalendarGrid(ShowcaseApp* app, Ctx* cx);
@@ -232,9 +243,11 @@ El* ShowcaseTabs(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseTextSelection(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseTextView(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseTextarea(ShowcaseApp* app, Ctx* cx);
+El* ShowcaseTimeField(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseToast(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseToggle(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseToggleGroup(ShowcaseApp* app, Ctx* cx);
+El* ShowcaseToolbar(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseTooltip(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseTree(ShowcaseApp* app, Ctx* cx);
 El* ShowcaseVirtualList(ShowcaseApp* app, Ctx* cx);

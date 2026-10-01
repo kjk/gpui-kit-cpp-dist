@@ -20,6 +20,7 @@ struct FormStory {
     InputState email;
     // TextareaState: the same engine, told it spans more than one line.
     InputState bio;
+    Entity<ColorPickerState> color = {};
     // Rust binds both the switch and the checkbox to this one field.
     bool subscribe = false;
     bool horizontal = false;
@@ -74,8 +75,13 @@ El* FormStory::Render(FormStory* self, Ctx* cx) {
         self->bio.kind = InputKind::Textarea;
         InputSetValue(&self->bio,
                       StrL("Hello \xe4\xb8\x96\xe7\x95\x8c\xef\xbc\x8cthis "
-                           "is GPUI Kit."));
+                           "is GPUI component."));
         InputSetPlaceholder(&self->email, StrL("Enter text here..."));
+        // default_value(indigo_500())
+        self->color = ColorPickerStateNew(cx);
+        if (ColorPickerState* state = self->color.Get(cx)) {
+            ColorPickerSetValue(state, 0x6366f1);
+        }
     }
     if (self->name.focused) {
         cx->win->input = &self->name;
@@ -111,16 +117,20 @@ El* FormStory::Render(FormStory* self, Ctx* cx) {
             ->Columns(self->twoColumns ? 2 : 1)
             ->Field(StrL("Name"),
                     component::Input::New(cx, StrL("form-name"), &self->name)
+                        ->WithSize(self->toolbar.size)
                         ->Prefix(prefix)
                         ->OnFocus(Listen(cx, &FocusName))
-                        ->IntoEl())
+                        ->IntoEl()
+                        ->PadL(0))
             ->Field(StrL("Email"),
                     component::Input::New(cx, StrL("form-email"), &self->email)
+                        ->WithSize(self->toolbar.size)
                         ->OnFocus(Listen(cx, &FocusEmail))
                         ->IntoEl())
             ->Required()
             ->Field(StrL("Bio"),
                     component::Textarea::New(cx, StrL("form-bio"), &self->bio)
+                        ->WithSize(self->toolbar.size)
                         ->Rows(5)
                         ->IntoEl())
             ->Align(component::FieldAlign::Start)
@@ -134,21 +144,25 @@ El* FormStory::Render(FormStory* self, Ctx* cx) {
             ->LabelIndent(false)
             ->SpanAll()
             ->Field(StrL("Please select your birthday"),
-                    component::DatePicker::New(cx)->Day(0)->IntoEl())
+                    component::DatePicker::New(cx)
+                        ->Day(0)
+                        ->WithSize(self->toolbar.size)
+                        ->IntoEl())
             ->Description(
                 StrL("Select your birthday, we will send you a gift."))
             ->Field(Str{}, component::Switch::New(cx, StrL("subscribe"))
+                               ->WithSize(self->toolbar.size)
                                ->Label(StrL("Subscribe our newsletter"))
                                ->Checked(self->subscribe)
                                ->OnClick(Listen(cx, &ToggleSubscribe))
                                ->IntoEl())
             ->LabelIndent(!self->horizontal || !self->twoColumns)
-            ->Field(Str{}, component::ColorPicker::New(cx, StrL("form-color"))
-                               ->WithSize(UiSize::Small)
-                               ->Label(StrL("Theme color"))
-                               ->IntoEl())
-            ->LabelIndent(!self->horizontal || !self->twoColumns)
+            ->Field(StrL("Theme color"),
+                    component::ColorSelect::New(cx, self->color)
+                        ->WithSize(self->toolbar.size)
+                        ->IntoEl())
             ->Field(Str{}, component::Checkbox::New(cx, StrL("future-events"))
+                               ->WithSize(self->toolbar.size)
                                ->Label(StrL("Use this color for future "
                                             "events"))
                                ->Checked(self->subscribe)
