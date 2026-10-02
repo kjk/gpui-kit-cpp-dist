@@ -307,20 +307,14 @@ static void OnMouseMove(FpsApp* app, Ctx* cx, const MouseMoveEvent* ev) {
     app->cursorTiltY = (ev->y / view.dipH - 0.5f) * 1.2f;
 }
 
-static void StepCurves(FpsApp* app, Ctx* cx, const ClickEvent*,
-                       intptr_t delta) {
+static void StepCurves(FpsApp* app, Ctx* cx, const ClickEvent*, int64_t delta) {
     int n = app->curves + (int)delta * kCurveStep;
-    if (n < 1) {
-        n = 1;
-    }
-    if (n > kMaxCurves) {
-        n = kMaxCurves;
-    }
+    n = ClampI(n, 1, kMaxCurves);
     app->curves = n;
     Notify(cx);
 }
 
-static El* LoadButton(Ctx* cx, Str id, Str label, intptr_t delta) {
+static El* LoadButton(Ctx* cx, Str id, Str label, int64_t delta) {
     return Div(cx->a)
         ->Click(HashClickId(id))
         ->FlexRow()

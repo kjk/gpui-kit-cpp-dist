@@ -99,12 +99,12 @@ static void OnListEvent(ListStory* self, Ctx* cx, const ListEvent* ev) {
 }
 
 static void ListMenuOpen(ListStory* self, Ctx* cx, const ClickEvent*,
-                         intptr_t which) {
+                         int64_t which) {
     self->openMenu = self->openMenu == (int)which ? 0 : (int)which;
     Notify(cx);
 }
 static void ListMenuAct(ListStory* self, Ctx* cx, const ClickEvent*,
-                        intptr_t act) {
+                        int64_t act) {
     switch (act) {
         case ListActSelectable:
             self->selectable = !self->selectable;
@@ -176,11 +176,12 @@ static component::ListItem* RenderQuote(Ctx* cx, void* data, int section,
         StoryTxt(cx, Str(r.change), 12, r.up ? th.green : th.red)->PadX(4)));
     line->Child(right);
     // list_story.rs refines the row with `.px_2().py_1().border_1()
-    // .rounded(radius)` — the padding is `ListItem`'s own here, and the
-    // border is transparent until the selection colours it. It is two of the
-    // pixels the list measures the row at, which is what makes it the 36 of
-    // upstream's rather than 34.
+    // .rounded(radius)` -- px_2 over ListItem's own px_3, and a border that is
+    // transparent until the selection colours it. It is two of the pixels the
+    // list measures the row at, which is what makes it the 36 of upstream's
+    // rather than 34.
     StateStyle rowStyle;
+    rowStyle.Pad(Rems(cx, 0.5f), Rems(cx, 0.25f));
     rowStyle.Border(1, Rgba8(0, 0, 0, 0));
     return component::ListItem::New(cx, line)
         ->Style(rowStyle)
@@ -239,13 +240,13 @@ El* ListStory::Render(ListStory* self, Ctx* cx) {
 
     // The list is the component now: it owns the rows' identity, the search
     // field, and what a click does to the selection. Only the rows the frame
-    // can show are ever built, which is what the delegate is for.
+    // can show are ever built, which is what the delegate is for. It is
+    // `flex_1()` under the toolbar and fills what the toolbar leaves.
     if (st) {
         st->loading = self->loading;
     }
     component::List* list =
         component::List::New(cx, StrL("list-story"), self->list)
-            ->H(WindowSize(cx->win).dipH - 247)
             ->Padding(8)
             ->Headers(&SectionHeader, &SectionFooter)
             ->Items(self, &RenderQuote);

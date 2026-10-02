@@ -15,6 +15,23 @@ namespace base {
 static int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 static int VscprintfUtf8(const char* fmt, va_list args);
 
+static PanicHook gPanicHook = nullptr;
+
+PanicHook SetPanicHook(PanicHook hook) {
+    PanicHook was = gPanicHook;
+    gPanicHook = hook;
+    return was;
+}
+
+void Panic(const char* msg) {
+    if (gPanicHook) {
+        gPanicHook(msg);
+        return;
+    }
+    log(Str(msg ? msg : "panic"));
+    abort();
+}
+
 float StrToFloatUnchecked(Str s) {
     if (!s.s || len(s) <= 0) {
         return 0;
@@ -1137,6 +1154,67 @@ Str StrTrimAscii(Str s) {
     return Str(s.s + start, end - start);
 }
 
+static bool IsUnicodeWhiteSpace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+
+static uint32_t StrTrimDecode(Str s, int i, int* n) {
+    uint8_t c = (uint8_t)s.s[i];
+    int want = c < 0x80         ? 1
+               : (c >> 5) == 6  ? 2
+               : (c >> 4) == 14 ? 3
+               : (c >> 3) == 30 ? 4
+                                : 0;
+    if (want <= 1 || i + want > len(s)) {
+        *n = 1;
+        return c;
+    }
+    uint32_t cp = c & (0x7F >> want);
+    for (int k = 1; k < want; k++) {
+        uint8_t b = (uint8_t)s.s[i + k];
+        if ((b & 0xC0) != 0x80) {
+            *n = 1;
+            return c;
+        }
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *n = want;
+    return cp;
+}
+
+Str StrTrim(Str s) {
+    if (!s.s || len(s) <= 0) {
+        return s;
+    }
+    int start = 0;
+    int end = len(s);
+    while (start < end) {
+        int n = 1;
+        if (!IsUnicodeWhiteSpace(StrTrimDecode(s, start, &n))) {
+            break;
+        }
+        start += n;
+    }
+    while (end > start) {
+
+        int at = end - 1;
+        while (at > start && ((uint8_t)s.s[at] & 0xC0) == 0x80 &&
+               end - at < 4) {
+            at--;
+        }
+        int n = 1;
+        uint32_t cp = StrTrimDecode(s, at, &n);
+        if (at + n != end || !IsUnicodeWhiteSpace(cp)) {
+            break;
+        }
+        end = at;
+    }
+    return Str(s.s + start, end - start);
+}
+
 Str StrReplaceAll(Str value, Str from, Str to) {
     if (len(from) == 0 || len(from) > len(value)) {
         return value;
@@ -1710,7 +1788,7 @@ static int64_t argToI64(const FmtArg& arg) {
         case FmtArg::Kind::Char:
             return (int64_t)arg.c;
         case FmtArg::Kind::Ptr:
-            return (int64_t)(intptr_t)arg.ptr;
+            return (int64_t)(int64_t)arg.ptr;
         default:
             return arg.i;
     }
@@ -1752,7 +1830,7 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     if (inst.conv == 'p') {
         const void* pv = arg.t == FmtArg::Kind::Ptr
                              ? arg.ptr
-                             : (const void*)(intptr_t)argToI64(arg);
+                             : (const void*)(int64_t)argToI64(arg);
         return appendConv(fmt, "%p", pv);
     }
 
@@ -1941,6 +2019,162 @@ Str ApplyUriWorkAround(Str uri, Str httpOrHttps, Str protocol) {
 Str RevertUriWorkAround(Str uri, Str httpOrHttps, Str protocol) {
     return base::StrReplaceAll(uri, WorkAroundUriPrefix(httpOrHttps, protocol),
                                base::FormatTemp("%s://", protocol));
+}
+
+Str ProxyUriTemp(const ProxyConfig* proxy) {
+    if (!proxy || proxy->kind == ProxyKind::None) {
+        return {};
+    }
+    const char* scheme = proxy->kind == ProxyKind::Socks5 ? "socks5" : "http";
+    return base::FormatTemp("%s://%s:%s", Str(scheme), proxy->host,
+                            proxy->port);
+}
+
+static int HexDigit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+Str PathFromFileUriTemp(Str uri) {
+    Str path = uri;
+    if (base::StrStartsWith(path, "file://")) {
+        path = Str(path.s + 7, len(path) - 7);
+    }
+    Str res = base::AllocStrTemp(len(path) + 1);
+    if (!res.s) {
+        return {};
+    }
+    int n = 0;
+    for (int i = 0; i < len(path); i++) {
+        char c = path.s[i];
+        if (c == '%' && i + 2 < len(path)) {
+            int hi = HexDigit(path.s[i + 1]);
+            int lo = HexDigit(path.s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                res.s[n++] = (char)(hi * 16 + lo);
+                i += 2;
+                continue;
+            }
+        }
+        res.s[n++] = c;
+    }
+    res.s[n] = 0;
+    res.len = n;
+    return res;
+}
+
+void DownloadFileNameParts(Str uri, Str suggested, Str* stem, Str* ext) {
+
+    Str name = suggested;
+    Str dotExt;
+    for (int i = 0; i < len(suggested); i++) {
+        if (suggested.s[i] == '.') {
+            name = Str(suggested.s, i);
+            dotExt = Str(suggested.s + i, len(suggested) - i);
+            break;
+        }
+    }
+
+    if (base::StrStartsWith(uri, "data:")) {
+        int slash = -1;
+        for (int i = 0; i < len(uri); i++) {
+            if (uri.s[i] == '/') {
+                slash = i;
+                break;
+            }
+        }
+        if (slash >= 0) {
+            Str rest = Str(uri.s + slash + 1, len(uri) - slash - 1);
+            for (int i = 0; i < len(rest); i++) {
+                if (rest.s[i] == ',') {
+                    Str prefix = Str(rest.s, i + 1);
+                    if (base::StrStartsWith(name, prefix)) {
+                        name = StrL("Unknown");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    *stem = base::StrDupTemp(name);
+    *ext = base::StrDupTemp(dotExt);
+}
+
+double ScaleFactorFromScreen(int widthPx, int widthMm) {
+    if (widthPx <= 0 || widthMm <= 0) {
+        return 1.0;
+    }
+    return ((double)widthPx * 25.4 / (double)widthMm) / 96.0;
+}
+
+Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
+    base::StrBuilder b(base::GetTempArena());
+    Str name = ev->pressed ? StrL("mousedown") : StrL("mouseup");
+    Str x = base::FormatTemp("%d", ev->x);
+    Str y = base::FormatTemp("%d", ev->y);
+    auto boolStr = [](bool v) { return v ? StrL("true") : StrL("false"); };
+    auto add = [&b](Str s) { b.Append(s); };
+    add(StrL("(() => {\n        const el = document.elementFromPoint("));
+    add(x);
+    add(StrL(","));
+    add(y);
+    add(StrL(");\n        const ev = new MouseEvent('"));
+    add(name);
+    add(StrL("', {\n          view: window,\n          button: "));
+    add(base::FormatTemp("%d", ev->button == 8 ? 3 : 4));
+    add(StrL(",\n          buttons: "));
+    add(base::FormatTemp("%d", ev->buttons));
+    add(StrL(",\n          x: "));
+    add(x);
+    add(StrL(",\n          y: "));
+    add(y);
+    add(StrL(",\n          bubbles: true,\n          detail: "));
+    add(base::FormatTemp("%d", ev->detail));
+    add(
+        StrL(",\n          cancelBubble: false,\n          cancelable: true,\n"
+             "          clientX: "));
+    add(x);
+    add(StrL(",\n          clientY: "));
+    add(y);
+    add(StrL(",\n          composed: true,\n          layerX: "));
+    add(x);
+    add(StrL(",\n          layerY: "));
+    add(y);
+    add(StrL(",\n          pageX: "));
+    add(x);
+    add(StrL(",\n          pageY: "));
+    add(y);
+    add(StrL(",\n          screenX: window.screenX + "));
+    add(x);
+    add(StrL(",\n          screenY: window.screenY + "));
+    add(y);
+    add(StrL(",\n          ctrlKey: "));
+    add(boolStr(ev->ctrlKey));
+    add(StrL(",\n          metaKey: "));
+    add(boolStr(ev->metaKey));
+    add(StrL(",\n          shiftKey: "));
+    add(boolStr(ev->shiftKey));
+    add(StrL(",\n          altKey: "));
+    add(boolStr(ev->altKey));
+    add(
+        StrL(",\n        });\n        el.dispatchEvent(ev)\n"
+             "        if (!ev.defaultPrevented && \""));
+    add(name);
+    add(
+        StrL("\" === \"mouseup\") {\n          if (ev.button === 3) {\n"
+             "            window.history.back();\n          }\n"
+             "          if (ev.button === 4) {\n"
+             "            window.history.forward();\n          }\n"
+             "        }\n      })()"));
+    return b.TakeStr();
 }
 
 }
@@ -2716,6 +2950,1710 @@ void PlatSleepMs(int ms) {
 #if GPUI_OS_LINUX
 #line 1 "src/wry/wry_linux.cpp"
 
+#if defined(GPUI_HAVE_WEBKITGTK) && GPUI_HAVE_WEBKITGTK
+
+#include <gtk/gtk.h>
+#include <gtk/gtkx.h>
+#include <gdk/gdkx.h>
+#include <webkit2/webkit2.h>
+#include <X11/Xlib.h>
+#include <math.h>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
+namespace wry {
+
+using base::logf;
+using base::Str;
+using base::StrDup;
+using base::StrFree;
+
+static constexpr CookieSameSite kSameSiteNone = CookieSameSite();
+
+static const char* const kWebViewIdKey = "webview_id";
+static const char* const kIpcScript =
+    "Object.defineProperty(window, 'ipc', { value: Object.freeze({ "
+    "postMessage: function(x) { "
+    "window.webkit.messageHandlers['ipc'].postMessage(x) } }) })";
+
+template <typename F>
+static GCallback Cb(F f) {
+    return (GCallback)(void*)f;
+}
+
+static const char* CStrTemp(Str s) {
+    if (!s.s || len(s) <= 0) {
+        return "";
+    }
+    Str z = base::StrDupTemp(s);
+    return z.s ? z.s : "";
+}
+
+static const char* CStrOrNull(Str s) {
+    return s.s ? CStrTemp(s) : nullptr;
+}
+
+static Str FromCTemp(const char* s) {
+    return s ? base::StrDupTemp(Str(s)) : Str();
+}
+
+static bool gGtkTried = false;
+static bool gGtkOk = false;
+
+static bool EnsureGtk() {
+    if (gGtkTried) {
+        return gGtkOk;
+    }
+    gGtkTried = true;
+    gdk_set_allowed_backends("x11");
+
+    gtk_disable_setlocale();
+    if (!gtk_init_check(nullptr, nullptr)) {
+        logf("wry: GTK could not open the X display\n");
+        return false;
+    }
+    GdkDisplay* display = gdk_display_get_default();
+    if (!display || !GDK_IS_X11_DISPLAY(display)) {
+        logf("wry: GTK did not open an X11 display\n");
+        return false;
+    }
+
+    if (!g_main_context_acquire(g_main_context_default())) {
+        logf("wry: GLib's main context belongs to another thread\n");
+        return false;
+    }
+    gGtkOk = true;
+    return true;
+}
+
+static ::Display* XDisplayOf(GdkDisplay* display) {
+    return gdk_x11_display_get_xdisplay(GDK_X11_DISPLAY(display));
+}
+
+struct XTrap {
+    GdkDisplay* display;
+    explicit XTrap(GdkDisplay* d) : display(d) {
+        gdk_x11_display_error_trap_push(display);
+    }
+    ~XTrap() { gdk_x11_display_error_trap_pop_ignored(display); }
+};
+
+static Vec<PollFd> gPollFds;
+static int gPollCount = 0;
+static int gMaxPriority = 0;
+static bool gPrepared = false;
+
+static_assert(sizeof(PollFd) == sizeof(GPollFD), "GPollFD layout");
+
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    *fds = nullptr;
+    if (!gGtkOk) {
+        return 0;
+    }
+    GMainContext* context = g_main_context_default();
+    g_main_context_prepare(context, &gMaxPriority);
+    int timeout = -1;
+
+    int room = gPollFds.cap > 0 ? gPollFds.cap : 0;
+    for (;;) {
+        int n = g_main_context_query(context, gMaxPriority, &timeout,
+                                     (GPollFD*)gPollFds.els, room);
+        if (n <= room) {
+            gPollCount = n;
+            break;
+        }
+        if (!VecReserve(gPollFds, n)) {
+            gPollCount = 0;
+            break;
+        }
+        room = n;
+    }
+    for (int i = 0; i < gPollCount; i++) {
+        gPollFds.els[i].revents = 0;
+    }
+    gPrepared = true;
+    if (timeout >= 0 && (*timeoutMs < 0 || timeout < *timeoutMs)) {
+        *timeoutMs = timeout;
+    }
+    *fds = gPollFds.els;
+    return gPollCount;
+}
+
+void EventLoopDispatch() {
+    if (!gPrepared) {
+        return;
+    }
+    gPrepared = false;
+    GMainContext* context = g_main_context_default();
+    if (g_main_context_check(context, gMaxPriority, (GPollFD*)gPollFds.els,
+                             gPollCount)) {
+        g_main_context_dispatch(context);
+    }
+}
+
+static void PumpUntil(const bool* done) {
+    while (!*done) {
+        g_main_context_iteration(nullptr, TRUE);
+    }
+}
+
+struct WebView;
+
+struct RelatedWebView {
+    GtkWidget* window;
+    WebView* webview;
+};
+
+struct DownloadState;
+
+enum class DragState : uint8_t {
+    Left,
+    Entered,
+    Leaving,
+};
+
+struct WebView {
+    Str id;
+    WebKitWebView* webview = nullptr;
+    WebKitWebContext* context = nullptr;
+    WebKitUserContentManager* manager = nullptr;
+    GCancellable* cancellable = nullptr;
+
+    bool hasX11 = false;
+    bool isChild = false;
+    GdkDisplay* display = nullptr;
+    ::Display* xdisplay = nullptr;
+    ::Window x11Window = 0;
+    ::Window parentWindow = 0;
+    GtkWidget* gtkWindow = nullptr;
+    bool followsParent = false;
+
+    bool inspectorOpen = false;
+
+    Vec<Str> pendingScripts;
+    bool pendingOpen = true;
+
+    void* ctx = nullptr;
+    void (*ipcHandler)(void* ctx, Str url, Str body) = nullptr;
+    bool (*navigationHandler)(void* ctx, Str url) = nullptr;
+    void (*documentTitleChangedHandler)(void* ctx, Str title) = nullptr;
+    void (*onPageLoadHandler)(void* ctx, PageLoadEvent event,
+                              Str url) = nullptr;
+    NewWindowResponse (*newWindowReqHandler)(
+        void* ctx, Str url, const NewWindowFeatures* features,
+        WebView** createdWebView) = nullptr;
+    DownloadStartedHandler downloadStartedHandler = nullptr;
+    DownloadCompletedHandler downloadCompletedHandler = nullptr;
+    DragDropHandler dragDropHandler = nullptr;
+
+    DragState dragState = DragState::Left;
+    Vec<Str> dragPaths;
+    bool hasDragPaths = false;
+    int dragX = 0;
+    int dragY = 0;
+    guint dragLeaveIdle = 0;
+
+    uint8_t bfState = 0;
+
+    Vec<RelatedWebView> related;
+    Vec<DownloadState*> downloads;
+};
+
+static void FreeStrs(Vec<Str>* v) {
+    for (int i = 0; i < v->len; i++) {
+        StrFree(v->els[i]);
+    }
+    VecReset(*v);
+}
+
+static Str UriTemp(WebKitWebView* webview) {
+    return FromCTemp(webkit_web_view_get_uri(webview));
+}
+
+struct EvalCall {
+    void* ctx;
+    void (*callback)(void* ctx, Str result);
+};
+
+static void OnEvalDone(GObject* source, GAsyncResult* result, gpointer data) {
+    EvalCall* call = (EvalCall*)data;
+    GError* error = nullptr;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish(
+        WEBKIT_WEB_VIEW(source), result, &error);
+#else
+    WebKitJavascriptResult* js = webkit_web_view_run_javascript_finish(
+        WEBKIT_WEB_VIEW(source), result, &error);
+    JSCValue* value = nullptr;
+    if (js) {
+        value =
+            (JSCValue*)g_object_ref(webkit_javascript_result_get_js_value(js));
+        webkit_javascript_result_unref(js);
+    }
+#endif
+    bool cancelled =
+        error && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+
+    char* json = value ? jsc_value_to_json(value, 0) : nullptr;
+    if (call && call->callback && !cancelled) {
+        call->callback(call->ctx, json ? Str(json) : Str());
+    }
+    g_free(json);
+    if (value) {
+        g_object_unref(value);
+    }
+    if (error) {
+        g_error_free(error);
+    }
+    delete call;
+}
+
+static void RunJavascript(WebView* wv, Str js, void* ctx,
+                          void (*callback)(void* ctx, Str result)) {
+    EvalCall* call = nullptr;
+    if (callback) {
+        call = new EvalCall{ctx, callback};
+    }
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    webkit_web_view_evaluate_javascript(wv->webview, CStrTemp(js), -1, nullptr,
+                                        nullptr, wv->cancellable,
+                                        call ? OnEvalDone : nullptr, call);
+#else
+    webkit_web_view_run_javascript(wv->webview, CStrTemp(js), wv->cancellable,
+                                   call ? OnEvalDone : nullptr, call);
+#endif
+}
+
+static void FlushPendingScripts(WebView* wv) {
+    if (!wv->pendingOpen) {
+        return;
+    }
+    wv->pendingOpen = false;
+    for (int i = 0; i < wv->pendingScripts.len; i++) {
+        RunJavascript(wv, wv->pendingScripts[i], nullptr, nullptr);
+    }
+    FreeStrs(&wv->pendingScripts);
+}
+
+static bool AddUserScript(WebView* wv, Str js, bool forMainFrameOnly) {
+    if (!wv->manager) {
+        logf("wry: the webview has no user content manager\n");
+        return false;
+    }
+    WebKitUserScript* script = webkit_user_script_new(
+        CStrTemp(js),
+        forMainFrameOnly ? WEBKIT_USER_CONTENT_INJECT_TOP_FRAME
+                         : WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(wv->manager, script);
+    webkit_user_script_unref(script);
+    return true;
+}
+
+static ::Window PlugXid(WebView* wv) {
+    if (!wv->gtkWindow) {
+        return 0;
+    }
+    GdkWindow* window = gtk_widget_get_window(wv->gtkWindow);
+    return window ? gdk_x11_window_get_xid(window) : 0;
+}
+
+static bool OwnsXFocus(WebView* wv) {
+    ::Window focus = 0;
+    int revert = 0;
+    XGetInputFocus(wv->xdisplay, &focus, &revert);
+    return focus != 0 && (focus == PlugXid(wv) || focus == wv->x11Window);
+}
+
+static void GiveXFocus(WebView* wv, Time time) {
+    if (!wv->hasX11) {
+        return;
+    }
+    ::Window plug = PlugXid(wv);
+    if (!plug) {
+        return;
+    }
+    XTrap trap(wv->display);
+    XSetInputFocus(wv->xdisplay, plug, RevertToParent, time);
+    XFlush(wv->xdisplay);
+}
+
+static void OnClose(WebKitWebView* webview, gpointer) {
+
+    gtk_widget_destroy(GTK_WIDGET(webview));
+}
+
+static void OnTitle(GObject*, GParamSpec*, gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (wv->documentTitleChangedHandler) {
+        wv->documentTitleChangedHandler(
+            wv->ctx, FromCTemp(webkit_web_view_get_title(wv->webview)));
+    }
+}
+
+static void OnLoadChanged(WebKitWebView* webview, WebKitLoadEvent event,
+                          gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (event == WEBKIT_LOAD_COMMITTED) {
+        if (wv->onPageLoadHandler) {
+            wv->onPageLoadHandler(wv->ctx, PageLoadEvent::Started,
+                                  UriTemp(webview));
+        }
+        FlushPendingScripts(wv);
+    } else if (event == WEBKIT_LOAD_FINISHED && wv->onPageLoadHandler) {
+        wv->onPageLoadHandler(wv->ctx, PageLoadEvent::Finished,
+                              UriTemp(webview));
+    }
+}
+
+static gboolean OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision,
+                               WebKitPolicyDecisionType type, gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION ||
+        !wv->navigationHandler) {
+        return FALSE;
+    }
+    WebKitNavigationAction* action =
+        webkit_navigation_policy_decision_get_navigation_action(
+            WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    WebKitURIRequest* request =
+        action ? webkit_navigation_action_get_request(action) : nullptr;
+    const char* uri = request ? webkit_uri_request_get_uri(request) : nullptr;
+    if (!uri) {
+        return FALSE;
+    }
+    if (wv->navigationHandler(wv->ctx, FromCTemp(uri))) {
+        webkit_policy_decision_use(decision);
+    } else {
+        webkit_policy_decision_ignore(decision);
+    }
+    return TRUE;
+}
+
+static void OnScriptMessage(WebKitUserContentManager*,
+                            WebKitJavascriptResult* result, gpointer data) {
+    WebView* wv = (WebView*)data;
+    JSCValue* value =
+        result ? webkit_javascript_result_get_js_value(result) : nullptr;
+    if (!value || !wv->ipcHandler) {
+        return;
+    }
+    char* body = jsc_value_to_string(value);
+    wv->ipcHandler(wv->ctx, UriTemp(wv->webview), body ? Str(body) : Str());
+    g_free(body);
+}
+
+static gboolean OnInspectorBringToFront(WebKitWebInspector*, gpointer data) {
+    ((WebView*)data)->inspectorOpen = true;
+    return FALSE;
+}
+
+static void OnInspectorClosed(WebKitWebInspector*, gpointer data) {
+    ((WebView*)data)->inspectorOpen = false;
+}
+
+static const uint8_t kBack = 1;
+static const uint8_t kForward = 2;
+
+static void DispatchSyntheticMouse(WebView* wv, GdkEventButton* event,
+                                   bool pressed) {
+    SyntheticMouseEvent ev;
+    ev.pressed = pressed;
+    ev.button = (int)event->button;
+    ev.x = (int)event->x;
+    ev.y = (int)event->y;
+    guint state = event->state;
+    ev.buttons = ((state & GDK_BUTTON1_MASK) ? 1 : 0) +
+                 ((state & GDK_BUTTON3_MASK) ? 2 : 0) +
+                 ((state & GDK_BUTTON2_MASK) ? 4 : 0) +
+                 ((wv->bfState & kBack) ? 8 : 0) +
+                 ((wv->bfState & kForward) ? 16 : 0);
+
+    guint clicks = 1;
+    if (!gdk_event_get_click_count((GdkEvent*)event, &clicks)) {
+        clicks = 1;
+    }
+    ev.detail = (int)clicks;
+    ev.ctrlKey = (state & GDK_CONTROL_MASK) != 0;
+    ev.altKey = (state & GDK_MOD1_MASK) != 0;
+    ev.shiftKey = (state & GDK_SHIFT_MASK) != 0;
+    ev.metaKey = (state & GDK_SUPER_MASK) != 0;
+    RunJavascript(wv, SyntheticMouseEventJsTemp(&ev), nullptr, nullptr);
+}
+
+static gboolean OnButtonPress(GtkWidget*, GdkEventButton* event,
+                              gpointer data) {
+    WebView* wv = (WebView*)data;
+
+    if (wv->hasX11) {
+        GiveXFocus(wv, event->time);
+        gtk_widget_grab_focus(GTK_WIDGET(wv->webview));
+    }
+    if (event->button == 8 || event->button == 9) {
+        wv->bfState |= event->button == 8 ? kBack : kForward;
+        DispatchSyntheticMouse(wv, event, true);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean OnButtonRelease(GtkWidget*, GdkEventButton* event,
+                                gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (event->button == 8 || event->button == 9) {
+        wv->bfState &= (uint8_t)~(event->button == 8 ? kBack : kForward);
+        DispatchSyntheticMouse(wv, event, false);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void OnDragDataReceived(GtkWidget*, GdkDragContext*, gint, gint,
+                               GtkSelectionData* data, guint info, guint,
+                               gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (info != 2) {
+        return;
+    }
+    gchar** uris = gtk_selection_data_get_uris(data);
+    Vec<Str> paths;
+    for (int i = 0; uris && uris[i]; i++) {
+        VecAppend(paths, StrDup(PathFromFileUriTemp(Str(uris[i]))));
+    }
+    g_strfreev(uris);
+    wv->dragState = DragState::Entered;
+    DragDropEvent ev;
+    ev.kind = DragDropKind::Enter;
+    ev.paths = paths.els;
+    ev.pathCount = paths.len;
+    ev.x = wv->dragX;
+    ev.y = wv->dragY;
+    wv->dragDropHandler(wv->ctx, &ev);
+    FreeStrs(&wv->dragPaths);
+    wv->dragPaths = paths;
+    wv->hasDragPaths = true;
+}
+
+static gboolean OnDragMotion(GtkWidget*, GdkDragContext*, gint x, gint y, guint,
+                             gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (wv->dragState == DragState::Entered) {
+        DragDropEvent ev;
+        ev.kind = DragDropKind::Over;
+        ev.x = x;
+        ev.y = y;
+        wv->dragDropHandler(wv->ctx, &ev);
+    } else {
+        wv->dragX = x;
+        wv->dragY = y;
+    }
+    return FALSE;
+}
+
+static gboolean OnDragDrop(GtkWidget*, GdkDragContext* context, gint x, gint y,
+                           guint time, gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (wv->dragState != DragState::Leaving || !wv->hasDragPaths) {
+        return FALSE;
+    }
+    Vec<Str> paths = wv->dragPaths;
+    wv->dragPaths = Vec<Str>();
+    wv->hasDragPaths = false;
+    gdk_drop_finish(context, TRUE, time);
+    wv->dragState = DragState::Left;
+    DragDropEvent ev;
+    ev.kind = DragDropKind::Drop;
+    ev.paths = paths.els;
+    ev.pathCount = paths.len;
+    ev.x = x;
+    ev.y = y;
+    bool handled = wv->dragDropHandler(wv->ctx, &ev);
+    FreeStrs(&paths);
+    return handled ? TRUE : FALSE;
+}
+
+static gboolean OnDragLeaveIdle(gpointer user) {
+    WebView* wv = (WebView*)user;
+    wv->dragLeaveIdle = 0;
+    if (wv->dragState == DragState::Leaving) {
+        wv->dragState = DragState::Left;
+        DragDropEvent ev;
+        ev.kind = DragDropKind::Leave;
+        wv->dragDropHandler(wv->ctx, &ev);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void OnDragLeave(GtkWidget*, GdkDragContext*, guint, gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (wv->dragState == DragState::Left) {
+        return;
+    }
+
+    wv->dragState = DragState::Leaving;
+    if (!wv->dragLeaveIdle) {
+        wv->dragLeaveIdle = g_idle_add(OnDragLeaveIdle, wv);
+    }
+}
+
+struct DownloadState {
+    WebView* wv;
+    WebKitDownload* download;
+    bool failed;
+};
+
+static void ForgetDownload(DownloadState* state) {
+    WebView* wv = state->wv;
+    for (int i = 0; i < wv->downloads.len; i++) {
+        if (wv->downloads[i] == state) {
+            wv->downloads.els[i] = wv->downloads.els[wv->downloads.len - 1];
+            wv->downloads.len--;
+            break;
+        }
+    }
+    g_signal_handlers_disconnect_by_data(state->download, state);
+    g_object_unref(state->download);
+    delete state;
+}
+
+static Str DownloadUriTemp(WebKitDownload* download) {
+    WebKitURIRequest* request = webkit_download_get_request(download);
+    return request ? FromCTemp(webkit_uri_request_get_uri(request)) : Str();
+}
+
+static gboolean OnDecideDestination(WebKitDownload* download, gchar* suggested,
+                                    gpointer data) {
+    DownloadState* state = (DownloadState*)data;
+    WebView* wv = state->wv;
+    Str uri = DownloadUriTemp(download);
+    if (!uri.s || !wv->downloadStartedHandler) {
+        return TRUE;
+    }
+
+    const char* dir = g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD);
+    char* cwd = nullptr;
+    if (!dir) {
+        cwd = g_get_current_dir();
+        dir = cwd;
+    }
+    Str stem;
+    Str ext;
+    DownloadFileNameParts(uri, suggested ? Str(suggested) : Str(), &stem, &ext);
+    char* path = g_build_filename(
+        dir, CStrTemp(base::FormatTemp("%s%s", stem, ext)), nullptr);
+
+    for (int counter = 1; g_file_test(path, G_FILE_TEST_EXISTS); counter++) {
+        g_free(path);
+        path = g_build_filename(
+            dir, CStrTemp(base::FormatTemp("%s (%d)%s", stem, counter, ext)),
+            nullptr);
+    }
+    g_free(cwd);
+    Str dest = FromCTemp(path);
+    g_free(path);
+    if (wv->downloadStartedHandler(wv->ctx, uri, &dest)) {
+        webkit_download_set_destination(download, CStrTemp(dest));
+    } else {
+        webkit_download_cancel(download);
+    }
+    return TRUE;
+}
+
+static void OnDownloadFailed(WebKitDownload*, GError*, gpointer data) {
+    ((DownloadState*)data)->failed = true;
+}
+
+static void OnDownloadFinished(WebKitDownload* download, gpointer data) {
+    DownloadState* state = (DownloadState*)data;
+    WebView* wv = state->wv;
+    Str uri = DownloadUriTemp(download);
+    if (wv->downloadCompletedHandler && uri.s) {
+        Str path = state->failed
+                       ? Str()
+                       : FromCTemp(webkit_download_get_destination(download));
+        wv->downloadCompletedHandler(wv->ctx, uri, path.s ? &path : nullptr,
+                                     !state->failed);
+    }
+    ForgetDownload(state);
+}
+
+static void OnDownloadStarted(WebKitWebContext*, WebKitDownload* download,
+                              gpointer data) {
+    WebView* wv = (WebView*)data;
+    DownloadState* state = new DownloadState{wv, download, false};
+    g_object_ref(download);
+    VecAppend(wv->downloads, state);
+    g_signal_connect(download, "decide-destination", Cb(OnDecideDestination),
+                     state);
+    g_signal_connect(download, "failed", Cb(OnDownloadFailed), state);
+    g_signal_connect(download, "finished", Cb(OnDownloadFinished), state);
+}
+
+struct ProtocolHandler {
+    Str name;
+    Str webviewId;
+    void* ctx;
+    void (*handler)(void* ctx, Str id, const Request* request,
+                    RequestResponder* responder);
+};
+
+static void FreeProtocolHandler(gpointer data) {
+    ProtocolHandler* p = (ProtocolHandler*)data;
+    StrFree(p->name);
+    StrFree(p->webviewId);
+    delete p;
+}
+
+struct RequestResponder {
+    WebKitURISchemeRequest* request;
+};
+
+static void CollectHeader(const char* name, const char* value, gpointer data) {
+    Header h;
+    h.name = FromCTemp(name);
+    h.value = FromCTemp(value);
+    VecAppend(*(Vec<Header>*)data, h);
+}
+
+static void OnUriScheme(WebKitURISchemeRequest* request, gpointer data) {
+    ProtocolHandler* p = (ProtocolHandler*)data;
+    const char* uri = webkit_uri_scheme_request_get_uri(request);
+    if (!uri) {
+        GError* error = g_error_new_literal(G_FILE_ERROR, G_FILE_ERROR_EXIST,
+                                            "Could not get uri.");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    Vec<Header> headers;
+    SoupMessageHeaders* h = webkit_uri_scheme_request_get_http_headers(request);
+    if (h) {
+        soup_message_headers_foreach(h, CollectHeader, &headers);
+    }
+    const char* method = webkit_uri_scheme_request_get_http_method(request);
+    Request req;
+    req.uri = FromCTemp(uri);
+    req.method = method ? FromCTemp(method) : StrL("GET");
+    req.headers = headers.els;
+    req.headerCount = headers.len;
+
+    Str id;
+    WebKitWebView* webview = webkit_uri_scheme_request_get_web_view(request);
+    if (webview) {
+        id = FromCTemp(
+            (const char*)g_object_get_data(G_OBJECT(webview), kWebViewIdKey));
+    }
+    RequestResponder* responder = new RequestResponder{request};
+    g_object_ref(request);
+    p->handler(p->ctx, id, &req, responder);
+    VecReset(headers);
+}
+
+struct PendingResponse {
+    WebKitURISchemeRequest* request;
+    int status;
+    Vec<Header> headers;
+    GBytes* body;
+};
+
+static gboolean FinishResponse(gpointer data) {
+    PendingResponse* r = (PendingResponse*)data;
+    GInputStream* input = g_memory_input_stream_new_from_bytes(r->body);
+    WebKitURISchemeResponse* response = webkit_uri_scheme_response_new(
+        input, (gint64)g_bytes_get_size(r->body));
+    webkit_uri_scheme_response_set_status(response, (guint)r->status, nullptr);
+    SoupMessageHeaders* headers =
+        soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
+    for (int i = 0; i < r->headers.len; i++) {
+        const char* name = CStrTemp(r->headers[i].name);
+        const char* value = CStrTemp(r->headers[i].value);
+        if (g_ascii_strcasecmp(name, "content-type") == 0) {
+            webkit_uri_scheme_response_set_content_type(response, value);
+        }
+        soup_message_headers_append(headers, name, value);
+    }
+    webkit_uri_scheme_response_set_http_headers(response, headers);
+    webkit_uri_scheme_request_finish_with_response(r->request, response);
+    g_object_unref(response);
+    g_object_unref(input);
+    g_object_unref(r->request);
+    g_bytes_unref(r->body);
+    for (int i = 0; i < r->headers.len; i++) {
+        StrFree(r->headers[i].name);
+        StrFree(r->headers[i].value);
+    }
+    VecReset(r->headers);
+    delete r;
+    return G_SOURCE_REMOVE;
+}
+
+void Respond(RequestResponder* responder, const Response* response) {
+    if (!responder) {
+        return;
+    }
+
+    PendingResponse* r = new PendingResponse();
+    r->request = responder->request;
+    r->status = response ? response->status : 500;
+    if (response) {
+        for (int i = 0; i < response->headerCount; i++) {
+            Header h;
+            h.name = StrDup(response->headers[i].name);
+            h.value = StrDup(response->headers[i].value);
+            VecAppend(r->headers, h);
+        }
+    }
+    r->body = g_bytes_new(response ? response->body : nullptr,
+                          response && response->body ? response->bodyLen : 0);
+    delete responder;
+    g_main_context_invoke(nullptr, FinishResponse, r);
+}
+
+static WebKitWebContext* NewWebContext(const WebViewAttributes* attrs) {
+    WebKitWebContext* context = nullptr;
+    if (attrs->incognito) {
+        context = webkit_web_context_new_ephemeral();
+    } else if (len(attrs->dataDirectory) > 0) {
+        const char* dir = CStrTemp(attrs->dataDirectory);
+        WebKitWebsiteDataManager* manager = webkit_website_data_manager_new(
+            "base-data-directory", dir, nullptr);
+        WebKitCookieManager* cookies =
+            webkit_website_data_manager_get_cookie_manager(manager);
+        if (cookies) {
+            char* path = g_build_filename(dir, "cookies", nullptr);
+            webkit_cookie_manager_set_persistent_storage(
+                cookies, path, WEBKIT_COOKIE_PERSISTENT_STORAGE_TEXT);
+            g_free(path);
+        }
+        context = webkit_web_context_new_with_website_data_manager(manager);
+        g_object_unref(manager);
+    } else {
+        context = webkit_web_context_new();
+    }
+
+    webkit_web_context_set_automation_allowed(context, FALSE);
+    return context;
+}
+
+static void RegisterProtocols(WebView* wv, const WebViewAttributes* attrs) {
+    WebKitSecurityManager* security =
+        webkit_web_context_get_security_manager(wv->context);
+    for (int i = 0; i < attrs->customProtocolCount; i++) {
+        const CustomProtocol& cp = attrs->customProtocols[i];
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (base::StrEq(attrs->customProtocols[j].name, cp.name)) {
+                duplicate = true;
+            }
+        }
+        if (duplicate || !cp.handler) {
+
+            logf("wry: custom protocol '%s' skipped\n", cp.name);
+            continue;
+        }
+        const char* scheme = CStrTemp(cp.name);
+        if (security) {
+            webkit_security_manager_register_uri_scheme_as_secure(security,
+                                                                  scheme);
+        }
+        ProtocolHandler* p = new ProtocolHandler();
+        p->name = StrDup(cp.name);
+        p->webviewId = StrDup(wv->id);
+        p->ctx = cp.ctx;
+        p->handler = cp.handler;
+        webkit_web_context_register_uri_scheme(wv->context, scheme, OnUriScheme,
+                                               p, FreeProtocolHandler);
+    }
+}
+
+static void SetWebviewSettings(WebView* wv, const WebViewAttributes* attrs) {
+
+    WebKitInputMethodContext* im =
+        webkit_web_view_get_input_method_context(wv->webview);
+    if (im) {
+        webkit_input_method_context_set_enable_preedit(im, FALSE);
+    }
+    webkit_web_context_set_use_system_appearance_for_scrollbars(wv->context,
+                                                                FALSE);
+    WebKitSettings* settings = webkit_web_view_get_settings(wv->webview);
+    if (!settings) {
+        return;
+    }
+    webkit_settings_set_enable_webgl(settings, TRUE);
+    webkit_settings_set_enable_webaudio(settings, TRUE);
+    webkit_settings_set_enable_back_forward_navigation_gestures(
+        settings, attrs->backForwardNavigationGestures);
+    if (attrs->clipboard) {
+        webkit_settings_set_javascript_can_access_clipboard(settings, TRUE);
+    }
+    webkit_settings_set_enable_page_cache(settings, TRUE);
+    webkit_settings_set_user_agent(settings, CStrOrNull(attrs->userAgent));
+    if (attrs->devtools) {
+        webkit_settings_set_enable_developer_extras(settings, TRUE);
+    }
+    if (attrs->javascriptDisabled) {
+        webkit_settings_set_enable_javascript(settings, FALSE);
+    }
+}
+
+static WebView* NewGtk(GtkWidget* container, const WebViewAttributes* attrs,
+                       WebKitWebView* relatedView);
+
+static void FreeRelated(WebView* wv, int index, bool destroyWindow);
+
+static void OnRelatedWindowDestroy(GtkWidget* window, gpointer data) {
+    WebView* wv = (WebView*)data;
+    for (int i = 0; i < wv->related.len; i++) {
+        if (wv->related[i].window == window) {
+            FreeRelated(wv, i, false);
+            return;
+        }
+    }
+}
+
+static GtkWidget* OnCreate(WebKitWebView* webview,
+                           WebKitNavigationAction* action, gpointer data) {
+    WebView* wv = (WebView*)data;
+    WebKitURIRequest* request = webkit_navigation_action_get_request(action);
+    const char* uri = request ? webkit_uri_request_get_uri(request) : nullptr;
+    if (!uri || !wv->newWindowReqHandler) {
+        return nullptr;
+    }
+    NewWindowFeatures features;
+    features.opener = wv;
+    WebView* created = nullptr;
+    NewWindowResponse response =
+        wv->newWindowReqHandler(wv->ctx, FromCTemp(uri), &features, &created);
+    if (response == NewWindowResponse::Create) {
+        return created && created->webview ? GTK_WIDGET(created->webview)
+                                           : nullptr;
+    }
+    if (response != NewWindowResponse::Allow) {
+        return nullptr;
+    }
+
+    GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), uri);
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(window), box);
+    gtk_widget_show_all(window);
+    WebViewAttributes defaults;
+    WebView* related = NewGtk(box, &defaults, webview);
+    if (!related) {
+        gtk_widget_destroy(window);
+        return nullptr;
+    }
+    VecAppend(wv->related, RelatedWebView{window, related});
+    g_signal_connect(window, "destroy", Cb(OnRelatedWindowDestroy), wv);
+    return GTK_WIDGET(related->webview);
+}
+
+static WebView* NewGtk(GtkWidget* container, const WebViewAttributes* attrs,
+                       WebKitWebView* relatedView) {
+    WebView* wv = new WebView();
+    wv->ctx = attrs->ctx;
+    wv->ipcHandler = attrs->ipcHandler;
+    wv->navigationHandler = attrs->navigationHandler;
+    wv->documentTitleChangedHandler = attrs->documentTitleChangedHandler;
+    wv->onPageLoadHandler = attrs->onPageLoadHandler;
+    wv->newWindowReqHandler = attrs->newWindowReqHandler;
+    wv->downloadStartedHandler = attrs->downloadStartedHandler;
+    wv->downloadCompletedHandler = attrs->downloadCompletedHandler;
+    wv->dragDropHandler = attrs->dragDropHandler;
+    wv->cancellable = g_cancellable_new();
+
+    wv->context = relatedView ? webkit_web_view_get_context(relatedView)
+                              : NewWebContext(attrs);
+    if (relatedView) {
+        g_object_ref(wv->context);
+    }
+    Str proxy = ProxyUriTemp(&attrs->proxyConfig);
+    if (proxy.s) {
+        WebKitWebsiteDataManager* manager =
+            webkit_web_context_get_website_data_manager(wv->context);
+        if (manager) {
+            WebKitNetworkProxySettings* settings =
+                webkit_network_proxy_settings_new(CStrTemp(proxy), nullptr);
+            webkit_website_data_manager_set_network_proxy_settings(
+                manager, WEBKIT_NETWORK_PROXY_MODE_CUSTOM, settings);
+            webkit_network_proxy_settings_free(settings);
+        }
+    }
+
+    if (len(attrs->extensionPath) > 0) {
+        webkit_web_context_set_web_extensions_directory(
+            wv->context, CStrTemp(attrs->extensionPath));
+    }
+
+    wv->manager = webkit_user_content_manager_new();
+    WebKitWebsitePolicies* policies = nullptr;
+    if (attrs->autoplay) {
+        policies = webkit_website_policies_new_with_policies(
+            "autoplay", WEBKIT_AUTOPLAY_ALLOW, nullptr);
+    }
+    GObject* object =
+        relatedView
+            ? (GObject*)g_object_new(
+                  WEBKIT_TYPE_WEB_VIEW, "user-content-manager", wv->manager,
+                  "is-controlled-by-automation", FALSE, "website-policies",
+                  policies, "related-view", relatedView, nullptr)
+            : (GObject*)g_object_new(
+                  WEBKIT_TYPE_WEB_VIEW, "user-content-manager", wv->manager,
+                  "is-controlled-by-automation", FALSE, "website-policies",
+                  policies, "web-context", wv->context, nullptr);
+    if (policies) {
+        g_object_unref(policies);
+    }
+    wv->webview = WEBKIT_WEB_VIEW(object);
+    g_object_ref_sink(wv->webview);
+
+    if (attrs->transparent) {
+        GdkRGBA clear = {0, 0, 0, 0};
+        webkit_web_view_set_background_color(wv->webview, &clear);
+    } else if (attrs->hasBackgroundColor) {
+
+        GdkRGBA c = {
+            attrs->backgroundColor.r / 255.0, attrs->backgroundColor.g / 255.0,
+            attrs->backgroundColor.b / 255.0, attrs->backgroundColor.a / 255.0};
+        webkit_web_view_set_background_color(wv->webview, &c);
+    }
+
+    SetWebviewSettings(wv, attrs);
+
+    GObject* view = G_OBJECT(wv->webview);
+    g_signal_connect(view, "close", Cb(OnClose), wv);
+    gtk_widget_add_events(GTK_WIDGET(wv->webview),
+                          GDK_BUTTON1_MOTION_MASK | GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(view, "button-press-event", Cb(OnButtonPress), wv);
+    g_signal_connect(view, "button-release-event", Cb(OnButtonRelease), wv);
+    if (wv->documentTitleChangedHandler) {
+        g_signal_connect(view, "notify::title", Cb(OnTitle), wv);
+    }
+    g_signal_connect(view, "load-changed", Cb(OnLoadChanged), wv);
+    if (wv->newWindowReqHandler) {
+        g_signal_connect(view, "create", Cb(OnCreate), wv);
+    }
+    if (wv->navigationHandler) {
+        g_signal_connect(view, "decide-policy", Cb(OnDecidePolicy), wv);
+    }
+    if (wv->downloadStartedHandler || wv->downloadCompletedHandler) {
+        g_signal_connect(wv->context, "download-started", Cb(OnDownloadStarted),
+                         wv);
+    }
+
+    g_signal_connect(wv->manager, "script-message-received::ipc",
+                     Cb(OnScriptMessage), wv);
+    webkit_user_content_manager_register_script_message_handler(wv->manager,
+                                                                "ipc");
+
+    if (wv->dragDropHandler) {
+        g_signal_connect(view, "drag-data-received", Cb(OnDragDataReceived),
+                         wv);
+        g_signal_connect(view, "drag-motion", Cb(OnDragMotion), wv);
+        g_signal_connect(view, "drag-drop", Cb(OnDragDrop), wv);
+        g_signal_connect(view, "drag-leave", Cb(OnDragLeave), wv);
+    }
+
+    gtk_box_pack_start(GTK_BOX(container), GTK_WIDGET(wv->webview), TRUE, TRUE,
+                       0);
+
+    WebKitWebInspector* inspector = webkit_web_view_get_inspector(wv->webview);
+    if (inspector) {
+        g_signal_connect(inspector, "bring-to-front",
+                         Cb(OnInspectorBringToFront), wv);
+        g_signal_connect(inspector, "closed", Cb(OnInspectorClosed), wv);
+    }
+
+    wv->id =
+        len(attrs->id) > 0
+            ? StrDup(attrs->id)
+            : StrDup(base::FormatTemp("%d", (long long)(intptr_t)wv->webview));
+    g_object_set_data_full(G_OBJECT(wv->webview), kWebViewIdKey,
+                           g_strdup(CStrTemp(wv->id)), g_free);
+
+    AddUserScript(wv, Str(kIpcScript), true);
+    for (int i = 0; i < attrs->initializationScriptCount; i++) {
+        AddUserScript(wv, attrs->initializationScripts[i].script,
+                      attrs->initializationScripts[i].forMainFrameOnly);
+    }
+
+    if (!relatedView) {
+        RegisterProtocols(wv, attrs);
+    }
+
+    if (attrs->url.s) {
+        if (attrs->headerCount > 0) {
+            WebViewLoadUrlWithHeaders(wv, attrs->url, attrs->headers,
+                                      attrs->headerCount);
+        } else {
+            webkit_web_view_load_uri(wv->webview, CStrTemp(attrs->url));
+        }
+    } else if (attrs->html.s) {
+        webkit_web_view_load_html(wv->webview, CStrTemp(attrs->html), nullptr);
+    }
+
+    if (attrs->visible) {
+        gtk_widget_show_all(GTK_WIDGET(wv->webview));
+    }
+    if (attrs->focused) {
+        gtk_widget_grab_focus(GTK_WIDGET(wv->webview));
+    }
+    return wv;
+}
+
+static int ToPhysical(double v, bool logical, double scale) {
+    return (int)lround(logical ? v * scale : v);
+}
+
+static int ToLogical(double v, bool logical, double scale) {
+    return (int)lround(logical ? v : v / scale);
+}
+
+static ::Window CreateContainer(::Display* xdpy, ::Window parent,
+                                const WebViewAttributes* attrs, bool asChild) {
+    int x = 0;
+    int y = 0;
+    int w = 1;
+    int h = 1;
+    if (asChild) {
+        XWindowAttributes pa = {};
+        XGetWindowAttributes(xdpy, parent, &pa);
+        double scale = pa.screen ? ScaleFactorFromScreen(pa.screen->width,
+                                                         pa.screen->mwidth)
+                                 : 1.0;
+        if (attrs->hasBounds) {
+            const Rect& b = attrs->bounds;
+            x = ToPhysical(b.position.x, b.position.logical, scale);
+            y = ToPhysical(b.position.y, b.position.logical, scale);
+            w = ToPhysical(b.size.width, b.size.logical, scale);
+            h = ToPhysical(b.size.height, b.size.logical, scale);
+        }
+    } else {
+
+        XWindowAttributes pa = {};
+        XGetWindowAttributes(xdpy, parent, &pa);
+        w = pa.width;
+        h = pa.height;
+    }
+
+    w = std::max(w, 1);
+    h = std::max(h, 1);
+    ::Window window = XCreateSimpleWindow(xdpy, parent, x, y, (unsigned)w,
+                                          (unsigned)h, 0, 0, 0);
+    if (attrs->visible) {
+        XMapWindow(xdpy, window);
+    }
+    return window;
+}
+
+static void PlaceMappedPlug(WebView* wv) {
+    ::Window plug = PlugXid(wv);
+    if (!plug) {
+        return;
+    }
+    XWindowAttributes ca = {};
+    XTrap trap(wv->display);
+    if (!XGetWindowAttributes(wv->xdisplay, wv->x11Window, &ca)) {
+        return;
+    }
+    XMoveResizeWindow(wv->xdisplay, plug, 0, 0, (unsigned)std::max(ca.width, 1),
+                      (unsigned)std::max(ca.height, 1));
+    XMapWindow(wv->xdisplay, plug);
+    XFlush(wv->xdisplay);
+}
+
+static void ResizeContainer(WebView* wv, int x, int y, int w, int h) {
+    w = std::max(w, 1);
+    h = std::max(h, 1);
+    {
+        XTrap trap(wv->display);
+        XMoveResizeWindow(wv->xdisplay, wv->x11Window, x, y, (unsigned)w,
+                          (unsigned)h);
+        ::Window plug = PlugXid(wv);
+        if (plug) {
+            XMoveResizeWindow(wv->xdisplay, plug, 0, 0, (unsigned)w,
+                              (unsigned)h);
+        }
+        XFlush(wv->xdisplay);
+    }
+
+    gtk_window_resize(GTK_WINDOW(wv->gtkWindow), w, h);
+    GtkAllocation a = {0, 0, w, h};
+    gtk_widget_size_allocate(wv->gtkWindow, &a);
+}
+
+static GdkFilterReturn ParentFilter(GdkXEvent* xevent, GdkEvent*,
+                                    gpointer data) {
+    WebView* wv = (WebView*)data;
+    XEvent* ev = (XEvent*)xevent;
+    if (ev->type == ConfigureNotify && ev->xconfigure
+                                               .window == wv->parentWindow) {
+        ResizeContainer(wv, 0, 0, ev->xconfigure.width, ev->xconfigure.height);
+    }
+    return GDK_FILTER_CONTINUE;
+}
+
+WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
+                    bool asChild) {
+    if (!attrs) {
+        return nullptr;
+    }
+    ::Window parent = (::Window)(uintptr_t)parentWindow;
+    if (!parent) {
+
+        logf("wry: a webview needs an X11 window to go in\n");
+        return nullptr;
+    }
+    if (!EnsureGtk()) {
+        return nullptr;
+    }
+    GdkDisplay* display = gdk_display_get_default();
+    ::Display* xdpy = XDisplayOf(display);
+
+    ::Window container = CreateContainer(xdpy, parent, attrs, asChild);
+    if (!container) {
+        logf("wry: could not make the webview's X11 window\n");
+        return nullptr;
+    }
+
+    GtkWidget* plug = gtk_plug_new_for_display(display, container);
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(plug), vbox);
+
+    WebView* wv = NewGtk(vbox, attrs, nullptr);
+
+    gtk_widget_show_all(plug);
+    wv->display = display;
+    wv->xdisplay = xdpy;
+    wv->x11Window = container;
+    wv->parentWindow = parent;
+    wv->gtkWindow = plug;
+    wv->isChild = asChild;
+    PlaceMappedPlug(wv);
+    if (!attrs->visible) {
+        WebViewSetVisible(wv, false);
+    }
+    wv->hasX11 = true;
+    if (!asChild) {
+        XTrap trap(display);
+        XSelectInput(xdpy, parent, StructureNotifyMask);
+        gdk_window_add_filter(nullptr, ParentFilter, wv);
+        wv->followsParent = true;
+    }
+    return wv;
+}
+
+static void FreeInner(WebView* wv) {
+    if (!wv) {
+        return;
+    }
+    g_cancellable_cancel(wv->cancellable);
+    if (wv->followsParent) {
+        gdk_window_remove_filter(nullptr, ParentFilter, wv);
+    }
+    while (wv->related.len > 0) {
+        FreeRelated(wv, wv->related.len - 1, true);
+    }
+    while (wv->downloads.len > 0) {
+        ForgetDownload(wv->downloads[wv->downloads.len - 1]);
+    }
+    if (wv->dragLeaveIdle) {
+        g_source_remove(wv->dragLeaveIdle);
+        wv->dragLeaveIdle = 0;
+    }
+
+    g_signal_handlers_disconnect_by_data(wv->webview, wv);
+    g_signal_handlers_disconnect_by_data(wv->manager, wv);
+    g_signal_handlers_disconnect_by_data(wv->context, wv);
+    WebKitWebInspector* inspector = webkit_web_view_get_inspector(wv->webview);
+    if (inspector) {
+        g_signal_handlers_disconnect_by_data(inspector, wv);
+    }
+
+    gtk_widget_destroy(GTK_WIDGET(wv->webview));
+    if (wv->hasX11) {
+        gtk_widget_destroy(wv->gtkWindow);
+        XTrap trap(wv->display);
+        XDestroyWindow(wv->xdisplay, wv->x11Window);
+        XFlush(wv->xdisplay);
+    }
+    g_object_unref(wv->webview);
+    g_object_unref(wv->manager);
+    g_object_unref(wv->context);
+    g_object_unref(wv->cancellable);
+    FreeStrs(&wv->pendingScripts);
+    FreeStrs(&wv->dragPaths);
+    VecReset(wv->related);
+    VecReset(wv->downloads);
+    StrFree(wv->id);
+    delete wv;
+}
+
+static void FreeRelated(WebView* wv, int index, bool destroyWindow) {
+    RelatedWebView r = wv->related[index];
+    wv->related.els[index] = wv->related.els[wv->related.len - 1];
+    wv->related.len--;
+    g_signal_handlers_disconnect_by_data(r.window, wv);
+    FreeInner(r.webview);
+    if (destroyWindow) {
+        gtk_widget_destroy(r.window);
+    }
+}
+
+void WebViewFree(WebView* wv) {
+    FreeInner(wv);
+}
+
+Str WebViewId(WebView* wv) {
+    return wv ? wv->id : Str();
+}
+
+bool WebViewEval(WebView* wv, Str js) {
+    return WebViewEvalWithCallback(wv, js, nullptr, nullptr);
+}
+
+bool WebViewEvalWithCallback(WebView* wv, Str js, void* ctx,
+                             void (*callback)(void* ctx, Str result)) {
+    if (!wv) {
+        return false;
+    }
+    if (wv->pendingOpen) {
+
+        VecAppend(wv->pendingScripts, StrDup(js));
+        return true;
+    }
+    RunJavascript(wv, js, ctx, callback);
+    return true;
+}
+
+Str WebViewUrlTemp(WebView* wv) {
+    return wv ? UriTemp(wv->webview) : Str();
+}
+
+bool WebViewLoadUrl(WebView* wv, Str url) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_load_uri(wv->webview, CStrTemp(url));
+    return true;
+}
+
+bool WebViewLoadUrlWithHeaders(WebView* wv, Str url, const Header* headers,
+                               int headerCount) {
+    if (!wv) {
+        return false;
+    }
+    WebKitURIRequest* request = webkit_uri_request_new(CStrTemp(url));
+    SoupMessageHeaders* h = webkit_uri_request_get_http_headers(request);
+    if (h) {
+        for (int i = 0; i < headerCount; i++) {
+            soup_message_headers_append(h, CStrTemp(headers[i].name),
+                                        CStrTemp(headers[i].value));
+        }
+    }
+    webkit_web_view_load_request(wv->webview, request);
+    g_object_unref(request);
+    return true;
+}
+
+bool WebViewLoadHtml(WebView* wv, Str html) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_load_html(wv->webview, CStrTemp(html), nullptr);
+    return true;
+}
+
+bool WebViewReload(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_reload(wv->webview);
+    return true;
+}
+
+bool WebViewBounds(WebView* wv, Rect* out) {
+    if (!wv || !out) {
+        return false;
+    }
+    *out = Rect{};
+    if (wv->hasX11) {
+        XWindowAttributes a = {};
+        XTrap trap(wv->display);
+        if (XGetWindowAttributes(wv->xdisplay, wv->x11Window, &a)) {
+            out->position = LogicalPosition(a.x, a.y);
+            out->size = LogicalSize(a.width, a.height);
+        }
+        return true;
+    }
+    GtkAllocation a = {};
+    gtk_widget_get_allocation(GTK_WIDGET(wv->webview), &a);
+    out->size = LogicalSize(a.width, a.height);
+    return true;
+}
+
+bool WebViewSetBounds(WebView* wv, Rect bounds) {
+    if (!wv) {
+        return false;
+    }
+    double scale = gtk_widget_get_scale_factor(GTK_WIDGET(wv->webview));
+    int w = ToLogical(bounds.size.width, bounds.size.logical, scale);
+    int h = ToLogical(bounds.size.height, bounds.size.logical, scale);
+    int x = ToLogical(bounds.position.x, bounds.position.logical, scale);
+    int y = ToLogical(bounds.position.y, bounds.position.logical, scale);
+    if (wv->hasX11 && !wv->followsParent) {
+
+        int s = (int)scale;
+        ResizeContainer(wv, x * s, y * s, w * s, h * s);
+    }
+    return true;
+}
+
+bool WebViewSetVisible(WebView* wv, bool visible) {
+    if (!wv) {
+        return false;
+    }
+
+    if (wv->hasX11 && wv->isChild) {
+        XTrap trap(wv->display);
+        if (visible) {
+            XMapWindow(wv->xdisplay, wv->x11Window);
+        } else {
+            XUnmapWindow(wv->xdisplay, wv->x11Window);
+        }
+    }
+    if (visible) {
+        gtk_widget_show_all(GTK_WIDGET(wv->webview));
+    } else {
+        gtk_widget_hide(GTK_WIDGET(wv->webview));
+    }
+    if (wv->hasX11 && wv->isChild) {
+        if (visible) {
+            gtk_widget_show_all(wv->gtkWindow);
+            PlaceMappedPlug(wv);
+        } else {
+            gtk_widget_hide(wv->gtkWindow);
+        }
+    }
+    return true;
+}
+
+bool WebViewFocus(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+
+    if (wv->hasX11) {
+        ::Window focus = 0;
+        int revert = 0;
+        XGetInputFocus(wv->xdisplay, &focus, &revert);
+        if (focus == wv->parentWindow || OwnsXFocus(wv)) {
+            GiveXFocus(wv, CurrentTime);
+        }
+    }
+    gtk_widget_grab_focus(GTK_WIDGET(wv->webview));
+    return true;
+}
+
+bool WebViewFocusParent(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+
+    if (wv->hasX11 && OwnsXFocus(wv)) {
+        XTrap trap(wv->display);
+        XSetInputFocus(wv->xdisplay, wv->parentWindow, RevertToParent,
+                       CurrentTime);
+        XFlush(wv->xdisplay);
+    }
+    return true;
+}
+
+bool WebViewZoom(WebView* wv, double scaleFactor) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_set_zoom_level(wv->webview, scaleFactor);
+    return true;
+}
+
+bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
+    if (!wv) {
+        return false;
+    }
+    GdkRGBA c = {color.r / 255.0, color.g / 255.0, color.b / 255.0,
+                 color.a / 255.0};
+    webkit_web_view_set_background_color(wv->webview, &c);
+    return true;
+}
+
+bool WebViewSetTheme(WebView*, Theme) {
+    return false;
+}
+bool WebViewSetMemoryUsageLevel(WebView*, MemoryUsageLevel) {
+    return false;
+}
+bool WebViewSetTrafficLightInset(WebView*, Position) {
+    return false;
+}
+
+bool WebViewReparent(WebView* wv, void* parentWindow) {
+    ::Window parent = (::Window)(uintptr_t)parentWindow;
+    if (!wv || !wv->hasX11 || !parent || wv->followsParent) {
+        return false;
+    }
+    XTrap trap(wv->display);
+    XReparentWindow(wv->xdisplay, wv->x11Window, parent, 0, 0);
+    XFlush(wv->xdisplay);
+    wv->parentWindow = parent;
+    return true;
+}
+
+bool WebViewPrint(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+    WebKitPrintOperation* op = webkit_print_operation_new(wv->webview);
+    webkit_print_operation_run_dialog(op, nullptr);
+    g_object_unref(op);
+    return true;
+}
+
+bool WebViewClearAllBrowsingData(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+    WebKitWebsiteDataManager* manager =
+        webkit_web_context_get_website_data_manager(wv->context);
+    if (manager) {
+        webkit_website_data_manager_clear(manager, WEBKIT_WEBSITE_DATA_ALL, 0,
+                                          nullptr, nullptr, nullptr);
+    }
+    return true;
+}
+
+static WebKitCookieManager* CookieManagerOf(WebView* wv) {
+    WebKitWebsiteDataManager* data =
+        wv ? webkit_web_view_get_website_data_manager(wv->webview) : nullptr;
+    return data ? webkit_website_data_manager_get_cookie_manager(data)
+                : nullptr;
+}
+
+static Cookie CookieFromSoup(SoupCookie* c) {
+    Cookie out;
+    out.name = StrDup(Str(soup_cookie_get_name(c)));
+    out.value = StrDup(Str(soup_cookie_get_value(c)));
+    const char* domain = soup_cookie_get_domain(c);
+    const char* path = soup_cookie_get_path(c);
+    out.domain = domain ? StrDup(Str(domain)) : Str();
+    out.path = path ? StrDup(Str(path)) : Str();
+    out.hasHttpOnly = true;
+    out.httpOnly = soup_cookie_get_http_only(c);
+    out.hasSecure = true;
+    out.secure = soup_cookie_get_secure(c);
+    out.hasSameSite = true;
+    SoupSameSitePolicy policy = soup_cookie_get_same_site_policy(c);
+    out.sameSite =
+        policy == SOUP_SAME_SITE_POLICY_LAX
+            ? CookieSameSite::Lax
+            : (policy == SOUP_SAME_SITE_POLICY_STRICT ? CookieSameSite::Strict
+                                                      : kSameSiteNone);
+    GDateTime* expires = soup_cookie_get_expires(c);
+    if (expires) {
+        out.session = false;
+
+        int64_t t = g_date_time_to_unix(expires);
+        if (t >= -377705116800LL && t <= 253402300799LL) {
+            out.hasExpires = true;
+            out.expiresUnixSeconds = t;
+        }
+    }
+    return out;
+}
+
+static SoupCookie* CookieToSoup(const Cookie* c) {
+    SoupCookie* out = soup_cookie_new(
+        CStrTemp(c->name), CStrTemp(c->value), CStrTemp(c->domain),
+        CStrTemp(c->path), c->hasMaxAge ? (int)c->maxAgeSeconds : -1);
+    if (c->hasExpires) {
+        GDateTime* dt = g_date_time_new_from_unix_utc(c->expiresUnixSeconds);
+        if (dt) {
+            soup_cookie_set_expires(out, dt);
+            g_date_time_unref(dt);
+        }
+    }
+    if (c->hasHttpOnly) {
+        soup_cookie_set_http_only(out, c->httpOnly);
+    }
+    if (c->hasSameSite) {
+        soup_cookie_set_same_site_policy(
+            out, c->sameSite == CookieSameSite::Lax
+                     ? SOUP_SAME_SITE_POLICY_LAX
+                     : (c->sameSite == CookieSameSite::Strict
+                            ? SOUP_SAME_SITE_POLICY_STRICT
+                            : SOUP_SAME_SITE_POLICY_NONE));
+    }
+    if (c->hasSecure) {
+        soup_cookie_set_secure(out, c->secure);
+    }
+    return out;
+}
+
+struct CookieWait {
+    bool done = false;
+    bool ok = false;
+    GList* cookies = nullptr;
+    bool all = false;
+};
+
+static void OnCookies(GObject* source, GAsyncResult* result, gpointer data) {
+    CookieWait* wait = (CookieWait*)data;
+    GError* error = nullptr;
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    if (wait->all) {
+        wait->cookies = webkit_cookie_manager_get_all_cookies_finish(
+            WEBKIT_COOKIE_MANAGER(source), result, &error);
+    } else
+#endif
+    {
+        wait->cookies = webkit_cookie_manager_get_cookies_finish(
+            WEBKIT_COOKIE_MANAGER(source), result, &error);
+    }
+    wait->ok = error == nullptr;
+    if (error) {
+        g_error_free(error);
+    }
+    wait->done = true;
+}
+
+static bool CookiesInner(WebView* wv, const char* uri, Vec<Cookie>* out) {
+    if (!out) {
+        return false;
+    }
+    CookieListFree(out);
+    WebKitCookieManager* manager = CookieManagerOf(wv);
+    if (!manager) {
+        return false;
+    }
+    CookieWait wait;
+    if (uri) {
+        webkit_cookie_manager_get_cookies(manager, uri, nullptr, OnCookies,
+                                          &wait);
+    } else {
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+        wait.all = true;
+        webkit_cookie_manager_get_all_cookies(manager, nullptr, OnCookies,
+                                              &wait);
+#else
+        logf("wry: listing every cookie needs WebKitGTK 2.42\n");
+        return false;
+#endif
+    }
+    PumpUntil(&wait.done);
+    for (GList* l = wait.cookies; l; l = l->next) {
+        VecAppend(*out, CookieFromSoup((SoupCookie*)l->data));
+    }
+    g_list_free_full(wait.cookies, (GDestroyNotify)soup_cookie_free);
+    return wait.ok;
+}
+
+bool WebViewCookies(WebView* wv, Vec<Cookie>* out) {
+    return CookiesInner(wv, nullptr, out);
+}
+
+bool WebViewCookiesForUrl(WebView* wv, Str url, Vec<Cookie>* out) {
+    return CookiesInner(wv, CStrTemp(url), out);
+}
+
+struct CookieChange {
+    bool done = false;
+    bool ok = false;
+    bool add = true;
+};
+
+static void OnCookieChanged(GObject* source, GAsyncResult* result,
+                            gpointer data) {
+    CookieChange* change = (CookieChange*)data;
+    GError* error = nullptr;
+    gboolean ok = change->add
+                      ? webkit_cookie_manager_add_cookie_finish(
+                            WEBKIT_COOKIE_MANAGER(source), result, &error)
+                      : webkit_cookie_manager_delete_cookie_finish(
+                            WEBKIT_COOKIE_MANAGER(source), result, &error);
+    change->ok = ok && !error;
+    if (error) {
+        g_error_free(error);
+    }
+    change->done = true;
+}
+
+static bool ChangeCookie(WebView* wv, const Cookie* cookie, bool add) {
+    WebKitCookieManager* manager = CookieManagerOf(wv);
+    if (!manager || !cookie) {
+        return false;
+    }
+    SoupCookie* soup = CookieToSoup(cookie);
+    CookieChange change;
+    change.add = add;
+    if (add) {
+        webkit_cookie_manager_add_cookie(manager, soup, nullptr,
+                                         OnCookieChanged, &change);
+    } else {
+        webkit_cookie_manager_delete_cookie(manager, soup, nullptr,
+                                            OnCookieChanged, &change);
+    }
+    PumpUntil(&change.done);
+    soup_cookie_free(soup);
+    return change.ok;
+}
+
+bool WebViewSetCookie(WebView* wv, const Cookie* cookie) {
+    return ChangeCookie(wv, cookie, true);
+}
+
+bool WebViewDeleteCookie(WebView* wv, const Cookie* cookie) {
+    return ChangeCookie(wv, cookie, false);
+}
+
+void WebViewOpenDevtools(WebView* wv) {
+    WebKitWebInspector* inspector =
+        wv ? webkit_web_view_get_inspector(wv->webview) : nullptr;
+    if (inspector) {
+        webkit_web_inspector_show(inspector);
+
+        wv->inspectorOpen = true;
+    }
+}
+
+void WebViewCloseDevtools(WebView* wv) {
+    WebKitWebInspector* inspector =
+        wv ? webkit_web_view_get_inspector(wv->webview) : nullptr;
+    if (inspector) {
+        webkit_web_inspector_close(inspector);
+    }
+}
+
+bool WebViewIsDevtoolsOpen(WebView* wv) {
+    return wv && wv->inspectorOpen;
+}
+
+Str WebViewVersionTemp() {
+    return base::FormatTemp("%d.%d.%d", (int)webkit_get_major_version(),
+                            (int)webkit_get_minor_version(),
+                            (int)webkit_get_micro_version());
+}
+
+bool WebViewAvailable() {
+    return EnsureGtk();
+}
+
+}
+
+#pragma GCC diagnostic pop
+
+#else
+
 namespace wry {
 
 using base::logf;
@@ -2725,7 +4663,7 @@ static void Unsupported() {
     static bool said = false;
     if (!said) {
         said = true;
-        logf("wry: no webview backend on this platform\n");
+        logf("wry: built without WebKitGTK, so there is no webview here\n");
     }
 }
 
@@ -2818,6 +4756,13 @@ bool WebViewIsDevtoolsOpen(WebView*) {
 }
 void Respond(RequestResponder*, const Response*) {}
 
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
+
 Str WebViewVersionTemp() {
     return {};
 }
@@ -2826,6 +4771,8 @@ bool WebViewAvailable() {
 }
 
 }
+
+#endif
 
 #endif
 
@@ -4148,6 +6095,13 @@ bool WebViewAvailable() {
     return true;
 }
 
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
+
 }
 
 #endif
@@ -4263,6 +6217,13 @@ Str WebViewVersionTemp() {
 bool WebViewAvailable() {
     return false;
 }
+
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
 
 }
 
@@ -9537,6 +11498,13 @@ void* WebViewEnvironmentRaw(WebView* wv) {
 void* WebViewNativeRaw(WebView* wv) {
     return wv ? wv->webview : nullptr;
 }
+
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
 
 }
 

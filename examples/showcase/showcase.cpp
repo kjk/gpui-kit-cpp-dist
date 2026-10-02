@@ -129,7 +129,7 @@ El* ScComingSoon(Ctx* cx, const char* name) {
 
 // Gallery navigation: the tile knows which component it opens.
 static void OpenComp(ShowcaseApp* app, Ctx* cx, const ClickEvent*,
-                     intptr_t comp) {
+                     int64_t comp) {
     app->component = (int)comp;
     app->scrollY = 0;
     Notify(cx);
@@ -350,12 +350,7 @@ void ShowcaseWheel(ShowcaseApp* app, float x, float y, float delta) {
     (void)x;
     (void)y;
     app->scrollY -= delta;
-    if (app->scrollY < 0) {
-        app->scrollY = 0;
-    }
-    if (app->scrollY > 4000) {
-        app->scrollY = 4000;
-    }
+    app->scrollY = ClampF(app->scrollY, 0, 4000);
 }
 
 // The text-selection page keeps no offsets of its own any more: its runs

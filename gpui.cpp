@@ -25,6 +25,23 @@ namespace base {
 static int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 static int VscprintfUtf8(const char* fmt, va_list args);
 
+static PanicHook gPanicHook = nullptr;
+
+PanicHook SetPanicHook(PanicHook hook) {
+    PanicHook was = gPanicHook;
+    gPanicHook = hook;
+    return was;
+}
+
+void Panic(const char* msg) {
+    if (gPanicHook) {
+        gPanicHook(msg);
+        return;
+    }
+    log(Str(msg ? msg : "panic"));
+    abort();
+}
+
 float StrToFloatUnchecked(Str s) {
     if (!s.s || len(s) <= 0) {
         return 0;
@@ -1147,6 +1164,67 @@ Str StrTrimAscii(Str s) {
     return Str(s.s + start, end - start);
 }
 
+static bool IsUnicodeWhiteSpace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+
+static uint32_t StrTrimDecode(Str s, int i, int* n) {
+    uint8_t c = (uint8_t)s.s[i];
+    int want = c < 0x80         ? 1
+               : (c >> 5) == 6  ? 2
+               : (c >> 4) == 14 ? 3
+               : (c >> 3) == 30 ? 4
+                                : 0;
+    if (want <= 1 || i + want > len(s)) {
+        *n = 1;
+        return c;
+    }
+    uint32_t cp = c & (0x7F >> want);
+    for (int k = 1; k < want; k++) {
+        uint8_t b = (uint8_t)s.s[i + k];
+        if ((b & 0xC0) != 0x80) {
+            *n = 1;
+            return c;
+        }
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *n = want;
+    return cp;
+}
+
+Str StrTrim(Str s) {
+    if (!s.s || len(s) <= 0) {
+        return s;
+    }
+    int start = 0;
+    int end = len(s);
+    while (start < end) {
+        int n = 1;
+        if (!IsUnicodeWhiteSpace(StrTrimDecode(s, start, &n))) {
+            break;
+        }
+        start += n;
+    }
+    while (end > start) {
+
+        int at = end - 1;
+        while (at > start && ((uint8_t)s.s[at] & 0xC0) == 0x80 &&
+               end - at < 4) {
+            at--;
+        }
+        int n = 1;
+        uint32_t cp = StrTrimDecode(s, at, &n);
+        if (at + n != end || !IsUnicodeWhiteSpace(cp)) {
+            break;
+        }
+        end = at;
+    }
+    return Str(s.s + start, end - start);
+}
+
 Str StrReplaceAll(Str value, Str from, Str to) {
     if (len(from) == 0 || len(from) > len(value)) {
         return value;
@@ -1720,7 +1798,7 @@ static int64_t argToI64(const FmtArg& arg) {
         case FmtArg::Kind::Char:
             return (int64_t)arg.c;
         case FmtArg::Kind::Ptr:
-            return (int64_t)(intptr_t)arg.ptr;
+            return (int64_t)(int64_t)arg.ptr;
         default:
             return arg.i;
     }
@@ -1762,7 +1840,7 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     if (inst.conv == 'p') {
         const void* pv = arg.t == FmtArg::Kind::Ptr
                              ? arg.ptr
-                             : (const void*)(intptr_t)argToI64(arg);
+                             : (const void*)(int64_t)argToI64(arg);
         return appendConv(fmt, "%p", pv);
     }
 
@@ -5272,7 +5350,17 @@ El* EntityRender(App* app, Window* win, Arena* a, EntityId id) {
     if (win) {
         VecAppend(win->rendered, id);
     }
-    return s.render(s.ptr, &cx);
+    El* e = s.render(s.ptr, &cx);
+#ifndef NDEBUG
+
+    if (win && e) {
+        Window::DebugViewRoot root;
+        root.el = e;
+        root.view = id;
+        VecAppend(win->debugViewRoots, root);
+    }
+#endif
+    return e;
 }
 
 static void InvalidateForNotify(Window* win) {
@@ -5663,15 +5751,44 @@ static void LaidOutHeightPrePaint(PaintCtx* ctx, El* e, void* user) {
                                                       : e->style.borderB;
         boxH -= e->style.pad.top + e->style.pad.bottom + bt + bb;
     }
+
+    if (slot && slot->rebuild && !LayoutInScratchPass()) {
+        float h = boxH - slot->inset;
+        if (h < 0) {
+            h = 0;
+        }
+        slot->measured = h;
+        if (fabsf(h - slot->built) > 0.5f) {
+            slot->built = h;
+            slot->chase = 0;
+            Ctx cx = slot->cx;
+            if (slot->rebuild(slot->rebuildUser, &cx, e, h)) {
+                IdsCollectChildren(e);
+                LayoutEl(ctx, e, e->x, e->y, e->w, e->h, e->laidFont,
+                         e->style.color);
+            }
+        }
+        return;
+    }
     if (LaidOutHeightObserve(slot, boxH) && ctx && ctx->window) {
         WindowRequestAnimationFrame(ctx->window);
     }
 }
 
-bool TrackLaidOutHeight(Ctx*, El* e, LaidOutHeight* slot) {
+bool TrackLaidOutHeight(Ctx* cx, El* e, LaidOutHeight* slot) {
+    return TrackLaidOutHeight(cx, e, slot, nullptr, nullptr);
+}
+
+bool TrackLaidOutHeight(Ctx* cx, El* e, LaidOutHeight* slot,
+                        bool (*rebuild)(void* user, Ctx* cx, El* box,
+                                        float height),
+                        void* user) {
     if (!e || !slot || e->prePaint || e->customPaint) {
         return false;
     }
+    slot->rebuild = rebuild;
+    slot->rebuildUser = user;
+    slot->cx = cx ? *cx : Ctx{};
     e->prePaint = &LaidOutHeightPrePaint;
     e->customUser = slot;
     return true;
@@ -5949,23 +6066,13 @@ static uint8_t ToByte(float v01) {
 }
 
 Rgba RgbaOpacity(Rgba c, float a01) {
-    if (a01 < 0) {
-        a01 = 0;
-    }
-    if (a01 > 1) {
-        a01 = 1;
-    }
+    a01 = ClampF(a01, 0, 1);
     c.a = (uint8_t)((float)c.a * a01);
     return c;
 }
 
 Rgba RgbaMix(Rgba a, Rgba b, float t) {
-    if (t < 0) {
-        t = 0;
-    }
-    if (t > 1) {
-        t = 1;
-    }
+    t = ClampF(t, 0, 1);
     Rgba o;
     o.r = (uint8_t)lroundf((float)a.r * t + (float)b.r * (1 - t));
     o.g = (uint8_t)lroundf((float)a.g * t + (float)b.g * (1 - t));
@@ -6263,8 +6370,89 @@ static El* NewEl(Arena* a, ElKind k) {
     return e;
 }
 
-El* Div(Arena* a) {
-    return NewEl(a, ElKind::Div);
+El* Div(Arena* a, const char* file, int line, int column) {
+    El* e = NewEl(a, ElKind::Div);
+#ifndef NDEBUG
+    e->sourceFile = file;
+    e->sourceLine = line;
+    e->sourceColumn = column;
+#else
+    (void)file;
+    (void)line;
+    (void)column;
+#endif
+    return e;
+}
+
+namespace {
+struct ElementIdRec {
+    const char* s = nullptr;
+    int kind = 0;
+    int nameLen = 0;
+};
+
+Vec<ElementIdRec> gElementIds;
+#ifndef NDEBUG
+const int kElementIdCap = 8192;
+#endif
+}
+
+static void ElementIdRemember(Str id, int kind, int nameLen) {
+#ifndef NDEBUG
+    if (gElementIds.len >= kElementIdCap) {
+        VecClear(gElementIds);
+    }
+    ElementIdRec rec;
+    rec.s = id.s;
+    rec.kind = kind;
+    rec.nameLen = nameLen;
+    VecAppend(gElementIds, rec);
+#else
+    (void)id;
+    (void)kind;
+    (void)nameLen;
+#endif
+}
+
+Str ElementIdNamed(Arena* a, Str name, uint64_t ix) {
+    Str id = StrDup(a, fmt("%s-%llu", name, (unsigned long long)ix));
+    ElementIdRemember(id, 2, len(name));
+    return id;
+}
+
+Str ElementIdInteger(Arena* a, uint64_t ix) {
+    Str id = StrDup(a, fmt("%llu", (unsigned long long)ix));
+    ElementIdRemember(id, 1, 0);
+    return id;
+}
+
+int ElementIdKindOf(Str id, int* nameLen) {
+    for (int i = gElementIds.len - 1; id.s && i >= 0; i--) {
+        if (gElementIds[i].s == id.s) {
+            if (nameLen) {
+                *nameLen = gElementIds[i].nameLen;
+            }
+            return gElementIds[i].kind;
+        }
+    }
+    return 0;
+}
+
+void ElementIdFrameBegin() {
+    VecClear(gElementIds);
+}
+
+Str DebugSourceMessage(Arena* a, Str cwd, const char* file, int line,
+                       int column) {
+    Str f = Str(file ? file : "");
+    bool absolute = len(f) > 0 && (f.s[0] == '/' || f.s[0] == '\\' ||
+                                   (len(f) > 1 && f.s[1] == ':'));
+    if (absolute || len(cwd) == 0) {
+        return StrDup(
+            a, fmt("This element was created at:\n%s:%d:%d", f, line, column));
+    }
+    return StrDup(a, fmt("This element was created at:\n%s/%s:%d:%d", cwd, f,
+                         line, column));
 }
 
 El* TextEl(Arena* a, Str s) {
@@ -6395,12 +6583,7 @@ El* ButtonSmall(Arena* a, int clickId, Str label, BtnKind kind, bool selected) {
 El* ProgressEl(Arena* a, float value01to100, float barW, float barH) {
     El* e = NewEl(a, ElKind::Progress);
     e->progress = value01to100;
-    if (e->progress < 0) {
-        e->progress = 0;
-    }
-    if (e->progress > 100) {
-        e->progress = 100;
-    }
+    e->progress = ClampF(e->progress, 0, 100);
     e->style.width = barW;
     e->style.height = barH;
     e->style.flexShrink = 0;
@@ -7695,6 +7878,10 @@ El* El::BindInput(InputState* s) {
     }
     return this;
 }
+El* El::BindInputText(InputState* s) {
+    input = s;
+    return this;
+}
 
 El* El::SelRange(int lo, int hi, Rgba color) {
     selLo = lo;
@@ -7966,7 +8153,7 @@ El* El::DeferredLayer(int layer) {
     return this;
 }
 El* El::ZIndex(int z) {
-    style.zIndex = z;
+    style.zIndex = (int16_t)(z < -32768 ? -32768 : (z > 32767 ? 32767 : z));
     return this;
 }
 El* El::AnchorBelow(float gap) {
@@ -8089,13 +8276,13 @@ El* El::OnScrollWheel(Listener fn) {
     return this;
 }
 
-El* El::OnClickAction(uint32_t action, intptr_t arg) {
+El* El::OnClickAction(uint32_t action, int64_t arg) {
     clickAction = action;
     clickActionArg = arg;
     clickActionFocusId = 0;
     return this;
 }
-El* El::OnClickActionAt(uint32_t action, FocusHandle focus, intptr_t arg) {
+El* El::OnClickActionAt(uint32_t action, FocusHandle focus, int64_t arg) {
     clickAction = action;
     clickActionArg = arg;
     clickActionFocusId = focus.id;
@@ -8128,6 +8315,23 @@ El* El::FocusRing(bool v) {
 }
 El* El::FocusLineStyle(FocusLine line) {
     style.focusLine = (uint8_t)line;
+    return this;
+}
+#ifndef NDEBUG
+El* El::Debug() {
+    debug = true;
+    return this;
+}
+El* El::DebugBelow() {
+    debugBelow = true;
+    return this;
+}
+#endif
+
+El* El::FocusLineStyle(FocusLine line, Rgba color) {
+    FocusLineStyle(line);
+    style.focusLineColor = color;
+    style.hasFocusLineColor = true;
     return this;
 }
 El* El::TrapId(int v) {
@@ -8752,12 +8956,7 @@ bool TextPointAt(PaintCtx* ctx, Str s, float fontSize, float maxW, bool wrap,
         return true;
     }
     uint16_t weight = font;
-    if (off < 0) {
-        off = 0;
-    }
-    if (off > len(s)) {
-        off = len(s);
-    }
+    off = ClampI(off, 0, len(s));
     TextLayout* tl = TextMeasLayout(ctx, s, fontSize, maxW, wrap, weight,
                                     lineHeight, nullptr);
     if (!tl) {
@@ -9009,6 +9208,141 @@ void PaintTextRange(PaintCtx* ctx, Str s, float fontSize, float maxW, bool wrap,
     TextLayoutRelease(layout);
 }
 
+float TextAlignedRowLeft(TextAlign align, float alignWidth, float width) {
+    switch (align) {
+        case TextAlign::Center:
+            return (alignWidth - width) / 2.f;
+        case TextAlign::Right:
+            return alignWidth - width;
+        default:
+            return 0.f;
+    }
+}
+
+int TextGlyphBoxes(TextLayout* layout, Str text, Vec<TextGlyphBox>* out) {
+    if (!out) {
+        return 0;
+    }
+    int before = len(*out);
+    if (!layout) {
+        return 0;
+    }
+
+    Vec<float> rowTops;
+    for (int at = 0; at < len(text);) {
+        uint32_t cp = 0;
+        int bytes = Utf8At(text, at, &cp);
+        bytes = bytes > 0 ? bytes : 1;
+        Bounds rect = {};
+        int n = TextLayoutRangeRects(layout, text, at, at + bytes, &rect, 1);
+        if (n < 1 || rect.w <= 0) {
+
+            if (len(*out) > before) {
+                (*out)[len(*out) - 1].hi = at + bytes;
+            }
+            at += bytes;
+            continue;
+        }
+        int row = -1;
+        for (int r = 0; r < len(rowTops); r++) {
+            if (fabsf(rowTops[r] - rect.y) < 0.5f) {
+                row = r;
+                break;
+            }
+        }
+        if (row < 0) {
+            row = len(rowTops);
+            VecAppend(rowTops, rect.y);
+        }
+        TextGlyphBox g;
+        g.lo = at;
+        g.hi = at + bytes;
+        g.row = row;
+        g.left = rect.x;
+        g.right = rect.x + rect.w;
+        g.top = rect.y;
+        g.h = rect.h;
+        VecAppend(*out, g);
+        at += bytes;
+    }
+
+    int nRows = len(rowTops);
+    for (int i = before; i < len(*out); i++) {
+        int below = 0;
+        for (int r = 0; r < nRows; r++) {
+            if (rowTops[r] < (*out)[i].top - 0.5f) {
+                below++;
+            }
+        }
+        (*out)[i].row = below;
+    }
+    return len(*out) - before;
+}
+
+int TextRangeBoxes(const TextGlyphBox* glyphs, int n, int lo, int hi,
+                   Vec<TextGlyphBox>* out) {
+    if (!out) {
+        return 0;
+    }
+    int before = len(*out);
+    for (int i = 0; i < n; i++) {
+        const TextGlyphBox& g = glyphs[i];
+        if (g.hi > lo && g.lo < hi) {
+            VecAppend(*out, g);
+        }
+    }
+    TextGlyphBox* hits = out->els + before;
+    int nHits = len(*out) - before;
+
+    for (int i = 1; i < nHits; i++) {
+        TextGlyphBox key = hits[i];
+        int j = i - 1;
+        while (j >= 0 && (hits[j].row > key.row || (hits[j].row == key.row &&
+                                                    hits[j].left > key.left))) {
+            hits[j + 1] = hits[j];
+            j--;
+        }
+        hits[j + 1] = key;
+    }
+    int write = 0;
+    for (int i = 0; i < nHits; i++) {
+        if (write > 0 && hits[write - 1].row == hits[i].row &&
+            hits[i].left <= hits[write - 1].right) {
+            TextGlyphBox& last = hits[write - 1];
+            last.right = std::max(last.right, hits[i].right);
+            last.lo = std::min(last.lo, hits[i].lo);
+            last.hi = std::max(last.hi, hits[i].hi);
+            continue;
+        }
+        hits[write++] = hits[i];
+    }
+    out->len = before + write;
+    return write;
+}
+
+void PaintTextRangeBoxes(PaintCtx* ctx, Str s, float fontSize, float maxW,
+                         bool wrap, uint16_t weight, float lineH, float x,
+                         float y, int lo, int hi, Rgba color, TextAlign align) {
+    if (!ctx || !ctx->rt || color.a == 0 || hi <= lo) {
+        return;
+    }
+    TextLayout* layout = TextMeasLayout(ctx, s, fontSize, maxW, wrap, weight,
+                                        lineH, nullptr, nullptr, align);
+    if (!layout) {
+        return;
+    }
+    Vec<TextGlyphBox> glyphs;
+    Vec<TextGlyphBox> boxes;
+    TextGlyphBoxes(layout, s, &glyphs);
+    TextRangeBoxes(glyphs.els, len(glyphs), lo, hi, &boxes);
+    for (int i = 0; i < len(boxes); i++) {
+        const TextGlyphBox& b = boxes[i];
+        CanvasFillRect(ctx, x + b.left, y + b.top, b.right - b.left, b.h,
+                       color);
+    }
+    TextLayoutRelease(layout);
+}
+
 struct LayoutNode {
     El* el = nullptr;
 
@@ -9031,6 +9365,12 @@ struct LayoutCache {
 static Vec<El*> gLayoutFixed;
 
 static LayoutCache gMeasureCache;
+
+static int gMeasureDepth = 0;
+
+bool LayoutInScratchPass() {
+    return gMeasureDepth > 0;
+}
 
 static void TranslateSubtree(El* e, float dx, float dy) {
     for (El* c = e->first; c; c = c->next) {
@@ -9478,11 +9818,11 @@ static void PrepareEl(PaintCtx* ctx, El* e, float inheritFont, Rgba inheritFg) {
         ResolveImageReplacement(ctx, e);
     }
 
+    float rem = ctx && ctx->window
+                    ? WindowRemSize(ctx->window)
+                    : RuntimeStyleNow(ctx ? ctx->app : nullptr).fontSize;
     float font =
-        e->style.fontSize > 0
-            ? e->style.fontSize *
-                  (RuntimeStyleNow(ctx ? ctx->app : nullptr).fontSize / 16.f)
-            : inheritFont;
+        e->style.fontSize > 0 ? e->style.fontSize * (rem / 16.f) : inheritFont;
     Rgba fg = e->style.hasColor ? e->style.color : inheritFg;
 
     if (e->style.hasHoverFg && e->clickId && ctx &&
@@ -10490,7 +10830,10 @@ void LayoutEl(PaintCtx* ctx, El* e, float x, float y, float availW,
         LayoutCacheReset(&gMeasureCache);
         lc = &gMeasureCache;
     }
+    bool scratch = lc == &gMeasureCache;
+    gMeasureDepth += scratch ? 1 : 0;
     LayoutElIn(lc, ctx, e, x, y, availW, availH, false, inheritFont, inheritFg);
+    gMeasureDepth -= scratch ? 1 : 0;
 }
 
 Size MeasureEl(PaintCtx* ctx, El* e, float inheritFont, Rgba inheritFg) {
@@ -10499,15 +10842,19 @@ Size MeasureEl(PaintCtx* ctx, El* e, float inheritFont, Rgba inheritFg) {
     }
 
     LayoutCacheReset(&gMeasureCache);
+    gMeasureDepth++;
     LayoutElIn(&gMeasureCache, ctx, e, 0, 0, 0, 0, true, inheritFont,
                inheritFg);
+    gMeasureDepth--;
     return Size{e->w, e->h};
 }
 
 Size MeasureElAtWidth(PaintCtx* ctx, El* e, float width) {
     if (!e) return Size{0, 0};
     LayoutCacheReset(&gMeasureCache);
+    gMeasureDepth++;
     LayoutElIn(&gMeasureCache, ctx, e, 0, 0, width, 0, false, 0, {});
+    gMeasureDepth--;
     return Size{e->w, e->h};
 }
 
@@ -10629,6 +10976,30 @@ static void FillBackground(PaintCtx* ctx, float x, float y, float w, float h,
     PathFree(p);
 }
 
+void CanvasEllipseGradient(PaintCtx* ctx, float cx, float cy, float rx,
+                           float ry, float x0, float y0, float x1, float y1,
+                           Rgba from, Rgba to) {
+    if (rx <= 0 || ry <= 0) {
+        return;
+    }
+    Path* p = PathNew(ctx, true);
+    if (!p) {
+        return;
+    }
+
+    const float k = 0.5522847498f;
+    float kx = rx * k;
+    float ky = ry * k;
+    PathMoveTo(p, cx + rx, cy);
+    PathCubicTo(p, cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
+    PathCubicTo(p, cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
+    PathCubicTo(p, cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
+    PathCubicTo(p, cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
+    PathClose(p);
+    PathFillGradient(ctx, p, x0, y0, x1, y1, from, to);
+    PathFree(p);
+}
+
 static void StrokeCorners(PaintCtx* ctx, float x, float y, float w, float h,
                           const Corners& c, float stroke, Rgba col) {
     if (w <= 0 || h <= 0) {
@@ -10671,12 +11042,7 @@ static void PaintBoxShadow(PaintCtx* ctx, const El* e,
         return;
     }
     int steps = (int)ceilf(blur);
-    if (steps < 2) {
-        steps = 2;
-    }
-    if (steps > 32) {
-        steps = 32;
-    }
+    steps = ClampI(steps, 2, 32);
     float previous = 0;
     for (int i = steps; i >= 0; i--) {
         float distance = blur * (float)i / (float)steps;
@@ -10800,6 +11166,20 @@ void ChartValueDomain(const ChartSeries& c, float* outMin, float* outMax) {
     }
     *outMin = lo > 0 ? 0 : lo;
     *outMax = hi;
+}
+
+void ChartRadarDomain(const ChartSeries& c, float* outMin, float* outMax) {
+    float lo = 0;
+    float hi = 0;
+    ChartValueDomain(c, &lo, &hi);
+
+    *outMin = lo > 0 ? 0 : lo;
+    *outMax = hi < 0 ? 0 : hi;
+}
+
+float ChartRadarFraction(float lo, float hi, float v) {
+    float t = hi > lo ? (v - lo) / (hi - lo) : 0.f;
+    return t < 0 ? 0 : (t > 1 ? 1 : t);
 }
 
 template <typename FX, typename FY>
@@ -10954,7 +11334,8 @@ static void DrawBar(PaintCtx* ctx, const ChartSeries& c, int i, float bx,
         return;
     }
 
-    Str text = fmt("%.0f", (double)c.ys[i]);
+    Str text = c.exact ? ChartFormatValue(GetTempArena(), c.exact[i], true)
+                       : ChartFormatValue(GetTempArena(), c.ys[i]);
     Rgba ink = c.barLabelColors ? c.barLabelColors[i] : th.foreground;
 
     ink = RgbaOpacity(ink, appear);
@@ -11127,37 +11508,21 @@ Rgba ChartBarTooltipColor(const ChartSeries& c, int index) {
     return c.barFills ? c.barFills[index] : c.stroke;
 }
 
-struct ChartTooltipRow {
-    Rgba swatch = {};
-    Str label = {};
-    Str value = {};
-    Rgba valueColor = {};
-    bool hasValueColor = false;
-};
-
-static void PaintChartSeriesTooltip(PaintCtx* ctx, const ChartSeries& c,
-                                    const RuntimeStyle& th, int index, float x,
-                                    float y, float w, float plotH, Point cursor,
-                                    float focus) {
-    Arena* a = GetTempArena();
-    const ChartTooltipContent& content = c.tooltipContent;
-    const float kFont = 12.f;
-    const float kPad = 8.f;
-    const float kSwatch = 8.f;
-    const float kRowGap = 4.f;
-    ChartTooltipRow rows[5] = {};
+static int ChartSeriesTooltipRows(const ChartSeries& c, int index,
+                                  component::ChartTooltipSeriesRow* rows,
+                                  int cap) {
     int nRows = 0;
-    auto addRow = [&](Rgba swatch, Str label, double value) {
-        if (nRows >= 5) {
-            return;
+    auto addRow = [&](Rgba swatch, Str name, double value) {
+        if (nRows < cap) {
+            rows[nRows++] = {swatch, name, value};
         }
-        ChartTooltipRow& row = rows[nRows];
-        row.swatch = swatch;
-        row.label = label;
-        row.value = content.ValueText(a, index, nRows, value);
-        row.hasValueColor =
-            content.ValueColor(index, nRows, value, &row.valueColor);
-        nRows++;
+    };
+
+    auto exactFirst = [&]() {
+        if (c.exact && nRows > 0) {
+            rows[0].value = c.exact[index];
+            rows[0].f64 = true;
+        }
     };
     if (c.kind == ChartKind::Candlestick) {
         double open = c.opens ? c.opens[index] : c.ys[index];
@@ -11171,71 +11536,99 @@ static void PaintChartSeriesTooltip(PaintCtx* ctx, const ChartSeries& c,
         addRow(color, component::Tr("Chart.close"), close);
     } else if (c.kind == ChartKind::Bar) {
         addRow(ChartBarTooltipColor(c, index), c.name, c.ys[index]);
+        exactFirst();
     } else {
         addRow(c.stroke, c.name, c.ys[index]);
+        exactFirst();
         for (int k = 0; k < c.nMore; k++) {
             if (c.more[k].ys) {
                 addRow(c.more[k].stroke, c.more[k].name, c.more[k].ys[index]);
             }
         }
     }
-    Str title = {};
-    Str own = c.labels ? Str(c.labels[index]) : Str(fmt("%d", index));
-    bool hasTitle = content.TitleText(a, index, own, true, &title);
+    return nRows;
+}
 
-    Size titleSz = hasTitle ? MeasureText(ctx, title, kFont, 240) : Size{};
-    float innerW = titleSz.w;
-    float innerH = hasTitle ? titleSz.h : 0.f;
-    float rowH[5] = {};
-    float labelW[5] = {};
-    float valueW[5] = {};
-    for (int k = 0; k < nRows; k++) {
-        Size label = rows[k].label.s
-                         ? MeasureText(ctx, rows[k].label, kFont, 240)
-                         : Size{};
-        Size value = MeasureText(ctx, rows[k].value, kFont, 240);
-        labelW[k] = label.w;
-        valueW[k] = value.w;
-        rowH[k] = label.h > value.h ? label.h : value.h;
-        float rowW = kSwatch + 6.f + label.w + 12.f + value.w;
-        innerW = rowW > innerW ? rowW : innerW;
-        innerH += (innerH > 0 ? kRowGap : 0.f) + rowH[k];
+Str PaintIdChainDebug(Arena* a, const PaintIdLink* chain) {
+    const PaintIdLink* ids[64];
+    int n = 0;
+    for (const PaintIdLink* l = chain; l && n < 64; l = l->parent) {
+        ids[n++] = l;
     }
-    float boxW = innerW + kPad * 2;
-    if (boxW < 150.f) {
-        boxW = 150.f;
-    }
-    innerW = boxW - kPad * 2;
-    float boxH = innerH + kPad * 2;
-    Point at =
-        component::PlotTooltipPlace(cursor, {w, plotH}, {boxW, boxH}, 8.f);
-    float bx = x + at.x;
-    float by = y + at.y;
-    FillRound(ctx, bx, by, boxW, boxH, 6.f, RgbaOpacity(th.background, focus));
-    DrawRoundStroke(ctx, bx, by, boxW, boxH, 6.f, 1.f,
-                    RgbaOpacity(th.border, focus));
-    float rowY = by + kPad;
-    if (hasTitle) {
-        DrawTextAt(ctx, title, bx + kPad, rowY, innerW, titleSz.h, kFont,
-                   RgbaOpacity(th.foreground, focus), false, false, -1.f,
-                   kFontWeightSemibold);
-        rowY += titleSz.h + kRowGap;
-    }
-    for (int k = 0; k < nRows; k++) {
-        const ChartTooltipRow& row = rows[k];
-        FillRound(ctx, bx + kPad, rowY + (rowH[k] - kSwatch) * 0.5f, kSwatch,
-                  kSwatch, th.radius * .5f, RgbaOpacity(row.swatch, focus));
-        if (row.label.s) {
-            DrawTextAt(ctx, row.label, bx + kPad + kSwatch + 6.f, rowY,
-                       labelW[k], rowH[k], kFont,
-                       RgbaOpacity(th.mutedForeground, focus), false);
+    StrBuilder b(a);
+    b.Append(StrL("GlobalElementId(["));
+    for (int i = n - 1; i >= 0; i--) {
+        if (ids[i]->view.IsValid()) {
+
+            b.Append(Str(fmt("View(EntityId(%dv%u))", ids[i]->view.index,
+                             ids[i]->view.gen)));
+        } else {
+
+            Str id = ids[i]->id;
+            int nameLen = 0;
+            int kind = ElementIdKindOf(id, &nameLen);
+            if (kind == 1) {
+                b.Append(StrL("Integer("));
+                b.Append(id);
+                b.Append(StrL(")"));
+            } else if (kind == 2 && nameLen < len(id)) {
+                b.Append(StrL("NamedInteger(\""));
+                b.Append(Str{id.s, nameLen});
+                b.Append(StrL("\", "));
+                b.Append(Str{id.s + nameLen + 1, len(id) - nameLen - 1});
+                b.Append(StrL(")"));
+            } else {
+                b.Append(StrL("Name(\""));
+                b.Append(id);
+                b.Append(StrL("\")"));
+            }
         }
-        Rgba ink = row.hasValueColor ? row.valueColor : th.foreground;
-        DrawTextAt(ctx, row.value, bx + boxW - kPad - valueW[k], rowY,
-                   valueW[k], rowH[k], kFont, RgbaOpacity(ink, focus), false);
-        rowY += rowH[k] + kRowGap;
+        if (i > 0) {
+            b.Append(StrL(", "));
+        }
+    }
+    b.Append(StrL("])"));
+    return b.TakeStr();
+}
+
+#ifndef NDEBUG
+
+static void PaintDebugInfo(PaintCtx* ctx, const El* e) {
+    if (!e->debug && ctx->debugBelow == 0) {
+        return;
+    }
+    Window* win = ctx->window;
+    if (!win || win->lastInputKeyboard || !e->pathId) {
+        return;
+    }
+    bool hovered = false;
+    for (int i = 0; i < win->debugHoveredPaths.len && !hovered; i++) {
+        hovered = win->debugHoveredPaths[i] == e->pathId;
+    }
+    if (!hovered) {
+        return;
+    }
+    const float kFontSize = 10.f;
+    Str text = PaintIdChainDebug(GetTempArena(), ctx->idChain);
+    Size size = MeasureText(ctx, text, kFontSize, 100000.f);
+    CanvasFillRect(ctx, e->x, e->y, size.w, kFontSize, Rgb(255, 255, 255));
+    DrawTextAt(ctx, text, e->x, e->y, size.w, kFontSize, kFontSize,
+               Rgb(255, 0, 0), false, false, -1.f, 0, kFontSize);
+    win->debugLabelShown = true;
+
+    Bounds textBounds = {e->x, e->y, size.w, kFontSize};
+    if (e->sourceFile && win->modifiers.Secondary() &&
+        textBounds.Contains({ctx->mouseX, ctx->mouseY})) {
+        CanvasFillRect(ctx, e->x, e->y + kFontSize - 2.f, size.w, 1.f,
+                       Rgb(255, 0, 0));
+        win->hasDebugSource = true;
+        win->debugSourceBounds = textBounds;
+        win->debugSourceFile = e->sourceFile;
+        win->debugSourceLine = e->sourceLine;
+        win->debugSourceColumn = e->sourceColumn;
     }
 }
+#endif
 
 static void DrawChart(PaintCtx* ctx, El* e) {
     const RuntimeStyle& th = RuntimeStyleNow(ctx->app);
@@ -11345,20 +11738,13 @@ static void DrawChart(PaintCtx* ctx, El* e) {
         }
         float lo = 0;
         float hi = 0;
-        ChartValueDomain(c, &lo, &hi);
+        ChartRadarDomain(c, &lo, &hi);
         float cx = x + w * 0.5f;
         float cy = y + h * 0.5f;
 
         float radius = h * 0.4f;
         if (c.radarRadius > 0) {
             radius = c.radarRadius;
-        }
-
-        if (lo > 0) {
-            lo = 0;
-        }
-        if (hi < 0) {
-            hi = 0;
         }
         if (radius < 8) {
             return;
@@ -11391,40 +11777,43 @@ static void DrawChart(PaintCtx* ctx, El* e) {
                      1.f, th.chartGrid);
         }
 
-        Path* shape = PathNew(ctx, true);
-        if (shape) {
-            for (int i = 0; i < n; i++) {
-                float t = hi > lo ? (ys[i] - lo) / (hi - lo) : 0.f;
-                if (t < 0) {
-                    t = 0;
-                }
-                if (t > 1) {
-                    t = 1;
-                }
-                t *= appearProgress;
-                float a = -1.5707963f + 6.2831853f * (float)i / (float)n;
-                float px = cx + radius * t * cosf(a);
-                float py = cy + radius * t * sinf(a);
-                if (i == 0) {
-                    PathMoveTo(shape, px, py);
-                } else {
-                    PathLineTo(shape, px, py);
-                }
+        for (int k = 0; k <= c.nMore; k++) {
+            const float* vs = k == 0 ? ys : c.more[k - 1].ys;
+            if (!vs) {
+                continue;
             }
-            PathClose(shape);
-            PathFill(ctx, shape, c.fillTop);
-            PathStroke(ctx, shape, 2.f, c.stroke);
-            PathFree(shape);
-        }
-
-        if (c.dot) {
-            for (int i = 0; i < n; i++) {
-                float t = hi > lo ? (ys[i] - lo) / (hi - lo) : 0.f;
-                t = (t < 0 ? 0 : (t > 1 ? 1 : t)) * appearProgress;
-                float a = -1.5707963f + 6.2831853f * (float)i / (float)n;
-                float px = cx + radius * t * cosf(a);
-                float py = cy + radius * t * sinf(a);
-                FillRound(ctx, px - 3.f, py - 3.f, 6.f, 6.f, 3.f, c.stroke);
+            Rgba stroke = k == 0 ? c.stroke : c.more[k - 1].stroke;
+            Rgba fill = k == 0 ? c.fillTop : c.more[k - 1].fillTop;
+            Path* shape = PathNew(ctx, true);
+            if (shape) {
+                for (int i = 0; i < n; i++) {
+                    float t =
+                        ChartRadarFraction(lo, hi, vs[i]) * appearProgress;
+                    float a = -1.5707963f + 6.2831853f * (float)i / (float)n;
+                    float px = cx + radius * t * cosf(a);
+                    float py = cy + radius * t * sinf(a);
+                    if (i == 0) {
+                        PathMoveTo(shape, px, py);
+                    } else {
+                        PathLineTo(shape, px, py);
+                    }
+                }
+                PathClose(shape);
+                PathFill(ctx, shape, fill);
+                PathStroke(ctx, shape, 2.f, stroke);
+                PathFree(shape);
+            }
+            if (c.dot) {
+                const float kDot = 8.f;
+                for (int i = 0; i < n; i++) {
+                    float t =
+                        ChartRadarFraction(lo, hi, vs[i]) * appearProgress;
+                    float a = -1.5707963f + 6.2831853f * (float)i / (float)n;
+                    float px = cx + radius * t * cosf(a);
+                    float py = cy + radius * t * sinf(a);
+                    FillRound(ctx, px - kDot * 0.5f, py - kDot * 0.5f, kDot,
+                              kDot, kDot * 0.5f, stroke);
+                }
             }
         }
         if (c.labels && !c.overlay) {
@@ -11447,6 +11836,7 @@ static void DrawChart(PaintCtx* ctx, El* e) {
                            th.mutedForeground, false);
             }
         }
+
         return;
     }
 
@@ -11558,12 +11948,7 @@ static void DrawChart(PaintCtx* ctx, El* e) {
             return y + at;
         }
         float t = hi > lo ? (v - lo) / (hi - lo) : 0.f;
-        if (t < 0) {
-            t = 0;
-        }
-        if (t > 1) {
-            t = 1;
-        }
+        t = ClampF(t, 0, 1);
         return y + 10.f + (1.f - t) * (plotH - 10.f);
     };
 
@@ -11744,12 +12129,7 @@ static void DrawChart(PaintCtx* ctx, El* e) {
                 float step = pointRange[1] / (float)(n - 1);
                 float t = n > 1 && step > 0 ? (ctx->mouseX - x) / step : 0.f;
                 index = (int)lroundf(t);
-                if (index < 0) {
-                    index = 0;
-                }
-                if (index > n - 1) {
-                    index = n - 1;
-                }
+                index = ClampI(index, 0, n - 1);
                 lineX = Xat(index);
             }
         }
@@ -11784,12 +12164,7 @@ static void DrawChart(PaintCtx* ctx, El* e) {
             if (show) {
                 focus = hover.Progress();
                 index = hover.State().index;
-                if (index < 0) {
-                    index = 0;
-                }
-                if (index > n - 1) {
-                    index = n - 1;
-                }
+                index = ClampI(index, 0, n - 1);
                 lineX = x + hover.State().crossLine.x;
                 if (hover.State().dotCount > 0 && hover.State().dots) {
                     lineX = x + hover.State().dots[0].x;
@@ -11819,65 +12194,70 @@ static void DrawChart(PaintCtx* ctx, El* e) {
             for (int k = 0; held.dots && k < held.dotCount && k < nDotAt; k++) {
                 dotAt[k] = {x + held.dots[k].x, y + held.dots[k].y};
             }
-            float drawX = targetX;
-            if (ctx->window && ctx->app) {
+            if (ctx->window && ctx->window->frameArena) {
 
-                Spring policy = plot::PointerSpring(ctx->app)
-                                    .WithTravel(!hover.IsEntering());
-                drawX = motion::spring(
-                    &hoverCx,
-                    motion::TransitionId(StrL("__plot-hover"),
-                                         bandHover ? StrL("band") : StrL("x")),
-                    targetX, policy);
-                for (int k = 0; !bandHover && k < nDotAt; k++) {
-                    dotAt[k].x = motion::spring(
-                        &hoverCx,
-                        motion::TransitionId(StrL("__plot-hover-dot-x"),
-                                             Str(fmt("%d", k))),
-                        dotAt[k].x, policy);
-                    dotAt[k].y = motion::spring(
-                        &hoverCx,
-                        motion::TransitionId(StrL("__plot-hover-dot-y"),
-                                             Str(fmt("%d", k))),
-                        dotAt[k].y, policy);
+                Ctx buildCx = hoverCx;
+                buildCx.a = ctx->window->frameArena;
+                component::plot::Tooltip* overlay =
+                    component::plot::Tooltip::New(&buildCx, lingerCursor,
+                                                  {w, plotH})
+                        ->Gap(8)
+                        ->Progress(focus);
+                if (bandHover) {
+                    const float range[2] = {0.f, w};
+                    component::ScaleBand band =
+                        component::ScaleBand::New(n, range, 2)
+                            .BandCount(c.bandCount)
+                            .MaxBandWidth(c.maxBandWidth);
+                    band.paddingInner = c.bandPadding;
+                    band.paddingOuter = c.bandPaddingOuter;
+                    float bandX = targetX - x;
+                    if (c.kind == ChartKind::Bar) {
+
+                        Spring policy = plot::PointerSpring(ctx->app)
+                                            .WithTravel(!hover.IsEntering());
+                        bandX = motion::spring(
+                                    &hoverCx,
+                                    motion::TransitionId(StrL("__plot-hover"),
+                                                         StrL("band")),
+                                    targetX, policy) -
+                                x;
+                        overlay->Glide(false);
+                    }
+                    component::plot::CrossLine cross =
+                        component::plot::CrossLine::New({bandX, 0});
+                    cross.Span(0, plotH)->Band(band.BandWidth());
+                    overlay->Cross(cross);
+                } else {
+
+                    component::plot::CrossLine cross =
+                        component::plot::CrossLine::New(
+                            {targetX - x, held.crossLine.y});
+                    cross.Height(plotH);
+                    overlay->Cross(cross);
+                    component::plot::Dot dots[5];
+                    for (int k = 0; k < nDotAt; k++) {
+                        dots[k] = component::plot::Dot::New(
+                            {dotAt[k].x - x, dotAt[k].y - y});
+                        dots[k]
+                            .Size(component::kChartHoverDotSize)
+                            ->Halo(component::kChartHoverHaloSize)
+                            ->Stroke(th.background)
+                            ->Fill(dotInk[k]);
+                    }
+                    overlay->Dots(dots, nDotAt);
                 }
+                component::ChartTooltipSeriesRow rows[5] = {};
+                int nRows = ChartSeriesTooltipRows(c, index, rows, 5);
+                Str own = c.labels ? Str(c.labels[index])
+                                   : StrDup(buildCx.a, Str(fmt("%d", index)));
+                component::ChartTooltipApply(c.tooltipContent, overlay,
+                                             c.tooltipContent
+                                                 .Datum(index, c.ys),
+                                             own, true, rows, nRows);
+                component::plot::PlotOverlayAttach(ctx, e, {x, y, w, plotH},
+                                                   overlay->IntoEl());
             }
-            const float kCrossDash[2] = {4.f, 3.f};
-            Rgba hair =
-                RgbaOpacity(RgbaMixHsl(th.border, th.foreground, 0.8f), focus);
-            if (bandHover) {
-                const float range[2] = {0.f, w};
-                component::ScaleBand band =
-                    component::ScaleBand::New(n, range, 2)
-                        .BandCount(c.bandCount)
-                        .MaxBandWidth(c.maxBandWidth);
-                band.paddingInner = c.bandPadding;
-                band.paddingOuter = c.bandPaddingOuter;
-                float bw = band.BandWidth();
-                CanvasFillRect(ctx, drawX - bw * 0.5f, y, bw, plotH,
-                               RgbaOpacity(th.foreground, 0.08f * focus));
-            } else {
-                CanvasLine(ctx, drawX, y, drawX, y + plotH, 1.f, hair,
-                           kCrossDash);
-
-                float halo = component::kChartHoverHaloSize * focus;
-                if (halo > 0) {
-                    FillRound(ctx, dotAt[0].x - halo * 0.5f,
-                              dotAt[0].y - halo * 0.5f, halo, halo, halo * 0.5f,
-                              RgbaOpacity(c.stroke, 0.2f * focus));
-                }
-                float ds = component::kChartHoverDotSize;
-                for (int k = 0; k < nDotAt; k++) {
-                    float dx = dotAt[k].x - ds * 0.5f;
-                    float dy = dotAt[k].y - ds * 0.5f;
-                    FillRound(ctx, dx, dy, ds, ds, ds * 0.5f, dotInk[k]);
-                    DrawRoundStroke(ctx, dx, dy, ds, ds, ds * 0.5f, 1.f,
-                                    th.background);
-                }
-            }
-
-            PaintChartSeriesTooltip(ctx, c, th, index, x, y, w, plotH,
-                                    lingerCursor, focus);
         }
     }
 
@@ -12169,11 +12549,13 @@ static void PaintCaretAt(PaintCtx* ctx, El* e, float font, int off,
     if (primary && e->caretOutY) {
         *e->caretOutY = y + h;
     }
-    CanvasFillRect(ctx, x, y, e->caretW, h, e->caretColor);
+    if (e->caretColor.a != 0) {
+        CanvasFillRect(ctx, x, y, e->caretW, h, e->caretColor);
+    }
 }
 
 static void PaintCaret(PaintCtx* ctx, El* e, float font) {
-    if (e->caretColor.a == 0) {
+    if (e->caretColor.a == 0 && !e->caretOutX && !e->caretOutY) {
         return;
     }
     if (e->caretOff >= 0) {
@@ -12322,6 +12704,16 @@ static void PaintElBorder(PaintCtx* ctx, El* e) {
 
 static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay);
 
+static int ElSelectionScope(PaintCtx* ctx, const El* e) {
+    Window* win = ctx ? ctx->window : nullptr;
+    if (win && win->textSelectionScopes.len > 0) {
+        uint64_t raw =
+            win->textSelectionScopes[win->textSelectionScopes.len - 1];
+        return (int)(raw & 0x7fffffffU);
+    }
+    return e->style.trapId;
+}
+
 static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
     if (!e || !ctx) {
         return;
@@ -12345,6 +12737,37 @@ static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
         (void)WindowPlotAppearScopeToken(ctx->window, e->plotAppearScope);
         VecAppend(ctx->window->plotAppearScopes, e->plotAppearScope);
     }
+
+    bool selectionScope = e->selectionScope != 0 && ctx->window;
+    if (selectionScope) {
+        VecAppend(ctx->window->textSelectionScopes, e->selectionScope);
+    }
+#ifndef NDEBUG
+
+    if (e->debugBelow) {
+        ctx->debugBelow++;
+    }
+
+    const PaintIdLink* outerIdChain = ctx->idChain;
+    PaintIdLink viewLink;
+    if (ctx->window) {
+        const Vec<Window::DebugViewRoot>& views = ctx->window->debugViewRoots;
+        for (int i = 0; i < views.len; i++) {
+            if (views[i].el == e) {
+                viewLink.view = views[i].view;
+                viewLink.parent = ctx->idChain;
+                ctx->idChain = &viewLink;
+                break;
+            }
+        }
+    }
+    PaintIdLink idLink;
+    if (e->id.s) {
+        idLink.id = e->id;
+        idLink.parent = ctx->idChain;
+        ctx->idChain = &idLink;
+    }
+#endif
     if (e->style.opacity >= 1.f) {
         PaintElNodeInner(ctx, e, skipOverlay);
     } else {
@@ -12353,15 +12776,24 @@ static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
         PaintElNodeInner(ctx, e, skipOverlay);
         ctx->opacity = prev;
     }
+#ifndef NDEBUG
+    if (e->debugBelow) {
+        ctx->debugBelow--;
+    }
+    ctx->idChain = outerIdChain;
+#endif
     if (appearScope) {
         ctx->window->plotAppearScopes.len--;
+    }
+    if (selectionScope) {
+        ctx->window->textSelectionScopes.len--;
     }
     ctx->groupHovered = prevGroup;
     scene::ContextPop(ctx, parentContext);
 }
 
 static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
-    if (!e || !ctx->rt) {
+    if (!e || (!ctx->rt && !ctx->headless)) {
         return;
     }
 
@@ -12418,17 +12850,20 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
     }
 
     int outerHitParent = ctx->hitParent;
-    if (e->clickId || e->onClick.IsValid() || e->listener.IsValid() ||
+    bool hasHitbox =
+        e->clickId || e->onClick.IsValid() || e->listener.IsValid() ||
         e->clickAction || e->onHover.IsValid() || e->onMouseMove.IsValid() ||
         e->onMouseDown.IsValid() || e->onMouseUp.IsValid() ||
         e->onDragMove.IsValid() || e->onMouseDownOut.IsValid() ||
         e->onMouseUpOut.IsValid() || e->onScrollWheel.IsValid() ||
         e->drag.IsValid() || e->onDrop.IsValid() ||
         e->cursor != CursorKind::Arrow || e->slider || e->stopMouseDown ||
-        e->suppressTextSelection || e->scrollMaskAxes) {
+        e->suppressTextSelection || e->scrollMaskAxes;
+    if (hasHitbox) {
         HitRect hr;
         hr.id = e->clickId;
         hr.focusId = e->style.focusId;
+        hr.pathId = e->pathId;
         hr.bounds = maskedBounds;
         hr.onClick = e->onClick;
         hr.clickAction = e->clickAction;
@@ -12439,6 +12874,7 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         hr.onMouseMove = e->onMouseMove;
         hr.tooltip = e->style.tooltip;
         hr.tooltipPlacement = e->style.tooltipPlacement;
+        hr.rootTooltip = e->rootTooltip;
         hr.onMouseDown = e->onMouseDown;
         hr.onMouseUp = e->onMouseUp;
         hr.mouseDownPhase = e->mouseDownPhase;
@@ -12495,12 +12931,25 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         VecAppend(ctx->scrolls, sr);
     }
 
-    bool focused = e->style.focusId && e->style.focusId == ctx->focusId &&
-                   e->style.focusRing;
+    bool focused =
+        e->style.focusId && e->style.focusRing && ctx->focusId &&
+        (e->style.focusId == ctx->focusId ||
+         WindowFocusContains(ctx->window, e->style.focusId, ctx->focusId));
     if (focused) {
         e->style.borderColor = RuntimeStyleNow(ctx->app).ring;
     }
 
+#ifndef NDEBUG
+
+    if (e->debug || ctx->debugBelow > 0) {
+        Rgba red = Rgb(255, 0, 0);
+        Bounds b = e->Bounds();
+        CanvasFillRect(ctx, b.x, b.y, b.w, 1.f, red);
+        CanvasFillRect(ctx, b.x, b.y + b.h - 1.f, b.w, 1.f, red);
+        CanvasFillRect(ctx, b.x, b.y, 1.f, b.h, red);
+        CanvasFillRect(ctx, b.x + b.w - 1.f, b.y, 1.f, b.h, red);
+    }
+#endif
     BoxFill fill = BoxFillFor(e->style.hasActiveBg, e->style.hasHoverBg,
                               e->clickId, ctx->activeId, ctx->hoverId);
 
@@ -12595,7 +13044,7 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         th.map = e->selMap;
         th.join = e->selJoin;
         th.atom = true;
-        th.scope = e->style.trapId;
+        th.scope = ElSelectionScope(ctx, e);
         th.paintLayer = ctx->paintLayer;
         VecAppend(ctx->texts, th);
         ctx->textDocLen += 1;
@@ -12627,13 +13076,14 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
             th.map = e->selMap;
             th.join = e->selJoin;
 
-            th.scope = e->style.trapId;
+            th.scope = ElSelectionScope(ctx, e);
             th.paintLayer = ctx->paintLayer;
             VecAppend(ctx->texts, th);
             ctx->textDocLen += len(e->text) + 1;
             int a = ctx->selA;
             int b = ctx->selB;
-            if (ctx->selScope >= 0 && ctx->selScope != e->style.trapId) {
+            if (ctx->selScope >= 0 &&
+                ctx->selScope != ElSelectionScope(ctx, e)) {
                 a = -1;
                 b = -1;
             }
@@ -12687,11 +13137,12 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
                 if (parts[p].hi <= w.lo) {
                     continue;
                 }
-                PaintTextRange(
-                    ctx, e->text, font, e->laidMaxW > 0 ? e->laidMaxW : e->w,
-                    e->style.wrap, ElTextWeight(e), e->style.lineHeight, e->x,
-                    e->y, std::max(parts[p].lo, w.lo), parts[p].hi, parts[p].bg,
-                    ElTextAlign(e));
+                auto paint =
+                    e->glyphWashes ? &PaintTextRangeBoxes : &PaintTextRange;
+                paint(ctx, e->text, font, e->laidMaxW > 0 ? e->laidMaxW : e->w,
+                      e->style.wrap, ElTextWeight(e), e->style.lineHeight, e->x,
+                      e->y, std::max(parts[p].lo, w.lo), parts[p].hi,
+                      parts[p].bg, ElTextAlign(e));
             }
         }
         if (lo >= 0 && hi > lo) {
@@ -12877,6 +13328,11 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
     if (e->customPaint) {
         e->customPaint(ctx, e, e->customUser);
     }
+#ifndef NDEBUG
+    if (hasHitbox && e->id.s) {
+        PaintDebugInfo(ctx, e);
+    }
+#endif
 
     ctx->paintDepth++;
     bool pushed =
@@ -13089,7 +13545,9 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         Rgba color = RuntimeStyleNow(ctx->app).ring;
         float inset = 0;
         if ((FocusLine)e->style.focusLine == FocusLine::Inside) {
-            color = RgbaOpacity(e->style.color, kFocusLineOpacity);
+            color = e->style.hasFocusLineColor
+                        ? e->style.focusLineColor
+                        : RgbaOpacity(e->style.color, kFocusLineOpacity);
             inset = kFocusLineGap;
         } else if ((FocusLine)e->style.focusLine == FocusLine::Outside) {
             inset = -kFocusLineGap;
@@ -13243,12 +13701,7 @@ static int TextHitLocal(PaintCtx* ctx, const TextHit* h, Point rel) {
     int local =
         TextIndexAt(ctx, h->text, h->font, h->maxW > 0 ? h->maxW : h->bounds.w,
                     h->wrap, rel.x, rel.y, false, 0, h->align);
-    if (local < 0) {
-        local = 0;
-    }
-    if (local > len(h->text)) {
-        local = len(h->text);
-    }
+    local = ClampI(local, 0, len(h->text));
     return local;
 }
 
@@ -13531,6 +13984,10 @@ static void CollectFocus(El* e, Window* win, int trap, Listener increment,
     if (e->style.trapId) {
         trap = e->style.trapId;
     }
+
+    if (e->selectable && trap) {
+        e->style.trapId = trap;
+    }
     if (e->accessibilityIncrement.IsValid()) {
         increment = e->accessibilityIncrement;
     }
@@ -13566,6 +14023,9 @@ static void CollectFocus(El* e, Window* win, int trap, Listener increment,
         fr.tabIndex = e->style.tabIndex;
         fr.tabStop = e->style.tabStop;
         fr.focusOnPress = e->style.focusOnPress;
+        if (e->input && e->input->focus.id == e->style.focusId) {
+            fr.input = e->input;
+        }
 
         DispatchNode marker;
         marker.depth = depth;
@@ -13769,7 +14229,7 @@ bool WindowDispatchKeyCaptureEvent(Window* win, KeyEvent* ev) {
 
 uint32_t WindowResolveKeyAction(Window* win, int vk, bool shift, bool ctrl,
                                 bool alt, bool platform, bool function,
-                                intptr_t* arg, bool* pending) {
+                                int64_t* arg, bool* pending) {
     if (arg) {
         *arg = 0;
     }
@@ -13814,7 +14274,7 @@ uint32_t WindowResolveKeyAction(Window* win, int vk, bool shift, bool ctrl,
 
 bool WindowDispatchKeyAction(Window* win, int vk, bool shift, bool ctrl,
                              bool alt, bool platform, bool function) {
-    intptr_t arg = 0;
+    int64_t arg = 0;
     bool pending = false;
     uint32_t action = WindowResolveKeyAction(
         win, vk, shift, ctrl, alt, platform, function, &arg, &pending);
@@ -13828,7 +14288,7 @@ bool WindowDispatchKeyAction(Window* win, int vk, bool shift, bool ctrl,
 }
 
 static bool WindowDispatchActionFrom(Window* win, int ix, uint32_t action,
-                                     intptr_t arg) {
+                                     int64_t arg) {
 
     for (int i = ix - 1; i >= 0; i--) {
         if (win->dispatch[i].subtreeEnd <= ix ||
@@ -13861,7 +14321,7 @@ static bool WindowDispatchActionFrom(Window* win, int ix, uint32_t action,
     return false;
 }
 
-bool WindowDispatchAction(Window* win, uint32_t action, intptr_t arg) {
+bool WindowDispatchAction(Window* win, uint32_t action, int64_t arg) {
     if (!win || !action) {
         return false;
     }
@@ -13869,7 +14329,7 @@ bool WindowDispatchAction(Window* win, uint32_t action, intptr_t arg) {
 }
 
 bool WindowDispatchActionAtFocus(Window* win, FocusHandle focus,
-                                 uint32_t action, intptr_t arg) {
+                                 uint32_t action, int64_t arg) {
     if (!win || !action) {
         return false;
     }
@@ -13983,6 +14443,15 @@ void IdsCollect(El* root) {
     IdCollect(root, 0);
     if (IdCheckOn()) {
         IdCheck(root);
+    }
+}
+
+void IdsCollectChildren(El* e) {
+    if (!e) {
+        return;
+    }
+    for (El* c = e->first; c; c = c->next) {
+        IdCollect(c, e->pathId);
     }
 }
 
@@ -14173,6 +14642,10 @@ static void AccessibilityCollectNode(El* e, Vec<AccessibilityNode>* out,
         }
         node.clickId = e->clickId;
         node.focusId = e->style.focusId;
+
+        if (e->input && e->input->focus.IsValid()) {
+            node.focusId = e->input->focus.id;
+        }
         node.onClick = e->onClick;
         node.listener = e->listener;
         node.accessibilityDefault = e->accessibilityDefault;
@@ -14282,6 +14755,22 @@ static void WindowFireBlur(Window* win, int was) {
     }
 }
 
+static void WindowSyncFocusedInput(Window* win, int id) {
+    if (win->input && win->input->focus.id != id) {
+        InputBlur(win->input, win->app, win);
+    }
+    if (!id || win->input) {
+        return;
+    }
+    for (int i = 0; i < win->focusEls.len; i++) {
+        InputState* s = win->focusEls[i].input;
+        if (win->focusEls[i].id == id && s && !s->disabled) {
+            InputFocus(s, win->app, win);
+            return;
+        }
+    }
+}
+
 void WindowSetFocusId(Window* win, int id) {
     if (!win || win->focusId == id) {
         return;
@@ -14292,6 +14781,7 @@ void WindowSetFocusId(Window* win, int id) {
     win->focusGen++;
     PlatAccessibilityFocusChanged(win, id);
     WindowFireBlur(win, was);
+    WindowSyncFocusedInput(win, id);
 }
 
 Subscription WindowOnBlur(Window* win, FocusHandle h, Listener handler) {
@@ -14333,6 +14823,11 @@ FocusHandle FocusHandleNew(Ctx* cx) {
 bool FocusHandleIsFocused(const Window* win, FocusHandle h) {
     return win && h.IsValid() && win->focusId == h.id;
 }
+bool FocusHandleContains(const Window* win, FocusHandle outer,
+                         FocusHandle inner) {
+    return outer.IsValid() && inner.IsValid() &&
+           WindowFocusContains(win, outer.id, inner.id);
+}
 bool FocusHandleContainsFocused(const Window* win, FocusHandle h) {
     return h.IsValid() && WindowFocusWithin(win, h.id);
 }
@@ -14354,19 +14849,39 @@ int WindowFocusedId(const Window* win) {
     return win ? win->focusId : 0;
 }
 
-bool WindowFocusWithin(const Window* win, int id) {
-    if (!win || !id) {
+bool WindowFocusContains(const Window* win, int outer, int inner) {
+    if (!win || !outer || !inner) {
         return false;
     }
-    if (win->focusId == id) {
+    if (outer == inner) {
         return true;
     }
     for (int i = 0; i < win->focusEls.len; i++) {
-        if (win->focusEls[i].id == win->focusId) {
-            return win->focusEls[i].trapId == id;
+        const FocusRect& in = win->focusEls[i];
+        if (in.id != inner) {
+            continue;
+        }
+
+        if (in.trapId == outer) {
+            return true;
+        }
+        for (int j = 0; j < win->focusEls.len; j++) {
+            const FocusRect& out = win->focusEls[j];
+
+            if (out.id != outer || out.dispatchIx >= win->dispatch.len) {
+                continue;
+            }
+            int end = win->dispatch[out.dispatchIx].subtreeEnd;
+            if (out.dispatchIx < in.dispatchIx && in.dispatchIx < end) {
+                return true;
+            }
         }
     }
     return false;
+}
+
+bool WindowFocusWithin(const Window* win, int id) {
+    return win && WindowFocusContains(win, id, win->focusId);
 }
 
 bool WindowRestoreFocus(Window* win, int id) {
@@ -14382,32 +14897,12 @@ bool WindowRestoreFocus(Window* win, int id) {
     return false;
 }
 
-static bool FocusIsLastOfItsHandle(const Window* win, int i) {
-    for (int j = i + 1; j < win->focusEls.len; j++) {
-        if (win->focusEls[j].id == win->focusEls[i].id) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool FocusHandleIsTabStop(const Window* win, int id) {
-    for (int i = 0; i < win->focusEls.len; i++) {
-        if (win->focusEls[i].id == id) {
-            return win->focusEls[i].tabStop;
-        }
-    }
-    return false;
-}
-
-int FocusNext(Window* win, int trapId, bool backward) {
+static bool FocusNextStop(const Window* win, int fromId, int trapId,
+                          bool backward, int* out) {
     int n = win->focusEls.len;
-    if (n == 0) {
-        return 0;
-    }
     int cur = -1;
     for (int i = 0; i < n; i++) {
-        if (win->focusEls[i].id == win->focusId) {
+        if (win->focusEls[i].id == fromId) {
             cur = i;
         }
     }
@@ -14415,10 +14910,7 @@ int FocusNext(Window* win, int trapId, bool backward) {
     int i = cur;
     for (int k = 0; k < n; k++) {
         i = (i + step + n) % n;
-        if (!FocusIsLastOfItsHandle(win, i)) {
-            continue;
-        }
-        if (!FocusHandleIsTabStop(win, win->focusEls[i].id)) {
+        if (!win->focusEls[i].tabStop) {
 
             continue;
         }
@@ -14434,10 +14926,29 @@ int FocusNext(Window* win, int trapId, bool backward) {
                 continue;
             }
         }
-        WindowSetFocusId(win, win->focusEls[i].id);
-        return win->focusId;
+        *out = win->focusEls[i].id;
+        return true;
+    }
+    return false;
+}
+
+int FocusNext(Window* win, int trapId, bool backward) {
+    if (win->focusEls.len == 0) {
+        return 0;
+    }
+    int next = 0;
+    if (FocusNextStop(win, win->focusId, trapId, backward, &next)) {
+        WindowSetFocusId(win, next);
     }
     return win->focusId;
+}
+
+int FocusNextFrom(const Window* win, int fromId, int trapId, bool backward) {
+    int next = fromId;
+    if (win) {
+        FocusNextStop(win, fromId, trapId, backward, &next);
+    }
+    return next;
 }
 }
 
@@ -15898,7 +16409,7 @@ struct BoundKey {
     KeyChord strokes[kMaxStrokes] = {};
     int nStrokes = 0;
     uint32_t action = 0;
-    intptr_t arg = 0;
+    int64_t arg = 0;
     int pred = -1;
 };
 
@@ -16037,7 +16548,7 @@ static bool BindingApplies(const BoundKey& b, const CtxLevel* levels, int n) {
 }
 
 static uint32_t MatchIn(const CtxLevel* levels, int n, bool* pending,
-                        intptr_t* arg) {
+                        int64_t* arg) {
     for (int i = gNBindings - 1; i >= 0; i--) {
         const BoundKey& b = gBindings[i];
         if (!BindingApplies(b, levels, n) || b.nStrokes < gNPending) {
@@ -16064,7 +16575,7 @@ static uint32_t MatchIn(const CtxLevel* levels, int n, bool* pending,
 }
 
 static uint32_t MatchStack(const CtxLevel* levels, int n, bool* pending,
-                           intptr_t* arg) {
+                           int64_t* arg) {
     for (int lvl = 0; lvl < n; lvl++) {
         uint32_t action = MatchIn(levels + lvl, n - lvl, pending, arg);
         if (action) {
@@ -16211,6 +16722,8 @@ enum PrimKind : uint8_t {
     kPPathFill,
     kPPathGradient,
     kPPathStroke,
+
+    kPPathStrokeGradient,
     kPImage,
     kPText,
     kPTextSpans
@@ -16901,6 +17414,26 @@ void RecPathStroke(PaintCtx* ctx, Path* p, float stroke, Rgba c,
     }
 }
 
+void RecPathStrokeGradient(PaintCtx* ctx, Path* p, float stroke, float x0,
+                           float y0, float x1, float y1, Rgba from, Rgba to,
+                           bool roundCaps) {
+    Prim* prim =
+        EmitPath(ctx, p, kPPathStrokeGradient, stroke > 0 ? stroke : 1);
+    if (!prim) {
+        return;
+    }
+    prim->g0 = stroke;
+    prim->e0 = x0;
+    prim->e1 = y0;
+    prim->e2 = x1;
+    prim->e3 = y1;
+    prim->color = PaintFade(ctx, from);
+    prim->color2 = PaintFade(ctx, to);
+    if (roundCaps) {
+        prim->flags |= kFRoundCaps;
+    }
+}
+
 void RecImageDraw(PaintCtx* ctx, RenderImage* img, Bounds bounds,
                   Bounds imageBounds, int frameIndex, float radius,
                   bool grayscale) {
@@ -16968,8 +17501,10 @@ static void FlattenContext(int context, Vec<Prim>& out, int* nextRank);
 
 static void FlattenEntry(int index, Vec<Prim>& out, int* nextRank) {
     const StackEntry& e = gEntries[index];
-    if (e.prim >= 0) VecAppend(out, gCur[e.prim]);
-    else if (e.context >= 0) FlattenContext(e.context, out, nextRank);
+    if (e.prim >= 0)
+        VecAppend(out, gCur[e.prim]);
+    else if (e.context >= 0)
+        FlattenContext(e.context, out, nextRank);
 }
 
 static void FlattenContext(int context, Vec<Prim>& out, int* nextRank) {
@@ -16978,7 +17513,10 @@ static void FlattenContext(int context, Vec<Prim>& out, int* nextRank) {
     int lastZ = 0;
     bool first = true;
     for (int e = gContexts[context].first; e >= 0; e = gEntries[e].next) {
-        if (!first && gEntries[e].z < lastZ) { mixed = true; break; }
+        if (!first && gEntries[e].z < lastZ) {
+            mixed = true;
+            break;
+        }
         first = false;
         lastZ = gEntries[e].z;
     }
@@ -17007,8 +17545,8 @@ static void OrderHits(PaintCtx* ctx) {
     if (!ctx || ctx->hits.len < 2) return;
     bool mixed = false;
     for (int i = 1; i < ctx->hits.len; i++) {
-        if (gContexts[ctx->hits[i].sceneContext].rank <
-            gContexts[ctx->hits[i - 1].sceneContext].rank) {
+        if (gContexts[ctx->hits[i].sceneContext]
+                .rank < gContexts[ctx->hits[i - 1].sceneContext].rank) {
             mixed = true;
             break;
         }
@@ -17019,8 +17557,8 @@ static void OrderHits(PaintCtx* ctx) {
         int rank = gContexts[ctx->hits[i].sceneContext].rank;
         int at = order.len;
         VecAppend(order, i);
-        while (at > 0 &&
-               gContexts[ctx->hits[order[at - 1]].sceneContext].rank > rank) {
+        while (at > 0 && gContexts[ctx->hits[order[at - 1]].sceneContext]
+                                 .rank > rank) {
             order[at] = order[at - 1];
             at--;
         }
@@ -17277,8 +17815,7 @@ static void MaskLine(Vec<MaskEdge>& edges, float x0, float y0, float x1,
     if (x0 != x1 || y0 != y1) VecAppend(edges, MaskEdge{x0, y0, x1, y1});
 }
 
-static void MaskEdges(const PathRec& pr, bool closeOpen,
-                      Vec<MaskEdge>& edges) {
+static void MaskEdges(const PathRec& pr, bool closeOpen, Vec<MaskEdge>& edges) {
     int vi = pr.verbFirst, pi = pr.ptFirst;
     float x = 0, y = 0, sx = 0, sy = 0;
     bool open = false;
@@ -17291,17 +17828,27 @@ static void MaskEdges(const PathRec& pr, bool closeOpen,
             open = true;
         } else if ((v & 0x7f) == kVLine) {
             float nx = gPts[pi++], ny = gPts[pi++];
-            if (open) MaskLine(edges, x, y, nx, ny);
-            else { sx = nx; sy = ny; open = true; }
-            x = nx; y = ny;
+            if (open)
+                MaskLine(edges, x, y, nx, ny);
+            else {
+                sx = nx;
+                sy = ny;
+                open = true;
+            }
+            x = nx;
+            y = ny;
         } else if ((v & 0x7f) == kVCubic) {
             float ax = gPts[pi++], ay = gPts[pi++];
             float bx = gPts[pi++], by = gPts[pi++];
             float nx = gPts[pi++], ny = gPts[pi++];
-            if (!open) { x = sx = nx; y = sy = ny; open = true; continue; }
-            float extent = fabsf(ax - x) + fabsf(ay - y) +
-                           fabsf(bx - ax) + fabsf(by - ay) +
-                           fabsf(nx - bx) + fabsf(ny - by);
+            if (!open) {
+                x = sx = nx;
+                y = sy = ny;
+                open = true;
+                continue;
+            }
+            float extent = fabsf(ax - x) + fabsf(ay - y) + fabsf(bx - ax) +
+                           fabsf(by - ay) + fabsf(nx - bx) + fabsf(ny - by);
             int steps = (int)(extent / 2.f) + 4;
             if (steps > 64) steps = 64;
             float ox = x, oy = y;
@@ -17312,9 +17859,11 @@ static void MaskEdges(const PathRec& pr, bool closeOpen,
                 float py = u * u * u * y + 3.f * u * u * t * ay +
                            3.f * u * t * t * by + t * t * t * ny;
                 MaskLine(edges, ox, oy, px, py);
-                ox = px; oy = py;
+                ox = px;
+                oy = py;
             }
-            x = nx; y = ny;
+            x = nx;
+            y = ny;
         } else if ((v & 0x7f) == kVArc) {
             float cx = gPts[pi++], cy = gPts[pi++], r = gPts[pi++];
             float a0 = gPts[pi++], a1 = gPts[pi++];
@@ -17324,18 +17873,26 @@ static void MaskEdges(const PathRec& pr, bool closeOpen,
             int steps = (int)(fabsf(sweep) / (kMaskPi / 30.f)) + 2;
             if (steps > 256) steps = 256;
             float ax = cx + cosf(a0) * r, ay = cy + sinf(a0) * r;
-            if (open) MaskLine(edges, x, y, ax, ay);
-            else { sx = ax; sy = ay; open = true; }
-            x = ax; y = ay;
+            if (open)
+                MaskLine(edges, x, y, ax, ay);
+            else {
+                sx = ax;
+                sy = ay;
+                open = true;
+            }
+            x = ax;
+            y = ay;
             for (int j = 1; j <= steps; j++) {
                 float a = a0 + sweep * ((float)j / steps);
                 float nx = cx + cosf(a) * r, ny = cy + sinf(a) * r;
                 MaskLine(edges, x, y, nx, ny);
-                x = nx; y = ny;
+                x = nx;
+                y = ny;
             }
         } else if ((v & 0x7f) == kVClose && open) {
             MaskLine(edges, x, y, sx, sy);
-            x = sx; y = sy;
+            x = sx;
+            y = sy;
             open = false;
         }
     }
@@ -17362,8 +17919,7 @@ static bool MaskStrokeContains(const Vec<MaskEdge>& edges, float x, float y,
         float dx = e.x1 - e.x0, dy = e.y1 - e.y0;
         float d = dx * dx + dy * dy;
         float t = d > 0 ? ((x - e.x0) * dx + (y - e.y0) * dy) / d : 0;
-        if (t < 0) t = 0;
-        if (t > 1) t = 1;
+        t = ClampF(t, 0, 1);
         float px = x - (e.x0 + t * dx), py = y - (e.y0 + t * dy);
         if (px * px + py * py <= limit) return true;
     }
@@ -17379,8 +17935,8 @@ static void MaskDrop(int slot) {
 }
 
 static MaskEntry* MaskFor(PaintCtx* ctx, const Prim& prim) {
-    if (SceneLevelOn() < kSceneCache || !ctx || !ctx->pa ||
-        prim.path < 0 || prim.path >= gPaths.len ||
+    if (SceneLevelOn() < kSceneCache || !ctx || !ctx->pa || prim.path < 0 ||
+        prim.path >= gPaths.len ||
         (prim.kind != kPPathFill &&
          !(prim.kind == kPPathStroke && (prim.flags & kFRoundCaps)))) {
         return nullptr;
@@ -17419,7 +17975,10 @@ static MaskEntry* MaskFor(PaintCtx* ctx, const Prim& prim) {
     gStats.maskCacheMisses++;
     int bytes = w * h * 4;
     uint8_t* pixels = (uint8_t*)Alloc(nullptr, bytes);
-    if (!pixels) { VecReset(edges); return nullptr; }
+    if (!pixels) {
+        VecReset(edges);
+        return nullptr;
+    }
     for (int py = 0; py < h; py++) {
         for (int px = 0; px < w; px++) {
             int cover = 0;
@@ -17427,9 +17986,10 @@ static MaskEntry* MaskFor(PaintCtx* ctx, const Prim& prim) {
                 for (int sx = 0; sx < 4; sx++) {
                     float fx = (x0 + px + (sx + .5f) / 4.f) / scale;
                     float fy = (y0 + py + (sy + .5f) / 4.f) / scale;
-                    cover += prim.kind == kPPathFill
-                        ? MaskContains(edges, fx, fy, pr.winding)
-                        : MaskStrokeContains(edges, fx, fy, prim.e1 * .5f);
+                    cover +=
+                        prim.kind == kPPathFill
+                            ? MaskContains(edges, fx, fy, pr.winding)
+                            : MaskStrokeContains(edges, fx, fy, prim.e1 * .5f);
                 }
             }
             int a = (prim.color.a * cover + 8) / 16;
@@ -17447,8 +18007,9 @@ static MaskEntry* MaskFor(PaintCtx* ctx, const Prim& prim) {
     while (gMaskBytes + bytes > kMaskBudget) {
         int victim = -1;
         for (int i = 0; i < kMaskSlots; i++) {
-            if (gMasks[i].image && (victim < 0 ||
-                gMasks[i].lastFrame < gMasks[victim].lastFrame)) victim = i;
+            if (gMasks[i].image &&
+                (victim < 0 || gMasks[i].lastFrame < gMasks[victim].lastFrame))
+                victim = i;
         }
         if (victim < 0) break;
         MaskDrop(victim);
@@ -17544,7 +18105,8 @@ bool FrameEnd(PaintCtx* ctx, Bounds* damage) {
     gStats.pathPrims = 0;
     gStats.pathVerbs = gVerbs.len;
     for (int i = 0; i < gCur.len; i++) {
-        if (gCur[i].kind >= kPPathFill && gCur[i].kind <= kPPathStroke) {
+        if (gCur[i].kind >= kPPathFill &&
+            gCur[i].kind <= kPPathStrokeGradient) {
             gStats.pathPrims++;
         }
     }
@@ -17722,7 +18284,8 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
                 break;
             case kPPathFill:
             case kPPathGradient:
-            case kPPathStroke: {
+            case kPPathStroke:
+            case kPPathStrokeGradient: {
                 MaskEntry* mask = MaskFor(ctx, p);
                 if (mask) {
                     RenderImageDraw(ctx, mask->image, mask->bounds);
@@ -17739,6 +18302,10 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
                 } else if (p.kind == kPPathGradient) {
                     PathFillGradient(ctx, path, p.e0 - dx, p.e1 - dy, p.e2 - dx,
                                      p.e3 - dy, p.color, p.color2, dx, dy);
+                } else if (p.kind == kPPathStrokeGradient) {
+                    PathStrokeGradient(ctx, path, p.g0, p.e0 - dx, p.e1 - dy,
+                                       p.e2 - dx, p.e3 - dy, p.color, p.color2,
+                                       (p.flags & kFRoundCaps) != 0, dx, dy);
                 } else {
                     PathStroke(ctx, path, p.e1, p.color,
                                (p.flags & kFRoundCaps) != 0, dx, dy);
@@ -17904,12 +18471,7 @@ static void AddEllipse(SvgIcon* ic, float cx, float cy, float rx, float ry) {
 
 static void gpui_svg_AddRoundRect(SvgIcon* ic, float x, float y, float w, float h,
                          float rx) {
-    if (rx < 0) {
-        rx = 0;
-    }
-    if (rx > w * 0.5f) {
-        rx = w * 0.5f;
-    }
+    rx = ClampF(rx, 0, w * 0.5f);
     if (rx > h * 0.5f) {
         rx = h * 0.5f;
     }
@@ -17979,12 +18541,7 @@ static float Angle(float ux, float uy, float vx, float vy) {
     float nu = sqrtf(ux * ux + uy * uy);
     float nv = sqrtf(vx * vx + vy * vy);
     float c = (nu > 0 && nv > 0) ? dot / (nu * nv) : 1;
-    if (c < -1) {
-        c = -1;
-    }
-    if (c > 1) {
-        c = 1;
-    }
+    c = ClampF(c, -1, 1);
     float a = acosf(c);
     if (ux * vy - uy * vx < 0) {
         a = -a;
@@ -18041,12 +18598,7 @@ static void gpui_svg_AddArc(SvgIcon* ic, float x1, float y1, float rx, float ry,
         dtheta += 2 * kPi;
     }
     int segs = (int)ceilf(fabsf(dtheta) / (kPi * 0.5f + 1e-6f));
-    if (segs < 1) {
-        segs = 1;
-    }
-    if (segs > 8) {
-        segs = 8;
-    }
+    segs = ClampI(segs, 1, 8);
     float dt = dtheta / (float)segs;
     for (int i = 0; i < segs; i++) {
         float t0 = theta1 + dt * (float)i;
@@ -18615,12 +19167,7 @@ static SvgCtx RefineCtx(const SvgIcon* ic, const SvgCtx& outer, Str tag) {
     value = GetAttrTemp(tag, "fill-opacity");
     if (value) {
         float o = StrToFloatUnchecked(value);
-        if (o < 0) {
-            o = 0;
-        }
-        if (o > 1) {
-            o = 1;
-        }
+        o = ClampF(o, 0, 1);
         cur.fill.a = (uint8_t)lroundf(o * 255.f);
         cur.hasFill = cur.hasFill || o < 1.f;
     }
@@ -18793,12 +19340,7 @@ static void ParseSvg(Str xml, SvgIcon* ic) {
                     stop = GetAttrTemp(tag, "stop-opacity");
                     if (stop) {
                         float o = StrToFloatUnchecked(stop);
-                        if (o < 0) {
-                            o = 0;
-                        }
-                        if (o > 1) {
-                            o = 1;
-                        }
+                        o = ClampF(o, 0, 1);
                         c.a = (uint8_t)lroundf(o * 255.f);
                     }
                     ic->gradients[gradIx].color = c;
@@ -19506,6 +20048,432 @@ bool SvgRasterizeXml(PaintApp* pa, Str xml, int px, Rgba color,
 
 }
 
+#line 1 "src/gpui/test_app.cpp"
+
+namespace gpui {
+
+struct TestPlatform {
+    bool on = false;
+    double now = 0;
+    Str clipboard = {};
+};
+
+static TestPlatform gTestPlatform;
+
+static bool gTestExecWasRunning = false;
+static const double kTestClockStart = 1000.0;
+
+static const int kMaxParkRounds = 1000;
+
+bool TestPlatformNow(double* out) {
+    if (!gTestPlatform.on) {
+        return false;
+    }
+    if (out) {
+        *out = gTestPlatform.now;
+    }
+    return true;
+}
+
+bool TestPlatformClipboardWrite(Str text) {
+    if (!gTestPlatform.on) {
+        return false;
+    }
+    StrFree(gTestPlatform.clipboard);
+    gTestPlatform.clipboard = len(text) > 0 ? StrDup(text) : Str{};
+    return true;
+}
+
+bool TestPlatformClipboardRead(Arena* a, ClipboardItem* out) {
+    if (!gTestPlatform.on) {
+        return false;
+    }
+    if (out) {
+        *out = ClipboardItem{};
+        if (len(gTestPlatform.clipboard) > 0) {
+            out->text = StrDup(a, gTestPlatform.clipboard);
+        }
+    }
+    return true;
+}
+
+double TestClockNow() {
+    return gTestPlatform.now;
+}
+
+App* TestAppNew() {
+    gTestExecWasRunning = ExecOnMainThread();
+    App* app = AppNewHeadless();
+    if (!app) {
+        return nullptr;
+    }
+    StrFree(gTestPlatform.clipboard);
+    gTestPlatform = TestPlatform{};
+    gTestPlatform.on = true;
+    gTestPlatform.now = kTestClockStart;
+    return app;
+}
+
+void TestAppFree(App* app) {
+    AppFreeHeadless(app);
+    StrFree(gTestPlatform.clipboard);
+    gTestPlatform = TestPlatform{};
+    if (gTestExecWasRunning) {
+        ExecInit();
+    }
+}
+
+Window* TestWindowOpen(App* app, EntityId root, float w, float h, float scale) {
+    if (!app) {
+        return nullptr;
+    }
+    Window* win = WindowAlloc(app, WinOpts{});
+    if (!win) {
+        return nullptr;
+    }
+    win->root = root;
+    win->paint.dpi = 96.f * (scale > 0 ? scale : 1.f);
+    win->paint.viewW = w;
+    win->paint.viewH = h;
+
+    TestDraw(win);
+    return win;
+}
+
+void TestDraw(Window* win) {
+    if (!win) {
+        return;
+    }
+    WindowDrawFrameHeadless(win, win->paint.viewW, win->paint.viewH);
+}
+
+static bool DrawDirty(App* app) {
+    bool drew = false;
+    for (int i = 0; i < app->windows.len; i++) {
+        Window* win = app->windows[i];
+
+        if (win && win->running && win->invalidations > 0) {
+            TestDraw(win);
+            drew = true;
+        }
+    }
+    return drew;
+}
+
+void TestFlushEffects(App* app) {
+    if (!app) {
+        return;
+    }
+
+    for (int round = 0; round < kMaxParkRounds && DrawDirty(app); round++) {
+    }
+}
+
+void TestSimulateResize(Window* win, float w, float h) {
+    if (!win) {
+        return;
+    }
+    win->paint.viewW = w;
+    win->paint.viewH = h;
+    TestDraw(win);
+    TestFlushEffects(win->app);
+}
+
+static double NextDeadline(Window* win) {
+    double soonest = -1;
+    for (int i = 0; i < win->timers.len; i++) {
+        double due = win->timers[i].dueAt;
+        if (due > 0 && (soonest < 0 || due < soonest)) {
+            soonest = due;
+        }
+    }
+    if (win->scrollDragNotifyPending && win->scrollDragNotifyDue > 0 &&
+        (soonest < 0 || win->scrollDragNotifyDue < soonest)) {
+        soonest = win->scrollDragNotifyDue;
+    }
+    if (win->anim || win->opts.anim || win->animFrame) {
+
+        double due = win->lastDrawTime + 0.016;
+        if (soonest < 0 || due < soonest) {
+            soonest = due;
+        }
+    }
+    return soonest;
+}
+
+static bool FireDueTimers(App* app) {
+    bool fired = false;
+    double now = gTestPlatform.now;
+    for (int i = 0; i < app->windows.len; i++) {
+        Window* win = app->windows[i];
+        if (!win) {
+            continue;
+        }
+        double due = NextDeadline(win);
+        if (due > 0 && due <= now) {
+            uint64_t before = win->invalidations;
+            int timersBefore = win->timers.len;
+            WindowTimerTick(win);
+
+            if (win->invalidations != before ||
+                win->timers.len != timersBefore || NextDeadline(win) != due) {
+                fired = true;
+            }
+        }
+    }
+    return fired;
+}
+
+void TestRunUntilParked(App* app) {
+    if (!app) {
+        return;
+    }
+    for (int round = 0; round < kMaxParkRounds; round++) {
+        bool busy = false;
+        if (ExecDrain() > 0) {
+            busy = true;
+        }
+        if (ExecPending() > 0) {
+            ExecWaitIdle(10000);
+            busy = true;
+        }
+        if (FireDueTimers(app)) {
+            busy = true;
+        }
+        if (DrawDirty(app)) {
+            busy = true;
+        }
+        if (!busy && ExecQueued() == 0) {
+            return;
+        }
+    }
+}
+
+void TestAdvanceClock(App* app, double ms) {
+    if (!app) {
+        return;
+    }
+    TestRunUntilParked(app);
+    double target = gTestPlatform.now + ms / 1000.0;
+
+    for (int round = 0; round < kMaxParkRounds * 10; round++) {
+        double soonest = -1;
+        for (int i = 0; i < app->windows.len; i++) {
+            Window* win = app->windows[i];
+            if (!win) {
+                continue;
+            }
+            double due = NextDeadline(win);
+            if (due > 0 && (soonest < 0 || due < soonest)) {
+                soonest = due;
+            }
+        }
+        if (soonest < 0 || soonest > target) {
+            break;
+        }
+        if (soonest > gTestPlatform.now) {
+            gTestPlatform.now = soonest;
+        }
+        TestRunUntilParked(app);
+
+        double after = -1;
+        for (int i = 0; i < app->windows.len; i++) {
+            Window* win = app->windows[i];
+            double due = win ? NextDeadline(win) : -1;
+            if (due > 0 && (after < 0 || due < after)) {
+                after = due;
+            }
+        }
+        if (after > 0 && after <= gTestPlatform.now) {
+            break;
+        }
+    }
+    gTestPlatform.now = target;
+    TestRunUntilParked(app);
+}
+
+static uint32_t TypedChar(Str key, const KeyChord& chord) {
+    if (chord.ctrl || chord.alt || chord.platform || chord.function) {
+        return 0;
+    }
+    if (base::StrEq(key, "space")) {
+        return ' ';
+    }
+    if (len(key) != 1) {
+        return 0;
+    }
+    char c = key.s[0];
+    if (chord.shift && c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+    return (uint32_t)(uint8_t)c;
+}
+
+static void PressKeystroke(Window* win, Str stroke) {
+    int n = len(stroke);
+    if (n == 0 || n > 48) {
+        return;
+    }
+
+    int keyAt = 0;
+    for (int i = 0; i < n - 1; i++) {
+        if (stroke.s[i] == '-') {
+            keyAt = i + 1;
+        }
+    }
+
+    char spec[64];
+    int at = 0;
+    char last = stroke.s[n - 1];
+    bool upper = keyAt == n - 1 && last >= 'A' && last <= 'Z';
+    if (upper) {
+        memcpy(spec, "shift-", 6);
+        at = 6;
+    }
+    memcpy(spec + at, stroke.s, (size_t)n);
+    at += n;
+    if (upper) {
+        spec[at - 1] = (char)(last - 'A' + 'a');
+    }
+    spec[at] = 0;
+    KeyChord chord;
+    if (!KeyChordParse(Str(spec, at), &chord)) {
+
+        uint32_t cp = 0;
+        if (keyAt == 0 && Utf8At(stroke, 0, &cp) == n) {
+            WindowChar(win, cp, false, false);
+        }
+        return;
+    }
+    uint32_t ch = TypedChar(Str(spec + at - (n - keyAt), n - keyAt), chord);
+    WindowKeyDown(win, chord.vk, chord.shift, chord.ctrl, chord.alt,
+                  chord.platform, chord.function);
+    if (ch) {
+        WindowChar(win, ch, false, false);
+    }
+}
+
+void TestSimulateKeystrokes(Window* win, const char* keystrokes) {
+    if (!win || !keystrokes) {
+        return;
+    }
+    const char* p = keystrokes;
+    while (*p) {
+        while (*p == ' ') {
+            p++;
+        }
+        const char* start = p;
+        while (*p && *p != ' ') {
+            p++;
+        }
+        if (p > start) {
+            PressKeystroke(win, Str(start, (int)(p - start)));
+            TestFlushEffects(win->app);
+        }
+    }
+    TestRunUntilParked(win->app);
+}
+
+void TestSimulateInput(Window* win, Str text) {
+    if (!win) {
+        return;
+    }
+    int i = 0;
+    while (i < len(text)) {
+        uint32_t cp = 0;
+        int step = Utf8At(text, i, &cp);
+        if (step <= 0) {
+            break;
+        }
+        Str one = Str(text.s + i, step);
+        i += step;
+        if (cp < 0x80 && cp > ' ' && cp != 0x7f) {
+            PressKeystroke(win, one);
+        } else if (cp == ' ') {
+            PressKeystroke(win, StrL("space"));
+        } else {
+            WindowChar(win, cp, false, false);
+        }
+        TestFlushEffects(win->app);
+    }
+    TestRunUntilParked(win->app);
+}
+
+static void Simulate(Window* win, const PlatformInput& input) {
+    if (!win) {
+        return;
+    }
+    WindowDispatchInput(win, &input);
+    TestFlushEffects(win->app);
+    TestRunUntilParked(win->app);
+}
+
+void TestSimulateMouseMove(Window* win, Point position, bool pressed,
+                           MouseButton button, Modifiers modifiers) {
+    Simulate(win, InputMouseMove(position.x, position.y, pressed, button,
+                                 modifiers));
+}
+
+void TestSimulateMouseDown(Window* win, Point position, MouseButton button,
+                           Modifiers modifiers) {
+    Simulate(win, InputMouseDown(button, position.x, position.y, modifiers, 1,
+                                 false));
+}
+
+void TestSimulateMouseUp(Window* win, Point position, MouseButton button,
+                         Modifiers modifiers) {
+    Simulate(win, InputMouseUp(button, position.x, position.y, modifiers, 1));
+}
+
+void TestSimulateClick(Window* win, Point position, Modifiers modifiers) {
+    TestSimulateMouseDown(win, position, MouseButton::Left, modifiers);
+    TestSimulateMouseUp(win, position, MouseButton::Left, modifiers);
+}
+
+bool TestDispatchAction(Window* win, uint32_t action, int64_t arg) {
+    if (!win || !action) {
+        return false;
+    }
+    bool taken = false;
+
+    if (win->input && win->input->focused) {
+        InputAction act = InputActionOf(action, arg);
+        if (act != InputAction::None) {
+            bool shift = act == InputAction::Enter && InputEnterShift(arg);
+            taken = InputPerform(win->input, win->app, win, act, shift);
+        }
+    }
+    if (!taken) {
+        taken = WindowDispatchAction(win, action, arg);
+    }
+    TestFlushEffects(win->app);
+    TestRunUntilParked(win->app);
+    return taken;
+}
+
+void TestWriteToClipboard(Str text) {
+    TestPlatformClipboardWrite(text);
+}
+
+Str TestReadFromClipboard(Arena* a) {
+    ClipboardItem item;
+    if (!TestPlatformClipboardRead(a, &item)) {
+        return {};
+    }
+    return item.text;
+}
+
+void TestFocus(Window* win, FocusHandle handle) {
+    if (!win) {
+        return;
+    }
+    FocusHandleFocus(win, handle);
+    AppInvalidate(win);
+    TestFlushEffects(win->app);
+}
+
+}
+
 #line 1 "src/gpui/window_common.cpp"
 
 namespace gpui {
@@ -19840,8 +20808,10 @@ static uint64_t AccessibilityTreeHash(const Vec<AccessibilityNode>& nodes) {
     return hash;
 }
 
-void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
-                     float dipH) {
+static void HitChain(Window* win, float x, float y, Vec<int>* out);
+
+static void DrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
+                      float dipH, bool headless) {
     if (!win) {
         return;
     }
@@ -19854,7 +20824,8 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     win->paint.viewH = dipH;
 
     win->paint.clientInset = 0;
-    if (!PaintTargetBegin(&win->paint, native, pxW, pxH)) {
+    win->paint.headless = headless;
+    if (!headless && !PaintTargetBegin(&win->paint, native, pxW, pxH)) {
         return;
     }
 
@@ -19867,6 +20838,24 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     ResetTempArena();
 
     win->paint.opacity = 1.f;
+    ElementIdFrameBegin();
+#ifndef NDEBUG
+    win->debugLabelShown = false;
+    win->hasDebugSource = false;
+
+    {
+        VecClear(win->debugHoveredPaths);
+        Vec<int> chain;
+        HitChain(win, win->mouseX, win->mouseY, &chain);
+        for (int i = 0; i < chain.len; i++) {
+            uint32_t path = win->paint.hits[chain[i]].pathId;
+            if (path) {
+                VecAppend(win->debugHoveredPaths, path);
+            }
+        }
+        VecReset(chain);
+    }
+#endif
     VecClear(win->paint.hits);
 
     {
@@ -19927,7 +20916,8 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
         win->prevInput = win->input;
     }
 
-    if (win->input && win->input->autoScroll.IsActive() && win->mouseDown) {
+    if (win->input && win->input->autoScroll.IsActive() &&
+        (win->mouseDown || win->input->touchDragging)) {
         InputState* s = win->input;
         float was = s->scrollY;
         s->scrollY += s->autoScroll.delta;
@@ -19941,7 +20931,10 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
         if (s->scrollY > most) {
             s->scrollY = most;
         }
-        if (s->scrollY != was && s->autoScroll.hasLastDrag) {
+        if (s->scrollY != was && s->autoScroll.hasLastDrag &&
+            s->touchDragging) {
+            InputExtendEdgeDragTo(s, win->app, win, s->autoScroll.lastDrag);
+        } else if (s->scrollY != was && s->autoScroll.hasLastDrag) {
             bool affinity = false;
             int columns = 0;
             int offset = InputIndexForPosition(
@@ -19959,9 +20952,12 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
 
     WindowSelectionApply(win);
 
+    win->hasAutoscroll = false;
+
     double tBuild0 = TimeNow();
 
     win->rendered.len = 0;
+    VecClear(win->debugViewRoots);
     El* root = EntityRender(win->app, win, win->frameArena, win->root);
     if (win->tooltip.IsValid()) {
         El* tooltip =
@@ -19989,7 +20985,8 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
         if (!win->layout) {
             win->layout = LayoutCacheNew();
         }
-        LayoutEl(&win->paint, root, 0, 0, dipW, dipH, th.fontSize,
+
+        LayoutEl(&win->paint, root, 0, 0, dipW, dipH, WindowRemSize(win),
                  th.foreground, win->layout);
         FocusCollect(win, root);
         AccessibilityCollect(root, &win->accessibility);
@@ -20030,7 +21027,9 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     win->paint.paintLayer = kPaintLayerTree;
 
     double tEnd0 = TimeNow();
-    PaintTargetEnd(&win->paint);
+    if (!headless) {
+        PaintTargetEnd(&win->paint);
+    }
 
     gFramePaintSecs += TimeNow() - tEnd0;
     TextMeasEndFrame(&win->paint);
@@ -20063,13 +21062,23 @@ void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     timing.invalidations = win->invalidations;
     win->invalidations = 0;
 
-    bool presented = !(SceneOn() && scene::SkipPresent(&win->paint));
+    bool presented =
+        !headless && !(SceneOn() && scene::SkipPresent(&win->paint));
     timing.presentAt = presented ? drawEnd : -1;
     win->frameTrace[win->frameSeq % (uint64_t)kFrameTraceCap] = timing;
     win->lastDrawTime = drawEnd;
     InteractionBenchRecord(win, timing);
     win->frameSeq++;
     FrameBenchTick(win, timing.drawSecs);
+}
+
+void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
+                     float dipH) {
+    DrawFrame(win, native, pxW, pxH, dipW, dipH, false);
+}
+
+void WindowDrawFrameHeadless(Window* win, float dipW, float dipH) {
+    DrawFrame(win, nullptr, 0, 0, dipW, dipH, true);
 }
 
 static bool FocusIdIsFocusable(Window* win, int id) {
@@ -20198,7 +21207,7 @@ static bool WindowKeyDownDispatch(Window* win, int key, bool shift, bool ctrl,
     win->eatChar = false;
     bool eaten = false;
 
-    intptr_t actionArg = 0;
+    int64_t actionArg = 0;
     bool actionPending = false;
     uint32_t action = 0;
     if (!held) {
@@ -20352,15 +21361,45 @@ static bool IsModifierKey(int key) {
            (key >= 0xA0 && key <= 0xA5);
 }
 
+static void WindowTrackModifiers(Window* win, int key, bool down, bool shift,
+                                 bool ctrl, bool alt, bool platform,
+                                 bool function) {
+    Modifiers m;
+    m.shift = shift;
+    m.control = ctrl;
+    m.alt = alt;
+    m.platform = platform;
+    m.function = function;
+    if (key == KeyShift || key == 0xA0 || key == 0xA1) {
+        m.shift = down;
+    } else if (key == KeyControl || key == 0xA2 || key == 0xA3) {
+        m.control = down;
+    } else if (key == KeyAlt || key == 0xA4 || key == 0xA5) {
+        m.alt = down;
+    } else if (key == 0x5B || key == 0x5C) {
+        m.platform = down;
+    }
+    bool secondaryChanged = m.Secondary() != win->modifiers.Secondary();
+    win->modifiers = m;
+    if (secondaryChanged && win->debugLabelShown) {
+        AppInvalidate(win);
+    }
+}
+
 bool WindowKeyDown(Window* win, int key, bool shift, bool ctrl, bool alt,
                    bool platform, bool function, KeyDownFlags flags) {
     if (!win) {
         return false;
     }
+    WindowTrackModifiers(win, key, true, shift, ctrl, alt, platform, function);
 
     bool wasKeyboard = win->lastInputKeyboard;
     if (!IsModifierKey(key)) {
         win->lastInputKeyboard = true;
+
+        if (win->input && win->input->focused) {
+            BlinkPause(win->app, win, &win->input->blink);
+        }
     }
     bool handled = WindowKeyDownDispatch(win, key, shift, ctrl, alt, platform,
                                          function, flags);
@@ -20379,6 +21418,7 @@ void WindowKeyUp(Window* win, int key, bool shift, bool ctrl, bool alt,
     if (!win) {
         return;
     }
+    WindowTrackModifiers(win, key, false, shift, ctrl, alt, platform, function);
 
     {
         KeyEvent ku = {};
@@ -20582,20 +21622,10 @@ bool WindowAccessibilitySetNumericValue(Window* win, uint32_t nodeId,
     AccessibilityNode node = *found;
     SliderState* slider = node.slider;
     float lo = slider->value.range ? slider->value.lo : slider->min;
-    if (value < lo) {
-        value = lo;
-    }
-    if (value > slider->max) {
-        value = slider->max;
-    }
+    value = ClampF(value, lo, slider->max);
     if (slider->step > 0) {
         value = roundf(value / slider->step) * slider->step;
-        if (value < lo) {
-            value = lo;
-        }
-        if (value > slider->max) {
-            value = slider->max;
-        }
+        value = ClampF(value, lo, slider->max);
     }
     if (value == slider->value.End()) {
         return true;
@@ -20621,7 +21651,25 @@ static void SliderPress(Window* win, const HitRect* hit, Point at) {
     AppInvalidate(win);
 }
 
+static void InputRightPress(Window* win, const MouseDownEvent& in) {
+    InputState* s = InputAtPosition(&win->paint, in.x, in.y);
+    if (!s || s->disabled || !s->enableContextMenu) {
+        return;
+    }
+    int offset = InputIndexForPosition(s, &win->paint, in.x, in.y);
+    if (!s->selectedRange.Contains(offset)) {
+        InputMoveTo(s, win->app, win, offset);
+    }
+    s->hasPendingContextMenu = true;
+    s->pendingContextMenuAt = {in.x, in.y};
+    s->pendingContextMenuOffset = offset;
+}
+
 static void InputPress(Window* win, const MouseDownEvent& in) {
+
+    if (win->defaultPrevented) {
+        return;
+    }
     InputState* s = InputAtPosition(&win->paint, in.x, in.y);
     if (!s) {
         if (win->input) {
@@ -20640,6 +21688,12 @@ static void InputPress(Window* win, const MouseDownEvent& in) {
     }
 
     InputClearInlineCompletion(s);
+
+    if (in.button == MouseButton::Left && in.clickCount == 1 &&
+        InputReopenEditMenuAt(s, win->app, win, {in.x, in.y})) {
+        return;
+    }
+    InputDismissTouchSelection(s, win->app, win);
     if (!s->focused) {
         InputFocus(s, win->app, win);
     }
@@ -20656,6 +21710,10 @@ static void InputPress(Window* win, const MouseDownEvent& in) {
         InputSelectLine(s, win->app, win, offset);
     } else if (in.clickCount == 2) {
         InputSelectWord(s, win->app, win, offset);
+
+        if (BaseIsTouchPress(win->app)) {
+            InputKeepTouchSelection(s, win->app, win);
+        }
     } else if (InputIsMultiLine(s) && in.button == MouseButton::Left &&
                in.modifiers.alt) {
 
@@ -21030,6 +22088,7 @@ static void DispatchMouseMove(Window* win, const MouseMoveEvent& in) {
         AppInvalidate(win);
     }
     win->mouseModifiers = in.modifiers;
+    win->modifiers = in.modifiers;
 
     for (int i = 0; i < win->paint.inputs.len; i++) {
         InputState* f = win->paint.inputs[i];
@@ -21069,18 +22128,21 @@ static void DispatchMouseMove(Window* win, const MouseMoveEvent& in) {
         Str tip = now ? now->tooltip : Str{};
         Bounds tipAt = now ? now->bounds : Bounds{};
         int tipPlacement = now ? now->tooltipPlacement : -1;
+        bool tipRoot = now && now->rootTooltip;
         WindowHoverChanged(win, win->hoverId, id);
         win->hoverId = id;
 
         if (tip.s) {
-            TooltipRequestShow(win, tip, tipAt, tipPlacement);
+            TooltipRequestShow(win, tip, tipAt, tipPlacement, tipRoot);
         } else {
             TooltipRequestHide(win);
         }
         AppInvalidate(win);
     }
 
-    WindowSelectionDrag(win, x, y);
+    if (!win->activeDrag.IsValid()) {
+        WindowSelectionDrag(win, x, y);
+    }
     if (win->onMouseMove.IsValid()) {
         ListenerCall(win->app, win, win->onMouseMove, &in);
     }
@@ -21198,6 +22260,16 @@ void WindowStopPropagation(Ctx* cx) {
     if (cx && cx->win) {
         cx->win->stopPropagation = true;
     }
+}
+
+void WindowPreventDefault(Ctx* cx) {
+    if (cx && cx->win) {
+        cx->win->defaultPrevented = true;
+    }
+}
+
+bool WindowDefaultPrevented(const Window* win) {
+    return win && (win->defaultPrevented || win->pressTookFocus);
 }
 
 static void HitChain(Window* win, float x, float y, Vec<int>* out);
@@ -21327,7 +22399,22 @@ static void DispatchMouseDownOut(Window* win, const MouseDownEvent& in) {
 }
 
 static void DispatchMouseDown(Window* win, const MouseDownEvent& in) {
+    win->modifiers = in.modifiers;
+#ifndef NDEBUG
+
+    if (win->hasDebugSource && in.modifiers.Secondary() &&
+        win->debugSourceBounds.Contains({in.x, in.y})) {
+        char cwd[1024] = {};
+        PlatGetCwd(cwd, (int)sizeof(cwd));
+        log(DebugSourceMessage(GetTempArena(), Str(cwd), win->debugSourceFile,
+                               win->debugSourceLine, win->debugSourceColumn));
+        win->debugSourcePrints++;
+        return;
+    }
+#endif
+    win->pressTookFocus = false;
     win->touchPress = win->touchPressPending;
+    win->defaultPrevented = false;
     win->touchPressPending = false;
     float x = in.x;
     float y = in.y;
@@ -21344,6 +22431,9 @@ static void DispatchMouseDown(Window* win, const MouseDownEvent& in) {
 
     if (!in.IsFocusing()) {
 
+        if (in.button == MouseButton::Right) {
+            InputRightPress(win, in);
+        }
         Vec<int> chain;
         HitChain(win, x, y, &chain);
         MouseDownEvent ev = in;
@@ -21408,6 +22498,8 @@ static void DispatchMouseDown(Window* win, const MouseDownEvent& in) {
     }
     if (focusTarget) {
         WindowSetFocusId(win, focusTarget);
+
+        win->pressTookFocus = true;
     }
 
     {
@@ -21518,6 +22610,15 @@ static void DispatchMouseUp(Window* win, const MouseUpEvent& in) {
     win->dragOverId = 0;
     SliderRelease(win);
 
+    InputState* released = in.button == MouseButton::Right
+                               ? InputAtPosition(&win->paint, in.x, in.y)
+                               : nullptr;
+    if (released && released->hasPendingContextMenu) {
+        InputState* s = released;
+        s->hasPendingContextMenu = false;
+        InputHandleRightClickMenu(s, win->app, win, s->pendingContextMenuAt,
+                                  s->pendingContextMenuOffset);
+    }
     if (win->input && win->input->selecting) {
         if (win->input->selectedRange.IsEmpty()) {
             win->input->selectionReversed = false;
@@ -21685,15 +22786,8 @@ static void DispatchScrollWheel(Window* win, const ScrollWheelEvent& in) {
             dx = dy;
             dy = 0;
         }
-        if (canY) {
-            field->scrollY =
-                ClampScroll(field->scrollY - dy, field->contentH, field->viewH);
-        }
-        if (canX) {
-            field->scrollX =
-                ClampScroll(field->scrollX - dx, field->contentW, field->viewW);
-        }
-        if (canX || canY) {
+
+        if (InputOnScrollWheel(field, win->app, win, dx, dy, in.phase)) {
             AppInvalidate(win);
             return;
         }
@@ -21803,6 +22897,8 @@ void WindowDispatchInput(Window* win, const PlatformInput* input) {
         case PlatformInputKind::TouchDrag: {
             const TouchDragEvent& touch = input->touchDrag;
             if (touch.phase == TouchPhase::Started) {
+
+                BaseNoteTouch(win->app);
                 win->touchPressPending = true;
                 win->touchScrollbarDrag = false;
                 win->scrollDragId = 0;
@@ -21849,9 +22945,31 @@ void WindowDispatchInput(Window* win, const PlatformInput* input) {
                     }
                 }
 
+                win->touchInputHandle = false;
+                if (!win->touchScrollbarDrag && win->input &&
+                    !(win->sel && win->sel->hasTouchEdgeDrag)) {
+                    TouchSelectionSnapshot snap = {};
+                    if (InputTouchSelection(win->input, win, &snap) &&
+                        !snap.IsEmpty()) {
+                        for (int edge = 0; edge < 2; edge++) {
+                            SelectionEdge which = edge == 0
+                                                      ? SelectionEdge::Start
+                                                      : SelectionEdge::End;
+                            if (snap.IsEdgeVisible(which) &&
+                                TouchHandle::HitBounds(which, snap.Edge(which))
+                                    .Contains(touch.position)) {
+                                InputBeginEdgeDrag(win->input, win->app, win,
+                                                   which, touch.position);
+                                win->touchInputHandle = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 (void)SliderTouchDrag(
                     win, touch,
-                    !win->touchScrollbarDrag &&
+                    !win->touchScrollbarDrag && !win->touchInputHandle &&
                         !(win->sel && win->sel->hasTouchEdgeDrag));
             } else if (win->touchSlider) {
                 (void)SliderTouchDrag(win, touch, false);
@@ -21869,6 +22987,19 @@ void WindowDispatchInput(Window* win, const PlatformInput* input) {
                     win->scrollDragGrab = 0;
                     win->scrollDragInput = nullptr;
                 }
+            } else if (win->touchInputHandle) {
+                if (win->input && touch.phase == TouchPhase::Moved) {
+                    InputUpdateEdgeDrag(win->input, win->app, win,
+                                        touch.position);
+                }
+                if (touch.phase == TouchPhase::Ended ||
+                    touch.phase == TouchPhase::Cancelled) {
+                    if (win->input) {
+                        InputEndEdgeDrag(win->input, win->app, win);
+                    }
+                    win->touchInputHandle = false;
+                }
+                AppInvalidate(win);
             } else if (win->sel && win->sel->hasTouchEdgeDrag) {
                 if (touch.phase == TouchPhase::Moved) {
                     Point at = win->sel->touchEdgeDrag
@@ -21889,6 +23020,30 @@ void WindowDispatchInput(Window* win, const PlatformInput* input) {
         }
         case PlatformInputKind::LongPress: {
             const LongPressEvent& touch = input->longPress;
+
+            if (touch.phase == TouchPhase::Started) {
+                win->longPressInput = nullptr;
+                InputState* field = InputAtPosition(
+                    &win->paint, touch.startPosition.x, touch.startPosition.y);
+                if (field && InputOnLongPress(field, win->app, win, touch)) {
+                    win->longPressInput = field;
+                    win->longPressSelection = false;
+                    AppInvalidate(win);
+                    break;
+                }
+            } else if (win->longPressInput) {
+                InputState* field = win->longPressInput;
+                if (touch.phase == TouchPhase::Ended ||
+                    touch.phase == TouchPhase::Cancelled) {
+                    win->longPressInput = nullptr;
+                }
+
+                if (field == win->input) {
+                    InputOnLongPress(field, win->app, win, touch);
+                }
+                AppInvalidate(win);
+                break;
+            }
             if (touch.phase == TouchPhase::Started) {
                 if (win->sel) {
                     win->sel->touchMenuOpen = false;
@@ -22206,7 +23361,7 @@ void BlinkCursor::OnFlip(BlinkCursor* self, Ctx* cx, const TickEvent*) {
 void BlinkCursor::OnResume(BlinkCursor* self, Ctx* cx, const TickEvent*) {
 
     self->paused = false;
-    self->visible = true;
+    self->visible = !self->visible;
     Listener flip;
     flip.SetFn(&BlinkCursor::OnFlip);
     flip.view = cx->self;
@@ -22448,6 +23603,8 @@ void WindowClosed(Window* win) {
     win->input = nullptr;
     win->prevInput = nullptr;
 
+    WindowSelectionFree(win);
+
     for (int i = 0; i < win->keyed.len; i++) {
         if (win->keyed[i].entity.IsValid()) {
             EntityDrop(win->app, win->keyed[i].entity);
@@ -22478,7 +23635,7 @@ static void AppFetchLanded(App* app) {
     }
 }
 
-App* AppNew() {
+static App* AppMake(bool platform) {
     App* app = new App();
 
     if (AssetsRootCount() == 0) {
@@ -22490,7 +23647,7 @@ App* AppNew() {
         return nullptr;
     }
     app->images = ImageStoreNew();
-    if (!PlatInit(app)) {
+    if (platform && !PlatInit(app)) {
         ImageStoreFree(app->images);
         app->images = nullptr;
         PaintAppFree(app->paint);
@@ -22499,20 +23656,31 @@ App* AppNew() {
     }
 
     ExecInit();
-    ExecSetWake(MkFunc0(PlatWake, app));
+
+    ExecSetWake(platform ? MkFunc0(PlatWake, app) : Func0{});
     HttpSetOnFetchDone(MkFunc0(AppFetchLanded, app));
     return app;
 }
 
+App* AppNew() {
+    return AppMake(true);
+}
+
+App* AppNewHeadless() {
+    return AppMake(false);
+}
+
 static void AppRunShutdownFns();
 
-void AppFree(App* app) {
+static void AppRelease(App* app, bool platform) {
     if (!app) {
         return;
     }
 
     ImageCacheClear();
     ExecShutdown();
+
+    HttpSetOnFetchDone(Func0{});
     EntityDropAll(app);
     for (int i = 0; i < app->windows.len; i++) {
         Window* w = app->windows[i];
@@ -22527,6 +23695,8 @@ void AppFree(App* app) {
         VecReset(w->timers);
         VecReset(w->imageCacheStack);
         VecReset(w->plotAppearScopes);
+        VecReset(w->debugViewRoots);
+        VecReset(w->debugHoveredPaths);
         WindowKeyedFree(w);
         WindowMotionFree(w);
         delete w;
@@ -22542,9 +23712,19 @@ void AppFree(App* app) {
     AppGlobalClear(app);
     PaintAppFree(app->paint);
     app->paint = nullptr;
-    PlatShutdown(app);
+    if (platform) {
+        PlatShutdown(app);
+    }
     delete app;
     DestroyTempArena();
+}
+
+void AppFree(App* app) {
+    AppRelease(app, true);
+}
+
+void AppFreeHeadless(App* app) {
+    AppRelease(app, false);
 }
 
 void WindowRequestAnimationFrame(Window* win) {
@@ -22554,6 +23734,36 @@ void WindowRequestAnimationFrame(Window* win) {
     win->animFrame = true;
 
     PlatSetTimer(win, WindowTimerMs(win));
+}
+
+float WindowRemSize(const Window* win) {
+    return win && win->remSize > 0 ? win->remSize : 16.f;
+}
+
+void WindowSetRemSize(Window* win, float size) {
+    if (!win || !(size > 0) || win->remSize == size) {
+        return;
+    }
+    win->remSize = size;
+    AppInvalidate(win);
+}
+
+void WindowRequestAutoscroll(Window* win, Bounds bounds) {
+    if (win) {
+        win->hasAutoscroll = true;
+        win->autoscroll = bounds;
+    }
+}
+
+bool WindowTakeAutoscroll(Window* win, Bounds* out) {
+    if (!win || !win->hasAutoscroll) {
+        return false;
+    }
+    win->hasAutoscroll = false;
+    if (out) {
+        *out = win->autoscroll;
+    }
+    return true;
 }
 
 static const int kMaxShutdownFns = 16;
@@ -22762,7 +23972,7 @@ bool AppIsMaximized(Window* win) {
 
 struct AppMenuBinding {
     uint32_t action = 0;
-    intptr_t arg = 0;
+    int64_t arg = 0;
 };
 
 struct AppMenuState {
@@ -22862,11 +24072,11 @@ void AppSetMenus(App* app, const MenuDef* menus, int n) {
     PlatSetAppMenu(app, bar, n);
 }
 
-bool AppMenuRowForId(int id, uint32_t* action, intptr_t* arg) {
+bool AppMenuRowForId(int id, uint32_t* action, int64_t* arg) {
     return AppMenuRowForId(gAppMenuApp, id, action, arg);
 }
 
-bool AppMenuRowForId(const App* app, int id, uint32_t* action, intptr_t* arg) {
+bool AppMenuRowForId(const App* app, int id, uint32_t* action, int64_t* arg) {
     AppMenuState* state = AppGlobalGet<AppMenuState>(app);
     if (!state || id <= 0 || id > state->rows.len) {
         return false;
@@ -22893,7 +24103,7 @@ void AppMenuClear(App* app) {
 
 void AppMenuChosen(int id) {
     uint32_t action = 0;
-    intptr_t arg = 0;
+    int64_t arg = 0;
     if (!gAppMenuApp || !AppMenuRowForId(gAppMenuApp, id, &action, &arg) ||
         !action) {
         return;
@@ -23197,12 +24407,8 @@ float MotionAppear(Ctx* cx, uint32_t key, float durationMs, EaseFn ease);
 
 namespace gpui {
 
-static float base_animation_ClampF(float v, float lo, float hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
 float CubicBezier(float x1, float y1, float x2, float y2, float t) {
-    t = base_animation_ClampF(t, 0.f, 1.f);
+    t = ClampF(t, 0.f, 1.f);
 
     float cx = 3.f * x1;
     float cy = 3.f * y1;
@@ -23224,7 +24430,7 @@ float CubicBezier(float x1, float y1, float x2, float y2, float t) {
         if (slope < 0 ? -slope < 1e-6f : slope < 1e-6f) {
             break;
         }
-        s = base_animation_ClampF(s - error / slope, 0.f, 1.f);
+        s = ClampF(s - error / slope, 0.f, 1.f);
     }
     if (!solved) {
         float low = 0.f;
@@ -23248,22 +24454,22 @@ float CubicBezier(float x1, float y1, float x2, float y2, float t) {
 }
 
 float EaseLinear(float t) {
-    return base_animation_ClampF(t, 0.f, 1.f);
+    return ClampF(t, 0.f, 1.f);
 }
 
 float EaseOutCubic(float t) {
-    t = base_animation_ClampF(t, 0.f, 1.f);
+    t = ClampF(t, 0.f, 1.f);
     float u = 1.f - t;
     return 1.f - u * u * u;
 }
 
 float EaseInCubic(float t) {
-    t = base_animation_ClampF(t, 0.f, 1.f);
+    t = ClampF(t, 0.f, 1.f);
     return t * t * t;
 }
 
 float EaseInOutCubic(float t) {
-    t = base_animation_ClampF(t, 0.f, 1.f);
+    t = ClampF(t, 0.f, 1.f);
     if (t < 0.5f) {
         return 4.f * t * t * t;
     }
@@ -23272,7 +24478,7 @@ float EaseInOutCubic(float t) {
 }
 
 float ClampF01(float t) {
-    return base_animation_ClampF(t, 0.f, 1.f);
+    return ClampF(t, 0.f, 1.f);
 }
 
 float EaseQuadratic(float t) {
@@ -23527,8 +24733,8 @@ static bool CalendarDateValid(LocalDate date) {
 }
 
 static int CalendarDateCompare(LocalDate a, LocalDate b) {
-    intptr_t ka = DatePickerDateKey(a);
-    intptr_t kb = DatePickerDateKey(b);
+    int64_t ka = DatePickerDateKey(a);
+    int64_t kb = DatePickerDateKey(b);
     return ka < kb ? -1 : (ka > kb ? 1 : 0);
 }
 
@@ -23810,7 +25016,7 @@ bool CalendarNextYearPage(CalendarState* s) {
 }
 
 void CalendarState::OnDate(CalendarState* self, Ctx* cx, const ClickEvent*,
-                           intptr_t dateKey) {
+                           int64_t dateKey) {
     CalendarStateSelectDate(self, DatePickerDateFromKey(dateKey), cx, true);
 }
 
@@ -23847,14 +25053,14 @@ void CalendarState::OnYearToggle(CalendarState* self, Ctx* cx,
 }
 
 void CalendarState::OnMonth(CalendarState* self, Ctx* cx, const ClickEvent*,
-                            intptr_t month) {
+                            int64_t month) {
     self->currentMonth = (int)month;
     self->view = CalendarView::Day;
     Notify(cx);
 }
 
 void CalendarState::OnYear(CalendarState* self, Ctx* cx, const ClickEvent*,
-                           intptr_t year) {
+                           int64_t year) {
     self->currentYear = (int)year;
     self->view = CalendarView::Day;
     Notify(cx);
@@ -24315,7 +25521,7 @@ El* Checkbox::New(Ctx* cx, Str id, CheckboxState state, bool disabled,
     }
     e->TabIndex(tabIndex)->TabStop(tabStop);
     if (onChange.IsValid()) {
-        e->OnClick(ListenerFill(onChange, (intptr_t)CheckboxActivated(state)));
+        e->OnClick(ListenerFill(onChange, (int64_t)CheckboxActivated(state)));
     }
     return e;
 }
@@ -24630,7 +25836,7 @@ static void base_color_picker_EmitChange(ColorPickerState* s, Ctx* cx, Hsla colo
     if (s->onChange.IsValid()) {
         ClickEvent ev = {};
         ListenerCall(cx->app, cx->win,
-                     ListenerFill(s->onChange, (intptr_t)s->value), &ev);
+                     ListenerFill(s->onChange, (int64_t)s->value), &ev);
     }
 }
 
@@ -24644,7 +25850,7 @@ void ColorPickerState::OnToggleOpen(ColorPickerState* s, Ctx* cx,
 }
 
 void ColorPickerState::OnOpenChange(ColorPickerState* s, Ctx* cx,
-                                    const ClickEvent*, intptr_t open) {
+                                    const ClickEvent*, int64_t open) {
     bool next = open != 0;
     if (s->open == next) {
         return;
@@ -24657,7 +25863,7 @@ void ColorPickerState::OnOpenChange(ColorPickerState* s, Ctx* cx,
 }
 
 void ColorPickerState::OnTab(ColorPickerState* s, Ctx* cx, const ClickEvent*,
-                             intptr_t ix) {
+                             int64_t ix) {
     if (s->activeTab == (int)ix) {
         return;
     }
@@ -24666,14 +25872,14 @@ void ColorPickerState::OnTab(ColorPickerState* s, Ctx* cx, const ClickEvent*,
 }
 
 void ColorPickerState::OnSwatchClick(ColorPickerState* s, Ctx* cx,
-                                     const ClickEvent*, intptr_t hex) {
+                                     const ClickEvent*, int64_t hex) {
     ColorPickerSelect(s, (uint32_t)hex);
     base_color_picker_EmitChange(s, cx, HslaFromRgba(RgbaHex((uint32_t)hex)));
     Notify(cx);
 }
 
 void ColorPickerState::OnSwatchHover(ColorPickerState* s, Ctx* cx,
-                                     const HoverEvent* ev, intptr_t hex) {
+                                     const HoverEvent* ev, int64_t hex) {
     if (ev->hovered) {
         ColorPickerPreview(s, (uint32_t)hex);
     } else if (!ColorPickerClearPreview(s)) {
@@ -25243,13 +26449,6 @@ static int CellColNext(const TableState* s) {
     return s->loopSelection ? 0 : last;
 }
 
-static int Clamp(int v, int lo, int hi) {
-    if (v < lo) {
-        return lo;
-    }
-    return v > hi ? hi : v;
-}
-
 void TablePerform(TableState* s, Ctx* cx, TableAction act) {
     if (act == TableAction::Cancel) {
 
@@ -25318,21 +26517,21 @@ void TablePerform(TableState* s, Ctx* cx, TableAction act) {
         case TableAction::SelectPageUp:
             if (cellMode) {
                 TableSetSelectedCell(
-                    s, cx, Clamp(s->selectedCellRow - s->pageRows, 0, last),
+                    s, cx, ClampI(s->selectedCellRow - s->pageRows, 0, last),
                     s->selectedCellCol);
             } else {
                 int cur = s->selectedRow < 0 ? 0 : s->selectedRow;
-                TableSetSelectedRow(s, cx, Clamp(cur - s->pageRows, 0, last));
+                TableSetSelectedRow(s, cx, ClampI(cur - s->pageRows, 0, last));
             }
             break;
         case TableAction::SelectPageDown:
             if (cellMode) {
                 TableSetSelectedCell(
-                    s, cx, Clamp(s->selectedCellRow + s->pageRows, 0, last),
+                    s, cx, ClampI(s->selectedCellRow + s->pageRows, 0, last),
                     s->selectedCellCol);
             } else {
                 int cur = s->selectedRow < 0 ? 0 : s->selectedRow;
-                TableSetSelectedRow(s, cx, Clamp(cur + s->pageRows, 0, last));
+                TableSetSelectedRow(s, cx, ClampI(cur + s->pageRows, 0, last));
             }
             break;
         default:
@@ -25341,7 +26540,7 @@ void TablePerform(TableState* s, Ctx* cx, TableAction act) {
 }
 
 void TableState::OnRowClick(TableState* self, Ctx* cx, const ClickEvent* ev,
-                            intptr_t row) {
+                            int64_t row) {
     TableSetSelectedRow(self, cx, (int)row);
     if (ev->clickCount == 2) {
         TableEmit(self, cx, TableEventKind::DoubleClickedRow, (int)row, -1,
@@ -25350,7 +26549,7 @@ void TableState::OnRowClick(TableState* self, Ctx* cx, const ClickEvent* ev,
 }
 
 void TableState::OnCellClick(TableState* self, Ctx* cx, const ClickEvent* ev,
-                             intptr_t packed) {
+                             int64_t packed) {
     if (!self->cellSelectable) {
         return;
     }
@@ -25370,7 +26569,7 @@ void TableState::OnCellClick(TableState* self, Ctx* cx, const ClickEvent* ev,
 }
 
 void TableState::OnRowMouseDown(TableState* self, Ctx* cx,
-                                const MouseDownEvent* ev, intptr_t row) {
+                                const MouseDownEvent* ev, int64_t row) {
     if (ev->button != MouseButton::Right) {
         return;
     }
@@ -25384,7 +26583,7 @@ void TableState::OnRowMouseDown(TableState* self, Ctx* cx,
 }
 
 void TableState::OnCellMouseDown(TableState* self, Ctx* cx,
-                                 const MouseDownEvent* ev, intptr_t packed) {
+                                 const MouseDownEvent* ev, int64_t packed) {
     if (ev->button != MouseButton::Right || !self->cellSelectable) {
         return;
     }
@@ -25401,13 +26600,13 @@ void TableState::OnCellMouseDown(TableState* self, Ctx* cx,
 }
 
 void TableState::OnHeadClick(TableState* self, Ctx* cx, const ClickEvent*,
-                             intptr_t col) {
+                             int64_t col) {
 
     TableSetSelectedCol(self, cx, (int)col);
 }
 
 void TableState::OnSortClick(TableState* self, Ctx* cx, const ClickEvent*,
-                             intptr_t col) {
+                             int64_t col) {
     TablePerformSort(self, cx, (int)col);
 }
 
@@ -25466,12 +26665,7 @@ bool TableMoveColumn(TableState* s, int from, int to) {
 
 int TableDragGapAt(const Bounds* colBounds, int n, float x, int dragCol,
                    int fixedCount) {
-    if (fixedCount < 0) {
-        fixedCount = 0;
-    }
-    if (fixedCount > n) {
-        fixedCount = n;
-    }
+    fixedCount = ClampI(fixedCount, 0, n);
 
     bool dragInFixed = dragCol < fixedCount;
     bool pointerInFixed = fixedCount > 0 && x < colBounds[fixedCount - 1]
@@ -25771,15 +26965,15 @@ static int DateCompare(LocalDate a, LocalDate b) {
     return 0;
 }
 
-intptr_t DatePickerDateKey(LocalDate date) {
-    intptr_t key = date.year;
-    intptr_t month = date.month;
-    intptr_t day = date.day;
+int64_t DatePickerDateKey(LocalDate date) {
+    int64_t key = date.year;
+    int64_t month = date.month;
+    int64_t day = date.day;
     key = key * 10000 + month * 100 + day;
     return key;
 }
 
-LocalDate DatePickerDateFromKey(intptr_t key) {
+LocalDate DatePickerDateFromKey(int64_t key) {
     int value = (int)key;
     LocalDate date;
     date.year = value / 10000;
@@ -26313,7 +27507,7 @@ El* DockBindTabRest(const DockTabGroup* g, El* rest) {
     }
     BindId(rest, DockElId(g->cx, "tabrest", g->node, 0));
     rest->OnDrop(kDockPanelDrag, ListenTo(g->state, &DockState::OnDropTabBar,
-                                          (intptr_t)g->node));
+                                          (int64_t)g->node));
     return rest;
 }
 
@@ -26338,7 +27532,7 @@ El* DockBindTabStrip(const DockTabGroup* g, El* strip) {
         ->ScrollX(n.tabScrollX)
         ->ScrollFromPath()
         ->OnScroll(
-            ListenTo(g->state, &DockState::OnTabBarScroll, (intptr_t)g->node))
+            ListenTo(g->state, &DockState::OnTabBarScroll, (int64_t)g->node))
         ->BoundsOut(&n.tabStripBounds);
     return strip;
 }
@@ -26370,7 +27564,7 @@ El* DockBindToggle(const DockTabGroup* g, DockPlacement p, El* e) {
         return e;
     }
     BindId(e, DockElId(g->cx, "toggle", g->node, (int)p), true);
-    e->OnClick(ListenTo(g->state, &DockState::OnToggleSide, (intptr_t)p));
+    e->OnClick(ListenTo(g->state, &DockState::OnToggleSide, (int64_t)p));
 
     e->TabStop(false);
     return e;
@@ -26381,7 +27575,7 @@ El* DockBindZoom(const DockTabGroup* g, int panelIx, El* e) {
         return e;
     }
     BindId(e, DockElId(g->cx, "zoom", g->node, panelIx), true);
-    e->OnClick(ListenTo(g->state, &DockState::OnZoomClick, (intptr_t)panelIx));
+    e->OnClick(ListenTo(g->state, &DockState::OnZoomClick, (int64_t)panelIx));
     e->TabStop(false);
     return e;
 }
@@ -26513,7 +27707,7 @@ El* RenderTabs(const AreaCtx& ac, int node) {
 
     box->BoundsOut(&n.bounds);
     box->OnDrop(kDockPanelDrag,
-                ListenTo(ac.state, &DockState::OnDropPanel, (intptr_t)node));
+                ListenTo(ac.state, &DockState::OnDropPanel, (int64_t)node));
 
     if (ac.r->tabBar) {
         if (El* bar = ac.r->tabBar(cx, ac.r->data, &g)) {
@@ -29070,7 +30264,7 @@ void DockToggleZoom(DockState* s, Ctx* cx, int panelIx) {
 }
 
 void DockState::OnTabClick(DockState* self, Ctx* cx, const ClickEvent*,
-                           intptr_t nodeAndIx) {
+                           int64_t nodeAndIx) {
     int node = DockUnpackNode(nodeAndIx);
     DockSetActive(self, cx, node, DockUnpackIx(nodeAndIx));
 
@@ -29082,18 +30276,18 @@ void DockState::OnTabClick(DockState* self, Ctx* cx, const ClickEvent*,
 }
 
 void DockState::OnCloseClick(DockState* self, Ctx* cx, const ClickEvent*,
-                             intptr_t nodeAndIx) {
+                             int64_t nodeAndIx) {
     DockClosePanel(self, cx, DockUnpackNode(nodeAndIx),
                    DockUnpackIx(nodeAndIx));
 }
 
 void DockState::OnZoomClick(DockState* self, Ctx* cx, const ClickEvent*,
-                            intptr_t panelIx) {
+                            int64_t panelIx) {
     DockToggleZoom(self, cx, (int)panelIx);
 }
 
 void DockState::OnToggleSide(DockState* self, Ctx* cx, const ClickEvent*,
-                             intptr_t placement) {
+                             int64_t placement) {
     DockToggleSide(self, cx, (DockPlacement)placement);
 }
 
@@ -29146,7 +30340,7 @@ static bool DockOwnsDrag(const DockState* self, const DragPayload& drag) {
 }
 
 void DockState::OnDropPanel(DockState* self, Ctx* cx, const DropEvent* ev,
-                            intptr_t node) {
+                            int64_t node) {
     if (!DockOwnsDrag(self, ev->drag)) {
         return;
     }
@@ -29156,7 +30350,7 @@ void DockState::OnDropPanel(DockState* self, Ctx* cx, const DropEvent* ev,
 }
 
 void DockState::OnDropTab(DockState* self, Ctx* cx, const DropEvent* ev,
-                          intptr_t nodeAndIx) {
+                          int64_t nodeAndIx) {
     if (!DockOwnsDrag(self, ev->drag)) {
         return;
     }
@@ -29167,7 +30361,7 @@ void DockState::OnDropTab(DockState* self, Ctx* cx, const DropEvent* ev,
 }
 
 void DockState::OnDropTabBar(DockState* self, Ctx* cx, const DropEvent* ev,
-                             intptr_t node) {
+                             int64_t node) {
     if (!DockOwnsDrag(self, ev->drag)) {
         return;
     }
@@ -29182,7 +30376,7 @@ void DockState::OnDropTabBar(DockState* self, Ctx* cx, const DropEvent* ev,
 }
 
 void DockState::OnMenuItem(DockState* self, Ctx* cx, const ClickEvent*,
-                           intptr_t item) {
+                           int64_t item) {
 
     int node = self->menuNode;
     if (node < 0 || node >= self->nodes.len || !self->nodes[node].used) {
@@ -29201,7 +30395,7 @@ void DockState::OnMenuItem(DockState* self, Ctx* cx, const ClickEvent*,
 }
 
 void DockState::OnTabBarScroll(DockState* self, Ctx* cx, const ScrollEvent* ev,
-                               intptr_t nodeArg) {
+                               int64_t nodeArg) {
     int node = (int)nodeArg;
     if (node < 0 || node >= self->nodes.len || !self->nodes[node].used) {
         return;
@@ -29423,6 +30617,18 @@ bool BaseIsTextSelectionSuppressed(const App* app) {
     return state && state->suppressTextSelection;
 }
 
+void BaseNoteTouch(App* app) {
+    if (BaseGlobalState* state = BaseGlobalStateOf(app)) {
+        state->lastTouch = TimeNow();
+    }
+}
+
+bool BaseIsTouchPress(const App* app) {
+    BaseGlobalState* state = AppGlobalGet<BaseGlobalState>(app);
+
+    return state && state->lastTouch >= 0 && TimeNow() - state->lastTouch < 1.0;
+}
+
 static MenuRow* CopyMenuRows(Arena* a, const MenuRow* rows, int count) {
     if (!rows || count <= 0) {
         return nullptr;
@@ -29554,7 +30760,7 @@ void HoverCardState::OnClose(HoverCardState* self, Ctx* cx, const TickEvent*) {
 }
 
 void HoverCardState::OnTap(HoverCardState* self, Ctx* cx, const ClickEvent*,
-                           intptr_t open) {
+                           int64_t open) {
     HoverCardCancel(self, cx);
     HoverCardSetOpen(self, cx, open != 0);
 }
@@ -30177,6 +31383,8 @@ struct RegisteredLanguageConfig {
 struct LanguageSettings {
     Arena* arena = nullptr;
     LanguageProvider provider = {};
+
+    uint64_t providerGeneration = 0;
     ArenaVec<RegisteredLanguageConfig> configs;
 
     LanguageSettings() { arena = ArenaNew(); }
@@ -30240,7 +31448,9 @@ static LanguageConfig LanguageConfigCopy(Arena* a,
 
 void InputSetLanguageProvider(App* app, const LanguageProvider& provider) {
     if (app) {
-        AppGlobalEnsure<LanguageSettings>(app)->provider = provider;
+        LanguageSettings* settings = AppGlobalEnsure<LanguageSettings>(app);
+        settings->provider = provider;
+        settings->providerGeneration++;
     }
 }
 
@@ -30297,6 +31507,46 @@ SyntaxContextProvider InputSyntaxContextProvider(App* app, Str language) {
             .syntaxContextProvider(settings->provider.data, canonical, &out);
     }
     return out;
+}
+
+struct InputSyntaxCache {
+    App* app = nullptr;
+    uint64_t generation = 0;
+    Str language = {};
+    SyntaxContextProvider provider = {};
+};
+
+SyntaxContext InputSyntaxContextAt(InputState* s, App* app, Str text,
+                                   int offset) {
+    if (!s || !app) {
+        return SyntaxContext::Code;
+    }
+    LanguageSettings* settings = AppGlobalEnsure<LanguageSettings>(app);
+    Str language = s->highlighter.Language();
+    InputSyntaxCache* cache = s->syntaxCache;
+    if (!cache) {
+        cache = new InputSyntaxCache();
+        s->syntaxCache = cache;
+    } else if (cache->app == app &&
+               cache->generation == settings->providerGeneration &&
+               StrEq(cache->language, language)) {
+        return cache->provider.ContextAt(text, offset);
+    }
+    cache->app = app;
+    cache->generation = settings->providerGeneration;
+    StrFree(cache->language);
+    cache->language = StrDup(language);
+    cache->provider = InputSyntaxContextProvider(app, language);
+    return cache->provider.ContextAt(text, offset);
+}
+
+void InputSyntaxCacheFree(InputState* s) {
+    if (!s || !s->syntaxCache) {
+        return;
+    }
+    StrFree(s->syntaxCache->language);
+    delete s->syntaxCache;
+    s->syntaxCache = nullptr;
 }
 
 Str TabSize::ToString(Arena* a) const {
@@ -30483,8 +31733,9 @@ DecorationCollections::~DecorationCollections() {
     DecorationsRelease(state);
 }
 
-TextDecorationCollection DecorationCollections::Create(
-    const TextDecoration* decorations, int n) {
+static TextDecorationCollection DecorationsCreate(
+    DecorationCollectionsState* state, const TextDecoration* decorations,
+    int n) {
     TextDecorationCollection result;
     if (!state || !state->ownerAlive) {
         return result;
@@ -30519,8 +31770,8 @@ static Selection AdjustDecorationRange(Selection range, Selection edit,
     return {start, end};
 }
 
-void DecorationCollections::AdjustForEdit(Selection editedRange,
-                                          int insertedLen) {
+static void DecorationsAdjust(DecorationCollectionsState* state,
+                              Selection editedRange, int insertedLen) {
     if (!state || !state->ownerAlive) {
         return;
     }
@@ -30540,7 +31791,7 @@ void DecorationCollections::AdjustForEdit(Selection editedRange,
     }
 }
 
-void DecorationCollections::Clear() {
+static void DecorationsClear(DecorationCollectionsState* state) {
     if (!state || !state->ownerAlive) {
         return;
     }
@@ -30553,7 +31804,8 @@ static bool SelectionOverlaps(Selection a, Selection b) {
     return a.start < b.end && b.start < a.end;
 }
 
-int DecorationCollections::BuildSpans(TextSpan* out, int cap) const {
+static int DecorationsBuildSpans(const DecorationCollectionsState* state,
+                                 TextSpan* out, int cap) {
     if (!state || !state->ownerAlive) {
         return 0;
     }
@@ -30601,6 +31853,40 @@ int DecorationCollections::BuildSpans(TextSpan* out, int cap) const {
         out[i] = accepted[i];
     }
     return len(accepted);
+}
+
+TextDecorationCollection DecorationCollections::Create(
+    const TextDecoration* decorations, int n) {
+    return DecorationsCreate(state, decorations, n);
+}
+
+void DecorationCollections::AdjustForEdit(Selection editedRange,
+                                          int insertedLen) {
+    DecorationsAdjust(state, editedRange, insertedLen);
+}
+
+void DecorationCollections::Clear() {
+    DecorationsClear(state);
+}
+
+int DecorationCollections::BuildSpans(TextSpan* out, int cap) const {
+    return DecorationsBuildSpans(state, out, cap);
+}
+
+TextDecorationCollection InputCreateDecorationsCollection(
+    InputState* s, const TextDecoration* decorations, int n) {
+    if (!s) {
+        return TextDecorationCollection{};
+    }
+    if (!s->textDecorations) {
+        s->textDecorations = new DecorationCollectionsState();
+        s->textDecorations->input = s;
+    }
+    return DecorationsCreate(s->textDecorations, decorations, n);
+}
+
+int InputDecorationSpans(const InputState* s, TextSpan* out, int cap) {
+    return s ? DecorationsBuildSpans(s->textDecorations, out, cap) : 0;
 }
 
 RangeDecoration RangeDecoration::New(Selection range) {
@@ -30975,8 +32261,18 @@ int InputRangeDecorations(const InputState* s, const Selection* ranges,
         .Intersecting(ranges, nRanges, out, cap);
 }
 
-void InputRangeDecorationsFree(InputState* s) {
-    if (!s || !s->rangeDecorations) {
+void InputDecorationsFree(InputState* s) {
+    if (!s) {
+        return;
+    }
+    if (DecorationCollectionsState* text = s->textDecorations) {
+
+        text->ownerAlive = false;
+        text->input = nullptr;
+        DecorationsRelease(text);
+        s->textDecorations = nullptr;
+    }
+    if (!s->rangeDecorations) {
         return;
     }
     RangeDecorationsState* state = s->rangeDecorations;
@@ -30990,15 +32286,21 @@ void InputRangeDecorationsFree(InputState* s) {
     s->rangeDecorations = nullptr;
 }
 
-void InputRangeDecorationsAdjustForEdit(InputState* s, Selection editedRange,
-                                        int insertedLen) {
+void InputDecorationsAdjustForEdit(InputState* s, Selection editedRange,
+                                   int insertedLen) {
+    if (s) {
+        DecorationsAdjust(s->textDecorations, editedRange, insertedLen);
+    }
     if (s && s->rangeDecorations) {
         s->rangeDecorations->collections
             .AdjustForEdit(editedRange, insertedLen);
     }
 }
 
-void InputRangeDecorationsReset(InputState* s) {
+void InputDecorationsReset(InputState* s) {
+    if (s) {
+        DecorationsClear(s->textDecorations);
+    }
     if (s && s->rangeDecorations) {
         s->rangeDecorations->collections.Clear();
     }
@@ -31486,6 +32788,18 @@ void InputHighlighter::Update(const InputEdit* edit, Str text,
     }
 }
 
+void InputHighlighter::UpdateBatch(const InputEditWithText* edits, int n,
+                                   bool folding) const {
+    if (updateBatch) {
+        updateBatch(data, edits, n, folding);
+        return;
+    }
+
+    for (int i = 0; i < n; i++) {
+        Update(&edits[i].edit, edits[i].text, folding);
+    }
+}
+
 int InputHighlighter::Styles(Selection range,
                              const HighlightStyleResolver* resolver, Arena* a,
                              TextSpan** out) const {
@@ -31506,6 +32820,182 @@ El* FoldIconRenderer::Render(Ctx* cx, int line, bool folded) const {
     return render ? render(data, cx, line, folded) : nullptr;
 }
 
+bool LineWrapperIsWordChar(uint32_t c) {
+
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9')) {
+        return true;
+    }
+
+    if ((c >= 0x00C0 && c <= 0x00FF) || (c >= 0x0100 && c <= 0x017F) ||
+        (c >= 0x0180 && c <= 0x024F) || (c >= 0x0400 && c <= 0x04FF) ||
+        (c >= 0x1E00 && c <= 0x1EFF) || (c >= 0x0300 && c <= 0x036F) ||
+        (c >= 0x0980 && c <= 0x09FF)) {
+        return true;
+    }
+    switch (c) {
+
+        case '-':
+        case '_':
+        case '.':
+        case '\'':
+        case 0x2019:
+        case 0x2018:
+        case '$':
+        case '%':
+        case '@':
+        case '#':
+        case '^':
+        case '~':
+        case ',':
+        case '=':
+        case ':':
+        case ';':
+
+        case '!':
+        case ')':
+        case ']':
+        case '}':
+        case '"':
+        case 0x201D:
+        case 0x00BB:
+        case 0x2026:
+
+        case 0x22EF:
+
+        case 0x202F:
+        case 0x00A0:
+        case 0x2011:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void LineWrapperWrapLine(const LineFragment* fragments, int n, float wrapWidth,
+                         WrapCharWidth widthFor, void* user,
+                         Vec<WrapBoundary>* out) {
+    float width = 0;
+    int firstNonWhitespace = -1;
+    int indent = -1;
+    int lastCandidateIx = 0;
+    float lastCandidateWidth = 0;
+    int lastWrapIx = 0;
+    uint32_t prevC = 0;
+    int index = 0;
+    for (int f = 0; f < n; f++) {
+        const LineFragment& frag = fragments[f];
+        bool element = frag.elementLen > 0 && !frag.text.s;
+        int at = 0;
+        while (element ? at == 0 : at < len(frag.text)) {
+            int ix = index;
+            uint32_t c = 0;
+            int bytes = 0;
+            if (element) {
+                bytes = frag.elementLen;
+            } else {
+                bytes = Utf8At(frag.text, at, &c);
+                if (bytes <= 0) {
+                    bytes = 1;
+                }
+            }
+            at += element ? 1 : bytes;
+            index += bytes;
+            uint32_t newPrevC = prevC;
+            float itemWidth = 0;
+            if (element) {
+                if (prevC == ' ' && firstNonWhitespace >= 0) {
+                    lastCandidateIx = ix;
+                    lastCandidateWidth = width;
+                }
+                if (firstNonWhitespace < 0) {
+                    firstNonWhitespace = ix;
+                }
+                itemWidth = frag.elementWidth;
+            } else {
+                if (c == '\n') {
+                    continue;
+                }
+                if (LineWrapperIsWordChar(c)) {
+                    if (prevC == ' ' && c != ' ' && firstNonWhitespace >= 0) {
+                        lastCandidateIx = ix;
+                        lastCandidateWidth = width;
+                    }
+                } else if (c != ' ' && firstNonWhitespace >= 0) {
+
+                    lastCandidateIx = ix;
+                    lastCandidateWidth = width;
+                }
+                if (c != ' ' && firstNonWhitespace < 0) {
+                    firstNonWhitespace = ix;
+                }
+                newPrevC = c;
+                itemWidth = widthFor(user, c);
+            }
+            width += itemWidth;
+            if (width > wrapWidth && ix > lastWrapIx) {
+                if (indent < 0 && firstNonWhitespace >= 0) {
+                    indent = std::min(kLineWrapperMaxIndent,
+                                      firstNonWhitespace - lastWrapIx);
+                }
+                if (lastCandidateIx > 0) {
+                    lastWrapIx = lastCandidateIx;
+                    width -= lastCandidateWidth;
+                    lastCandidateIx = 0;
+                } else {
+                    lastWrapIx = ix;
+                    width = itemWidth;
+                }
+                if (indent >= 0) {
+                    width += widthFor(user, ' ') * (float)indent;
+                }
+                VecAppend(*out,
+                          WrapBoundary{lastWrapIx, indent >= 0 ? indent : 0});
+            }
+            prevC = newPrevC;
+        }
+    }
+}
+
+void TextWrapperWrapItem(Str line, bool wrap, WrappingIndent indent,
+                         WrapLineFn wrapLine, void* user, Vec<int>* rows,
+                         int* indentChars) {
+    VecClear(*rows);
+    int prev = 0;
+    int indentOut = 0;
+    if (wrap) {
+        Vec<WrapBoundary> boundaries;
+        wrapLine(user, line, 0, &boundaries);
+        if (indent == WrappingIndent::Same) {
+
+            for (int i = 0; i < len(boundaries); i++) {
+                VecAppend(*rows, prev);
+                prev = boundaries[i].ix;
+                indentOut = boundaries[i].nextIndent;
+            }
+        } else if (len(boundaries) > 0) {
+
+            int first = boundaries[0].ix;
+            VecAppend(*rows, prev);
+            prev = first;
+            Vec<WrapBoundary> rest;
+            wrapLine(user, Str(line.s + first, len(line) - first), first,
+                     &rest);
+            for (int i = 0; i < len(rest); i++) {
+                VecAppend(*rows, prev);
+                prev = first + rest[i].ix;
+            }
+        }
+    }
+
+    if (prev < len(line) || prev == 0) {
+        VecAppend(*rows, prev);
+    }
+    if (indentChars) {
+        *indentChars = indentOut;
+    }
+}
+
 }
 
 #line 1 "src/base/input_keys.cpp"
@@ -31520,6 +33010,7 @@ namespace input {
         return id;                                    \
     }
 
+GPUI_INPUT_ACTION(ActivateToken, "input::ActivateToken")
 GPUI_INPUT_ACTION(AddCursorAbove, "input::AddCursorAbove")
 GPUI_INPUT_ACTION(AddCursorBelow, "input::AddCursorBelow")
 GPUI_INPUT_ACTION(Backspace, "input::Backspace")
@@ -31634,6 +33125,10 @@ void InputInitKeys() {
         {"shift-right", input::SelectRight(), ctx},
         {"shift-up", input::SelectUp(), ctx},
         {"shift-down", input::SelectDown(), ctx},
+#if !GPUI_OS_MAC && !GPUI_OS_LINUX
+        {"shift-alt-left", input::SelectLeft(), ctx},
+        {"shift-alt-right", input::SelectRight(), ctx},
+#endif
 
 #if GPUI_OS_MAC
         {"cmd-alt-up", input::AddCursorAbove(), ctx},
@@ -31655,12 +33150,14 @@ void InputInitKeys() {
         {"ctrl-shift-e", input::SelectToEndOfLine(), ctx},
         {"shift-cmd-left", input::SelectToStartOfLine(), ctx},
         {"shift-cmd-right", input::SelectToEndOfLine(), ctx},
+#endif
+#if GPUI_OS_MAC || GPUI_OS_LINUX
         {"alt-shift-left", input::SelectToPreviousWordStart(), ctx},
 #endif
 #if !GPUI_OS_MAC
         {"ctrl-shift-left", input::SelectToPreviousWordStart(), ctx},
 #endif
-#if GPUI_OS_MAC
+#if GPUI_OS_MAC || GPUI_OS_LINUX
         {"alt-shift-right", input::SelectToNextWordEnd(), ctx},
 #endif
 #if !GPUI_OS_MAC
@@ -31744,7 +33241,7 @@ void InputInitKeys() {
     KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
 }
 
-InputAction InputActionOf(uint32_t id, intptr_t arg) {
+InputAction InputActionOf(uint32_t id, int64_t arg) {
     (void)arg;
     if (!id) {
         return InputAction::None;
@@ -31836,6 +33333,9 @@ InputAction InputActionOf(uint32_t id, intptr_t arg) {
     }
     if (id == input::ToggleCodeActions()) {
         return InputAction::ToggleCodeActions;
+    }
+    if (id == input::ActivateToken()) {
+        return InputAction::ActivateToken;
     }
     if (id == input::Search()) {
         return InputAction::Search;
@@ -32324,6 +33824,17 @@ InlineTokenError InlineToken::Validate() const {
     return InlineTokenError::Ok;
 }
 
+static bool IsGraphemeExtend(uint32_t c) {
+    return (c >= 0x0300 && c <= 0x036F) || (c >= 0x0483 && c <= 0x0489) ||
+           (c >= 0x0591 && c <= 0x05BD) || (c >= 0x0610 && c <= 0x061A) ||
+           (c >= 0x064B && c <= 0x065F) || (c >= 0x1AB0 && c <= 0x1AFF) ||
+           (c >= 0x1DC0 && c <= 0x1DFF) || c == 0x200C || c == 0x200D ||
+           (c >= 0x20D0 && c <= 0x20FF) || (c >= 0x302A && c <= 0x302F) ||
+           (c >= 0x3099 && c <= 0x309A) || (c >= 0xFE00 && c <= 0xFE0F) ||
+           (c >= 0xFE20 && c <= 0xFE2F) || (c >= 0x1F3FB && c <= 0x1F3FF) ||
+           (c >= 0xE0020 && c <= 0xE007F) || (c >= 0xE0100 && c <= 0xE01EF);
+}
+
 static bool IsCharBoundary(Str text, int off) {
     if (off < 0 || off > len(text)) {
         return false;
@@ -32331,7 +33842,20 @@ static bool IsCharBoundary(Str text, int off) {
     if (off == 0 || off == len(text)) {
         return true;
     }
-    return Utf8ClipLeft(text, off) == off;
+    if (Utf8ClipLeft(text, off) != off) {
+        return false;
+    }
+    if (text.s[off - 1] == '\r' && text.s[off] == '\n') {
+        return false;
+    }
+    uint32_t next = 0;
+    Utf8At(text, off, &next);
+    if (IsGraphemeExtend(next)) {
+        return false;
+    }
+    uint32_t prev = 0;
+    Utf8At(text, Utf8Prev(text, off), &prev);
+    return prev != 0x200D;
 }
 
 InputContent InputContent::New(Str text) {
@@ -32769,12 +34293,452 @@ static El* RowMatchWashes(Arena* a, El* el, const InputEditorStyle& style,
 
 static const float kInputLineH = 20.f;
 
+static float InputLineH(const Ctx* cx) {
+    return Rems(cx, 1.25f);
+}
+
+static float InputLineMult(const Ctx* cx, float lineH, float font) {
+    return FontPx(cx, lineH) / font;
+}
+
+static const float kEditorRightMargin = 10.f;
+
 static float DisplayLineH(const InputState* s, int row, float lineH);
 static float DisplayRowDocY(const InputState* s, int row, float lineH);
+static void Notify(App* app, Window* win);
+
+static int WrapEncodeUtf8(uint32_t c, char* out) {
+    if (c < 0x80) {
+        out[0] = (char)c;
+        return 1;
+    }
+    if (c < 0x800) {
+        out[0] = (char)(0xC0 | (c >> 6));
+        out[1] = (char)(0x80 | (c & 0x3F));
+        return 2;
+    }
+    if (c < 0x10000) {
+        out[0] = (char)(0xE0 | (c >> 12));
+        out[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (c & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (c >> 18));
+    out[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((c >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (c & 0x3F));
+    return 4;
+}
+
+struct WrapMeasure {
+    InputWrapMap* map = nullptr;
+    PaintCtx* ctx = nullptr;
+};
+
+static bool WrapAdvance(const WrapMeasure* wm, Str bytes, float* out) {
+    const InputWrapMap* m = wm->map;
+    float x = 0, y = 0, h = 0;
+    if (!wm->ctx || !TextPointAt(wm->ctx, bytes, m->fontSize, 0, false,
+                                 len(bytes), &x, &y, &h, m->fontWord)) {
+        return false;
+    }
+    *out = x;
+    return true;
+}
+
+static float WrapCharWidthOf(void* user, uint32_t c) {
+    WrapMeasure* wm = (WrapMeasure*)user;
+    InputWrapMap* m = wm->map;
+    if (m->charFont != m->fontSize || m->charWord != m->fontWord) {
+        m->charFont = m->fontSize;
+        m->charWord = m->fontWord;
+        for (float& w : m->asciiWidths) {
+            w = -1;
+        }
+        for (uint32_t& k : m->otherChars) {
+            k = 0;
+        }
+    }
+    int slot = -1;
+    if (c < 128) {
+        if (m->asciiWidths[c] >= 0) {
+            return m->asciiWidths[c];
+        }
+    } else {
+        const int kSlots = (int)dimof(m->otherChars);
+        int at = (int)((c * 2654435761u) >> 24) % kSlots;
+        for (int probe = 0; probe < kSlots; probe++) {
+            int i = (at + probe) % kSlots;
+            if (m->otherChars[i] == c) {
+                return m->otherWidths[i];
+            }
+            if (m->otherChars[i] == 0) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    char buf[4];
+    int n = WrapEncodeUtf8(c, buf);
+    float w = 0;
+    if (!WrapAdvance(wm, Str(buf, n), &w)) {
+
+        return m->fontSize * 0.6f;
+    }
+    if (c < 128) {
+        m->asciiWidths[c] = w;
+    } else if (slot >= 0) {
+        m->otherChars[slot] = c;
+        m->otherWidths[slot] = w;
+    }
+    return w;
+}
+
+struct WrapLineUser {
+    WrapMeasure* measure = nullptr;
+    float width = 0;
+    int lineStart = 0;
+    const InlineTokenSpan* spans = nullptr;
+    const float* widths = nullptr;
+    int nSpans = 0;
+};
+
+static float WrapTokenWidth(WrapLineUser* u, int i) {
+    if (u->widths) {
+        return u->widths[i];
+    }
+
+    Str label = u->spans[i].token.label;
+    if (len(label) == 0) {
+        label = u->spans[i].token.text;
+    }
+    float w = 0;
+    for (int at = 0; at < len(label);) {
+        uint32_t c = 0;
+        int n = Utf8At(label, at, &c);
+        w += WrapCharWidthOf(u->measure, c);
+        at += n > 0 ? n : 1;
+    }
+    return w > 1 ? w : 1;
+}
+
+static void WrapLineFragments(void* user, Str slice, int base,
+                              Vec<WrapBoundary>* out) {
+    WrapLineUser* u = (WrapLineUser*)user;
+    if (u->nSpans == 0) {
+        LineFragment f = LineFragment::Text(slice);
+        LineWrapperWrapLine(&f, 1, u->width, &WrapCharWidthOf, u->measure, out);
+        return;
+    }
+    Vec<LineFragment> frags;
+    int from = u->lineStart + base;
+    int end = from + len(slice);
+    int at = from;
+    for (int i = 0; i < u->nSpans; i++) {
+        const InlineTokenSpan& span = u->spans[i];
+        if (span.end <= from || span.start >= end) {
+            continue;
+        }
+        int s0 = span.start < from ? from : span.start;
+        if (s0 > at) {
+            VecAppend(frags,
+                      LineFragment::Text(Str(slice.s + (at - from), s0 - at)));
+        }
+        int e0 = span.end > end ? end : span.end;
+        VecAppend(frags, LineFragment::Element(WrapTokenWidth(u, i), e0 - s0));
+        at = e0;
+    }
+    if (at < end) {
+        VecAppend(frags,
+                  LineFragment::Text(Str(slice.s + (at - from), end - at)));
+    }
+    LineWrapperWrapLine(frags.els, len(frags), u->width, &WrapCharWidthOf,
+                        u->measure, out);
+}
+
+static void WrapOneLine(InputState* s, WrapMeasure* wm, int line,
+                        Vec<int>* rows, float* indentOut) {
+    InputWrapMap* m = &s->wrap;
+    const Vec<int>& lineStarts = InputLineStarts(s);
+    Str text = InputValue(s);
+    int nLines = len(lineStarts);
+    int start = lineStarts[line];
+    int end = line + 1 < nLines ? lineStarts[line + 1] - 1 : len(text);
+    Str str = Str(text.s + start, end - start);
+    WrapLineUser u;
+    u.measure = wm;
+    u.width = m->width;
+    u.lineStart = start;
+    const Vec<InlineTokenSpan>* spans =
+        InputTokensVisible(s) ? InputTokens(s) : nullptr;
+    int nSpans = spans ? len(*spans) : 0;
+    if (nSpans > 0) {
+
+        int lo = 0, hi = nSpans;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if ((*spans)[mid].end <= start) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        int count = 0;
+        while (lo + count < nSpans && (*spans)[lo + count].start < end) {
+            count++;
+        }
+        if (count > 0) {
+            const float* widths =
+                len(m->tokenWidths) == nSpans ? m->tokenWidths.els : nullptr;
+            u.spans = spans->els + lo;
+            u.widths = widths ? widths + lo : nullptr;
+            u.nSpans = count;
+        }
+    }
+    WrappingIndent indent =
+        m->wrappingIndent ? WrappingIndent::Same : WrappingIndent::None;
+    int indentChars = 0;
+    VecClear(*rows);
+    TextWrapperWrapItem(str, m->width > 0, indent, &WrapLineFragments, &u, rows,
+                        &indentChars);
+    *indentOut = 0;
+
+    if (indentChars > 0 && len(*rows) > 1) {
+        int bytes = 0;
+        for (int k = 0; k < indentChars && bytes < len(str); k++) {
+            uint32_t c = 0;
+            int n = Utf8At(str, bytes, &c);
+            bytes += n > 0 ? n : 1;
+        }
+        float x = 0;
+        if (!WrapAdvance(wm, Str(str.s, bytes), &x)) {
+            x = m->spaceWidth * (float)indentChars;
+        }
+        *indentOut = x;
+    }
+}
+
+static void WrapMapCaughtUp(InputState* s) {
+    InputWrapMap* m = &s->wrap;
+    m->docVersion = s->docVersion;
+    m->hasEdit = false;
+    m->editWhole = false;
+    m->valid = true;
+}
+
+static void WrapMapRebuild(InputState* s, PaintCtx* ctx) {
+    InputWrapMap* m = &s->wrap;
+    VecClear(m->lines);
+    VecClear(m->starts);
+    VecClear(m->dirtyLines);
+    m->totalRows = 0;
+    WrapMapCaughtUp(s);
+    int nLines = len(InputLineStarts(s));
+    WrapMeasure wm;
+    wm.map = m;
+    wm.ctx = ctx;
+    m->spaceWidth = WrapCharWidthOf(&wm, ' ');
+    VecReserve(m->lines, nLines);
+    Vec<int> rows;
+    for (int line = 0; line < nLines; line++) {
+        InputWrapLine item;
+        WrapOneLine(s, &wm, line, &rows, &item.indent);
+        item.firstStart = len(m->starts);
+        item.nRows = len(rows);
+        item.rowsAbove = m->totalRows;
+        VecAppendN(m->starts, rows.els, len(rows));
+        m->totalRows += item.nRows;
+        VecAppend(m->lines, item);
+    }
+}
+
+static void WrapMapReplaceLines(InputState* s, WrapMeasure* wm, int first,
+                                int oldCount, int newCount) {
+    InputWrapMap* m = &s->wrap;
+    int nOld = len(m->lines);
+    int sFrom = first < nOld ? m->lines[first].firstStart : len(m->starts);
+    int sTo = first + oldCount < nOld ? m->lines[first + oldCount].firstStart
+                                      : len(m->starts);
+    Vec<InputWrapLine> items;
+    Vec<int> starts;
+    Vec<int> rows;
+    VecReserve(items, newCount);
+    for (int i = 0; i < newCount; i++) {
+        InputWrapLine item;
+        WrapOneLine(s, wm, first + i, &rows, &item.indent);
+        item.nRows = len(rows);
+        VecAppendN(starts, rows.els, len(rows));
+        VecAppend(items, item);
+    }
+    VecRemoveAtN(m->lines, first, oldCount);
+    if (newCount > 0) {
+        if (InputWrapLine* at = VecInsertSpace(m->lines, first, newCount)) {
+            memcpy((void*)at, (const void*)items.els,
+                   sizeof(InputWrapLine) * (size_t)newCount);
+        }
+    }
+    VecRemoveAtN(m->starts, sFrom, sTo - sFrom);
+    if (len(starts) > 0) {
+        if (int* at = VecInsertSpace(m->starts, sFrom, len(starts))) {
+            memcpy(at, starts.els, sizeof(int) * (size_t)len(starts));
+        }
+    }
+
+    int firstStart = sFrom;
+    int above = 0;
+    if (first > 0) {
+        above = m->lines[first - 1].rowsAbove + m->lines[first - 1].nRows;
+    }
+    for (int i = first; i < len(m->lines); i++) {
+        InputWrapLine& item = m->lines[i];
+        item.firstStart = firstStart;
+        item.rowsAbove = above;
+        firstStart += item.nRows;
+        above += item.nRows;
+    }
+    m->totalRows = above;
+}
+
+static int WrapLineOfOffset(const Vec<int>& lineStarts, int offset) {
+    int lo = 0, hi = len(lineStarts) - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (lineStarts[mid] <= offset) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+static void WrapMapCatchUp(InputState* s, PaintCtx* ctx) {
+    InputWrapMap* m = &s->wrap;
+    bool edited = m->docVersion != s->docVersion;
+    if (!edited && len(m->dirtyLines) == 0) {
+        return;
+    }
+    if (edited && (!m->hasEdit || m->editWhole)) {
+        WrapMapRebuild(s, ctx);
+        return;
+    }
+    WrapMeasure wm;
+    wm.map = m;
+    wm.ctx = ctx;
+    const Vec<int>& lineStarts = InputLineStarts(s);
+    int nNew = len(lineStarts);
+    int nOld = len(m->lines);
+    if (edited) {
+
+        int first = WrapLineOfOffset(lineStarts, m->editStart);
+        int lastNew = WrapLineOfOffset(lineStarts, m->editNewEnd);
+        int lastOld = nOld - (nNew - lastNew);
+        if (lastOld < first || lastNew < first || lastOld >= nOld) {
+            WrapMapRebuild(s, ctx);
+            return;
+        }
+        WrapMapReplaceLines(s, &wm, first, lastOld - first + 1,
+                            lastNew - first + 1);
+        WrapMapCaughtUp(s);
+    }
+    for (int i = 0; i < len(m->dirtyLines); i++) {
+        int line = m->dirtyLines[i];
+        if (line >= 0 && line < len(m->lines)) {
+            WrapMapReplaceLines(s, &wm, line, 1, 1);
+        }
+    }
+    VecClear(m->dirtyLines);
+}
+
+void InputUpdateWrapMap(InputState* s, PaintCtx* ctx, float width,
+                        float fontSize, uint16_t fontWord) {
+    if (!s) {
+        return;
+    }
+    InputWrapMap* m = &s->wrap;
+    if (width < 0) {
+        width = 0;
+    }
+
+    bool same = m->valid && m->width == width && m->fontSize == fontSize &&
+                m->fontWord == fontWord &&
+                m->wrappingIndent == s->wrappingIndent;
+    if (same) {
+        WrapMapCatchUp(s, ctx);
+        return;
+    }
+    m->width = width;
+    m->fontSize = fontSize;
+    m->fontWord = fontWord;
+    m->wrappingIndent = s->wrappingIndent;
+    WrapMapRebuild(s, ctx);
+}
+
+static const InputWrapMap* WrapMapOf(const InputState* s, PaintCtx* ctx) {
+    if (!s || !s->softWrap || !InputIsMultiLine(s)) {
+        return nullptr;
+    }
+    const InputWrapMap* m = &s->wrap;
+    if (!m->valid || m->width <= 0) {
+        return nullptr;
+    }
+    InputState* ms = const_cast<InputState*>(s);
+    if (m->wrappingIndent != s->wrappingIndent) {
+        ms->wrap.wrappingIndent = s->wrappingIndent;
+        WrapMapRebuild(ms, ctx);
+    } else {
+        WrapMapCatchUp(ms, ctx);
+    }
+    return m;
+}
+
+int InputWrapRows(const InputState* s, int line, const int** starts,
+                  float* indent) {
+    static const int kZero = 0;
+    const InputWrapMap* m = WrapMapOf(s, nullptr);
+    if (!m || line < 0 || line >= len(m->lines)) {
+        if (starts) {
+            *starts = &kZero;
+        }
+        if (indent) {
+            *indent = 0;
+        }
+        return 1;
+    }
+    const InputWrapLine& item = m->lines[line];
+    if (starts) {
+        *starts = m->starts.els + item.firstStart;
+    }
+    if (indent) {
+        *indent = item.indent;
+    }
+    return item.nRows;
+}
+
+void InputSetWrappingIndent(InputState* s, App* app, Window* win,
+                            WrappingIndent indent) {
+    if (!s) {
+        return;
+    }
+    s->wrappingIndent = indent == WrappingIndent::Same ? 1 : 0;
+    Notify(app, win);
+}
+
+static int WrapRowOfOffset(const int* starts, int nRows, int local,
+                           bool lineEndAffinity) {
+    int k = nRows - 1;
+    while (k > 0 && starts[k] > local) {
+        k--;
+    }
+    if (lineEndAffinity && k > 0 && starts[k] == local) {
+        k--;
+    }
+    return k;
+}
 
 static void RowExtraCursors(Arena* a, El* el, const InputState* state,
                             const InputEditorStyle& style, int start, int len,
-                            bool caret) {
+                            bool caret, bool lastRow) {
     int n = state->extraCursors.len;
     auto* sels = (Selection*)Alloc(a, n * (int)sizeof(Selection));
     auto* carets = (int*)Alloc(a, n * (int)sizeof(int));
@@ -32797,7 +34761,8 @@ static void RowExtraCursors(Arena* a, El* el, const InputState* state,
             sels[nSels++] = Selection{lo, hi};
         }
         int cur = c.Cursor();
-        if (caret && cur >= start && cur <= start + len) {
+        if (caret && cur >= start && cur <= start + len &&
+            (lastRow || cur < start + len)) {
             carets[nCarets++] = cur - start;
         }
     }
@@ -32887,7 +34852,11 @@ static El* TokenChip(Ctx* cx, InputState* state, const InlineTokenSpan& span,
     ctx.disabled = state->disabled;
     ctx.readonly = state->readonly;
     ctx.lineHeight = lineH > 0 ? lineH : kInputLineH;
-    ctx.availableWidth = state->lastBounds.w > 0 ? state->lastBounds.w : kFill;
+
+    float avail = state->wrap.width > 0 && InputIsMultiLine(state)
+                      ? state->wrap.width
+                      : state->viewW - kEditorRightMargin;
+    ctx.availableWidth = avail > 1 ? avail : kFill;
     El* chip = nullptr;
     InlineTokenStore* store = state->tokens;
     if (store && store->renderer) {
@@ -32921,6 +34890,102 @@ static El* TokenChip(Ctx* cx, InputState* state, const InlineTokenSpan& span,
     return chip;
 }
 
+static void MeasureTokenWidths(Ctx* cx, InputState* state,
+                               const InputEditorStyle& style, float font,
+                               float lineH, float width) {
+    InputWrapMap* m = &state->wrap;
+    const Vec<InlineTokenSpan>* spans =
+        InputTokensVisible(state) ? InputTokens(state) : nullptr;
+    int n = spans ? len(*spans) : 0;
+    if (n == 0) {
+        if (len(m->tokenWidths) > 0) {
+            VecClear(m->tokenWidths);
+            m->valid = false;
+        }
+        return;
+    }
+    if (!cx->win) {
+        return;
+    }
+    uint32_t fontBits = 0, widthBits = 0, lineBits = 0;
+    memcpy(&fontBits, &font, sizeof(fontBits));
+    memcpy(&widthBits, &width, sizeof(widthBits));
+    memcpy(&lineBits, &lineH, sizeof(lineBits));
+    uint64_t key = state->docVersion * 1000003u;
+    key = (key ^ fontBits) * 1000003u;
+    key = (key ^ widthBits) * 1000003u;
+    key = (key ^ lineBits) * 1000003u;
+    key ^= (uint64_t)n;
+
+    bool all = key != m->tokenKey || len(m->tokenWidths) != n;
+    Selection visible = {0, 0};
+    if (!all) {
+        float viewH = state->viewH > 0 ? state->viewH : 600.f;
+        float top = state->scrollY - viewH;
+        float bottom = state->scrollY + 2 * viewH;
+        int lines = InputLinesLen(state);
+        float at = 0;
+        visible = {-1, len(InputValue(state))};
+        for (int i = 0; i < lines; i++) {
+            float h = DisplayLineH(state, i, lineH);
+            if (visible.start < 0 && at + h > top) {
+                visible.start = InputLineStartOffset(state, i);
+            }
+            if (at > bottom) {
+                visible.end = InputLineStartOffset(state, i);
+                break;
+            }
+            at += h;
+        }
+        if (visible.start < 0) {
+            visible.start = 0;
+        }
+    }
+
+    Vec<float> was;
+    bool sameChips = len(m->tokenWidths) == n;
+    bool wraps = state->softWrap && InputIsMultiLine(state);
+    if (!sameChips && m->docVersion == state->docVersion) {
+
+        m->valid = false;
+    }
+    if (all) {
+        if (sameChips) {
+            VecAppendVec(was, m->tokenWidths);
+        }
+        VecClear(m->tokenWidths);
+        if (VecAppendBlanks(m->tokenWidths, n)) {
+            for (int i = 0; i < n; i++) {
+                m->tokenWidths[i] = 0;
+            }
+        }
+    }
+    Selection none = {};
+    for (int i = 0; i < n && i < len(m->tokenWidths); i++) {
+        const InlineTokenSpan& span = (*spans)[i];
+        if (!all && (span.end < visible.start || span.start > visible.end)) {
+            continue;
+        }
+        El* chip = TokenChip(cx, state, span, none, lineH, style, font);
+        Size size = MeasureEl(&cx->win->paint, chip, font);
+        float w = size.w;
+        if (width > 0 && w > width) {
+            w = width;
+        }
+        w = w > 1 ? w : 1.f;
+        float before = all ? (sameChips ? was[i] : -1.f) : m->tokenWidths[i];
+        if (before != w && wraps) {
+            int line = WrapLineOfOffset(InputLineStarts(state), span.start);
+            if (len(m->dirtyLines) == 0 ||
+                m->dirtyLines[len(m->dirtyLines) - 1] != line) {
+                VecAppend(m->dirtyLines, line);
+            }
+        }
+        m->tokenWidths[i] = w;
+    }
+    m->tokenKey = key;
+}
+
 static bool LineHasVisibleTokens(const InputState* state, int start, int end) {
     if (!InputTokensVisible(state)) {
         return false;
@@ -32951,11 +35016,10 @@ static uint16_t InputFontWord(const InputEditorStyle& style) {
                       FontFamilyBits(style.fontFamily));
 }
 
-static void EmitTokenTextPiece(El* row, Arena* a, InputState* state,
-                               const InputEditorStyle& style, float font,
-                               float lineMult, Str slice, int docStart,
-                               const Selection& sel, bool caret, int cursor,
-                               bool wrap) {
+static void EmitTokenTextRun(El* row, Arena* a, const InputEditorStyle& style,
+                             float font, float lineMult, Str slice,
+                             int docStart, const Selection& sel, bool caret,
+                             int cursor) {
     if (!row || len(slice) == 0) {
         return;
     }
@@ -32963,12 +35027,10 @@ static void EmitTokenTextPiece(El* row, Arena* a, InputState* state,
                     ->Font(font)
                     ->LineHeight(lineMult)
                     ->Fg(style.foreground)
-                    ->BindInput(state);
-    InputFace(piece, style);
-    if (wrap) {
 
-        piece->Shrink0();
-    }
+                    ->Shrink0();
+
+    InputFace(piece, style);
     int lo = sel.start - docStart;
     int hi = sel.end - docStart;
     if (lo < 0) {
@@ -32986,37 +35048,10 @@ static void EmitTokenTextPiece(El* row, Arena* a, InputState* state,
     row->Child(piece);
 }
 
-static void EmitTokenTextRun(El* row, Arena* a, InputState* state,
-                             const InputEditorStyle& style, float font,
-                             float lineMult, Str slice, int docStart,
-                             const Selection& sel, bool caret, int cursor,
-                             bool wrap) {
-    if (!row || len(slice) == 0) {
-        return;
-    }
-    if (!wrap) {
-        EmitTokenTextPiece(row, a, state, style, font, lineMult, slice,
-                           docStart, sel, caret, cursor, false);
-        return;
-    }
-
-    int at = 0;
-    while (at < len(slice)) {
-        int start = at;
-        uint32_t codepoint = 0;
-        int bytes = Utf8At(slice, at, &codepoint);
-        at += bytes > 0 ? bytes : 1;
-        EmitTokenTextPiece(row, a, state, style, font, lineMult,
-                           Str(slice.s + start, at - start), docStart + start,
-                           sel, caret, cursor, true);
-    }
-}
-
 static void AppendTokenPieces(El* row, Ctx* cx, InputState* state,
                               const InputEditorStyle& style, float font,
                               float lineMult, float lineH, Str run, int start,
-                              const Selection& sel, bool caret, int cursor,
-                              bool wrap) {
+                              const Selection& sel, bool caret, int cursor) {
     if (!row) {
         return;
     }
@@ -33033,18 +35068,18 @@ static void AppendTokenPieces(El* row, Ctx* cx, InputState* state,
                 break;
             }
             if (span.start > at) {
-                EmitTokenTextRun(row, cx->a, state, style, font, lineMult,
+                EmitTokenTextRun(row, cx->a, style, font, lineMult,
                                  Str(run.s + (at - start), span.start - at), at,
-                                 sel, caret, cursor, wrap);
+                                 sel, caret, cursor);
             }
             row->Child(TokenChip(cx, state, span, sel, lineH, style, font));
             at = span.end;
         }
     }
     if (at < end) {
-        EmitTokenTextRun(row, cx->a, state, style, font, lineMult,
+        EmitTokenTextRun(row, cx->a, style, font, lineMult,
                          Str(run.s + (at - start), end - at), at, sel, caret,
-                         cursor, wrap);
+                         cursor);
     }
 }
 
@@ -33062,8 +35097,9 @@ El* Input::New(Ctx* cx, InputState* state, const InputEditorStyle& projected) {
         InputEditorStyleResolve(projected, theme.tokens);
     const InputEditorStyle& style = resolved;
     float font = style.fontSize > 0 ? style.fontSize : 12.f;
-    float lineMult = kInputLineH / font;
-    state->lastLineH = kInputLineH;
+    float lineH = InputLineH(cx);
+    float lineMult = InputLineMult(cx, lineH, font);
+    state->lastLineH = lineH;
     state->lastFontWord = InputFontWord(style);
     Str text = InputValue(state);
     bool masked = style.mask || state->masked;
@@ -33075,7 +35111,7 @@ El* Input::New(Ctx* cx, InputState* state, const InputEditorStyle& projected) {
                   ->FlexRow()
                   ->ItemsCenter()
                   ->H(kFill)
-                  ->MinH(kInputLineH)
+                  ->MinH(lineH)
                   ->Flex1()
                   ->BindInput(state);
     if (style.align == 1) {
@@ -33111,16 +35147,24 @@ El* Input::New(Ctx* cx, InputState* state, const InputEditorStyle& projected) {
         mark.start = MaskedOffset(text, mark.start);
         mark.end = MaskedOffset(text, mark.end);
     }
+
+    state->chipLine = false;
     if (InputTokensVisible(state) && !masked) {
-        AppendTokenPieces(row, cx, state, style, font, lineMult, kInputLineH,
-                          run, 0, sel, caret, cursor, false);
-        return row;
+
+        MeasureTokenWidths(cx, state, style, font, lineH, 0);
+        state->chipLine = true;
+        state->lastFont = font;
+        El* line = Div(a)->FlexRow()->ItemsCenter()->Shrink0()->BoundsOut(
+            &state->lastBounds);
+        AppendTokenPieces(line, cx, state, style, font, lineMult, lineH, run, 0,
+                          sel, caret, cursor);
+        return row->Child(line);
     }
     El* el = TextEl(a, run)
                  ->Font(font)
                  ->LineHeight(lineMult)
                  ->Fg(style.foreground)
-                 ->BindInput(state);
+                 ->BindInputText(state);
 
     if (!masked) {
         int matchAt = 0;
@@ -33186,7 +35230,7 @@ static El* FoldChevron(Arena* a, InputState* state,
                    ->Radius(4)
                    ->ItemsCenter()
                    ->JustifyCenter()
-                   ->PathClick(StrDup(a, fmt("fold-%d", row)))
+                   ->PathClick(ElementIdNamed(a, StrL("fold"), (uint64_t)row))
                    ->HoverBg(RgbaOpacity(style.mutedForeground, 0.25f))
                    ->Cursor(CursorKind::Pointer)
                    ->Child(IconEl(a,
@@ -33238,10 +35282,13 @@ int InputComposeSpans(TextSpan* spans, int n, const TextSpan* decs, int nDecs,
 }
 
 struct RangeDecorationRow {
-    El* box = nullptr;
     El* text = nullptr;
     int start = 0;
     int len = 0;
+    int lineStart = 0;
+    int lineLen = 0;
+    bool first = true;
+    bool last = true;
 };
 
 struct RangeDecorationPath {
@@ -33264,56 +35311,154 @@ struct RangeDecorationPaint {
     int nPaths = 0;
 };
 
-struct RangeDecorationRowPaint {
-    RangeDecorationPaint* shared = nullptr;
-};
-
 static int RangeDecorationCorners(PaintCtx* ctx, const RangeDecorationPaint* p,
                                   Selection range, Vec<RangeCorners>* out) {
     int before = len(*out);
-    Bounds rects[64];
     for (int r = 0; r < p->nRows; r++) {
         const RangeDecorationRow& row = p->rows[r];
-        int lineEnd = row.start + row.len;
+        if (!row.text || row.text->kind != ElKind::Text) {
+            continue;
+        }
+        int rowEnd = row.start + row.len;
+        int lineEnd = row.lineStart + row.lineLen;
         int startIx = std::max(range.start, row.start);
-        int endIx = std::min(range.end, lineEnd);
-        bool newline = range.start <= lineEnd && range.end > lineEnd;
-        int n = 0;
-        if (startIx < endIx) {
-            n = ElTextRangeRects(ctx, row.text, startIx - row.start,
-                                 endIx - row.start, rects, dimof(rects));
+        int endIx = std::min(range.end, rowEnd);
+        bool newline =
+            row.last && range.start <= lineEnd && range.end > lineEnd;
+        bool hasText = startIx < endIx;
+        if (!hasText && !newline) {
+            continue;
         }
-        if (newline && n == 0) {
+        float left = row.text->x;
+        float right = row.text->x;
+        Bounds rect = {};
+        if (hasText && ElTextRangeRects(ctx, row.text, startIx - row.start,
+                                        endIx - row.start, &rect, 1) == 0) {
 
-            Bounds end = {row.text->x, row.text->y, 0, p->lineH};
-            Bounds whole[64];
-            int m = row.len > 0 ? ElTextRangeRects(ctx, row.text, 0, row.len,
-                                                   whole, dimof(whole))
-                                : 0;
-            if (m > 0) {
-                end = {whole[m - 1].x + whole[m - 1].w, whole[m - 1].y, 0,
-                       p->lineH};
+            if (!newline) {
+                continue;
             }
-            if (n < (int)dimof(rects)) {
-                rects[n++] = end;
+            hasText = false;
+        }
+        if (hasText) {
+            left = rect.x;
+            right = rect.x + rect.w;
+        } else if (row.len > 0) {
+
+            Bounds whole = {};
+            if (ElTextRangeRects(ctx, row.text, 0, row.len, &whole, 1) > 0) {
+                left = right = whole.x + whole.w;
             }
         }
-        for (int i = 0; i < n; i++) {
-            float left = rects[i].x;
-            float right = rects[i].x + rects[i].w;
-            if (newline && i == n - 1) {
-                right += ElTextSpaceWidth(ctx, row.text);
-            }
-            float top = rects[i].y;
-            RangeCorners c;
-            c.topLeft = {left, top};
-            c.topRight = {right, top};
-            c.bottomLeft = {left, top + p->lineH};
-            c.bottomRight = {right, top + p->lineH};
-            VecAppend(*out, c);
+        if (newline) {
+            right += ElTextSpaceWidth(ctx, row.text);
         }
+        float top = row.text->y;
+        RangeCorners c;
+        c.topLeft = {left, top};
+        c.topRight = {right, top};
+        c.bottomLeft = {left, top + p->lineH};
+        c.bottomRight = {right, top + p->lineH};
+        VecAppend(*out, c);
     }
     return len(*out) - before;
+}
+
+struct InputPaintedRows {
+    RangeDecorationPaint geometry;
+    RangeDecorationPaint* decorations = nullptr;
+
+    const struct EditorUnderlay* underlay = nullptr;
+};
+
+static const InputPaintedRows* LastPaintedRows(const InputState* s,
+                                               const Window* win) {
+
+    if (!s || !win || !s->paintedRows ||
+        s->paintedRowsFrame + 1 != win->frameSeq) {
+        return nullptr;
+    }
+    return s->paintedRows;
+}
+
+int InputLastPaintedRows(const InputState* s, const Window* win, Selection* out,
+                         int cap) {
+    const InputPaintedRows* pr = LastPaintedRows(s, win);
+    if (!pr) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < pr->geometry.nRows; i++) {
+        const RangeDecorationRow& row = pr->geometry.rows[i];
+        if (!row.first) {
+            continue;
+        }
+        if (n < cap && out) {
+            out[n] = Selection{row.lineStart, row.lineStart + row.lineLen};
+        }
+        n++;
+    }
+    return n;
+}
+
+int InputLastVisualRows(const InputState* s, Window* win,
+                        InputPaintedVisualRow* out, int cap) {
+    const InputPaintedRows* pr = LastPaintedRows(s, win);
+    if (!pr) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < pr->geometry.nRows; i++) {
+        const RangeDecorationRow& row = pr->geometry.rows[i];
+        if (n < cap && out && row.text) {
+            InputPaintedVisualRow& v = out[n];
+            v.start = row.start;
+            v.len = row.len;
+            v.lineStart = row.lineStart;
+            v.lineLen = row.lineLen;
+            v.lastOfLine = row.last;
+            v.text = row.text->Bounds();
+            v.width = 0;
+            Bounds whole = {};
+            if (row.len > 0 && row.text->kind == ElKind::Text &&
+                ElTextRangeRects(&win->paint, row.text, 0, row.len, &whole, 1) >
+                    0) {
+                v.width = whole.x + whole.w - row.text->x;
+            }
+        }
+        n++;
+    }
+    return n;
+}
+
+int InputLastRangeCorners(const InputState* s, Window* win, Selection range,
+                          Vec<RangeCorners>* out) {
+    const InputPaintedRows* pr = LastPaintedRows(s, win);
+    if (!pr || !out) {
+        return 0;
+    }
+    return RangeDecorationCorners(&win->paint, &pr->geometry, range, out);
+}
+
+bool InputLastRangeDecorationPaths(const InputState* s, const Window* win,
+                                   int* fills, int* frames) {
+    int nFills = 0, nFrames = 0;
+    const InputPaintedRows* pr = LastPaintedRows(s, win);
+    const RangeDecorationPaint* p = pr ? pr->decorations : nullptr;
+    for (int i = 0; p && i < p->nPaths; i++) {
+        if (p->paths[i].stroke > 0) {
+            nFrames++;
+        } else {
+            nFills++;
+        }
+    }
+    if (fills) {
+        *fills = nFills;
+    }
+    if (frames) {
+        *frames = nFrames;
+    }
+    return pr != nullptr;
 }
 
 static void BuildRangeDecorationPaths(PaintCtx* ctx, RangeDecorationPaint* p,
@@ -33365,24 +35510,60 @@ static void BuildRangeDecorationPaths(PaintCtx* ctx, RangeDecorationPaint* p,
     }
 }
 
-static void PaintRangeDecorationsRow(PaintCtx* ctx, El* e, void* user);
+struct EditorUnderlay {
+    InputState* state = nullptr;
+    RangeDecorationPaint* decorations = nullptr;
+    El* activeLine = nullptr;
+    Rgba activeColor = {};
+    float activeBleedL = 0;
+    Ctx cx = {};
+    InputEditorStyle projected = {};
+    bool lineNumbers = false;
+};
 
-static void AttachRangeDecorationRow(Arena* a, RangeDecorationPaint* p, El* box,
-                                     El* text, int start, int len) {
-    RangeDecorationRow& row = p->rows[p->nRows++];
-    row.box = box;
-    row.text = text;
-    row.start = start;
-    row.len = len;
-    RangeDecorationRowPaint* user = ArenaNew<RangeDecorationRowPaint>(a);
-    user->shared = p;
-    box->customPaint = &PaintRangeDecorationsRow;
-    box->customUser = user;
+static void RewrapEditorColumn(PaintCtx* ctx, El* e, void* user) {
+    EditorUnderlay* u = (EditorUnderlay*)user;
+    InputState* s = u ? u->state : nullptr;
+    if (!s || !s->softWrap || e->w <= 0 || e->w == s->wrap.measuredWidth ||
+        LayoutInScratchPass()) {
+        return;
+    }
+    s->contentBox = e->Bounds();
+    Ctx cx = u->cx;
+    El* fresh = Textarea::New(&cx, s, u->projected, u->lineNumbers);
+    if (!fresh || !fresh->first) {
+        return;
+    }
+    float was = e->h;
+    e->first = fresh->first;
+    e->last = fresh->last;
+    e->customPaint = fresh->customPaint;
+    e->customUser = fresh->customUser;
+    IdsCollectChildren(e);
+    LayoutEl(ctx, e, e->x, e->y, e->w, 0, e->laidFont, e->style.color);
+    if (e->h != was && ctx->window) {
+        AppInvalidate(ctx->window);
+    }
 }
 
-static void PaintRangeDecorationsRow(PaintCtx* ctx, El* e, void* user) {
-    RangeDecorationRowPaint* rp = (RangeDecorationRowPaint*)user;
-    RangeDecorationPaint* p = rp ? rp->shared : nullptr;
+static void PaintEditorUnderlay(PaintCtx* ctx, El* e, void* user) {
+    EditorUnderlay* u = (EditorUnderlay*)user;
+    if (!u) {
+        return;
+    }
+
+    InputState* s = u->state;
+    if (s && s->softWrap && e->w > 0 && e->w != s->wrap.measuredWidth &&
+        ctx->window) {
+        AppInvalidate(ctx->window);
+    }
+    if (u->activeLine && u->activeColor.a != 0) {
+        const El* band = u->activeLine;
+        FillRound(ctx, band->x - u->activeBleedL, band->y,
+                  band->w + u->activeBleedL, band->h, 0,
+                  PaintFade(ctx, u->activeColor));
+    }
+    RangeDecorationPaint* p = u->decorations;
     if (!p) {
         return;
     }
@@ -33390,10 +35571,6 @@ static void PaintRangeDecorationsRow(PaintCtx* ctx, El* e, void* user) {
         Bounds mask = ctx->hasHitMask ? ctx->hitMask : e->Bounds();
         BuildRangeDecorationPaths(ctx, p, mask);
     }
-    if (p->nPaths == 0) {
-        return;
-    }
-    CanvasPushClip(ctx, e->x - 2, e->y, e->w + 4, e->h);
     for (int i = 0; i < p->nPaths; i++) {
         const RangeDecorationPath& path = p->paths[i];
         Path* shape = PathNew(ctx, true);
@@ -33413,7 +35590,20 @@ static void PaintRangeDecorationsRow(PaintCtx* ctx, El* e, void* user) {
         }
         PathFree(shape);
     }
-    CanvasPopClip(ctx);
+}
+
+bool InputLastActiveLine(const InputState* s, const Window* win, Bounds* out) {
+    const InputPaintedRows* pr = LastPaintedRows(s, win);
+    const EditorUnderlay* u = pr ? pr->underlay : nullptr;
+    if (!u || !u->activeLine || u->activeColor.a == 0) {
+        return false;
+    }
+    if (out) {
+        const El* band = u->activeLine;
+        *out = {band->x - u->activeBleedL, band->y, band->w + u->activeBleedL,
+                band->h};
+    }
+    return true;
 }
 
 El* Textarea::New(Ctx* cx, InputState* state) {
@@ -33432,9 +35622,10 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     const InputEditorStyle& style = resolved;
     float font = style.fontSize > 0 ? style.fontSize : 12.f;
 
-    float lineH =
-        state->kind == InputKind::Editor ? roundf(font * 1.5f) : kInputLineH;
-    float lineMult = lineH / font;
+    float lineH = state->kind == InputKind::Editor
+                      ? Rems(cx, roundf(font * 1.5f) / 16.f)
+                      : InputLineH(cx);
+    float lineMult = InputLineMult(cx, lineH, font);
     state->lastLineH = lineH;
     state->lastFontWord = InputFontWord(style);
     Str text = InputValue(state);
@@ -33443,11 +35634,9 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     int cursor = InputCursor(state);
     Selection sel = state->selectedRange;
 
-    bool wrap = state->softWrap;
     El* col = Div(a)->FlexCol()->W(kFill)->BindInput(state);
     col->BoundsOut(&state->contentBox);
     if (len(text) == 0) {
-        VecClear(state->rowBoxes);
         if (caret) {
             col->Caret(0, style.caret);
         }
@@ -33465,24 +35654,6 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     if (LayoutModeIsFolding(state->mode)) {
         FoldMapRebuild(&state->folds, rows);
         state->contentH = (float)FoldMapDisplayRowCount(&state->folds) * lineH;
-    }
-    if (wrap) {
-
-        float wrapped = DisplayRowDocY(state, rows, lineH);
-        if (wrapped > 0) {
-            state->contentH = wrapped;
-        }
-    }
-
-    if (!wrap) {
-        VecClear(state->rowBoxes);
-    } else if (state->rowBoxes.len != rows) {
-        VecClear(state->rowBoxes);
-        if (Bounds* slots = VecAppendBlanks(state->rowBoxes, rows)) {
-            for (int i = 0; i < rows; i++) {
-                slots[i] = Bounds{};
-            }
-        }
     }
     float numW = 0;
 
@@ -33506,6 +35677,32 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     float foldW = folding ? kFoldIconHitbox : 0.f;
     if (folding) {
         FoldMapRebuild(&state->folds, rows);
+    }
+
+    bool wrap = false;
+    {
+        float colW = state->contentBox.w;
+        float gutterW =
+            lineNumbers ? numW + kLineNumberRightMargin + foldW : 0.f;
+        float textW = 0;
+        if (colW > 0) {
+            textW = colW - gutterW - kEditorRightMargin;
+            if (textW < 1) {
+                textW = 1;
+            }
+        }
+
+        MeasureTokenWidths(cx, state, style, font, lineH, textW);
+        if (state->softWrap) {
+            InputUpdateWrapMap(state, cx->win ? &cx->win->paint : nullptr,
+                               textW, font, InputFontWord(style));
+            state->wrap.measuredWidth = colW;
+            wrap = WrapMapOf(state, cx->win ? &cx->win->paint : nullptr) !=
+                   nullptr;
+            if (wrap) {
+                state->contentH = DisplayRowDocY(state, rows, lineH);
+            }
+        }
     }
 
     bool gutterHover = folding && GutterHovered(state, cx->win);
@@ -33543,7 +35740,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         const int kSlack = 2;
         float top = state->scrollY;
         float bottom = top + vh;
-        if (!wrap || state->rowBoxes.len != rows) {
+        if (!wrap) {
             int first = (int)(top / lineH) - kSlack;
             int end = (int)(bottom / lineH) + 1 + kSlack;
             firstRow = first < 0 ? 0 : (first > rows ? rows : first);
@@ -33705,17 +35902,31 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         TextSpan* hl = nullptr;
         int nHl = state->highlighter
                       .Styles(vis, &style.highlightStyles, a, &hl);
-        if (style.nSpans > 0) {
 
-            int cap = nHl + 2 * style.nSpans;
+        int nOwn = InputDecorationSpans(state, nullptr, 0);
+        TextSpan* own = nullptr;
+        if (nOwn > 0) {
+            own = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * nOwn);
+            nOwn = own ? InputDecorationSpans(state, own, nOwn) : 0;
+        }
+        if (style.nSpans > 0 || nOwn > 0) {
+
+            int cap = nHl + 2 * style.nSpans + 2 * nOwn;
             auto* buf = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * cap);
             auto* tmp = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * cap);
             if (buf && tmp) {
                 if (nHl > 0) {
                     memcpy(buf, hl, (size_t)nHl * sizeof(TextSpan));
                 }
-                nDocSpans = InputComposeSpans(buf, nHl, style.spans,
-                                              style.nSpans, cap, tmp);
+                nDocSpans = nHl;
+                if (style.nSpans > 0) {
+                    nDocSpans = InputComposeSpans(buf, nDocSpans, style.spans,
+                                                  style.nSpans, cap, tmp);
+                }
+                if (nOwn > 0) {
+                    nDocSpans =
+                        InputComposeSpans(buf, nDocSpans, own, nOwn, cap, tmp);
+                }
                 docSpans = buf;
             }
         } else {
@@ -33748,35 +35959,69 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                 a, (int)sizeof(const RangeDecoration*) * n);
             rangePaint->nDecorations = InputRangeDecorations(
                 state, spans.els, len(spans), rangePaint->decorations, n);
-            rangePaint->rows = (RangeDecorationRow*)Alloc(
-                a, (int)sizeof(RangeDecorationRow) * (endRow - firstRow));
             rangePaint->foreground = style.foreground;
             rangePaint->lineH = lineH;
             rangePaint->arena = a;
         }
     }
+
+    int visualRows = 0;
     for (int row = firstRow; row < endRow; row++) {
-        int start = lineStarts[row];
+        visualRows += InputWrapRows(state, row, nullptr, nullptr);
+    }
+    InputPaintedRows* painted = ArenaNew<InputPaintedRows>(a);
+    state->paintedRows = painted;
+    state->paintedRowsFrame = cx->win ? cx->win->frameSeq : 0;
+    if (painted) {
+        painted->decorations = rangePaint;
+        painted->geometry.lineH = lineH;
+        painted->geometry.arena = a;
+        if (visualRows > 0) {
+            painted->geometry.rows = (RangeDecorationRow*)Alloc(
+                a, (int)sizeof(RangeDecorationRow) * visualRows);
+        }
+        if (rangePaint) {
+            rangePaint->rows = painted->geometry.rows;
+        }
+    }
+
+    EditorUnderlay* underlay = ArenaNew<EditorUnderlay>(a);
+    if (underlay) {
+        underlay->state = state;
+        underlay->decorations = rangePaint;
+        underlay->activeColor = style.activeLine;
+        underlay->activeBleedL = style.activeLineBleedL;
+        underlay->cx = *cx;
+        underlay->projected = projected;
+        underlay->lineNumbers = lineNumbers;
+        col->customPaint = &PaintEditorUnderlay;
+        col->customUser = underlay;
+        if (state->softWrap) {
+            col->prePaint = &RewrapEditorColumn;
+        }
+        if (painted) {
+            painted->underlay = underlay;
+        }
+    }
+    for (int row = firstRow; row < endRow; row++) {
+        int lineStart = lineStarts[row];
         int lineEnd =
             row + 1 < len(lineStarts) ? lineStarts[row + 1] - 1 : len(text);
-        Str line = Str(text.s + start, lineEnd - start);
+        Str lineText = Str(text.s + lineStart, lineEnd - lineStart);
 
         if (folding && FoldMapLineHidden(&state->folds, row)) {
-            if (row < state->rowBoxes.len) {
-                state->rowBoxes[row] = Bounds{};
-            }
             continue;
         }
 
         if (row == firstRow) {
-            while (spanAt < nDocSpans && docSpans[spanAt].hi <= start) {
+            while (spanAt < nDocSpans && docSpans[spanAt].hi <= lineStart) {
                 spanAt++;
             }
 
             int lo = matchAt, hi = style.nMatches;
             while (lo < hi) {
                 int mid = lo + (hi - lo) / 2;
-                if (style.matches[mid].end <= start) {
+                if (style.matches[mid].end <= lineStart) {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -33784,252 +36029,284 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
             }
             matchAt = lo;
         }
-        bool tokenLine = LineHasVisibleTokens(state, start, start + len(line));
-        El* el = nullptr;
-        if (tokenLine) {
+        const int* wrapStarts = nullptr;
+        float wrapIndent = 0;
+        int nVis = InputWrapRows(state, row, &wrapStarts, &wrapIndent);
 
-            el = Div(a)->FlexRow()->ItemsCenter();
-            if (wrap) {
-                el->FlexWrap()->W(kFill);
-                if (lineNumbers) {
-                    el->Flex1();
-                }
+        El* lineEl = nVis > 1 ? Div(a)->FlexCol()->W(kFill) : nullptr;
+        El* single = nullptr;
+        for (int vis = 0; vis < nVis; vis++) {
+            int segLo = wrapStarts[vis];
+            int segHi = vis + 1 < nVis ? wrapStarts[vis + 1] : len(lineText);
+            int start = lineStart + segLo;
+            Str line = Str(lineText.s + segLo, segHi - segLo);
+            bool firstSeg = vis == 0;
+            bool lastSeg = vis == nVis - 1;
+            bool tokenLine =
+                LineHasVisibleTokens(state, start, start + len(line));
+            El* el = nullptr;
+            RangeDecorationRow* paintedRow = nullptr;
+            if (painted && painted->geometry.rows &&
+                painted->geometry.nRows < visualRows) {
+                paintedRow = &painted->geometry.rows[painted->geometry.nRows++];
+                paintedRow->start = start;
+                paintedRow->len = len(line);
+                paintedRow->lineStart = lineStart;
+                paintedRow->lineLen = len(lineText);
+                paintedRow->first = firstSeg;
+                paintedRow->last = lastSeg;
+            }
+            if (tokenLine) {
+
+                state->lastFont = font;
+                el = Div(a)->FlexRow()->ItemsCenter()->H(lineH);
+                AppendTokenPieces(el, cx, state, style, font, lineMult, lineH,
+                                  line, start, sel, caret, cursor);
             } else {
-                el->H(lineH);
+                el = TextEl(a, line)->Font(font)->LineHeight(lineMult)->Fg(
+                    style.foreground);
+                InputFace(el, style);
             }
-            AppendTokenPieces(el, cx, state, style, font, lineMult, lineH, line,
-                              start, sel, caret, cursor, wrap);
-        } else {
-            el = TextEl(a, line)->Font(font)->LineHeight(lineMult)->Fg(
-                style.foreground);
-            InputFace(el, style);
-        }
+            if (paintedRow) {
+                paintedRow->text = el;
+            }
 
-        const int kMaxHighlightLineLen = 10000;
+            const int kMaxHighlightLineLen = 10000;
 
-        if (!tokenLine && nDocSpans > 0 && len(line) <= kMaxHighlightLineLen) {
-            while (spanAt < nDocSpans && docSpans[spanAt].hi <= start) {
-                spanAt++;
-            }
-            int first = spanAt;
-            int count = 0;
-            while (first + count < nDocSpans &&
-                   docSpans[first + count].lo < start + len(line)) {
-                count++;
-            }
-            if (count > 0) {
-                auto* rowSpans =
-                    (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * count);
-                int nRowSpans = 0;
-                for (int k = 0; k < count; k++) {
-                    const TextSpan& sp = docSpans[first + k];
-                    int lo = sp.lo - start;
-                    int hi = sp.hi - start;
-                    if (lo < 0) {
-                        lo = 0;
-                    }
-                    if (hi > len(line)) {
-                        hi = len(line);
-                    }
-                    if (hi <= lo) {
-                        continue;
-                    }
-                    rowSpans[nRowSpans] = sp;
-                    rowSpans[nRowSpans].lo = lo;
-                    rowSpans[nRowSpans].hi = hi;
-                    nRowSpans++;
+            if (!tokenLine && nDocSpans > 0 &&
+                len(lineText) <= kMaxHighlightLineLen) {
+                while (spanAt < nDocSpans && docSpans[spanAt].hi <= start) {
+                    spanAt++;
                 }
-                if (nRowSpans > 0) {
-                    el->Spans(rowSpans, nRowSpans);
+                int first = spanAt;
+                int count = 0;
+                while (first + count < nDocSpans &&
+                       docSpans[first + count].lo < start + len(line)) {
+                    count++;
+                }
+                if (count > 0) {
+                    auto* rowSpans =
+                        (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * count);
+                    int nRowSpans = 0;
+                    for (int k = 0; k < count; k++) {
+                        const TextSpan& sp = docSpans[first + k];
+                        int lo = sp.lo - start;
+                        int hi = sp.hi - start;
+                        if (lo < 0) {
+                            lo = 0;
+                        }
+                        if (hi > len(line)) {
+                            hi = len(line);
+                        }
+                        if (hi <= lo) {
+                            continue;
+                        }
+                        rowSpans[nRowSpans] = sp;
+                        rowSpans[nRowSpans].lo = lo;
+                        rowSpans[nRowSpans].hi = hi;
+                        nRowSpans++;
+                    }
+                    if (nRowSpans > 0) {
+                        el->Spans(rowSpans, nRowSpans);
+                    }
                 }
             }
-        }
 
-        if (!tokenLine && state->diagnostics.len > 0) {
-            int nDiag = 0;
-            for (int d = 0; d < state->diagnostics.len; d++) {
-                const Diagnostic& dg = state->diagnostics[d];
-                if (dg.range.end <= start ||
-                    dg.range.start >= start + len(line)) {
-                    continue;
-                }
-                nDiag++;
-            }
-            if (nDiag > 0) {
-                auto* runs = (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * nDiag);
-                int n = 0;
-                for (int d = 0; d < state->diagnostics.len && runs; d++) {
+            if (!tokenLine && state->diagnostics.len > 0) {
+                int nDiag = 0;
+                for (int d = 0; d < state->diagnostics.len; d++) {
                     const Diagnostic& dg = state->diagnostics[d];
-                    int lo = dg.range.start - start;
-                    int hi = dg.range.end - start;
-                    if (lo < 0) {
-                        lo = 0;
-                    }
-                    if (hi > len(line)) {
-                        hi = len(line);
-                    }
-                    if (hi <= lo) {
+                    if (dg.range.end <= start ||
+                        dg.range.start >= start + len(line)) {
                         continue;
                     }
-                    Rgba c = style.diagnostics.info;
-                    if (dg.severity == DiagnosticSeverity::Error) {
-                        c = style.diagnostics.error;
-                    } else if (dg.severity == DiagnosticSeverity::Warning) {
-                        c = style.diagnostics.warning;
-                    } else if (dg.severity == DiagnosticSeverity::Hint) {
-                        c = style.diagnostics.hint;
-                    }
-                    if (c.a == 0) {
-                        continue;
-                    }
-                    runs[n].lo = lo;
-                    runs[n].hi = hi;
-                    runs[n].color = c;
-                    runs[n].bg = Rgba{0, 0, 0, 0};
-                    runs[n].underline = true;
-                    runs[n].wavy = true;
-                    n++;
+                    nDiag++;
                 }
-                if (n > 0) {
-                    el->Underlines(runs, n);
+                if (nDiag > 0) {
+                    auto* runs =
+                        (TextSpan*)Alloc(a, (int)sizeof(TextSpan) * nDiag);
+                    int n = 0;
+                    for (int d = 0; d < state->diagnostics.len && runs; d++) {
+                        const Diagnostic& dg = state->diagnostics[d];
+                        int lo = dg.range.start - start;
+                        int hi = dg.range.end - start;
+                        if (lo < 0) {
+                            lo = 0;
+                        }
+                        if (hi > len(line)) {
+                            hi = len(line);
+                        }
+                        if (hi <= lo) {
+                            continue;
+                        }
+                        Rgba c = style.diagnostics.info;
+                        if (dg.severity == DiagnosticSeverity::Error) {
+                            c = style.diagnostics.error;
+                        } else if (dg.severity == DiagnosticSeverity::Warning) {
+                            c = style.diagnostics.warning;
+                        } else if (dg.severity == DiagnosticSeverity::Hint) {
+                            c = style.diagnostics.hint;
+                        }
+                        if (c.a == 0) {
+                            continue;
+                        }
+                        runs[n].lo = lo;
+                        runs[n].hi = hi;
+                        runs[n].color = c;
+                        runs[n].bg = Rgba{0, 0, 0, 0};
+                        runs[n].underline = true;
+                        runs[n].wavy = true;
+                        n++;
+                    }
+                    if (n > 0) {
+                        el->Underlines(runs, n);
+                    }
                 }
             }
-        }
 
-        if (!tokenLine && state->hoverDef.locations.len > 0 &&
-            style.linkText.a != 0) {
-            Selection sym = state->hoverDef.symbolRange;
-            int lo = sym.start - start;
-            int hi = sym.end - start;
+            if (!tokenLine && state->hoverDef.locations.len > 0 &&
+                style.linkText.a != 0) {
+                Selection sym = state->hoverDef.symbolRange;
+                int lo = sym.start - start;
+                int hi = sym.end - start;
+                if (lo < 0) {
+                    lo = 0;
+                }
+                if (hi > len(line)) {
+                    hi = len(line);
+                }
+                if (hi > lo) {
+                    auto* run = (TextSpan*)Alloc(a, (int)sizeof(TextSpan));
+                    if (run) {
+                        run->lo = lo;
+                        run->hi = hi;
+                        run->color = style.linkText;
+                        run->bg = Rgba{0, 0, 0, 0};
+                        run->underline = true;
+                        run->wavy = false;
+                        el->Underlines(run, 1);
+                    }
+
+                    if (sym.start >= start || firstSeg) {
+                        el->RangeOut(lo, hi, &state->hoverDef.bounds);
+                    }
+                }
+            }
+
+            Selection popoverRange = state->hoverRange;
+            if (state->hoverDiagnostic >= 0 &&
+                state->hoverDiagnostic < state->diagnostics.len) {
+                popoverRange = state->diagnostics[state->hoverDiagnostic].range;
+            }
+            int popoverLo = popoverRange.start - start;
+            int popoverHi = popoverRange.end - start;
+            bool popoverHere = popoverRange.start >= start || firstSeg;
+            if (popoverLo < 0) popoverLo = 0;
+            if (popoverHi > len(line)) popoverHi = len(line);
+            if (!tokenLine && popoverHere && popoverHi > popoverLo) {
+                if (state->popoverTriggerRange.start != popoverRange.start ||
+                    state->popoverTriggerRange.end != popoverRange.end) {
+                    state->popoverTriggerRange = popoverRange;
+                    state->popoverTriggerBounds = {};
+                    WindowRequestAnimationFrame(cx->win);
+                }
+                el->RangeOut(popoverLo, popoverHi,
+                             &state->popoverTriggerBounds);
+            }
+            if (!tokenLine) {
+                RowMatchWashes(a, el, style, state, start, len(line), &matchAt);
+            }
+
+            if (row == 0 && firstSeg) {
+                el->BindInputText(state);
+                if (tokenLine) {
+
+                    el->BoundsOut(&state->lastBounds);
+                }
+            }
+            int lo = sel.start - start;
+            int hi = sel.end - start;
             if (lo < 0) {
                 lo = 0;
             }
             if (hi > len(line)) {
                 hi = len(line);
             }
-            if (hi > lo) {
-                auto* run = (TextSpan*)Alloc(a, (int)sizeof(TextSpan));
-                if (run) {
-                    run->lo = lo;
-                    run->hi = hi;
-                    run->color = style.linkText;
-                    run->bg = Rgba{0, 0, 0, 0};
-                    run->underline = true;
-                    run->wavy = false;
-                    el->Underlines(run, 1);
+            if (!tokenLine && !sel.IsEmpty() && lo < hi) {
+                el->SelRange(lo, hi, style.selection);
+            }
+
+            bool caretHere = cursor >= start && cursor <= start + len(line);
+            if (caretHere && cursor == start + len(line) && !lastSeg &&
+                !state->cursorLineEndAffinity) {
+                caretHere = false;
+            }
+            if (caretHere && cursor == start && !firstSeg &&
+                state->cursorLineEndAffinity) {
+                caretHere = false;
+            }
+            if (!tokenLine && caretFolded) {
+                if (row == caretRow && firstSeg) {
+                    el->Caret(0, style.caret);
                 }
+            } else if (!tokenLine && caret && caretHere) {
+                el->Caret(cursor - start, style.caret, 2,
+                          state->cursorLineEndAffinity);
 
-                el->RangeOut(lo, hi, &state->hoverDef.bounds);
+                el->CaretOut(&state->caretWinX, &state->caretWinY);
+            } else if (!tokenLine && !caretFolded && caretHere) {
+
+                el->Caret(cursor - start, Rgba{0, 0, 0, 0}, 2,
+                          state->cursorLineEndAffinity);
+                el->CaretOut(&state->caretWinX, &state->caretWinY);
+            }
+            if (!tokenLine && state->extraCursors.len > 0) {
+                RowExtraCursors(a, el, state, style, start, len(line), caret,
+                                lastSeg);
+            }
+
+            if (indentGuides && firstSeg) {
+                int indent = lastIndent;
+                if (len(lineText) > 0) {
+                    indent = TabSize{style.indentWidth}.IndentCount(lineText);
+                    lastIndent = indent;
+                }
+                if (!tokenLine) {
+                    el->IndentGuides(style.indentGuide, indent,
+                                     style.indentWidth);
+                }
+            }
+
+            if (!tokenLine && state->showWhitespaces) {
+                el->Whitespaces(style.mutedForeground);
+            }
+            if (!lineEl) {
+                single = el;
+            } else if (vis > 0 && wrapIndent > 0) {
+                lineEl->Child(
+                    Div(a)->FlexRow()->H(lineH)->PadL(wrapIndent)->Child(el));
+            } else {
+                lineEl->Child(el);
             }
         }
-
-        Selection popoverRange = state->hoverRange;
-        if (state->hoverDiagnostic >= 0 &&
-            state->hoverDiagnostic < state->diagnostics.len) {
-            popoverRange = state->diagnostics[state->hoverDiagnostic].range;
+        El* el = lineEl ? lineEl : single;
+        if (!el) {
+            continue;
         }
-        int popoverLo = popoverRange.start - start;
-        int popoverHi = popoverRange.end - start;
-        if (popoverLo < 0) popoverLo = 0;
-        if (popoverHi > len(line)) popoverHi = len(line);
-        if (!tokenLine && popoverHi > popoverLo) {
-            if (state->popoverTriggerRange.start != popoverRange.start ||
-                state->popoverTriggerRange.end != popoverRange.end) {
-                state->popoverTriggerRange = popoverRange;
-                state->popoverTriggerBounds = {};
-                WindowRequestAnimationFrame(cx->win);
-            }
-            el->RangeOut(popoverLo, popoverHi, &state->popoverTriggerBounds);
-        }
-        if (!tokenLine) {
-            RowMatchWashes(a, el, style, state, start, len(line), &matchAt);
-        }
-        if (!tokenLine && state->softWrap) {
-
-            el->Wrap();
-            if (lineNumbers) {
-                el->Flex1();
-            }
-        }
-
-        if (row == 0) {
-            el->BindInput(state);
-        }
-        int lo = sel.start - start;
-        int hi = sel.end - start;
-        if (lo < 0) {
-            lo = 0;
-        }
-        if (hi > len(line)) {
-            hi = len(line);
-        }
-        if (!tokenLine && !sel.IsEmpty() && lo < hi) {
-            el->SelRange(lo, hi, style.selection);
-        }
-        if (!tokenLine && caretFolded) {
-            if (row == caretRow) {
-                el->Caret(0, style.caret);
-            }
-        } else if (!tokenLine && caret && cursor >= start &&
-                   cursor <= start + len(line)) {
-            el->Caret(cursor - start, style.caret, 2,
-                      state->cursorLineEndAffinity);
-
-            el->CaretOut(&state->caretWinX, &state->caretWinY);
-        }
-        if (!tokenLine && state->extraCursors.len > 0) {
-            RowExtraCursors(a, el, state, style, start, len(line), caret);
-        }
-
-        if (indentGuides) {
-            int indent = lastIndent;
-            if (len(line) > 0) {
-                indent = TabSize{style.indentWidth}.IndentCount(line);
-                lastIndent = indent;
-            }
-            if (!tokenLine) {
-                el->IndentGuides(style.indentGuide, indent, style.indentWidth);
-            }
-        }
-
-        if (!tokenLine && state->showWhitespaces) {
-            el->Whitespaces(style.mutedForeground);
-        }
-
-        bool rangeRow = rangePaint && rangePaint->rows && !tokenLine;
         if (!lineNumbers) {
-            El* only = el;
-            if (rangeRow) {
-                only = Div(a)->W(kFill);
-                only->Child(el);
-                if (!wrap) {
-                    only->H(lineH);
-                }
-            }
-            if (rangeRow) {
-                AttachRangeDecorationRow(a, rangePaint, only, el, start,
-                                         len(line));
-            }
-            if (wrap && row < state->rowBoxes.len) {
-                only->BoundsOut(&state->rowBoxes[row]);
-            }
-            col->Child(only);
+            col->Child(el);
             continue;
         }
 
-        El* band = Div(a)->FlexRow()->W(kFill)->Gap(kLineNumberRightMargin);
-        if (wrap) {
+        El* band = Div(a)
+                       ->FlexRow()
+                       ->W(kFill)
+                       ->Gap(kLineNumberRightMargin)
+                       ->H((float)nVis * lineH)
+                       ->ItemsStart();
 
-            band->MinH(lineH)->ItemsStart();
-            if (row < state->rowBoxes.len) {
-                band->BoundsOut(&state->rowBoxes[row]);
-            }
-        } else {
-            band->H(lineH);
-        }
-
-        if (row == caretRow && style.activeLine.a != 0) {
-            band->Bg(style.activeLine);
+        if (row == caretRow && style.activeLine.a != 0 && underlay) {
+            underlay->activeLine = band;
         }
 
         El* num =
@@ -34042,11 +36319,8 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         El* numCell = Div(a)->W(numW)->JustifyEnd()->Child(num);
         if (folding) {
 
-            El* gutter = Div(a)->FlexRow()->ItemsCenter()->PathClick(
+            El* gutter = Div(a)->FlexRow()->ItemsCenter()->H(lineH)->PathClick(
                 StrDup(a, fmt("gutter-%d", row)));
-            if (!wrap) {
-                gutter->H(lineH);
-            }
             gutter->Child(numCell);
             gutter->Child(FoldChevron(a, state, style, row, caretRow, lineH,
                                       gutterHover));
@@ -34060,11 +36334,15 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
             }
             band->Child(numCell);
         }
-        band->Child(el);
-        if (rangeRow) {
-            AttachRangeDecorationRow(a, rangePaint, band, el, start, len(line));
+        if (wrap) {
+
+            el->Flex1();
         }
+        band->Child(el);
         col->Child(band);
+    }
+    if (rangePaint && painted) {
+        rangePaint->nRows = painted->geometry.nRows;
     }
     if (padBottom > 0) {
         col->Child(Div(a)->W(kFill)->Shrink0()->H(padBottom));
@@ -34213,7 +36491,11 @@ InputState::~InputState() {
     if (gPendingPaste.state == this) {
         gPendingPaste.state = nullptr;
     }
-    InputRangeDecorationsFree(this);
+    InputDecorationsFree(this);
+    if (contextMenuDrop && contextMenuData) {
+        contextMenuDrop(contextMenuData);
+    }
+    InputSyntaxCacheFree(this);
 
     if (focusWin) {
         if (focusWin->input == this) {
@@ -34237,11 +36519,129 @@ static void TextReserve(InputState* s, int want) {
     VecReserve(s->text, want + 1);
 }
 
+static void WrapMapNoteEdit(InputWrapMap* m, int a, int b, int insLen) {
+    if (m->editWhole) {
+        return;
+    }
+    if (!m->hasEdit) {
+        m->hasEdit = true;
+        m->editStart = a;
+        m->editOldEnd = b;
+        m->editNewEnd = a + insLen;
+        return;
+    }
+    if (a < m->editStart) {
+        m->editStart = a;
+    }
+    if (b > m->editNewEnd) {
+        m->editOldEnd += b - m->editNewEnd;
+        m->editNewEnd = b;
+    }
+    m->editNewEnd += insLen - (b - a);
+}
+
+static const int kMaxHighlightEdits = 64;
+
+static const int64_t kMaxHighlightBatchBytes = 64ll << 20;
+
+static void HighlightLogClear(InputState* s) {
+    VecClear(s->highlightEdits);
+    VecClear(s->highlightRemoved);
+    s->highlightWhole = false;
+}
+
+static void HighlightLogWhole(InputState* s) {
+    HighlightLogClear(s);
+    s->highlightWhole = true;
+}
+
+static void HighlightLogEdit(InputState* s, int a, int b, int insLen) {
+    if (!s->highlighter.update || s->highlightWhole) {
+        return;
+    }
+    if (len(s->highlightEdits) >= kMaxHighlightEdits) {
+        HighlightLogWhole(s);
+        return;
+    }
+    InputHighlightEdit e;
+    e.edit = InputEdit{a, b, a + insLen};
+    e.removedAt = len(s->highlightRemoved);
+    e.removedLen = b - a;
+    if (e.removedLen > 0) {
+        VecAppendN(s->highlightRemoved, s->text.els + a, e.removedLen);
+    }
+    VecAppend(s->highlightEdits, e);
+}
+
+void InputDriveHighlighter(InputState* s, bool folding) {
+    if (!s) {
+        return;
+    }
+    Str text = InputValue(s);
+    int n = len(s->highlightEdits);
+    bool tooBig =
+        (int64_t)(n - 1) * (int64_t)len(text) > kMaxHighlightBatchBytes;
+    if (s->highlightWhole || n == 0 || (n > 1 && tooBig)) {
+
+        InputEdit whole = {};
+        whole.oldEndByte = -1;
+        whole.newEndByte = len(text);
+        s->highlighter.Update(&whole, text, folding);
+    } else if (n == 1) {
+        s->highlighter.Update(&s->highlightEdits[0].edit, text, folding);
+    } else {
+
+        Arena* a = GetTempArena();
+        auto* batch =
+            (InputEditWithText*)Alloc(a, (int)sizeof(InputEditWithText) * n);
+        if (batch) {
+            batch[n - 1].edit = s->highlightEdits[n - 1].edit;
+            batch[n - 1].text = text;
+            for (int k = n - 1; k > 0; k--) {
+                const InputHighlightEdit& e = s->highlightEdits[k];
+                Str after = batch[k].text;
+                int ins = e.edit.newEndByte - e.edit.startByte;
+                int outLen = len(after) - ins + e.removedLen;
+                char* buf = (char*)Alloc(a, outLen + 1);
+                if (!buf) {
+                    batch = nullptr;
+                    break;
+                }
+                memcpy(buf, after.s, (size_t)e.edit.startByte);
+                memcpy(buf + e.edit.startByte,
+                       s->highlightRemoved.els + e.removedAt,
+                       (size_t)e.removedLen);
+                memcpy(buf + e.edit.startByte + e.removedLen,
+                       after.s + e.edit.newEndByte,
+                       (size_t)(len(after) - e.edit.newEndByte));
+                buf[outLen] = 0;
+                batch[k - 1].edit = s->highlightEdits[k - 1].edit;
+                batch[k - 1].text = Str(buf, outLen);
+            }
+        }
+        if (batch) {
+            s->highlighter.UpdateBatch(batch, n, folding);
+        } else {
+            InputEdit whole = {};
+            whole.oldEndByte = -1;
+            whole.newEndByte = len(text);
+            s->highlighter.Update(&whole, text, folding);
+        }
+    }
+    InputSkipHighlighterEdits(s);
+}
+
+void InputSkipHighlighterEdits(InputState* s) {
+    if (!s) {
+        return;
+    }
+    HighlightLogClear(s);
+    s->hasPendingEdit = false;
+}
+
 static void TextSplice(InputState* s, int a, int b, Str ins) {
     int n = len(s->text);
-    if (a < 0) {
-        a = 0;
-    }
+    a = ClampI(a, 0, n);
     if (b > n) {
         b = n;
     }
@@ -34254,6 +36654,7 @@ static void TextSplice(InputState* s, int a, int b, Str ins) {
     if (!s->text.els) {
         return;
     }
+    HighlightLogEdit(s, a, b, insLen);
     memmove(s->text.els + a + insLen, s->text.els + b, (size_t)(n - b));
     if (insLen > 0) {
         memcpy(s->text.els + a, ins.s, (size_t)insLen);
@@ -34261,13 +36662,8 @@ static void TextSplice(InputState* s, int a, int b, Str ins) {
     s->text.len = out;
     s->text.els[out] = 0;
     s->docVersion++;
-
-    if (s->hasPendingEdit) {
-        s->pendingEdit = InputEdit{0, -1, len(s->text)};
-    } else {
-        s->pendingEdit = InputEdit{a, b, a + insLen};
-        s->hasPendingEdit = true;
-    }
+    WrapMapNoteEdit(&s->wrap, a, b, insLen);
+    s->hasPendingEdit = true;
 }
 
 static void TextSet(InputState* s, Str v) {
@@ -34282,7 +36678,8 @@ static void TextSet(InputState* s, Str v) {
     s->text.len = n;
     s->text.els[n] = 0;
     s->docVersion++;
-    s->pendingEdit = InputEdit{0, -1, n};
+    s->wrap.editWhole = true;
+    HighlightLogWhole(s);
     s->hasPendingEdit = true;
 }
 
@@ -34742,38 +37139,18 @@ int InputNextBoundary(const InputState* s, int offset) {
     return InputCursorBoundary(s, offset + 1, Bias::Right);
 }
 
-static bool WrappedRowOfCaret(const InputState* s, Window* win, Str line,
+static bool WrappedRowOfCaret(const InputState* s, Window* win, int line,
                               int rel, int* outLo, int* outHi) {
 
-    if (!win || !s->softWrap || s->kind != InputKind::Editor ||
-        len(line) == 0) {
+    if (s->kind != InputKind::Editor ||
+        !WrapMapOf(s, win ? &win->paint : nullptr)) {
         return false;
     }
-    PaintCtx* ctx = &win->paint;
-    float maxW = s->lastBounds.w;
-    float font = s->lastFont;
-    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
-    if (maxW <= 0 || font <= 0 || lineH <= 0) {
-        return false;
-    }
-    float lineMult = lineH / font;
-    float cx = 0, cy = 0, ch = lineH;
-    if (!TextPointAt(ctx, line, font, maxW, true, rel, &cx, &cy, &ch,
-                     s->lastFontWord, lineMult, s->cursorLineEndAffinity)) {
-        return false;
-    }
-
-    float mid = cy + ch * 0.5f;
-    int lo = TextIndexAt(ctx, line, font, maxW, true, 0, mid, s->lastFontWord,
-                         lineMult);
-
-    int hi = TextIndexAt(ctx, line, font, maxW, true, maxW + font, mid,
-                         s->lastFontWord, lineMult);
-    if (lo > rel || hi < rel) {
-        return false;
-    }
-    *outLo = lo;
-    *outHi = hi;
+    const int* starts = nullptr;
+    int nRows = InputWrapRows(s, line, &starts, nullptr);
+    int k = WrapRowOfOffset(starts, nRows, rel, s->cursorLineEndAffinity);
+    *outLo = starts[k];
+    *outHi = k + 1 < nRows ? starts[k + 1] : len(InputSliceLine(s, line));
     return true;
 }
 
@@ -34787,8 +37164,7 @@ int InputStartOfLine(const InputState* s, Window* win) {
     int start = RopeLineStartOffset(t, row);
 
     int lo = 0, hi = 0;
-    if (WrappedRowOfCaret(s, win, RopeSliceLine(t, row), cursor - start, &lo,
-                          &hi) &&
+    if (WrappedRowOfCaret(s, win, row, cursor - start, &lo, &hi) &&
         cursor != start + lo) {
         return start + lo;
     }
@@ -34804,8 +37180,7 @@ int InputEndOfLine(const InputState* s, Window* win) {
     int row = RopeOffsetToPoint(t, cursor).row;
     int start = RopeLineStartOffset(t, row);
     int lo = 0, hi = 0;
-    if (WrappedRowOfCaret(s, win, RopeSliceLine(t, row), cursor - start, &lo,
-                          &hi) &&
+    if (WrappedRowOfCaret(s, win, row, cursor - start, &lo, &hi) &&
         cursor != start + hi) {
         return start + hi;
     }
@@ -35051,6 +37426,64 @@ void InputScrollToCursor(InputState* s, InputMoveDir dir) {
     InputScrollToCaret(s, s->caretX, caretY, dir);
 }
 
+#if GPUI_OS_MAC
+static const float kInputCursorWidth = 1.5f;
+#else
+static const float kInputCursorWidth = 2.f;
+#endif
+
+bool InputUpdateScrollOffset(InputState* s, App* app, Window* win,
+                             const Point* offset) {
+    (void)app;
+    if (!s) {
+        return false;
+    }
+
+    Point want = offset ? *offset : Point{s->scrollX, s->scrollY};
+
+    float safeX = s->align == 0 ? 0.f : kInputCursorWidth;
+    float mostY = s->contentH - s->viewH;
+    float mostX = s->contentW - s->viewW + safeX;
+    if (mostY < 0) {
+        mostY = 0;
+    }
+    if (mostX < safeX) {
+        mostX = safeX;
+    }
+    float y = 0;
+    if (!InputIsSingleLine(s)) {
+        y = want.y < 0 ? 0 : (want.y > mostY ? mostY : want.y);
+    }
+    float x = want.x < 0 ? 0 : (want.x > mostX ? mostX : want.x);
+    if (x == s->scrollX && y == s->scrollY) {
+        return false;
+    }
+    s->scrollX = x;
+    s->scrollY = y;
+    Notify(app, win);
+    return true;
+}
+
+bool InputOnScrollWheel(InputState* s, App* app, Window* win, float dx,
+                        float dy, TouchPhase phase) {
+    if (!s) {
+        return false;
+    }
+    float oldX = s->scrollX;
+    float oldY = s->scrollY;
+    Point want = {oldX - dx, oldY - dy};
+    InputUpdateScrollOffset(s, app, win, &want);
+    bool moved = s->scrollX != oldX || s->scrollY != oldY;
+
+    if (s->hoverDiagnostic >= 0) {
+        s->hoverDiagnostic = -1;
+        Notify(app, win);
+    }
+
+    InputEditMenuOnScroll(s, app, win, phase);
+    return moved;
+}
+
 void InputScrollToOffset(InputState* s, int offset, InputMoveDir dir) {
     InputScrollToOffsetWithPadding(s, offset, dir,
                                    dir != InputMoveDir::None
@@ -35078,16 +37511,14 @@ static void InputScrollToSearchOffset(InputState* s, Window* win, int offset) {
     int row = RopeOffsetToPoint(InputValue(s), offset).row;
     row = FoldMapNearestVisibleLine(&s->folds, row);
     float y = DisplayRowDocY(s, row, lineH);
-    if (win && s->softWrap && s->lastBounds.w > 0 && s->lastFont > 0) {
-        Str line = RopeSliceLine(InputValue(s), row);
+    if (WrapMapOf(s, win ? &win->paint : nullptr)) {
+
         int lineStart = RopeLineStartOffset(InputValue(s), row);
-        float x = 0;
-        float localY = 0;
-        float h = lineH;
-        TextPointAt(&win->paint, line, s->lastFont, s->lastBounds.w, true,
-                    std::max(0, offset - lineStart), &x, &localY, &h,
-                    s->lastFontWord, lineH / s->lastFont, false);
-        y += localY;
+        const int* starts = nullptr;
+        int nRows = InputWrapRows(s, row, &starts, nullptr);
+        int k = WrapRowOfOffset(starts, nRows, std::max(0, offset - lineStart),
+                                false);
+        y += (float)k * lineH;
     }
     InputScrollToCaretWithPadding(s, -1, y, InputMoveDir::None,
                                   InputScrollPadding::SurroundingLines);
@@ -35181,7 +37612,10 @@ void InputSetSelectedRange(InputState* s, App* app, Window* win, int a, int b) {
 void InputSelectWord(InputState* s, App* app, Window* win, int offset) {
     int a = 0;
     int b = 0;
-    if (!TextWordRangeAt(InputValue(s), offset, &a, &b)) {
+
+    if (s->masked) {
+        b = len(InputValue(s));
+    } else if (!TextWordRangeAt(InputValue(s), offset, &a, &b)) {
         return;
     }
     UndoBreakCoalescing(&s->undo);
@@ -35357,32 +37791,8 @@ void InputAddCursorAt(InputState* s, App* app, Window* win, int offset) {
     Notify(app, win);
 }
 
-static int WrappedRowStarts(const InputState* s, PaintCtx* ctx, Str line,
-                            Arena* a, int** outStarts) {
-    float maxW = s->lastBounds.w;
-    float font = s->lastFont;
-    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
-    float lineMult = lineH / font;
-    float endX = 0, endY = 0, endH = 0;
-    if (!TextPointAt(ctx, line, font, maxW, true, len(line), &endX, &endY,
-                     &endH, s->lastFontWord, lineMult, true)) {
-        return 0;
-    }
-    float rowH = endH > 0 ? endH : lineH;
-    int rows = (int)(endY / rowH + 0.5f) + 1;
-    if (rows < 1) {
-        rows = 1;
-    }
-    int* starts = (int*)Alloc(a, rows * (int)sizeof(int));
-    starts[0] = 0;
-    for (int k = 1; k < rows; k++) {
-        int at =
-            TextIndexAt(ctx, line, font, maxW, true, 0,
-                        ((float)k + 0.5f) * rowH, s->lastFontWord, lineMult);
-        starts[k] = at > starts[k - 1] ? at : starts[k - 1];
-    }
-    *outStarts = starts;
-    return rows;
+static int WrappedRowStarts(const InputState* s, int line, const int** out) {
+    return InputWrapRows(s, line, out, nullptr);
 }
 
 struct WrapPoint {
@@ -35391,32 +37801,20 @@ struct WrapPoint {
     int column = 0;
 };
 
-static bool WrapPointAt(const InputState* s, PaintCtx* ctx, Str t, int offset,
-                        Arena* a, WrapPoint* out) {
+static void WrapPointAt(const InputState* s, Str t, int offset,
+                        WrapPoint* out) {
     RopePoint p = RopeOffsetToPoint(t, offset);
-    Str line = RopeSliceLine(t, p.row);
-    int* starts = nullptr;
-    int rows = WrappedRowStarts(s, ctx, line, a, &starts);
-    if (rows == 0) {
-        return false;
-    }
+    const int* starts = nullptr;
+    int rows = WrappedRowStarts(s, p.row, &starts);
     int local = offset - RopeLineStartOffset(t, p.row);
-    int k = rows - 1;
-    while (k > 0 && starts[k] > local) {
-        k--;
-    }
+    int k = WrapRowOfOffset(starts, rows, local, false);
     out->line = p.row;
     out->row = k;
     out->column = local - starts[k];
-    return true;
 }
 
 static PaintCtx* DisplayCtx(const InputState* s, Window* win) {
-    if (!win || !s->softWrap) {
-        return nullptr;
-    }
-    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
-    if (s->lastBounds.w <= 0 || s->lastFont <= 0 || lineH <= 0) {
+    if (!win || !WrapMapOf(s, &win->paint)) {
         return nullptr;
     }
     return &win->paint;
@@ -35432,10 +37830,9 @@ static bool ColumnarRowsDisplay(const InputState* s, PaintCtx* ctx, Str t,
         end = swap;
     }
     WrapPoint ps, pe;
-    if (!WrapPointAt(s, ctx, t, start.offset, a, &ps) ||
-        !WrapPointAt(s, ctx, t, end.offset, a, &pe)) {
-        return false;
-    }
+    (void)ctx;
+    WrapPointAt(s, t, start.offset, &ps);
+    WrapPointAt(s, t, end.offset, &pe);
     ps.column += start.columnsPastLineEnd;
     pe.column += end.columnsPastLineEnd;
     int col0 = ps.column <= pe.column ? ps.column : pe.column;
@@ -35443,7 +37840,7 @@ static bool ColumnarRowsDisplay(const InputState* s, PaintCtx* ctx, Str t,
     bool folding = LayoutModeIsFolding(s->mode);
 
     int nLines = pe.line - ps.line + 1;
-    auto* lineStarts = (int**)Alloc(a, nLines * (int)sizeof(int*));
+    auto* lineStarts = (const int**)Alloc(a, nLines * (int)sizeof(int*));
     int* lineRows = (int*)Alloc(a, nLines * (int)sizeof(int));
     int cap = 0;
     for (int i = 0; i < nLines; i++) {
@@ -35452,8 +37849,7 @@ static bool ColumnarRowsDisplay(const InputState* s, PaintCtx* ctx, Str t,
         if (folding && FoldMapLineHidden(&s->folds, ps.line + i)) {
             continue;
         }
-        Str text = RopeSliceLine(t, ps.line + i);
-        lineRows[i] = WrappedRowStarts(s, ctx, text, a, &lineStarts[i]);
+        lineRows[i] = WrappedRowStarts(s, ps.line + i, &lineStarts[i]);
         if (lineRows[i] == 0) {
             return false;
         }
@@ -35469,7 +37865,7 @@ static bool ColumnarRowsDisplay(const InputState* s, PaintCtx* ctx, Str t,
         int line = ps.line + i;
         Str text = RopeSliceLine(t, line);
         int lineStart = RopeLineStartOffset(t, line);
-        int* starts = lineStarts[i];
+        const int* starts = lineStarts[i];
         int kFrom = line == ps.line ? ps.row : 0;
         int kTo = line == pe.line ? pe.row : rows - 1;
         if (kTo > rows - 1) {
@@ -35797,9 +38193,7 @@ static bool InputAutoCloseBefore(const LanguageConfig& config, Str all,
 }
 
 static SyntaxContext InputEditingContext(InputState* s, App* app, int at) {
-    SyntaxContextProvider provider =
-        InputSyntaxContextProvider(app, s->highlighter.Language());
-    return provider.ContextAt(InputValue(s), at);
+    return InputSyntaxContextAt(s, app, InputValue(s), at);
 }
 
 static bool AutoClosedContains(const Vec<AutoClosedPairRange>& pairs,
@@ -36018,6 +38412,8 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
 
     InputHideContextMenu(s);
     InputClearInlineCompletion(s);
+
+    PauseBlink(s, app, win);
     if (InputIsMultiLine(s)) {
 
         bool multiCursor = !range && !s->imeMarking && s->extraCursors.len > 0;
@@ -36030,9 +38426,6 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
         }
     }
     Selection selBefore = s->selectedRange;
-    if (win && BlinkVisible(app, s->blink)) {
-        PauseBlink(s, app, win);
-    }
 
     Arena* tmp = GetTempArena();
     Str text = NormalizeInput(tmp, s, newText);
@@ -36044,9 +38437,8 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
         InputNormalizeTokenRange(s, &r.start, &r.end);
     }
     Str before = InputValue(s);
-    if (r.start < 0) {
-        r.start = 0;
-    }
+
+    r.start = ClampI(r.start, 0, len(before));
     if (r.end > len(before)) {
         r.end = len(before);
     }
@@ -36060,11 +38452,19 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
     bool languageEdit = s->kind == InputKind::Editor && s->autoClose &&
                         !range && !s->imeMarking && r.IsEmpty() &&
                         s->extraCursors.len == 0;
-    if (languageEdit) {
+
+    bool skipEdit = s->kind == InputKind::Editor && s->autoClose &&
+                    !s->imeMarking && r.IsEmpty() &&
+                    r.start == InputCursor(s) && s->extraCursors.len == 0 &&
+                    !s->silentReplace && !UndoIsIgnoring(&s->undo);
+    if (skipEdit) {
         language = InputLanguageConfig(app, s->highlighter.Language());
         if (InputTrySkipCloser(s, app, win, text, language)) {
             return true;
         }
+    }
+    if (languageEdit) {
+        language = InputLanguageConfig(app, s->highlighter.Language());
         text =
             InputAutoCloseText(s, app, tmp, text, language, r.start,
                                &pairedCaret, &pairedOpenLen, &pairedCloseLen);
@@ -36138,9 +38538,9 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
     }
 
     if (maskChanged) {
-        InputRangeDecorationsReset(s);
+        InputDecorationsReset(s);
     } else {
-        InputRangeDecorationsAdjustForEdit(s, r, len(text));
+        InputDecorationsAdjustForEdit(s, r, len(text));
     }
     if (maskChanged) {
 
@@ -36177,6 +38577,7 @@ bool InputReplaceTextInRange(InputState* s, App* app, Window* win,
     UpdatePreferredColumn(s);
 
     InputUpdateSearch(s);
+    InputDismissTouchSelection(s, app, win);
     if (InputIsMultiLine(s) && s->mode.kind == LayoutModeKind::AutoGrow) {
         LayoutModeSetRows(&s->mode, RopeLinesLen(InputValue(s)));
     }
@@ -36390,19 +38791,29 @@ void InputReplaceAndMarkText(InputState* s, App* app, Window* win,
         r.end = r.start;
     }
     Str oldAll = StrDup(tmp, before);
+
+    int nPairsBefore = 0;
+    AutoClosedPairRange* pairsBefore = nullptr;
+    if (!UndoIsIgnoring(&s->undo)) {
+        pairsBefore = AutoClosedDup(s->autoClosed, &nPairsBefore);
+    }
     TextSplice(s, r.start, r.end, text);
     if (InputIsSingleLine(s)) {
 
         Str pending = InputValue(s);
         if (!IsValidInput(s, pending) && IsValidInput(s, oldAll)) {
             TextSet(s, oldAll);
+            free(pairsBefore);
             if (startsComposition) {
                 UndoCommitTransaction(&s->undo);
             }
             return;
         }
     }
-    InputRangeDecorationsAdjustForEdit(s, r, len(text));
+    if (!UndoIsIgnoring(&s->undo)) {
+        AutoClosedAdjust(s->autoClosed, r.start, r.end, len(text));
+    }
+    InputDecorationsAdjustForEdit(s, r, len(text));
     s->cursorLineEndAffinity = false;
     if (len(text) == 0) {
 
@@ -36428,6 +38839,11 @@ void InputReplaceAndMarkText(InputState* s, App* app, Window* win,
 
     Selection after = s->selectedRange;
     PushHistory(s, oldAll, r, text, hasIntent, requested, selBefore, &after);
+    if (!UndoIsIgnoring(&s->undo)) {
+        UndoRecordAutoClosedPairs(&s->undo, pairsBefore, nPairsBefore,
+                                  s->autoClosed.els, s->autoClosed.len);
+    }
+    free(pairsBefore);
     UpdatePreferredColumn(s);
     if (InputIsMultiLine(s) && s->mode.kind == LayoutModeKind::AutoGrow) {
         LayoutModeSetRows(&s->mode, RopeLinesLen(InputValue(s)));
@@ -36505,6 +38921,11 @@ void InputSetValue(InputState* s, Str value) {
     base_input_ResetSelection(s);
     UndoClear(&s->undo);
     Notify(app, win);
+}
+
+void InputDefaultValue(InputState* s, Str value) {
+
+    TextSet(s, NormalizeInput(GetTempArena(), s, value));
 }
 
 void InputSetValue(InputState* s, const InputContent& content) {
@@ -37356,6 +39777,60 @@ void InputHoverDefinition(InputState* s, int offset) {
     }
 }
 
+void InputOnContextMenu(InputState* state, InputContextMenuFn handler,
+                        void* data, void (*drop)(void* data)) {
+    if (!state) {
+        return;
+    }
+    if (state->contextMenuDrop && state->contextMenuData &&
+        state->contextMenuData != data) {
+        state->contextMenuDrop(state->contextMenuData);
+    }
+    state->contextMenuHandler = handler;
+    state->contextMenuData = data;
+    state->contextMenuDrop = drop;
+}
+
+struct ContextMenuJob {
+    InputContextMenuFn handler = nullptr;
+    void* data = nullptr;
+    InputContextMenuCapabilities caps = {};
+    Point position = {};
+    App* app = nullptr;
+    Window* win = nullptr;
+};
+
+static void RunContextMenuJob(ContextMenuJob* job) {
+    NativeMenu menu;
+    job->handler(job->data, &menu, job->caps, job->position, job->app,
+                 job->win);
+    delete job;
+}
+
+void InputHandleRightClickMenu(InputState* s, App* app, Window* win,
+                               Point position, int offset) {
+    if (!s || s->disabled || BaseIsInDeferredContext(app)) {
+        return;
+    }
+    if (!s->selectedRange.Contains(offset)) {
+        InputMoveTo(s, app, win, offset);
+    }
+    if (s->kind == InputKind::Editor) {
+        InputHoverDefinition(s, offset);
+    }
+    if (!s->contextMenuHandler) {
+        return;
+    }
+    auto* job = new ContextMenuJob();
+    job->handler = s->contextMenuHandler;
+    job->data = s->contextMenuData;
+    job->caps = InputContextMenuCapabilities::Of(s);
+    job->position = position;
+    job->app = app;
+    job->win = win;
+    ExecPost(MkFunc0(&RunContextMenuJob, job));
+}
+
 static bool DefinitionIsExternal(Str uri) {
     return base::StrStartsWithI(uri, "http://") ||
            base::StrStartsWithI(uri, "https://");
@@ -37680,15 +40155,23 @@ static float DisplayLineH(const InputState* s, int row, float lineH) {
     if (FoldMapLineHidden(&s->folds, row)) {
         return 0;
     }
-    if (row >= 0 && row < s->rowBoxes.len && s->rowBoxes[row].h > 0) {
-        return s->rowBoxes[row].h;
-    }
-    return lineH;
+    return (float)InputWrapRows(s, row, nullptr, nullptr) * lineH;
 }
 
 static float DisplayRowDocY(const InputState* s, int row, float lineH) {
     if (!s || row <= 0) {
         return 0;
+    }
+    const InputWrapMap* m = WrapMapOf(s, nullptr);
+    bool folded = len(s->folds.folded) > 0;
+    if (!folded) {
+        if (!m) {
+            return (float)row * lineH;
+        }
+        if (row < len(m->lines)) {
+            return (float)m->lines[row].rowsAbove * lineH;
+        }
+        return (float)m->totalRows * lineH;
     }
     float y = 0;
     for (int i = 0; i < row; i++) {
@@ -37706,95 +40189,194 @@ struct VerticalTarget {
     bool noFurtherRow = false;
 };
 
-static bool InputLineEndAffinityAt(PaintCtx* ctx, Str line, float font,
-                                   float maxW, int offset, float relY,
-                                   bool mono, float lineMult) {
-    if (!ctx || offset <= 0 || offset >= len(line)) {
-        return false;
+struct WrapRowSpan {
+    int lo = 0;
+    int hi = 0;
+    float x = 0;
+    int lineStart = 0;
+};
+
+static WrapRowSpan WrapRowSpanOf(const int* starts, int nRows, float indent,
+                                 int lineLen, int k, int lineStart) {
+    WrapRowSpan r;
+    r.lo = starts[k];
+    r.hi = k + 1 < nRows ? starts[k + 1] : lineLen;
+    r.x = k > 0 ? indent : 0;
+    r.lineStart = lineStart;
+    return r;
+}
+
+static float WrapFontOf(const InputState* s) {
+    if (s->lastFont > 0) {
+        return s->lastFont;
     }
-    float endX = 0, endY = 0, endH = 0;
-    float startX = 0, startY = 0, startH = 0;
-    if (!TextPointAt(ctx, line, font, maxW, true, offset, &endX, &endY, &endH,
-                     mono, lineMult, true) ||
-        !TextPointAt(ctx, line, font, maxW, true, offset, &startX, &startY,
-                     &startH, mono, lineMult, false)) {
-        return false;
+    return s->wrap.fontSize > 0 ? s->wrap.fontSize : 14.f;
+}
+
+static float WrapTextAdvance(PaintCtx* ctx, const InputState* s, Str text) {
+    float x = 0, y = 0, h = 0;
+    if (len(text) > 0 && ctx) {
+        TextPointAt(ctx, text, WrapFontOf(s), 0, false, len(text), &x, &y, &h,
+                    s->lastFontWord);
     }
-    float dy = endY - startY;
-    if (dy > -0.5f && dy < 0.5f) {
-        return false;
+    return x;
+}
+
+struct WrapFragment {
+    int lo = 0;
+    int hi = 0;
+    bool chip = false;
+    float width = 0;
+};
+
+static int WrapRowFragments(const InputState* s, Str line, WrapRowSpan r,
+                            WrapFragment* out, int cap) {
+    int n = 0;
+    int at = r.lo;
+    const Vec<InlineTokenSpan>* spans =
+        InputTokensVisible(s) ? InputTokens(s) : nullptr;
+    int nSpans = spans ? len(*spans) : 0;
+    const Vec<float>& widths = s->wrap.tokenWidths;
+    for (int i = 0; i < nSpans && n + 2 < cap; i++) {
+        const InlineTokenSpan& span = (*spans)[i];
+        int lo = span.start - r.lineStart;
+        int hi = span.end - r.lineStart;
+        if (hi <= r.lo || lo >= r.hi) {
+            continue;
+        }
+        if (lo > at) {
+            out[n++] = {at, lo, false, 0};
+        }
+        float w = len(widths) == nSpans ? widths[i] : 0;
+        out[n++] = {lo, hi, true, w};
+        at = hi;
     }
-    float endMid = endY + endH * 0.5f;
-    float startMid = startY + startH * 0.5f;
-    float toEnd = relY - endMid;
-    float toStart = relY - startMid;
-    if (toEnd < 0) toEnd = -toEnd;
-    if (toStart < 0) toStart = -toStart;
-    return toEnd <= toStart;
+    if (at < r.hi || n == 0) {
+        out[n++] = {at, r.hi, false, 0};
+    }
+    (void)line;
+    return n;
+}
+
+static float WrapRowX(PaintCtx* ctx, const InputState* s, Str line,
+                      WrapRowSpan r, int local) {
+    WrapFragment frags[64];
+    int n = WrapRowFragments(s, line, r, frags, (int)dimof(frags));
+    float x = r.x;
+    for (int i = 0; i < n; i++) {
+        const WrapFragment& f = frags[i];
+        if (local <= f.lo) {
+            break;
+        }
+        if (f.chip) {
+            if (local < f.hi) {
+                break;
+            }
+            x += f.width;
+            continue;
+        }
+        int end = local < f.hi ? local : f.hi;
+        x += WrapTextAdvance(ctx, s, Str(line.s + f.lo, end - f.lo));
+        if (local < f.hi) {
+            break;
+        }
+    }
+    return x;
+}
+
+static int WrapRowIndexAt(PaintCtx* ctx, const InputState* s, Str line,
+                          WrapRowSpan r, float x) {
+    if (x <= r.x || r.hi <= r.lo || !ctx) {
+        return r.lo;
+    }
+    WrapFragment frags[64];
+    int n = WrapRowFragments(s, line, r, frags, (int)dimof(frags));
+    float at = r.x;
+    float font = WrapFontOf(s);
+    for (int i = 0; i < n; i++) {
+        const WrapFragment& f = frags[i];
+        if (f.chip) {
+            if (x < at + f.width) {
+                return x < at + f.width * 0.5f ? f.lo : f.hi;
+            }
+            at += f.width;
+            continue;
+        }
+        Str text = Str(line.s + f.lo, f.hi - f.lo);
+        float w = WrapTextAdvance(ctx, s, text);
+        if (x < at + w || i == n - 1) {
+            return f.lo + TextIndexAt(ctx, text, font, 0, false, x - at, 0,
+                                      s->lastFontWord);
+        }
+        at += w;
+    }
+    return r.hi;
 }
 
 static bool VerticalTargetDisplay(const InputState* s, Window* win, int lines,
                                   Str t, int from, VerticalTarget* out) {
-    if (!win || !s->softWrap) {
+    if (!win) {
         return false;
     }
     PaintCtx* ctx = &win->paint;
-    float maxW = s->lastBounds.w;
-    float font = s->lastFont;
-    float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
-    if (maxW <= 0 || font <= 0 || lineH <= 0) {
+    if (!WrapMapOf(s, ctx)) {
         return false;
     }
     RopePoint p = RopeOffsetToPoint(t, from);
-    Str line = RopeSliceLine(t, p.row);
+    Str text = RopeSliceLine(t, p.row);
     int start = RopeLineStartOffset(t, p.row);
-    float cx = 0, cy = 0, ch = lineH;
-    float lineMult = lineH / font;
-    if (!TextPointAt(ctx, line, font, maxW, true, from - start, &cx, &cy, &ch,
-                     s->lastFontWord, lineMult, s->cursorLineEndAffinity)) {
-        return false;
-    }
+    const int* starts = nullptr;
+    float indent = 0;
+    int nRows = InputWrapRows(s, p.row, &starts, &indent);
+    int k =
+        WrapRowOfOffset(starts, nRows, from - start, s->cursorLineEndAffinity);
+    float cx = WrapRowX(
+        ctx, s, text, WrapRowSpanOf(starts, nRows, indent, len(text), k, start),
+        from - start);
 
     float wantX = s->preferredX >= 0 ? s->preferredX : cx;
-    int maxRow = RopeLinesLen(t) - 1;
-    int row = p.row;
-    float y = cy + (float)lines * lineH;
+    int maxLine = RopeLinesLen(t) - 1;
+    int line = p.row;
+    int row = k;
+    for (int step = lines; step < 0; step++) {
+        if (row > 0) {
+            row--;
+            continue;
+        }
+        int prev = line - 1;
+        while (prev >= 0 && FoldMapLineHidden(&s->folds, prev)) {
+            prev--;
+        }
+        if (prev < 0) {
+            break;
+        }
+        line = prev;
+        row = InputWrapRows(s, line, nullptr, nullptr) - 1;
+    }
+    for (int step = lines; step > 0; step--) {
+        if (row + 1 < InputWrapRows(s, line, nullptr, nullptr)) {
+            row++;
+            continue;
+        }
+        int next = line + 1;
+        while (next <= maxLine && FoldMapLineHidden(&s->folds, next)) {
+            next++;
+        }
+        if (next > maxLine) {
+            break;
+        }
+        line = next;
+        row = 0;
+    }
+    out->noFurtherRow = line == p.row && row == k;
+    Str target = RopeSliceLine(t, line);
+    nRows = InputWrapRows(s, line, &starts, &indent);
+    WrapRowSpan r = WrapRowSpanOf(starts, nRows, indent, len(target), row,
+                                  RopeLineStartOffset(t, line));
+    int local = WrapRowIndexAt(ctx, s, target, r, wantX);
+    out->offset = RopeLineStartOffset(t, line) + local;
 
-    float fromRowTop = (float)(int)(cy / lineH) * lineH;
-    while (y < 0 && row > 0) {
-        row--;
-        y += DisplayLineH(s, row, lineH);
-    }
-    float h = DisplayLineH(s, row, lineH);
-    while (y >= h && row < maxRow) {
-        y -= h;
-        row++;
-        h = DisplayLineH(s, row, lineH);
-    }
-    if (y < 0) {
-        y = 0;
-    }
-    float atY = y < h ? y : h - 1;
-    if (row == p.row && atY >= fromRowTop && atY < fromRowTop + lineH) {
-        out->noFurtherRow = true;
-    }
-
-    y = ((float)(int)(y / lineH) + 0.5f) * lineH;
-    if (y > h - 1) {
-        y = h - 1;
-    }
-
-    row = FoldMapNearestVisibleLine(&s->folds, row);
-    Str target = RopeSliceLine(t, row);
-    int targetStart = RopeLineStartOffset(t, row);
-    out->offset = targetStart;
-    if (len(target) > 0) {
-        int local = TextIndexAt(ctx, target, font, maxW, true, wantX, y,
-                                s->lastFontWord, lineMult);
-        out->offset += local;
-        out->lineEndAffinity = InputLineEndAffinityAt(
-            ctx, target, font, maxW, local, y, s->lastFontWord, lineMult);
-    }
+    out->lineEndAffinity = local == r.hi && row + 1 < nRows;
     out->preferredX = wantX;
     return true;
 }
@@ -37809,12 +40391,7 @@ static VerticalTarget VerticalTargetFor(const InputState* s, Window* win,
     int column = s->preferredColumn >= 0 ? s->preferredColumn : p.column;
     int maxRow = RopeLinesLen(t) - 1;
     int row = p.row + lines;
-    if (row < 0) {
-        row = 0;
-    }
-    if (row > maxRow) {
-        row = maxRow;
-    }
+    row = ClampI(row, 0, maxRow);
     out.noFurtherRow = row == p.row;
     int lineLen = RopeLineLen(t, row);
     int want = column < lineLen ? column : lineLen;
@@ -38224,7 +40801,7 @@ static bool ModeIsIndentable(const InputState* s) {
 }
 
 static Str TabIndent(const InputState* s) {
-    int n = s->mode.tabSize > 0 ? s->mode.tabSize : 4;
+    int n = s->mode.tabSize > 0 ? s->mode.tabSize : 2;
     Str tab = AllocStrTemp(n);
     memset(tab.s, ' ', (size_t)n);
     return tab;
@@ -38608,6 +41185,41 @@ static void PendingPasteResolved(void*, App* app, Window* win,
     }
 }
 
+static void ActivateSelectedToken(InputState* s, App* app, Window* win) {
+    InlineTokenStore* store = s->tokens;
+    const Vec<InlineTokenSpan>* spans = InputTokens(s);
+    if (!store || !store->click || !spans || s->disabled ||
+        !InputTokensVisible(s)) {
+        return;
+    }
+    Selection sel = s->selectedRange;
+    if (sel.start > sel.end) {
+        sel = {sel.end, sel.start};
+    }
+    for (int i = 0; i < spans->len; i++) {
+        const InlineTokenSpan& span = (*spans)[i];
+        if (span.start != sel.start || span.end != sel.end) {
+            continue;
+        }
+        Bounds bounds = {};
+        if (!InputRangeToBounds(s, win, {span.start, span.end}, &bounds)) {
+            return;
+        }
+        InlineTokenClickEvent ev = {};
+        ev.span = span;
+        ev.bounds = bounds;
+        ev.click.keyboard = true;
+        ev.click.el = bounds;
+        Ctx cx = {};
+        cx.app = app;
+        cx.win = win;
+        cx.a = win ? win->frameArena : nullptr;
+
+        store->click(&ev, &cx, store->clickUser);
+        return;
+    }
+}
+
 bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
                   bool shift) {
     if (!s) {
@@ -38876,6 +41488,11 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
                     s->selectedRange = SelectionAt(oldCursor + caretInText);
                     s->selectionReversed = false;
                     UpdatePreferredColumn(s);
+
+                    int n = 0;
+                    CursorSelection* cursors =
+                        AllCursors(GetTempArena(), s, &n);
+                    UndoRecordSelections(&s->undo, nullptr, 0, cursors, n);
                 }
                 PauseBlink(s, app, win);
                 handled = true;
@@ -38919,6 +41536,11 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
             }
 
             InputClearInlineCompletion(s);
+
+            if (win ? InputTouchSelection(s, win, nullptr) : s->touchLive) {
+                InputDismissTouchSelection(s, app, win);
+                return true;
+            }
             if (s->cleanOnEscape) {
                 InputClean(s, app, win);
                 return true;
@@ -38965,6 +41587,9 @@ bool InputPerform(InputState* s, App* app, Window* win, InputAction action,
                 return false;
             }
             InputToggleCodeActions(s, app, win);
+            return true;
+        case InputAction::ActivateToken:
+            ActivateSelectedToken(s, app, win);
             return true;
         case InputAction::Search:
         case InputAction::Replace:
@@ -39023,23 +41648,19 @@ static int FirstVisibleOffset(const InputState* s) {
     if (s->scrollY <= 0) {
         return 0;
     }
-    int row = 0;
     float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
-    if (s->rowBoxes.len > 0) {
-        float at = 0;
-        for (int i = 0; i < s->rowBoxes.len; i++) {
-            float h = DisplayLineH(s, i, lineH);
-            if (at + h > s->scrollY) {
-                row = i;
-                break;
-            }
-            at += h;
+    int rows = InputLinesLen(s);
+    int row = rows - 1;
+    float at = 0;
+    for (int i = 0; i < rows; i++) {
+        float h = DisplayLineH(s, i, lineH);
+        if (at + h > s->scrollY) {
             row = i;
+            break;
         }
-        row = FoldMapNearestVisibleLine(&s->folds, row);
-    } else {
-        row = (int)(s->scrollY / lineH);
+        at += h;
     }
+    row = FoldMapNearestVisibleLine(&s->folds, row);
     return RopeLineStartOffset(text, row);
 }
 
@@ -39199,11 +41820,12 @@ void InputFocus(InputState* s, App* app, Window* win) {
     if (!s->focus.IsValid()) {
         s->focus = FocusHandleNew(app);
     }
-    FocusHandleFocus(win, s->focus);
+
     s->focused = true;
     s->focusWin = win;
     win->input = s;
     win->prevInput = s;
+    FocusHandleFocus(win, s->focus);
     BlinkStart(app, win, &s->blink);
     base_input_Emit(s, app, win, InputEvent{InputEventKind::Focus});
     Notify(app, win);
@@ -39215,6 +41837,15 @@ void InputBlur(InputState* s, App* app, Window* win) {
     }
 
     UndoBreakCoalescing(&s->undo);
+
+    if (!InputIsContextMenuOpen(s)) {
+        InputClearHoverDefinition(s);
+        s->hoverText = Str{};
+        s->hoverRange = Selection{};
+        s->hoverDiagnostic = -1;
+        InputClearInlineCompletion(s);
+        InputDismissTouchSelection(s, app, win);
+    }
 
     if (s->numberHasMin || s->numberHasMax) {
         double value = 0;
@@ -39236,12 +41867,12 @@ void InputBlur(InputState* s, App* app, Window* win) {
     s->focusWin = nullptr;
     if (win) {
         BlinkStop(app, win, &s->blink);
-        if (FocusHandleIsFocused(win, s->focus)) {
-            WindowSetFocusId(win, 0);
-        }
         if (win->input == s) {
             win->input = nullptr;
             win->prevInput = nullptr;
+        }
+        if (FocusHandleIsFocused(win, s->focus)) {
+            WindowSetFocusId(win, 0);
         }
     }
     base_input_Emit(s, app, win, InputEvent{InputEventKind::Blur});
@@ -39267,6 +41898,12 @@ int InputIndexForPosition(const InputState* s, PaintCtx* ctx, float x, float y,
     }
     float font = s->lastFont > 0 ? s->lastFont : 14.f;
     if (InputIsSingleLine(s)) {
+
+        if (s->chipLine) {
+            WrapRowSpan r;
+            r.hi = len(t);
+            return WrapRowIndexAt(ctx, s, t, r, x - b.x);
+        }
         if (x <= b.x) {
             return 0;
         }
@@ -39274,77 +41911,59 @@ int InputIndexForPosition(const InputState* s, PaintCtx* ctx, float x, float y,
     }
     float lineH = s->lastLineH > 0 ? s->lastLineH : b.h;
     int rows = InputLinesLen(s);
-    int row = 0;
+
+    float originY = b.y;
+    if (s->inputBounds.h > 0) {
+        originY = s->inputBounds.y - s->scrollY;
+    }
+    float docY = y - originY;
+    int row = FoldMapNearestVisibleLine(&s->folds, rows - 1);
 
     float relY = 0;
-    if (s->rowBoxes.len == rows && rows > 0) {
-
-        float originY = b.y;
-        if (s->inputBounds.h > 0) {
-            originY = s->inputBounds.y - s->scrollY;
+    float at = 0;
+    for (int i = 0; i < rows; i++) {
+        float h = DisplayLineH(s, i, lineH);
+        if (h <= 0) {
+            continue;
         }
-        float docY = y - originY;
-        float at = 0;
-        row = FoldMapNearestVisibleLine(&s->folds, rows - 1);
-        for (int i = 0; i < rows; i++) {
-            float h = DisplayLineH(s, i, lineH);
-            if (h <= 0) {
-                continue;
+        if (docY < at + h) {
+            row = i;
+            relY = docY - at;
+            if (relY < 0) {
+                relY = 0;
             }
-            if (docY < at + h) {
-                row = i;
-                relY = docY - at;
-                if (relY < 0) {
-                    relY = 0;
-                }
-                break;
-            }
-            at += h;
+            break;
         }
-    } else {
-
-        float originY = b.y;
-        if (s->inputBounds.h > 0) {
-            originY = s->inputBounds.y - s->scrollY;
+        at += h;
+        if (i == rows - 1) {
+            relY = h - 1;
         }
-        row = lineH > 0 ? (int)((y - originY) / lineH) : 0;
-        if (row < 0) {
-            row = 0;
-        }
-        if (row > rows - 1) {
-            row = rows - 1;
-        }
-        row = FoldMapNearestVisibleLine(&s->folds, row);
     }
     Str line = InputSliceLine(s, row);
     int start = InputLineStartOffset(s, row);
+    const int* starts = nullptr;
+    float indent = 0;
+    int nRows = InputWrapRows(s, row, &starts, &indent);
+    int k = lineH > 0 ? (int)(relY / lineH) : 0;
+    if (k > nRows - 1) {
+        k = nRows - 1;
+    }
+    WrapRowSpan r = WrapRowSpanOf(starts, nRows, indent, len(line), k, start);
+    float localX = x - b.x;
+    int local = WrapRowIndexAt(ctx, s, line, r, localX);
 
-    if (len(line) == 0 || (x <= b.x && !s->softWrap)) {
-        return start;
+    if (lineEndAffinity && local == r.hi && k + 1 < nRows) {
+        *lineEndAffinity = true;
     }
-    float maxW = s->softWrap ? b.w : 0;
-    float lineMult = s->lastLineH > 0 ? s->lastLineH / font : 0;
-    int local = TextIndexAt(ctx, line, font, maxW, s->softWrap, x - b.x, relY,
-                            s->lastFontWord, lineMult);
-    if (lineEndAffinity && s->softWrap) {
-        *lineEndAffinity = InputLineEndAffinityAt(
-            ctx, line, font, maxW, local, relY, s->lastFontWord, lineMult);
-    }
-    if (columnsPastLineEnd && local == len(line)) {
-        float endX = 0, endY = 0, endH = 0;
+    if (columnsPastLineEnd && local == len(line) && k == nRows - 1) {
+        float endX = WrapRowX(ctx, s, line, r, local);
         float spaceX = 0, spaceY = 0, spaceH = 0;
-        bool finalVisualRow = !s->softWrap;
-        if (TextPointAt(ctx, line, font, maxW, s->softWrap, len(line), &endX,
-                        &endY, &endH, s->lastFontWord, lineMult, true)) {
-            float rowH = endH > 0 ? endH : lineH;
-            finalVisualRow = finalVisualRow || relY + rowH * 0.5f >= endY;
-            if (finalVisualRow && x - b.x > endX &&
-                TextPointAt(ctx, StrL(" "), font, 0, false, 1, &spaceX, &spaceY,
-                            &spaceH, s->lastFontWord, 0, true) &&
-                spaceX > 0) {
-                float columns = (x - b.x - endX) / spaceX;
-                *columnsPastLineEnd = (int)(columns + 0.5f);
-            }
+        if (localX > endX &&
+            TextPointAt(ctx, StrL(" "), font, 0, false, 1, &spaceX, &spaceY,
+                        &spaceH, s->lastFontWord, 0, true) &&
+            spaceX > 0) {
+            float columns = (localX - endX) / spaceX;
+            *columnsPastLineEnd = (int)(columns + 0.5f);
         }
     }
     return start + local;
@@ -40484,6 +43103,416 @@ const UndoTransaction* UndoPopRedo(UndoManager* m) {
     return &m->undos[m->undos.len - 1];
 }
 
+bool InputLastCaretPoint(const InputState* s, Window* win, int offset,
+                         Point* out) {
+    if (!s || !win || !out) {
+        return false;
+    }
+    PaintCtx* ctx = &win->paint;
+    float font = s->lastFont > 0 ? s->lastFont : 14.f;
+    float lineH = s->lastLineH;
+    if (lineH <= 0) {
+        return false;
+    }
+    Str text = InputValue(s);
+    offset = offset < 0 ? 0 : (offset > len(text) ? len(text) : offset);
+    if (InputIsSingleLine(s)) {
+        const Bounds& b = s->lastBounds;
+        if (len(text) == 0) {
+
+            if (s->inputBounds.w <= 0 && s->inputBounds.h <= 0) {
+                return false;
+            }
+            *out = {s->inputBounds.x,
+                    s->inputBounds.y + (s->inputBounds.h - lineH) * 0.5f};
+            return true;
+        }
+        if (b.w <= 0 && b.h <= 0) {
+            return false;
+        }
+        if (s->chipLine) {
+            WrapRowSpan r;
+            r.hi = len(text);
+            float x = WrapRowX(ctx, s, text, r, offset);
+            *out = {b.x + x, b.y + (b.h - lineH) * 0.5f};
+            return true;
+        }
+        Str run = text;
+        int at = offset;
+        if (s->masked) {
+            run = MaskedRun(GetTempArena(), text);
+            at = MaskedOffset(text, offset);
+        }
+        float x = 0, y = 0, h = 0;
+        if (!TextPointAt(ctx, run, font, 0, false, at, &x, &y, &h,
+                         s->lastFontWord)) {
+            return false;
+        }
+        *out = {b.x + x, b.y + y};
+        return true;
+    }
+
+    const InputPaintedRows* pr = LastPaintedRows(s, win);
+    if (!pr) {
+        return false;
+    }
+    for (int i = 0; i < pr->geometry.nRows; i++) {
+        const RangeDecorationRow& row = pr->geometry.rows[i];
+        if (offset < row.start || offset > row.start + row.len || !row.text) {
+            continue;
+        }
+
+        bool affinity = s->cursorLineEndAffinity;
+        if (offset == row.start + row.len && !row.last && !affinity) {
+            continue;
+        }
+        if (offset == row.start && !row.first && affinity) {
+            continue;
+        }
+        if (row.text->kind != ElKind::Text) {
+
+            WrapRowSpan r;
+            r.lo = row.start - row.lineStart;
+            r.hi = r.lo + row.len;
+            r.lineStart = row.lineStart;
+            float x = WrapRowX(ctx, s, Str(text.s + row.lineStart, row.lineLen),
+                               r, offset - row.lineStart);
+            *out = {row.text->x + x, row.text->y};
+            return true;
+        }
+        Str line = Str(text.s + row.start, row.len);
+
+        float lineMult = lineH * 16.f / WindowRemSize(win) / font;
+        float x = 0, y = 0, h = 0;
+        if (!TextPointAt(ctx, line, font, 0, false, offset - row.start, &x, &y,
+                         &h, s->lastFontWord, lineMult, affinity)) {
+            return false;
+        }
+        *out = {row.text->x + x, row.text->y + y};
+        return true;
+    }
+    return false;
+}
+
+bool InputRangeToBounds(const InputState* s, Window* win, Selection range,
+                        Bounds* out) {
+    Point start = {}, end = {};
+    if (!s || !out || !InputLastCaretPoint(s, win, range.start, &start) ||
+        !InputLastCaretPoint(s, win, range.end, &end)) {
+        return false;
+    }
+    *out = {start.x, start.y, end.x - start.x, end.y + s->lastLineH - start.y};
+    return true;
+}
+
+static Selection ActiveTouchRange(const InputState* s) {
+    Selection r = s->selectedRange;
+    if (r.start > r.end) {
+        int t = r.start;
+        r.start = r.end;
+        r.end = t;
+    }
+    return r;
+}
+
+static void RetainTouchSelection(InputState* s) {
+    s->touchLive = true;
+    s->touchRange = ActiveTouchRange(s);
+}
+
+static void ResetTouchSelection(InputState* s) {
+    s->touchLive = false;
+    s->touchRange = {};
+    s->touchMenuOpen = false;
+    s->touchDragging = false;
+    s->touchDragEdge = 0;
+    s->touchDragOffset = {};
+}
+
+bool InputTouchSelection(const InputState* s, Window* win,
+                         TouchSelectionSnapshot* out) {
+    if (!s || !s->touchLive) {
+        return false;
+    }
+    Selection selection = ActiveTouchRange(s);
+    if (selection.start != s->touchRange.start || selection.end != s->touchRange
+                                                                       .end) {
+        return false;
+    }
+    float lineH = s->lastLineH;
+    if (!win || lineH <= 0) {
+        return false;
+    }
+    Bounds viewport = s->inputBounds;
+
+    auto caretBox = [&](int offset, float standInY) {
+        Point at = {};
+        if (InputLastCaretPoint(s, win, offset, &at)) {
+            return TouchCaretLineBox(at, lineH);
+        }
+        return TouchCaretLineBox({viewport.x, standInY}, lineH);
+    };
+    Bounds start = caretBox(s->touchRange.start, viewport.y - lineH);
+    Bounds end = caretBox(s->touchRange.end, viewport.y + viewport.h);
+    TouchSelectionSnapshot snapshot =
+        TouchSelectionSnapshot::New(start, end)
+            .WithEdgeVisible(SelectionEdge::Start,
+                             TouchCaretInView(start, viewport))
+            .WithEdgeVisible(SelectionEdge::End,
+                             TouchCaretInView(end, viewport))
+            .WithMenuOpen(s->touchMenuOpen);
+    if (s->touchDragging) {
+        snapshot = snapshot.WithDragging((SelectionEdge)s->touchDragEdge);
+    }
+    if (out) {
+        *out = snapshot;
+    }
+    return true;
+}
+
+void InputKeepTouchSelection(InputState* s, App* app, Window* win) {
+    if (!s) {
+        return;
+    }
+    RetainTouchSelection(s);
+    s->touchMenuOpen = true;
+    s->touchDragging = false;
+    Notify(app, win);
+}
+
+void InputDismissTouchSelection(InputState* s, App* app, Window* win) {
+    if (!s || !s->touchLive) {
+        return;
+    }
+    ResetTouchSelection(s);
+    Notify(app, win);
+}
+
+void InputCloseEditMenu(InputState* s, App* app, Window* win) {
+    if (!s || !s->touchMenuOpen) {
+        return;
+    }
+    s->touchMenuOpen = false;
+    Notify(app, win);
+}
+
+bool InputReopenEditMenuAt(InputState* s, App* app, Window* win, Point at) {
+    TouchSelectionSnapshot snapshot;
+    if (!s || !win || !InputTouchSelection(s, win, &snapshot) ||
+        snapshot.IsEmpty()) {
+        return false;
+    }
+    int offset = InputIndexForPosition(s, &win->paint, at.x, at.y);
+    Selection selection = ActiveTouchRange(s);
+    if (offset <= selection.start || offset >= selection.end) {
+        return false;
+    }
+    s->touchMenuOpen = true;
+    Notify(app, win);
+    return true;
+}
+
+void InputEditMenuOnScroll(InputState* s, App* app, Window* win,
+                           TouchPhase phase) {
+    if (!s || !s->touchLive) {
+        return;
+    }
+    if (phase == TouchPhase::Ended || phase == TouchPhase::Cancelled) {
+        if (!s->touchMenuOpen) {
+            s->touchMenuOpen = true;
+            Notify(app, win);
+        }
+        return;
+    }
+    InputCloseEditMenu(s, app, win);
+}
+
+void InputSelectAllFromEditMenu(InputState* s, App* app, Window* win) {
+    if (!s) {
+        return;
+    }
+    bool touch = s->touchLive;
+    InputSelectAll(s, app, win);
+    if (touch) {
+        RetainTouchSelection(s);
+        s->touchMenuOpen = true;
+        Notify(app, win);
+    }
+}
+
+static bool AllWhitespace(Str text) {
+    for (int i = 0; i < len(text); i++) {
+        char c = text.s[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' &&
+            c != '\v') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool InputOnLongPress(InputState* s, App* app, Window* win,
+                      const LongPressEvent& event) {
+    if (!s || !win) {
+        return false;
+    }
+    switch (event.phase) {
+        case TouchPhase::Started: {
+            if (s->disabled) {
+                return false;
+            }
+            if (!s->focused) {
+                InputFocus(s, app, win);
+            }
+
+            BaseSuppressTextSelection(app);
+            UndoBreakCoalescing(&s->undo);
+            InputClearInlineCompletion(s);
+            ResetTouchSelection(s);
+
+            bool affinity = false;
+            int offset =
+                InputIndexForPosition(s, &win->paint, event.startPosition.x,
+                                      event.startPosition.y, &affinity);
+            InputRemoveExtraCursors(s);
+
+            s->selectedRange = {offset, offset};
+            s->selectionReversed = false;
+            InputSelectWord(s, app, win, offset);
+            Selection selected = ActiveTouchRange(s);
+            bool pressedWord =
+                !selected.IsEmpty() && !AllWhitespace(InputSelectedValue(s));
+            if (!pressedWord) {
+
+                InputMoveToWithAffinity(s, app, win, offset, affinity);
+                s->hasSelectedWordRange = false;
+            }
+            s->selecting = true;
+            RetainTouchSelection(s);
+            Notify(app, win);
+            return true;
+        }
+        case TouchPhase::Moved: {
+            bool affinity = false;
+            int offset = InputIndexForPosition(s, &win->paint, event.position.x,
+                                               event.position.y, &affinity);
+            if (s->hasSelectedWordRange) {
+
+                InputSelectToWithAffinity(s, app, win, offset, affinity);
+            } else {
+
+                InputMoveToWithAffinity(s, app, win, offset, affinity);
+            }
+            RetainTouchSelection(s);
+            return true;
+        }
+        case TouchPhase::Ended:
+        case TouchPhase::Cancelled:
+            s->selecting = false;
+            s->hasSelectedWordRange = false;
+            if (s->touchLive) {
+                s->touchMenuOpen = true;
+            }
+            Notify(app, win);
+            return true;
+    }
+    return false;
+}
+
+void InputBeginEdgeDrag(InputState* s, App* app, Window* win,
+                        SelectionEdge edge, Point finger) {
+    TouchSelectionSnapshot snapshot;
+    if (!s || !InputTouchSelection(s, win, &snapshot)) {
+        return;
+    }
+    UndoBreakCoalescing(&s->undo);
+    s->hasSelectedWordRange = false;
+    s->selectionReversed = edge == SelectionEdge::Start;
+    TouchEdgeDrag drag =
+        TouchEdgeDrag::Begin(edge, snapshot.Edge(edge), finger);
+    s->touchDragging = true;
+    s->touchDragEdge = (uint8_t)drag.edge;
+    s->touchDragOffset = drag.offset;
+    s->touchMenuOpen = false;
+    Notify(app, win);
+}
+
+void InputExtendEdgeDragTo(InputState* s, App* app, Window* win,
+                           Point position) {
+    if (!s->touchDragging || !win) {
+        return;
+    }
+    bool affinity = false;
+    int offset = InputIndexForPosition(s, &win->paint, position.x, position.y,
+                                       &affinity);
+    Selection before = s->selectedRange;
+    bool beforeReversed = s->selectionReversed;
+    InputSelectToWithAffinity(s, app, win, offset, affinity);
+
+    if (s->selectedRange.IsEmpty()) {
+        s->selectedRange = before;
+        s->selectionReversed = beforeReversed;
+        return;
+    }
+
+    SelectionEdge edge =
+        s->selectionReversed ? SelectionEdge::Start : SelectionEdge::End;
+    s->touchDragEdge = (uint8_t)edge;
+    RetainTouchSelection(s);
+    Notify(app, win);
+}
+
+void InputUpdateEdgeDrag(InputState* s, App* app, Window* win, Point finger) {
+    if (!s || !s->touchDragging) {
+        return;
+    }
+    TouchEdgeDrag drag;
+    drag.edge = (SelectionEdge)s->touchDragEdge;
+    drag.offset = s->touchDragOffset;
+    Point position = drag.TextPosition(finger);
+    InputExtendEdgeDragTo(s, app, win, position);
+    if (InputIsSingleLine(s)) {
+        return;
+    }
+
+    s->autoScroll.lastDrag = position;
+    s->autoScroll.hasLastDrag = true;
+    float delta = 0;
+    if (AutoScrollComputeDelta(position.y, s->inputBounds, &delta)) {
+        s->autoScroll.Set(delta);
+        WindowRequestAnimationFrame(win);
+    } else {
+        s->autoScroll.SetNone();
+    }
+}
+
+void InputEndEdgeDrag(InputState* s, App* app, Window* win) {
+    if (!s || !s->touchDragging) {
+        return;
+    }
+    s->touchDragging = false;
+    s->autoScroll.Stop();
+    if (s->selectedRange.IsEmpty()) {
+        s->selectionReversed = false;
+    }
+    s->touchMenuOpen = true;
+    Notify(app, win);
+}
+
+bool InputIsEditMenuOpen(const InputState* s) {
+    return s && s->touchMenuOpen;
+}
+
+bool InputTouchSelectionRange(const InputState* s, Selection* out) {
+    if (!s || !s->touchLive) {
+        return false;
+    }
+    if (out) {
+        *out = s->touchRange;
+    }
+    return true;
+}
+
 }
 
 #line 1 "src/base/json.cpp"
@@ -41089,7 +44118,7 @@ void ListInitKeys() {
     KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
 }
 
-ListKeyAction ListActionOf(uint32_t id, intptr_t arg) {
+ListKeyAction ListActionOf(uint32_t id, int64_t arg) {
     ListKeyAction out;
     if (id == action::SelectUp()) {
         out.action = ListAction::SelectPrev;
@@ -41518,7 +44547,7 @@ void ListState::OnMouseDownOut(ListState* self, Ctx* cx,
 }
 
 void ListState::OnRowClick(ListState* self, Ctx* cx, const ClickEvent* ev,
-                           intptr_t ix) {
+                           int64_t ix) {
     ListClickRow(self, cx, (int)ix, ev->modifiers.Secondary());
 }
 
@@ -41528,7 +44557,7 @@ void ListState::OnScroll(ListState* self, Ctx* cx, const ScrollEvent* ev) {
 }
 
 void ListState::OnRowMouseDown(ListState* self, Ctx* cx,
-                               const MouseDownEvent* ev, intptr_t ix) {
+                               const MouseDownEvent* ev, int64_t ix) {
 
     if (ev->button == MouseButton::Right) {
         ListRightClickRow(self, cx, (int)ix);
@@ -41793,12 +44822,7 @@ float Easing::Sample(float progress) const {
                     break;
             }
             float step = floorf(progress * steps) + offset;
-            if (step < 0.f) {
-                step = 0.f;
-            }
-            if (step > jumps) {
-                step = jumps;
-            }
+            step = ClampF(step, 0.f, jumps);
             return jumps > 0.f ? step / jumps : 0.f;
         }
         case EasingKind::LinearStops: {
@@ -42666,7 +45690,7 @@ NumberStep NumberStep::Fixed(double value) {
     return step;
 }
 
-NumberStep NumberStep::ByValue(NumberStepByValueFn fn, intptr_t value) {
+NumberStep NumberStep::ByValue(NumberStepByValueFn fn, int64_t value) {
     NumberStep step;
     step.kind = NumberStepKind::ByValue;
     step.byValue = fn;
@@ -42946,13 +45970,38 @@ char OtpDigitChar(uint32_t c) {
     return 0;
 }
 
+Str OtpValue(const OtpState* s) {
+    if (!s || s->len <= 0 || !s->value.els) {
+        return StrL("");
+    }
+    return Str(s->value.els, s->len);
+}
+
+static void OtpTerminate(OtpState* s) {
+    VecResize(s->value, s->len);
+    VecAppend(s->value, (char)0);
+}
+
+void OtpSetValue(OtpState* s, Str value) {
+    if (!s) {
+        return;
+    }
+    VecClear(s->value);
+    int n = len(value);
+    if (n > 0) {
+        VecAppendN(s->value, value.s, n);
+    }
+    s->len = n > 0 ? n : 0;
+    OtpTerminate(s);
+}
+
 bool OtpEditValue(OtpState* s, int key, uint32_t ch) {
     if (key == KeyBack) {
         if (s->len == 0) {
             return false;
         }
         s->len--;
-        s->value[s->len] = 0;
+        OtpTerminate(s);
         return true;
     }
 
@@ -42964,14 +46013,13 @@ bool OtpEditValue(OtpState* s, int key, uint32_t ch) {
         return false;
     }
 
-    int cap = s->length < (int)sizeof(s->value) - 1 ? s->length
-                                                    : (int)sizeof(s->value) - 1;
-    if (s->len >= cap) {
+    if (s->len >= s->length) {
         return false;
     }
-    s->value[s->len] = digit;
+    VecResize(s->value, s->len);
+    VecAppend(s->value, digit);
     s->len++;
-    s->value[s->len] = 0;
+    OtpTerminate(s);
     return true;
 }
 
@@ -43064,7 +46112,7 @@ El* OtpInput::New(Ctx* cx, Str id, Entity<OtpState> state) {
 
 namespace gpui {
 
-PaginationState PaginationStateNew(int currentPage, int totalPages) {
+PaginationState PaginationStateNew(int64_t currentPage, int64_t totalPages) {
     PaginationState s = {};
     s.totalPages = totalPages < 1 ? 1 : totalPages;
     s.currentPage = currentPage < 1              ? 1
@@ -43073,21 +46121,21 @@ PaginationState PaginationStateNew(int currentPage, int totalPages) {
     return s;
 }
 
-int PaginationPrevPage(const PaginationState* s) {
+int64_t PaginationPrevPage(const PaginationState* s) {
     if (s->disabled || s->currentPage <= 1) {
         return 0;
     }
     return s->currentPage - 1;
 }
 
-int PaginationNextPage(const PaginationState* s) {
+int64_t PaginationNextPage(const PaginationState* s) {
     if (s->disabled || s->currentPage >= s->totalPages) {
         return 0;
     }
     return s->currentPage + 1;
 }
 
-bool PaginationCanRequest(const PaginationState* s, int page) {
+bool PaginationCanRequest(const PaginationState* s, int64_t page) {
     if (s->disabled || page == s->currentPage) {
         return false;
     }
@@ -43095,15 +46143,15 @@ bool PaginationCanRequest(const PaginationState* s, int page) {
 }
 
 int PaginationItems(const PaginationState* s, PaginationItem* out, int cap) {
-    int current = s->currentPage;
-    int total = s->totalPages;
+    int64_t current = s->currentPage;
+    int64_t total = s->totalPages;
     int n = 0;
     if (total <= 1) {
         return 0;
     }
-    int maxVisible = s->visiblePages < 5 ? 5 : s->visiblePages;
+    int64_t maxVisible = s->visiblePages < 5 ? 5 : s->visiblePages;
     if (total <= maxVisible) {
-        for (int i = 1; i <= total && n < cap; i++) {
+        for (int64_t i = 1; i <= total && n < cap; i++) {
             out[n].page = i;
             n++;
         }
@@ -43111,20 +46159,20 @@ int PaginationItems(const PaginationState* s, PaginationItem* out, int cap) {
     }
     out[n].page = 1;
     n++;
-    int side = (maxVisible - 3) / 2;
-    int start = current <= side + 1          ? 2
-                : current > total - side - 1 ? total - side - 1
-                                             : current - side;
+    int64_t side = (maxVisible - 3) / 2;
+    int64_t start = current <= side + 1          ? 2
+                    : current > total - side - 1 ? total - side - 1
+                                                 : current - side;
     if (start > 2 && n < cap) {
         out[n].page = 0;
         out[n].from = 2;
         out[n].to = start - 1;
         n++;
     }
-    int end = current >= total - side ? total - 1
-              : current <= side + 1   ? side + 2
-                                      : current + side;
-    for (int i = start; i <= end && n < cap; i++) {
+    int64_t end = current >= total - side ? total - 1
+                  : current <= side + 1   ? side + 2
+                                          : current + side;
+    for (int64_t i = start; i <= end && n < cap; i++) {
         out[n].page = i;
         n++;
     }
@@ -43379,12 +46427,7 @@ int ScaleBand::NearestIndex(float tick) const {
         return 0;
     }
     int index = (int)lroundf((tick - rangeStart - outer) / step);
-    if (index < 0) {
-        index = 0;
-    }
-    if (index > domainLen - 1) {
-        index = domainLen - 1;
-    }
+    index = ClampI(index, 0, domainLen - 1);
     return index;
 }
 
@@ -43438,10 +46481,80 @@ static void PaintPathFill(PaintCtx* ctx, Path* path, Background fill,
 }
 
 static void PaintPathStroke(PaintCtx* ctx, Path* path, float width,
-                            Background stroke) {
-    if (path) {
-        PathStroke(ctx, path, width, stroke.color);
+                            Background stroke, Bounds box) {
+    if (!path) {
+        return;
     }
+    if (!stroke.gradient) {
+        PathStroke(ctx, path, width, stroke.color);
+        return;
+    }
+    Point p0 = {}, p1 = {};
+    BackgroundLine(stroke, box, &p0, &p1);
+    PathStrokeGradient(ctx, path, width, p0.x, p0.y, p1.x, p1.y,
+                       stroke.from.color, stroke.to.color);
+}
+
+static Bounds StrokeBox(const Point* points, int count, float width) {
+    if (!points || count <= 0) {
+        return Bounds{};
+    }
+    float x0 = points[0].x, y0 = points[0].y, x1 = x0, y1 = y0;
+    for (int i = 1; i < count; i++) {
+        x0 = points[i].x < x0 ? points[i].x : x0;
+        y0 = points[i].y < y0 ? points[i].y : y0;
+        x1 = points[i].x > x1 ? points[i].x : x1;
+        y1 = points[i].y > y1 ? points[i].y : y1;
+    }
+    float half = width * 0.5f;
+    return Bounds{x0 - half, y0 - half, x1 - x0 + width, y1 - y0 + width};
+}
+
+static void PaintQuadFill(PaintCtx* ctx, Bounds box, Background fill) {
+    if (box.w <= 0 || box.h <= 0) {
+        return;
+    }
+    if (!fill.gradient) {
+        CanvasFillRect(ctx, box.x, box.y, box.w, box.h, fill.color);
+        return;
+    }
+    Path* path = PathNew(ctx, true);
+    if (!path) {
+        return;
+    }
+    PathMoveTo(path, box.x, box.y);
+    PathLineTo(path, box.x + box.w, box.y);
+    PathLineTo(path, box.x + box.w, box.y + box.h);
+    PathLineTo(path, box.x, box.y + box.h);
+    PathClose(path);
+    PaintPathFill(ctx, path, fill, box);
+    PathFree(path);
+}
+
+Bounds GridLineBounds(Point start, Point end) {
+    if (start.x == end.x) {
+        float top = start.y < end.y ? start.y : end.y;
+        float bottom = start.y > end.y ? start.y : end.y;
+        return Bounds{start.x - 0.5f, top, 1.f, bottom - top};
+    }
+    float left = start.x < end.x ? start.x : end.x;
+    float right = start.x > end.x ? start.x : end.x;
+    return Bounds{left, start.y - 0.5f, right - left, 1.f};
+}
+
+static void PaintAxisLine(PaintCtx* ctx, Point a, Point b, Background stroke) {
+    if (!stroke.gradient) {
+        CanvasLine(ctx, a.x, a.y, b.x, b.y, 1, stroke.color);
+        return;
+    }
+    Path* path = PathNew(ctx, false);
+    if (!path) {
+        return;
+    }
+    PathMoveTo(path, a.x, a.y);
+    PathLineTo(path, b.x, b.y);
+    PaintPathStroke(ctx, path, 1, stroke, GridLineBounds(a, b));
+    PathFree(path);
 }
 
 Path* Polygon(PaintCtx* ctx, const Point* points, int count, Bounds bounds) {
@@ -43695,8 +46808,8 @@ void PlotAxis::Paint(PaintCtx* ctx, Bounds bounds) const {
     Arena* arena = a ? a : GetTempArena();
     if (hasX) {
         if (xAxis) {
-            CanvasLine(ctx, bounds.x, bounds.y + x, bounds.x + bounds.w,
-                       bounds.y + x, 1, stroke.color);
+            PaintAxisLine(ctx, {bounds.x, bounds.y + x},
+                          {bounds.x + bounds.w, bounds.y + x}, stroke);
         }
         PlotLabel label = PlotLabel::New(arena);
         label.items = XTexts(arena, x);
@@ -43704,8 +46817,8 @@ void PlotAxis::Paint(PaintCtx* ctx, Bounds bounds) const {
     }
     if (hasY) {
         if (yAxis) {
-            CanvasLine(ctx, bounds.x + y, bounds.y, bounds.x + y,
-                       bounds.y + bounds.h, 1, stroke.color);
+            PaintAxisLine(ctx, {bounds.x + y, bounds.y},
+                          {bounds.x + y, bounds.y + bounds.h}, stroke);
         }
         PlotLabel label = PlotLabel::New(arena);
         label.items = YTexts(arena, y);
@@ -43740,46 +46853,49 @@ Grid* Grid::DashArray(const float* values, int count) {
     return this;
 }
 
-static void PaintPlotLine(PaintCtx* ctx, Point a, Point b, Rgba color,
-                          const float* dash, int dashCount) {
-    if (!dash || dashCount <= 0) {
-        CanvasLine(ctx, a.x, a.y, b.x, b.y, 1, color);
-        return;
-    }
-    float dx = b.x - a.x;
-    float dy = b.y - a.y;
+void GridDashSegments(Arena* arena, Point start, Point end, const float* dash,
+                      int dashCount, ArenaVec<Point>* out) {
+    float dx = end.x - start.x;
+    float dy = end.y - start.y;
     float length = sqrtf(dx * dx + dy * dy);
-    float pattern = 0;
-    for (int i = 0; i < dashCount; i++) {
-        if (dash[i] > 0) {
-            pattern += dash[i];
-        }
+    bool anyDash = false;
+    for (int i = 0; dash && i < dashCount; i++) {
+        anyDash = anyDash || dash[i] > 0;
     }
-    if (length <= 0 || pattern <= 0) {
-        CanvasLine(ctx, a.x, a.y, b.x, b.y, 1, color);
+    if (!dash || dashCount <= 0 || length <= 0 || !anyDash) {
+        out->Append(arena, start);
+        out->Append(arena, end);
         return;
     }
-    float ux = dx / length;
-    float uy = dy / length;
-    float at = 0;
-    int ix = 0;
-    bool draw = true;
-    while (at < length) {
-        float run = dash[ix] > 0 ? dash[ix] : 0;
-        float end = at + run;
-        if (end > length) {
-            end = length;
+    int patternLen = dashCount % 2 == 1 ? dashCount * 2 : dashCount;
+    float position = 0;
+    int index = 0;
+    while (position < length) {
+        float run = dash[index % dashCount] > 0 ? dash[index % dashCount] : 0;
+        float next = position + run < length ? position + run : length;
+        if (index % 2 == 0 && next > position) {
+            out->Append(arena, Point{start.x + dx * position / length,
+                                     start.y + dy * position / length});
+            out->Append(arena, Point{start.x + dx * next / length,
+                                     start.y + dy * next / length});
         }
-        if (draw && end > at) {
-            CanvasLine(ctx, a.x + ux * at, a.y + uy * at, a.x + ux * end,
-                       a.y + uy * end, 1, color);
-        }
-        at = end;
-        ix = (ix + 1) % dashCount;
-        draw = !draw;
-        if (run <= 0) {
+        position = next;
+        index = (index + 1) % patternLen;
+    }
+}
 
-            continue;
+static void PaintGridLine(PaintCtx* ctx, Point a, Point b, Background stroke,
+                          const float* dash, int dashCount) {
+    Arena* arena = GetTempArena();
+    ArenaVec<Point> segments;
+    GridDashSegments(arena, a, b, dash, dashCount, &segments);
+    for (int i = 0; i + 1 < len(segments); i += 2) {
+        Point from = segments[i];
+        Point to = segments[i + 1];
+        if (!stroke.gradient) {
+            CanvasLine(ctx, from.x, from.y, to.x, to.y, 1, stroke.color);
+        } else {
+            PaintQuadFill(ctx, GridLineBounds(from, to), stroke);
         }
     }
 }
@@ -43787,13 +46903,13 @@ static void PaintPlotLine(PaintCtx* ctx, Point a, Point b, Rgba color,
 void Grid::Paint(PaintCtx* ctx, Bounds bounds) const {
     for (int i = 0; i < xCount; i++) {
         float px = bounds.x + x[i];
-        PaintPlotLine(ctx, {px, bounds.y}, {px, bounds.y + bounds.h},
-                      stroke.color, dashArray, dashCount);
+        PaintGridLine(ctx, {px, bounds.y}, {px, bounds.y + bounds.h}, stroke,
+                      dashArray, dashCount);
     }
     for (int i = 0; i < yCount; i++) {
         float py = bounds.y + y[i];
-        PaintPlotLine(ctx, {bounds.x, py}, {bounds.x + bounds.w, py},
-                      stroke.color, dashArray, dashCount);
+        PaintGridLine(ctx, {bounds.x, py}, {bounds.x + bounds.w, py}, stroke,
+                      dashArray, dashCount);
     }
 }
 
@@ -43939,7 +47055,16 @@ static void PaintDot(PaintCtx* ctx, Point point, float size, Background fill,
     Rgba edge = hasStroke        ? stroke
                 : !fill.gradient ? fill.color
                                  : RgbaTransparent();
-    CanvasEllipse(ctx, point.x, point.y, radius, radius, 0, fill.color);
+    if (fill.gradient) {
+        Point p0 = {}, p1 = {};
+        BackgroundLine(fill,
+                       Bounds{point.x - radius, point.y - radius, size, size},
+                       &p0, &p1);
+        CanvasEllipseGradient(ctx, point.x, point.y, radius, radius, p0.x, p0.y,
+                              p1.x, p1.y, fill.from.color, fill.to.color);
+    } else {
+        CanvasEllipse(ctx, point.x, point.y, radius, radius, 0, fill.color);
+    }
     CanvasEllipse(ctx, point.x, point.y, radius, radius, 1, edge);
 }
 
@@ -43948,7 +47073,8 @@ void Line::Paint(PaintCtx* ctx, Bounds bounds) const {
     if (len(points) > 0) {
         Path* path = PathNew(ctx, false);
         PlotRun(path, points, curve);
-        PaintPathStroke(ctx, path, strokeWidth, stroke);
+        PaintPathStroke(ctx, path, strokeWidth, stroke,
+                        StrokeBox(points.els, len(points), strokeWidth));
         PathFree(path);
     }
     if (dot) {
@@ -44036,7 +47162,8 @@ void Area::Paint(PaintCtx* ctx, Bounds bounds) const {
         PathClose(area);
     }
     PaintPathFill(ctx, area, fill, bounds);
-    PaintPathStroke(ctx, line, 1, stroke);
+    PaintPathStroke(ctx, line, 1, stroke,
+                    StrokeBox(points.els, len(points), 1));
     PathFree(area);
     PathFree(line);
 }
@@ -44498,7 +47625,8 @@ void RadialLine::Paint(PaintCtx* ctx, Bounds bounds) const {
         if (closed && len(points) > 2) {
             PathClose(path);
         }
-        PaintPathStroke(ctx, path, strokeWidth, stroke);
+        PaintPathStroke(ctx, path, strokeWidth, stroke,
+                        StrokeBox(points.els, len(points), strokeWidth));
         PathFree(path);
     }
     if (dot) {
@@ -44874,7 +48002,7 @@ void PopoverSetOpenFocused(PopoverState* s, Ctx* cx, bool open) {
 }
 
 void PopoverToggle(PopoverState* self, Ctx* cx, const MouseDownEvent* ev,
-                   intptr_t button) {
+                   int64_t button) {
     if (ev->button != (MouseButton)button) {
         return;
     }
@@ -44972,7 +48100,7 @@ Popover* Popover::Trigger(El* e) {
 
     if (state.IsValid()) {
 
-        e->OnMouseDown(ListenTo(state, &PopoverToggle, (intptr_t)button));
+        e->OnMouseDown(ListenTo(state, &PopoverToggle, (int64_t)button));
     }
     trigger = e;
     return this;
@@ -45286,13 +48414,13 @@ void PopupMenuState::OnAction(PopupMenuState* self, Ctx* cx,
 }
 
 void PopupMenuState::OnItemClick(PopupMenuState* self, Ctx* cx,
-                                 const ClickEvent*, intptr_t ix) {
+                                 const ClickEvent*, int64_t ix) {
     self->selected = (int)ix;
     PopupMenuConfirm(self, cx, (int)ix);
 }
 
 void PopupMenuState::OnTriggerClick(PopupMenuState* self, Ctx* cx,
-                                    const ClickEvent*, intptr_t wasOpen) {
+                                    const ClickEvent*, int64_t wasOpen) {
 
     self->open = wasOpen != 0;
     if (self->open) {
@@ -45329,7 +48457,7 @@ void PopupMenuState::OnContextDown(PopupMenuState* self, Ctx* cx,
 }
 
 void PopupMenuState::OnItemHover(PopupMenuState* self, Ctx* cx,
-                                 const HoverEvent* ev, intptr_t ix) {
+                                 const HoverEvent* ev, int64_t ix) {
 
     if (ev->hovered) {
         self->selected = (int)ix;
@@ -45342,14 +48470,14 @@ void PopupMenuState::OnItemHover(PopupMenuState* self, Ctx* cx,
 }
 
 void PopupMenuState::OnSubmenuClick(PopupMenuState* self, Ctx* cx,
-                                    const ClickEvent*, intptr_t ix) {
+                                    const ClickEvent*, int64_t ix) {
     self->selected = (int)ix;
     self->openSubmenu = (int)ix;
     Notify(cx);
 }
 
 void PopupMenuState::OnSubmenuHover(PopupMenuState* self, Ctx* cx,
-                                    const HoverEvent* ev, intptr_t ix) {
+                                    const HoverEvent* ev, int64_t ix) {
 
     if (ev->hovered) {
         self->selected = (int)ix;
@@ -46110,7 +49238,7 @@ QuestionnaireSchemaError QuestionnaireStateNew(
                 SetOwned(&r.freeform, value);
             }
             input->onChange =
-                ListenTo(e, &QuestionnaireState::OnInputChange, (intptr_t)i);
+                ListenTo(e, &QuestionnaireState::OnInputChange, (int64_t)i);
         }
         for (int c = 0; c < nc; c++) {
             r.initialSelected[c] = r.selected[c];
@@ -46680,7 +49808,7 @@ static void SyncInputAnswer(QuestionnaireState* s, int ix, bool emit, Ctx* cx) {
 }
 
 void QuestionnaireState::OnInputChange(QuestionnaireState* self, Ctx* cx,
-                                       const InputEvent* ev, intptr_t itemIx) {
+                                       const InputEvent* ev, int64_t itemIx) {
     if (!ev || ev->kind != InputEventKind::Change || itemIx < 0 ||
         itemIx >= self->nItems) {
         return;
@@ -47192,16 +50320,16 @@ bool QuestionnaireState::MoveCurrentRadio(int direction, Ctx* cx) {
     return true;
 }
 
-static intptr_t PackChoice(int itemIx, int choiceIx) {
-    return (intptr_t)itemIx << 16 | (intptr_t)(choiceIx & 0xffff);
+static int64_t PackChoice(int itemIx, int choiceIx) {
+    return (int64_t)itemIx << 16 | (int64_t)(choiceIx & 0xffff);
 }
 
-static void UnpackChoice(intptr_t v, int* itemIx, int* choiceIx) {
+static void UnpackChoice(int64_t v, int* itemIx, int* choiceIx) {
     *itemIx = (int)(v >> 16);
     *choiceIx = (int)(v & 0xffff);
 }
 
-static bool ChoiceAt(const QuestionnaireState* s, intptr_t packed, Str* item,
+static bool ChoiceAt(const QuestionnaireState* s, int64_t packed, Str* item,
                      Str* value) {
     int ix = 0;
     int c = 0;
@@ -47220,7 +50348,7 @@ static int KeyModifierCount(const KeyEvent* ev) {
 }
 
 static void ChoiceConfirmKey(QuestionnaireState* self, Ctx* cx,
-                             const KeyEvent* ev, intptr_t packed) {
+                             const KeyEvent* ev, int64_t packed) {
     Str item;
     Str value;
     if (!ev || !ev->propagate || ev->held || ev->vk != KeyReturn ||
@@ -47237,7 +50365,7 @@ static void ChoiceConfirmKey(QuestionnaireState* self, Ctx* cx,
 }
 
 static void ChoiceChange(QuestionnaireState* self, Ctx* cx, const ClickEvent*,
-                         intptr_t packed) {
+                         int64_t packed) {
     Str item;
     Str value;
     if (!ChoiceAt(self, packed, &item, &value)) {
@@ -47270,7 +50398,7 @@ bool QuestionnaireChoiceControl::New(Ctx* cx, Entity<QuestionnaireState> state,
     int total = 0;
     bool hasPosition = s->ChoicePosition(item, value, &position, &total);
     FocusHandle focus = s->runtime[ix].choiceFocus[c];
-    intptr_t packed = PackChoice(ix, c);
+    int64_t packed = PackChoice(ix, c);
     Listener change = ListenTo(state, &ChoiceChange, packed);
 
     El* e = nullptr;
@@ -47557,7 +50685,7 @@ float ResizablePanelSize(const ResizableState* s, int ix, float declared) {
 }
 
 void ResizableState::OnHandleDown(ResizableState* self, Ctx* cx,
-                                  const MouseDownEvent* ev, intptr_t ix) {
+                                  const MouseDownEvent* ev, int64_t ix) {
     if (ev->button != MouseButton::Left) {
         return;
     }
@@ -48132,10 +51260,11 @@ El* ResizablePanelGroup::IntoEl() {
             continue;
         }
 
-        El* box = Div(a)
-                      ->Id(StrDup(a, fmt("resizable-panel-%d", i)))
-                      ->FlexCol()
-                      ->Shrink0();
+        El* box =
+            Div(a)
+                ->Id(ElementIdNamed(a, StrL("resizable-panel"), (uint64_t)i))
+                ->FlexCol()
+                ->Shrink0();
 
         float boxW = horiz ? s->sizes[i] : kFill;
         float boxH = horiz ? kFill : s->sizes[i];
@@ -48302,17 +51431,7 @@ struct BaseRootPluginRegistry {
 };
 
 struct BaseRootWindowState {
-    bool captured = false;
-    Vec<RootPluginInstance> plugins;
     EntityId root = {};
-    ~BaseRootWindowState() {
-        for (int i = 0; i < plugins.len; i++) {
-            if (plugins[i].type->drop && plugins[i].state) {
-                plugins[i].type->drop(plugins[i].state);
-            }
-        }
-        VecReset(plugins);
-    }
 };
 
 BaseRootWindowState* BaseRootWindowStateOf(Window* window) {
@@ -48325,6 +51444,38 @@ BaseRootWindowState* BaseRootWindowStateOf(Window* window) {
         &EntityDropT<BaseRootWindowState>);
 }
 
+void RootCapturePlugins(Root* root, Window* window) {
+    if (!root || root->captured || !window) {
+        return;
+    }
+    root->captured = true;
+    BaseRootPluginRegistry* registry =
+        AppGlobalGet<BaseRootPluginRegistry>(root->app);
+    for (int i = 0; registry && i < registry->plugins.len; i++) {
+        RootPluginInstance instance;
+        instance.type = registry->plugins[i];
+        if (instance.type->build) {
+            instance.state = instance.type->build(window, root->app);
+        }
+        VecAppend(root->plugins, instance);
+    }
+}
+
+void RootMount(Window* window, EntityId root) {
+    if (BaseRootWindowState* state = BaseRootWindowStateOf(window)) {
+        state->root = root;
+    }
+}
+
+}
+
+Root::~Root() {
+    for (int i = 0; i < plugins.len; i++) {
+        if (plugins[i].type->drop && plugins[i].state) {
+            plugins[i].type->drop(plugins[i].state);
+        }
+    }
+    VecReset(plugins);
 }
 
 void Root::RegisterPlugin(App* app, const RootPlugin* plugin) {
@@ -48341,50 +51492,21 @@ void Root::RegisterPlugin(App* app, const RootPlugin* plugin) {
     VecAppend(registry->plugins, plugin);
 }
 
-const RootPluginInstance* RootPlugins(Window* window, int* n) {
-    *n = 0;
-    BaseRootWindowState* state = BaseRootWindowStateOf(window);
-    if (!state) {
-        return nullptr;
-    }
-    if (!state->captured) {
-
-        state->captured = true;
-        BaseRootPluginRegistry* registry =
-            AppGlobalGet<BaseRootPluginRegistry>(window->app);
-        for (int i = 0; registry && i < registry->plugins.len; i++) {
-            RootPluginInstance instance;
-            instance.type = registry->plugins[i];
-            if (instance.type->build) {
-                instance.state = instance.type->build(window, window->app);
-            }
-            VecAppend(state->plugins, instance);
-        }
-    }
-    *n = state->plugins.len;
-    return state->plugins.els;
-}
-
 Entity<Root> Root::New(App* app, Window* window, EntityId view) {
     Entity<Root> e = EntityNew<Root>(app);
     if (Root* root = e.Get(app)) {
         root->app = app;
         root->view = view;
-    }
-    if (window) {
-        int n = 0;
-        (void)RootPlugins(window, &n);
-        if (BaseRootWindowState* state = BaseRootWindowStateOf(window)) {
-            state->root = e.id;
+        if (window) {
+            RootCapturePlugins(root, window);
+            RootMount(window, e.id);
         }
     }
     return e;
 }
 
-void* Root::Plugin(Window* window, const RootPlugin* type) {
-    int n = 0;
-    const RootPluginInstance* plugins = RootPlugins(window, &n);
-    for (int i = 0; i < n; i++) {
+void* Root::Plugin(const RootPlugin* type) const {
+    for (int i = 0; i < plugins.len; i++) {
         if (plugins[i].type == type) {
             return plugins[i].state;
         }
@@ -48406,17 +51528,24 @@ Root* Root::Refine(const Style& s, uint32_t fields) {
     return this;
 }
 
-El* RootSurface(Ctx* cx, const Root* root, El* content) {
+El* RootSurface(Ctx* cx, Root* root, El* content) {
     Arena* a = cx->a;
-    int n = 0;
-    const RootPluginInstance* plugins = RootPlugins(cx->win, &n);
+    if (root) {
+        RootCapturePlugins(root, cx->win);
+    }
+    int n = root ? root->plugins.len : 0;
+    const RootPluginInstance* plugins = root ? root->plugins.els : nullptr;
     for (int i = 0; i < n; i++) {
         if (plugins[i].type->prepare) {
             plugins[i].type->prepare(plugins[i].state, cx);
         }
     }
 
-    El* surface = Div(a)->KeyContext(StrL("Root"))->FlexCol()->SizeFull();
+    El* surface = Div(a)
+                      ->Id(StrL("root"))
+                      ->KeyContext(StrL("Root"))
+                      ->FlexCol()
+                      ->SizeFull();
     surface->Child(TextSelectionLayer::New(cx));
     if (content) {
         surface->Child(content);
@@ -48469,17 +51598,15 @@ El* Root::Render(Root* self, Ctx* cx) {
 
 Window* KitOpenWindow(App* app, Str title, int dipW, int dipH, EntityId content,
                       WinOpts opts) {
+
     Entity<Root> root = Root::New(app, nullptr, content);
     Window* win = WindowOpenView(app, title, dipW, dipH, root.id, opts);
     if (!win) {
         EntityDrop(app, root.id);
         return nullptr;
     }
-    int n = 0;
-    (void)RootPlugins(win, &n);
-    if (BaseRootWindowState* state = BaseRootWindowStateOf(win)) {
-        state->root = root.id;
-    }
+    RootCapturePlugins(root.Get(app), win);
+    RootMount(win, root.id);
     return win;
 }
 
@@ -49684,13 +52811,6 @@ static El* ApplyScrollbarTheme(Ctx* cx, El* box) {
 
 static const float kMinThumb = 48.f;
 
-static float base_scrollbar_ClampF(float v, float lo, float hi) {
-    if (v < lo) {
-        return lo;
-    }
-    return v > hi ? hi : v;
-}
-
 ScrollbarThumbGeometry ScrollbarGeometry(float origin, float container,
                                          float content, float marginEnd,
                                          float inset, float minLength) {
@@ -49699,10 +52819,9 @@ ScrollbarThumbGeometry ScrollbarGeometry(float origin, float container,
     float track = container - marginEnd;
     if (track < 0) track = 0;
     float logical = content > 0 ? container / content * container : 0;
-    if (logical < minLength) logical = minLength;
-    if (logical > track) logical = track;
+    logical = ClampF(logical, minLength, track);
     float maxInset = logical * .5f;
-    out.inset = base_scrollbar_ClampF(inset, 0, maxInset);
+    out.inset = ClampF(inset, 0, maxInset);
     out.length = logical - out.inset * 2.f;
     out.travel = track - logical;
     out.extent = content - container;
@@ -49710,7 +52829,7 @@ ScrollbarThumbGeometry ScrollbarGeometry(float origin, float container,
 }
 
 float ScrollbarThumbGeometry::Start(float offset) const {
-    float pct = extent > 0 ? base_scrollbar_ClampF(offset / extent, 0, 1) : 0;
+    float pct = extent > 0 ? ClampF(offset / extent, 0, 1) : 0;
     return origin + inset + pct * travel;
 }
 
@@ -49718,7 +52837,7 @@ float ScrollbarThumbGeometry::DragOffset(float position, float grab,
                                          float current) const {
     if (travel <= 0 || extent <= 0) return current;
     float pct = (position - origin - inset - grab) / travel;
-    return base_scrollbar_ClampF(pct, 0, 1) * extent;
+    return ClampF(pct, 0, 1) * extent;
 }
 
 float ScrollbarThumbSize(float track, float container, float content,
@@ -49742,7 +52861,7 @@ static float OffsetForPct(float pct, float container, float content) {
     if (max <= 0) {
         return 0;
     }
-    return base_scrollbar_ClampF(pct, 0.f, 1.f) * max;
+    return ClampF(pct, 0.f, 1.f) * max;
 }
 
 float ScrollbarThumbPos(float track, float thumb, float offset, float container,
@@ -49752,7 +52871,7 @@ float ScrollbarThumbPos(float track, float thumb, float offset, float container,
     if (max <= 0 || travel <= 0) {
         return 0;
     }
-    return base_scrollbar_ClampF(offset / max, 0.f, 1.f) * travel;
+    return ClampF(offset / max, 0.f, 1.f) * travel;
 }
 
 float ScrollbarThumbPos(float track, float thumb, float offset, float container,
@@ -49806,7 +52925,7 @@ AxisPrepaintState ScrollbarPrepaintAxis(Axis axis, Bounds track, float offset,
     float maxRadius = out.thumbFillBounds.w < out.thumbFillBounds.h
                           ? out.thumbFillBounds.w * .5f
                           : out.thumbFillBounds.h * .5f;
-    out.radius = base_scrollbar_ClampF(radius, 0.f, maxRadius);
+    out.radius = ClampF(radius, 0.f, maxRadius);
     out.visibilityOpacity = 1.f;
     out.visibilityPosition = 1.f;
     out.visibilityRequested = true;
@@ -50262,17 +53381,10 @@ El* Sheet::IntoEl() {
 
 namespace gpui {
 
-static float base_slider_ClampF(float v, float lo, float hi) {
-    if (v < lo) {
-        return lo;
-    }
-    return v > hi ? hi : v;
-}
-
 SliderValue SliderValueClamp(SliderValue v, float min, float max) {
-    v.hi = base_slider_ClampF(v.hi, min, max);
+    v.hi = ClampF(v.hi, min, max);
     if (v.range) {
-        v.lo = base_slider_ClampF(v.lo, min, max);
+        v.lo = ClampF(v.lo, min, max);
     }
     return v;
 }
@@ -50346,7 +53458,7 @@ float SliderPctToValue(const SliderState* s, float pct) {
     }
 
     float base = s->max / s->min;
-    return base_slider_ClampF(powf(base, pct) * s->min, s->min, s->max);
+    return ClampF(powf(base, pct) * s->min, s->min, s->max);
 }
 
 float SliderValueToPct(const SliderState* s, float value) {
@@ -50363,17 +53475,17 @@ float SliderValueToPct(const SliderState* s, float value) {
     if (logBase == 0 || value <= 0) {
         return 0;
     }
-    return base_slider_ClampF(::logf(value / s->min) / logBase, 0.f, 1.f);
+    return ClampF(::logf(value / s->min) / logBase, 0.f, 1.f);
 }
 
 void SliderUpdateThumbPos(SliderState* s) {
     if (!s->value.range) {
         s->pctLo = 0;
-        s->pctHi = SliderValueToPct(s, base_slider_ClampF(s->value.hi, s->min, s->max));
+        s->pctHi = SliderValueToPct(s, ClampF(s->value.hi, s->min, s->max));
         return;
     }
-    s->pctLo = SliderValueToPct(s, base_slider_ClampF(s->value.lo, s->min, s->max));
-    s->pctHi = SliderValueToPct(s, base_slider_ClampF(s->value.hi, s->min, s->max));
+    s->pctLo = SliderValueToPct(s, ClampF(s->value.lo, s->min, s->max));
+    s->pctHi = SliderValueToPct(s, ClampF(s->value.hi, s->min, s->max));
 }
 
 static float PctAt(const SliderState* s, Axis axis, Point pos) {
@@ -50383,7 +53495,7 @@ static float PctAt(const SliderState* s, Axis axis, Point pos) {
     if (total <= 0) {
         return 0;
     }
-    return base_slider_ClampF(inner, 0.f, total) / total;
+    return ClampF(inner, 0.f, total) / total;
 }
 
 bool SliderIsStartAt(const SliderState* s, Axis axis, Point pos) {
@@ -50398,7 +53510,7 @@ bool SliderUpdateByPosition(SliderState* s, Axis axis, Point pos,
                             bool isStart) {
     s->dragging = true;
     float pct = PctAt(s, axis, pos);
-    pct = isStart ? base_slider_ClampF(pct, 0.f, s->pctHi) : base_slider_ClampF(pct, s->pctLo, 1.f);
+    pct = isStart ? ClampF(pct, 0.f, s->pctHi) : ClampF(pct, s->pctLo, 1.f);
 
     float value = SliderPctToValue(s, pct);
     if (s->step > 0) {
@@ -50430,7 +53542,7 @@ bool SliderStepBy(SliderState* s, int dir, bool isStart) {
 
     float lo = isStart ? s->min : SliderPctToValue(s, s->pctLo);
     float hi = isStart ? SliderPctToValue(s, s->pctHi) : s->max;
-    want = base_slider_ClampF(want, lo, hi);
+    want = ClampF(want, lo, hi);
     if (want == from) {
         return false;
     }
@@ -50535,6 +53647,11 @@ StateStyle& StateStyle::BorderB(float w, Rgba c) {
     set |= StateFieldBorderB;
     return *this;
 }
+StateStyle& StateStyle::Pad(float x, float y) {
+    style.pad = Edges::New(x, x, y, y);
+    set |= StateFieldPad;
+    return *this;
+}
 StateStyle& StateStyle::Radius(float v) {
     style.radius = v;
     set |= StateFieldRadius;
@@ -50567,6 +53684,10 @@ StateStyle& StateStyle::Opacity(float v) {
 }
 
 void StateStyleRefine(StateStyle* into, const StateStyle& over) {
+    if (over.Has(StateFieldPad)) {
+        into->style.pad = over.style.pad;
+        into->set |= StateFieldPad;
+    }
     if (over.Has(StateFieldBg)) {
         into->Bg(over.style.bg);
     }
@@ -51955,6 +55076,13 @@ void TextSelectionHandle::Register(TextSelectionRegistration value,
                                    Window* window, App* app) const {
     TextSelectionParticipantState* participant = ParticipantState(*this, app);
     if (!participant || !window) return;
+
+    if (!WindowSelectionLayerLive(window)) return;
+
+    TextSelectionScopeId current = {};
+    if (CurrentTextSelectionScope(window, &current)) {
+        value.scope = current;
+    }
     participant->window = window;
     participant->registered = true;
     participant->registration = value;
@@ -52052,6 +55180,8 @@ static TextSelectionRange ProjectRun(const TextSelectionRun& run,
     }
     if (!snapshot.hasWindowPoints) return out;
 
+    if (TextLayoutTextLen(run.layout) != len(run.text)) return out;
+
     float rowsTop = 0, rowsBottom = 0;
     if (RunRowsExtent(run, &rowsTop, &rowsBottom)) {
         TextSelectionBand band = TextSelectionBandFor(
@@ -52097,11 +55227,32 @@ static TextSelectionRange ProjectRun(const TextSelectionRun& run,
     return out;
 }
 
+TextSelectionProjection TextSelectionProjectRanges(
+    const TextSelectionSnapshot* snapshot, const TextSelectionRun* runs,
+    int count) {
+    TextSelectionProjection out;
+    out.active = snapshot != nullptr;
+    for (int i = 0; i < count; i++) {
+        VecAppend(out.ranges, snapshot ? ProjectRun(runs[i], *snapshot)
+                                       : TextSelectionRange{});
+    }
+    return out;
+}
+
+void TextSelectionHandleSetSnapshot(const TextSelectionHandle& handle, App* app,
+                                    const TextSelectionSnapshot* snapshot) {
+    ParticipantSetSnapshot(ParticipantState(handle, app), app,
+                           snapshot != nullptr,
+                           snapshot ? *snapshot : TextSelectionSnapshot{});
+}
+
 TextSelectionProjection TextSelectionHandle::UpdateRuns(
     const TextSelectionRun* values, int count, App* app) const {
-    TextSelectionProjection out;
     TextSelectionParticipantState* participant = ParticipantState(*this, app);
-    if (!participant) return out;
+    if (!participant) {
+        TextSelectionProjection none;
+        return none;
+    }
     for (int i = 0; i < participant->runs.len; i++) {
         if (participant->runs[i].layout) {
             TextLayoutRelease(participant->runs[i].layout);
@@ -52112,12 +55263,9 @@ TextSelectionProjection TextSelectionHandle::UpdateRuns(
         VecAppend(participant->runs, values[i]);
         if (values[i].layout) TextLayoutAddRef(values[i].layout);
     }
-    out.active = participant->hasSnapshot;
-    for (int i = 0; i < count; i++) {
-        VecAppend(out.ranges, participant->hasSnapshot
-                                  ? ProjectRun(values[i], participant->snapshot)
-                                  : TextSelectionRange{});
-    }
+    TextSelectionProjection out = TextSelectionProjectRanges(
+        participant->hasSnapshot ? &participant->snapshot : nullptr, values,
+        count);
 
     Vec<int> order;
     for (int i = 0; i < count; i++) {
@@ -52221,11 +55369,42 @@ El* TextSelection::New(Ctx* cx, Str id, int clickId) {
 }
 
 El* TextSelectionLayer::New(Ctx* cx) {
+    if (cx->win) {
+        WindowSelectionOf(cx->win)->layerFrame = cx->win->frameSeq + 1;
+    }
     return Div(cx->a)->Id(StrL("window-text-selection"))->W(0)->H(0);
 }
 
 El* TextSelectionScope(El* element, TextSelectionScopeId scope) {
-    return element ? element->TrapId(scope.RuntimeScope()) : nullptr;
+    if (element) {
+        element->selectionScope = (uint32_t)scope.RuntimeScope();
+    }
+    return element;
+}
+
+bool CurrentTextSelectionScope(const Window* win, TextSelectionScopeId* out) {
+    if (!win || win->textSelectionScopes.len == 0) {
+        return false;
+    }
+    if (out) {
+        *out = TextSelectionScopeId::FromRaw(
+            win->textSelectionScopes[win->textSelectionScopes.len - 1]);
+    }
+    return true;
+}
+
+TextSelectionScopeGuard::TextSelectionScopeGuard(Window* window,
+                                                 TextSelectionScopeId scope)
+    : win(window) {
+    if (win) {
+        VecAppend(win->textSelectionScopes, scope.Value());
+    }
+}
+
+TextSelectionScopeGuard::~TextSelectionScopeGuard() {
+    if (win && win->textSelectionScopes.len > 0) {
+        win->textSelectionScopes.len--;
+    }
 }
 
 WindowSelection* WindowSelectionOf(Window* win) {
@@ -52299,6 +55478,16 @@ bool WindowSelectionHas(const Window* win) {
     return TextSelectionPublishes(&s->gesture);
 }
 
+static bool AnchorResolves(Window* win, const WindowSelection* s) {
+    if (!s->anchorParticipant.IsValid()) {
+        return true;
+    }
+    TextSelectionParticipantState* participant =
+        (TextSelectionParticipantState*)EntityGet(win->app,
+                                                  s->anchorParticipant);
+    return participant && participant->registered && participant->window == win;
+}
+
 void WindowSelectionPress(Window* win, float x, float y, int clickCount,
                           bool extend) {
     if (win && BaseIsTextSelectionSuppressed(win->app)) {
@@ -52309,17 +55498,37 @@ void WindowSelectionPress(Window* win, float x, float y, int clickCount,
     if (!s) {
         return;
     }
+
+    {
+        bool keep = extend && s->anchor >= 0;
+        int anchor = s->anchor;
+        int scope = s->scope;
+        Point anchorPoint = s->anchorPoint;
+        bool anchorInsideText = s->anchorInsideText;
+        EntityId anchorParticipant = s->anchorParticipant;
+        WindowSelectionClear(win);
+        if (keep) {
+            s->anchor = anchor;
+            s->cursor = anchor;
+            s->scope = scope;
+            s->anchorPoint = anchorPoint;
+            s->cursorPoint = anchorPoint;
+            s->hasWindowPoints = true;
+            s->anchorInsideText = anchorInsideText;
+            s->anchorParticipant = anchorParticipant;
+        }
+    }
     PaintCtx* ctx = &win->paint;
 
-    if (extend && s->anchor >= 0) {
+    if (extend && s->anchor >= 0 && AnchorResolves(win, s)) {
         int off = TextHitOffsetIn(ctx, x, y, true, s->scope, nullptr);
         if (off >= 0) {
             s->cursor = off;
             s->cursorPoint = {x, y};
             s->hasWindowPoints = true;
-            TextSelectionExtend(
-                &s->gesture,
-                TextHitOffsetIn(ctx, x, y, false, s->scope, nullptr) >= 0);
+            bool inside =
+                TextHitOffsetIn(ctx, x, y, false, s->scope, nullptr) >= 0;
+            TextSelectionBegin(&s->gesture, s->anchorInsideText || inside);
         }
         WindowSelectionPublish(win);
         return;
@@ -52341,6 +55550,9 @@ void WindowSelectionPress(Window* win, float x, float y, int clickCount,
         s->anchorPoint = {x - 0.5f, y};
         s->cursorPoint = {x + 0.5f, y};
         s->hasWindowPoints = true;
+        s->anchorInsideText = true;
+        s->anchorParticipant = {};
+        ParticipantAt(win, s->anchorPoint, &s->anchorParticipant);
         TextSelectionBegin(&s->gesture, true);
         TextSelectionEnd(&s->gesture);
         WindowSelectionPublish(win);
@@ -52358,11 +55570,13 @@ void WindowSelectionPress(Window* win, float x, float y, int clickCount,
         s->anchorPoint = {x, y};
         s->cursorPoint = {x, y};
         s->hasWindowPoints = true;
-        TextSelectionBegin(&s->gesture, TextHitOffsetIn(ctx, x, y, false, scope,
-                                                        nullptr) >= 0);
+        s->anchorInsideText =
+            TextHitOffsetIn(ctx, x, y, false, scope, nullptr) >= 0;
+        TextSelectionBegin(&s->gesture, s->anchorInsideText);
         EntityId participantId = {};
         TextSelectionParticipantState* participant =
             ParticipantAt(win, s->anchorPoint, &participantId);
+        s->anchorParticipant = participant ? participantId : EntityId{};
         if (participant && participant->focus) {
             participant->focus(participant->focusUser, win, win->app);
         }
@@ -52737,6 +55951,12 @@ void WindowSelectionApply(Window* win) {
     win->paint.selScope = publishes ? s->scope : -1;
 }
 
+bool WindowSelectionLayerLive(const Window* win) {
+
+    return win && win->sel && win->sel->layerFrame != 0 &&
+           win->sel->layerFrame >= win->frameSeq;
+}
+
 void WindowSelectionFinishFrame(Window* win) {
     WindowSelection* selection = win ? win->sel : nullptr;
     if (selection) {
@@ -52919,6 +56139,12 @@ static uint64_t NextMarkdownExtensionsRevision() {
     return out;
 }
 
+MarkdownExtensions& MarkdownExtensions::ParserRevision(uint64_t value) {
+    parserRevision = value;
+    revision = NextMarkdownExtensionsRevision();
+    return *this;
+}
+
 MarkdownExtensions& MarkdownExtensions::Mdx() {
     enableMdx = true;
     revision = NextMarkdownExtensionsRevision();
@@ -52976,7 +56202,8 @@ MarkdownExtensions& MarkdownExtensions::Plugin(Arena* a,
 
 bool MarkdownExtensions::HasSameParserConfiguration(
     const MarkdownExtensions& other) const {
-    if (enableMdx != other.enableMdx ||
+    if (parserRevision != other.parserRevision ||
+        enableMdx != other.enableMdx ||
         enableFrontmatter != other.enableFrontmatter ||
         blockParsers.len != other.blockParsers.len ||
         blockRenderers.len != other.blockRenderers.len ||
@@ -53001,6 +56228,7 @@ bool MarkdownExtensions::HasSameParserConfiguration(
 uint64_t MarkdownExtensions::ParserFingerprint() const {
     uint64_t h = enableMdx ? 0x9e3779b97f4a7c15ull : 0xcbf29ce484222325ull;
     h = h * 1099511628211ull + (enableFrontmatter ? 1ull : 0ull);
+    h = h * 1099511628211ull + parserRevision;
     h = h * 1099511628211ull + (uint64_t)blockParsers.len;
     h = h * 1099511628211ull + (uint64_t)blockRenderers.len;
     h = h * 1099511628211ull + (uint64_t)inlineParsers.len;
@@ -53295,10 +56523,21 @@ void TextViewState::OnFadeTick(TextViewState* self, Ctx* cx, const TickEvent*) {
     NotifyEntity(cx->app, self->self, cx->win);
 }
 
+static void TextViewParseFree(TextViewParse* p);
+static void TextViewParseDetach(TextViewParseJob* job);
+static void TextViewBaselineDetach(TextViewState* s);
+
 TextViewState::~TextViewState() {
     StrFree(text);
     RenderedIndexFree(renderedIndex);
     RangeHighlightFrameFree(rangeHighlights);
+
+    TextViewParseDetach(parseFlight);
+    TextViewBaselineDetach(this);
+    TextViewParseFree(parsed);
+    for (TextViewParse* p : retiredParses) {
+        TextViewParseFree(p);
+    }
 }
 
 static Entity<TextViewState> NewTextViewState(App* app, Str text,
@@ -53310,6 +56549,9 @@ static Entity<TextViewState> NewTextViewState(App* app, Str text,
         state->self = entity.id;
         state->text = StrDup(text);
         state->format = format;
+        state->updateRevision = 1;
+        state->fullUpdateRevision = 1;
+        state->StartParse(app, nullptr);
     }
     return entity;
 }
@@ -53348,6 +56590,9 @@ void TextViewState::SetText(Str value, App* app, Window* window) {
     StrFree(text);
     text = replacement;
     Changed(app, window, false);
+    updateRevision++;
+    fullUpdateRevision = updateRevision;
+    StartParse(app, window);
 }
 
 void TextViewState::PushStr(Str value, App* app, Window* window) {
@@ -53365,6 +56610,8 @@ void TextViewState::PushStr(Str value, App* app, Window* window) {
     StrFree(text);
     text = Str(joined, oldLen + len(value));
     Changed(app, window, true);
+    updateRevision++;
+    StartParse(app, window);
 }
 
 void TextViewState::SetSelectable(bool value, App* app, Window* window) {
@@ -53712,6 +56959,8 @@ struct MdBuild {
     const md::NodePositions* positions = nullptr;
 
     int32_t posShift = 0;
+
+    Str parsed = {};
     MdNode* cur = nullptr;
 
     uint8_t marks = 0;
@@ -54211,6 +57460,18 @@ static void AddCustomInline(MdBuild* b, const MarkdownNode& custom,
     r->custom.text = StrDup(b->a, custom.text);
     r->custom.markdown = StrDup(b->a, custom.markdown);
 
+    Span span = r->custom.span;
+    if (r->custom.hasSpan && span.start >= 0 && span.start <= span.end &&
+        span.end <= len(b->source)) {
+        Str source = Str(b->source.s + span.start, span.end - span.start);
+        if (len(r->custom.text) == 0) {
+            r->custom.text = StrDup(b->a, source);
+        }
+        if (len(r->custom.markdown) == 0) {
+            r->custom.markdown = StrDup(b->a, source);
+        }
+    }
+
     r->text = r->custom.text;
     r->hasCustom = true;
     r->marks = b->marks;
@@ -54504,7 +57765,7 @@ static bool MdClaimedInline(MdBuild* b, const md::Node* n, MarkdownNode* out) {
     }
     MarkdownParseContext context;
     context.arena = b->a;
-    context.source = b->source;
+    context.source = b->parsed;
     context.positions = b->positions;
     for (int i = 0; i < b->extensions->inlineParsers.len; i++) {
         const MarkdownBlockParser& parser = b->extensions->inlineParsers[i];
@@ -54651,8 +57912,19 @@ static void MdInline(MdBuild* b, const md::Node* n) {
 static void MdBlockNode(MdBuild* b, const md::Node* n);
 
 static void MdBlockChildren(MdBuild* b, const md::Node* n) {
+
+    MdNode* parent = b->cur;
+    bool top = parent && parent->kind == MdKind::Doc;
     for (const md::Node* child : md::NodeKids(b->a, n)) {
+        MdNode* before = top ? parent->last : nullptr;
         MdBlockNode(b, child);
+        Span span;
+        if (top && MdNodeSpan(b, child, &span)) {
+            for (MdNode* c = before ? before->next : parent->first; c;
+                 c = c->next) {
+                c->blockStart = span.start;
+            }
+        }
     }
 }
 
@@ -54726,7 +57998,7 @@ static void MdBlockNode(MdBuild* b, const md::Node* n) {
     if (b->extensions) {
         MarkdownParseContext context;
         context.arena = b->a;
-        context.source = b->source;
+        context.source = b->parsed;
         context.positions = b->positions;
         for (int i = 0; i < b->extensions->blockParsers.len; i++) {
             const MarkdownBlockParser& parser = b->extensions->blockParsers[i];
@@ -54886,10 +58158,15 @@ static void MdExpandHtml(Arena* a, MdNode* n) {
 }
 
 static MdNode* MdParseWithExtensions(Arena* a, Str source,
-                                     const MarkdownExtensions* extensions) {
+                                     const MarkdownExtensions* extensions,
+                                     int from = 0) {
     MdNode* doc = ArenaNew<MdNode>(a);
     doc->kind = MdKind::Doc;
-    if (!source.s || len(source) <= 0) {
+    if (from < 0 || from > len(source)) {
+        from = 0;
+    }
+    Str parsed = Str(source.s + from, len(source) - from);
+    if (!source.s || len(parsed) <= 0) {
         return doc;
     }
 
@@ -54901,11 +58178,13 @@ static MdNode* MdParseWithExtensions(Arena* a, Str source,
                                                        ->enableFrontmatter;
 
     md::NodePositions positions;
-    md::Node* root = md::ToMdast(a, source, options, &positions);
+    md::Node* root = md::ToMdast(a, parsed, options, &positions);
 
     MdBuild b;
     b.a = a;
     b.source = source;
+    b.parsed = parsed;
+    b.posShift = from;
     b.extensions = extensions;
     b.positions = &positions;
     b.cur = doc;
@@ -55007,12 +58286,12 @@ static void MdOpenHref(char* href) {
 
 Listener TextView::LinkListener(Str href) {
     if (!onLinkHasContext) {
-        return ListenerArg(onLink, (intptr_t)href.s);
+        return ListenerArg(onLink, (int64_t)href.s);
     }
     TextViewLinkBinding* binding = ArenaNew<TextViewLinkBinding>(a);
     binding->context = onLinkContext;
     binding->href = href.s;
-    return ListenerArg(onLink, (intptr_t)binding);
+    return ListenerArg(onLink, (int64_t)binding);
 }
 
 static float HeadingScale(int level) {
@@ -55311,6 +58590,10 @@ El* TextView::SrcImage(El* e, MdRun* r) {
 static const Rgba kMarkBg = {0xfe, 0xf0, 0x8a, 0xff};
 static const Rgba kMarkFg = {0x0a, 0x0a, 0x0a, 0xff};
 
+static float FontLen(const Ctx* cx, float v) {
+    return Rems(cx, v / 16.f);
+}
+
 El* TextView::ImageRun(MdRun* r, float font, Rgba color, bool inFlow) {
 
     gpui::ImageSource imgSource =
@@ -55321,7 +58604,7 @@ El* TextView::ImageRun(MdRun* r, float font, Rgba color, bool inFlow) {
     float h = r->imgH;
 
     if (inFlow && w <= 0 && h <= 0) {
-        h = font * kLineHeight * 0.75f;
+        h = FontLen(cx, font * kLineHeight * 0.75f);
     }
 
     if ((w > 0) != (h > 0)) {
@@ -55464,7 +58747,7 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
         } else if (align == MdAlignRight) {
             t->TextRight();
         }
-        return t->W(kFill)->ReportLineSpan(font * kLineHeight);
+        return t->W(kFill)->ReportLineSpan(FontLen(cx, font * kLineHeight));
     }
 
     bool inFlow = false;
@@ -55607,7 +58890,7 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
         RevealMark(lastWord, lastWordLo, revealOffset);
     }
     col->Child(row);
-    return col->ReportLineSpan(font * kLineHeight);
+    return col->ReportLineSpan(FontLen(cx, font * kLineHeight));
 }
 
 static int RunsLen(MdNode* n) {
@@ -55782,8 +59065,13 @@ El* TextView::CodeBlock(MdNode* n) {
 
     SrcOpen(SrcCat(a, StrL("```"), n->lang, StrL("\n"), srcLinePre),
             SrcCat(a, StrL("\n"), srcLinePre, StrL("```")));
-    El* box = Div(a)->FlexCol()->W(kFill)->Pad(12)->Radius(radius)->Bg(
-        textViewStyle.codeBackground);
+
+    El* box = Div(a)
+                  ->FlexCol()
+                  ->W(kFill)
+                  ->Pad(Rems(cx, 0.75f))
+                  ->Radius(radius)
+                  ->Bg(textViewStyle.codeBackground);
     if (textViewStyle.codeBlockFields) {
         box->Refine(textViewStyle.codeBlock, textViewStyle.codeBlockFields);
     }
@@ -55843,7 +59131,7 @@ El* TextView::CodeBlock(MdNode* n) {
         if (RevealIn(n, &reveal)) {
             RevealMark(t, 0, reveal);
         }
-        box->Child(t->ReportLineSpan(codeFont * kLineHeight));
+        box->Child(t->ReportLineSpan(FontLen(cx, codeFont * kLineHeight)));
     }
     if (codeActions) {
 
@@ -55851,8 +59139,8 @@ El* TextView::CodeBlock(MdNode* n) {
         if (actions) {
             box->Child(Div(a)
                            ->Absolute()
-                           ->Top(8)
-                           ->Right(8)
+                           ->Top(Rems(cx, 0.5f))
+                           ->Right(Rems(cx, 0.5f))
                            ->Radius(radius)
                            ->Bg(textViewStyle.codeBackground)
                            ->Child(actions));
@@ -55866,7 +59154,7 @@ El* TextView::CodeLines(Str code, const ArenaVec<CodeHighlight>& spans,
                         const MdNode* leaf) {
     const int count = len(spans);
     El* col = Div(a)->FlexCol()->W(kFill);
-    float lineH = codeFont * kLineHeight;
+    float lineH = FontLen(cx, codeFont * kLineHeight);
     El* row = Div(a)->FlexRow()->H(lineH);
 
     char* piece = (char*)Alloc(a, len(code) + 1);
@@ -56026,12 +59314,7 @@ El* TextView::ScrollTable(MdNode* n) {
     }
     for (int i = 0; i < nCols; i++) {
         float floorW = colW[i] / kWrapLines;
-        if (floorW < kWrapMin) {
-            floorW = kWrapMin;
-        }
-        if (floorW > kWrapMax) {
-            floorW = kWrapMax;
-        }
+        floorW = ClampF(floorW, kWrapMin, kWrapMax);
         colMin[i] = floorW < colW[i] ? floorW : colW[i];
         minTotal += colMin[i];
     }
@@ -56063,8 +59346,8 @@ El* TextView::ScrollTable(MdNode* n) {
                            ->Grow(colW[col])
                            ->MinW(colMin[col])
                            ->ClipX()
-                           ->PadX(8)
-                           ->PadY(4);
+                           ->PadX(Rems(cx, 0.5f))
+                           ->PadY(Rems(cx, 0.25f));
             if (textViewStyle.tableCellFields) {
                 cell->Refine(textViewStyle.tableCell, textViewStyle
                                                           .tableCellFields);
@@ -56104,7 +59387,12 @@ El* TextView::ScrollTable(MdNode* n) {
         return scroller;
     }
 
-    return Div(a)->FlexCol()->W(kFill)->Gap(4)->Child(scroller)->Child(actions);
+    return Div(a)
+        ->FlexCol()
+        ->W(kFill)
+        ->Gap(Rems(cx, 0.25f))
+        ->Child(scroller)
+        ->Child(actions);
 }
 
 El* TextView::Table(MdNode* n) {
@@ -56171,7 +59459,11 @@ El* TextView::Table(MdNode* n) {
         int ix = 0;
         for (MdNode* c = r->first; c; c = c->next, ix++) {
             float frac = ix < nCols ? (float)colLen[ix] / total : 1.f / total;
-            El* cell = Div(a)->WFrac(frac)->MinW(tableColW)->PadX(8)->PadY(4);
+            El* cell = Div(a)
+                           ->WFrac(frac)
+                           ->MinW(tableColW > 0 ? tableColW : Rems(cx, 4.f))
+                           ->PadX(Rems(cx, 0.5f))
+                           ->PadY(Rems(cx, 0.25f));
             if (textViewStyle.tableCellFields) {
                 cell->Refine(textViewStyle.tableCell, textViewStyle
                                                           .tableCellFields);
@@ -56194,7 +59486,12 @@ El* TextView::Table(MdNode* n) {
     if (!actions) {
         return table;
     }
-    return Div(a)->FlexCol()->W(kFill)->Gap(4)->Child(table)->Child(actions);
+    return Div(a)
+        ->FlexCol()
+        ->W(kFill)
+        ->Gap(Rems(cx, 0.25f))
+        ->Child(table)
+        ->Child(actions);
 }
 
 Rgba TextView::BlockFg() const {
@@ -56202,12 +59499,12 @@ Rgba TextView::BlockFg() const {
     return blockFgSet ? blockFg : kInheritFg;
 }
 
-static El* TaskBox(Arena* a, const TextViewStyle& style, float lineHeight,
-                   bool on) {
+static El* TaskBox(const Ctx* cx, Arena* a, const TextViewStyle& style,
+                   float lineHeight, bool on) {
     El* box = Div(a)
                   ->Flex()
-                  ->W(14)
-                  ->H(14)
+                  ->W(Rems(cx, 0.875f))
+                  ->H(Rems(cx, 0.875f))
                   ->Shrink0()
                   ->ItemsCenter()
                   ->JustifyCenter()
@@ -56216,7 +59513,7 @@ static El* TaskBox(Arena* a, const TextViewStyle& style, float lineHeight,
 
         Rgba tick = style.isDark ? RgbaHex(0x000000) : RgbaHex(0xffffff);
         box->Bg(style.foreground)
-            ->Child(IconEl(a, IconName::Check, 10)->Fg(tick));
+            ->Child(IconEl(a, IconName::Check, Rems(cx, 0.625f))->Fg(tick));
     }
 
     return Div(a)
@@ -56224,7 +59521,7 @@ static El* TaskBox(Arena* a, const TextViewStyle& style, float lineHeight,
         ->H(lineHeight)
         ->Flex()
         ->ItemsCenter()
-        ->PadR(6)
+        ->PadR(Rems(cx, 0.375f))
         ->Child(box);
 }
 
@@ -56253,8 +59550,8 @@ El* TextView::Item(MdNode* n, Str marker, int depth) {
     srcLinePre = savedPre;
     El* row = Div(a)->FlexRow()->W(kFill)->ItemsStart();
     if (n->hasCheck) {
-        row->Child(
-            TaskBox(a, textViewStyle, baseFont * kLineHeight, n->checked));
+        row->Child(TaskBox(cx, a, textViewStyle,
+                           FontLen(cx, baseFont * kLineHeight), n->checked));
     } else if (len(marker) > 0) {
 
         row->Child(TextEl(a, marker)->Font(baseFont)->Shrink0());
@@ -56647,8 +59944,10 @@ struct LeafRemap {
     int newLen = 0;
     int unchangedPrefix = 0;
     int unchangedSuffix = 0;
+    int tailStart = -1;
 
-    static LeafRemap New(const RenderedIndex* prev, const RenderedIndex* next) {
+    static LeafRemap New(const RenderedIndex* prev, const RenderedIndex* next,
+                         bool tailOnly = false, int tailStart = -1) {
         LeafRemap r;
         r.prev = prev;
         r.next = next;
@@ -56656,6 +59955,11 @@ struct LeafRemap {
         Str newSource = next->source;
         r.oldLen = len(oldSource);
         r.newLen = len(newSource);
+        if (tailOnly) {
+            r.tailStart = tailStart >= 0 ? tailStart : r.oldLen;
+            r.unchangedPrefix = r.oldLen;
+            return r;
+        }
         int shorter = std::min(r.oldLen, r.newLen);
         int prefix = 0;
         while (prefix < shorter && oldSource.s[prefix] == newSource.s[prefix]) {
@@ -56678,6 +59982,11 @@ struct LeafRemap {
 
     bool Leaf(TextLeafKey key, TextLeafKey* newKey, int* unchanged) const {
         int start = key.BlockStart();
+        if (tailStart >= 0 && start < tailStart) {
+            *newKey = key;
+            *unchanged = 0x7fffffff;
+            return true;
+        }
         int moved = -1;
         if (start < unchangedPrefix) {
             moved = start;
@@ -56710,11 +60019,12 @@ struct LeafRemap {
 
 RangeHighlightFrame* RangeHighlightFrameRemap(const RangeHighlightFrame* frame,
                                               const RenderedIndex* prev,
-                                              const RenderedIndex* next) {
+                                              const RenderedIndex* next,
+                                              bool tailOnly, int tailStart) {
     if (!frame || !prev || !next) {
         return nullptr;
     }
-    LeafRemap remap = LeafRemap::New(prev, next);
+    LeafRemap remap = LeafRemap::New(prev, next, tailOnly, tailStart);
     Vec<RangePiece> pieces;
     for (const RangeHighlightFrame::Leaf& leaf : frame->leaves) {
         TextLeafKey newKey = {};
@@ -56876,25 +60186,290 @@ void TextViewState::ClearRangeHighlights(App* app, Window* window) {
     if (app && self.IsValid()) NotifyEntity(app, self, window);
 }
 
-void TextViewState::ReconcileRangeHighlights(const MdNode* doc,
-                                             uint64_t extensions, double now) {
-    if (renderedIndex && indexedRevision == revision &&
-        indexedExtensions == extensions) {
-        return;
-    }
-    indexedRevision = revision;
+static const int kMaxSyncFullReplaceBytes = 4 * 1024;
 
-    if (renderedIndex && indexedExtensions == extensions &&
-        base::StrEq(renderedIndex->source, text)) {
+static const double kFadeAtFirstFrame = -1e12;
+
+struct TextViewParse {
+    Vec<Arena*> arenas;
+    MdNode* doc = nullptr;
+    Str source = {};
+    bool html = false;
+    uint64_t fingerprint = 0;
+};
+
+static void TextViewParseFree(TextViewParse* p) {
+    if (!p) {
         return;
     }
-    indexedExtensions = extensions;
-    RenderedIndex* next = RenderedIndexNew(doc, text);
+    for (int i = 0; i < len(p->arenas); i++) {
+        ArenaDelete(p->arenas[i]);
+    }
+    StrFree(p->source);
+    delete p;
+}
+
+static void TextViewParseRetire(TextViewState* s, TextViewParse* p) {
+    if (!p) {
+        return;
+    }
+    const int n = (int)dimof(s->retiredParses);
+    TextViewParseFree(s->retiredParses[n - 1]);
+    for (int i = n - 1; i > 0; i--) {
+        s->retiredParses[i] = s->retiredParses[i - 1];
+    }
+    s->retiredParses[0] = p;
+}
+
+struct TextViewParseJob {
+    TextViewState* state = nullptr;
+    Str source = {};
+    int from = 0;
+    bool append = false;
+    bool html = false;
+    bool frontmatter = false;
+    bool mdx = false;
+    uint64_t fingerprint = 0;
+    uint64_t revision = 0;
+    App* app = nullptr;
+    Arena* arena = nullptr;
+    MdNode* doc = nullptr;
+};
+
+static MdNode* TextViewParseSource(Arena* a, Str source, int from, bool html,
+                                   const MarkdownExtensions* extensions) {
+    if (html) {
+        return HtmlParse(a, Str(source.s + from, len(source) - from));
+    }
+    return MdParseWithExtensions(a, source, extensions, from);
+}
+
+static void TextViewParseDetach(TextViewParseJob* job) {
+    if (job) {
+        job->state = nullptr;
+    }
+}
+
+static void TextViewParseWork(TextViewParseJob* job) {
+    job->arena = ArenaNew();
+
+    MarkdownExtensions flags;
+    flags.enableFrontmatter = job->frontmatter;
+    flags.enableMdx = job->mdx;
+    job->doc = TextViewParseSource(job->arena, job->source, job->from,
+                                   job->html, &flags);
+}
+
+static bool TextViewParseAppend(const TextViewState* s, uint64_t fingerprint,
+                                int* from) {
+    const TextViewParse* p = s->parsed;
+    bool html = s->format == TextViewFormat::Html;
+    if (!p || p->fingerprint != fingerprint || p->html != html ||
+        s->fullUpdateRevision > s->committedRevision || s->baselinePending ||
+        len(s->text) <= len(p->source) || !StrStartsWith(s->text, p->source)) {
+        *from = 0;
+        return false;
+    }
+
+    const MdNode* last = p->doc ? p->doc->last : nullptr;
+    *from = !html && last && last->blockStart >= 0 ? last->blockStart
+                                                   : len(p->source);
+    return true;
+}
+
+static void TextViewCommit(TextViewState* s, App* app, Arena* arena,
+                           MdNode* doc, Str source, bool append, int from,
+                           uint64_t revision, uint64_t fingerprint,
+                           double now) {
+    bool tailOnly = append && s->fullUpdateRevision <= s->committedRevision;
+    TextViewParse* p = s->parsed;
+    if (append && p && p->doc) {
+        if (p->doc->last && from < len(p->source)) {
+
+            MdNode* prev = nullptr;
+            for (MdNode* c = p->doc->first; c && c != p->doc->last;
+                 c = c->next) {
+                prev = c;
+            }
+            if (prev) {
+                prev->next = nullptr;
+            } else {
+                p->doc->first = nullptr;
+            }
+            p->doc->last = prev;
+        }
+        for (MdNode* c = doc ? doc->first : nullptr; c;) {
+            MdNode* next = c->next;
+            c->parent = p->doc;
+            c->next = nullptr;
+            if (p->doc->last) {
+                p->doc->last->next = c;
+            } else {
+                p->doc->first = c;
+            }
+            p->doc->last = c;
+            c = next;
+        }
+        VecAppend(p->arenas, arena);
+
+        TextViewParse* old = new TextViewParse();
+        old->source = p->source;
+        TextViewParseRetire(s, old);
+        p->source = source;
+    } else {
+        TextViewParse* next = new TextViewParse();
+        VecAppend(next->arenas, arena);
+        next->doc = doc;
+        next->source = source;
+        TextViewParseRetire(s, p);
+        s->parsed = next;
+        p = next;
+    }
+    p->html = s->format == TextViewFormat::Html;
+    p->fingerprint = fingerprint;
+    s->committedRevision = revision;
+    s->ReconcileRangeHighlights(p->doc, p->source, now, tailOnly,
+                                tailOnly ? from : -1);
+    if (app && s->self.IsValid()) {
+        NotifyEntity(app, s->self, nullptr);
+    }
+}
+
+struct TextViewBaselineAck {
+    TextViewState* state = nullptr;
+};
+
+static void TextViewBaselineDetach(TextViewState* s) {
+    if (s->baselineAck) {
+        s->baselineAck->state = nullptr;
+        s->baselineAck = nullptr;
+    }
+}
+
+static void TextViewBaselineAcked(TextViewBaselineAck* ack) {
+    if (TextViewState* s = ack->state) {
+        s->baselinePending = false;
+        s->baselineAck = nullptr;
+    }
+    delete ack;
+}
+
+Str TextViewState::Source() const {
+    return parsed ? parsed->source : Str{};
+}
+
+int TextViewState::ParsedBlockCount() const {
+    int n = 0;
+    for (const MdNode* c = parsed && parsed->doc ? parsed->doc->first : nullptr;
+         c; c = c->next) {
+        n++;
+    }
+    return n;
+}
+
+void TextViewState::StartParse(App* app, Window* window,
+                               const MarkdownExtensions* extensions, bool now) {
+    (void)window;
+    bool html = format == TextViewFormat::Html;
+    if (extensions && !html) {
+        parserFingerprint = extensions->ParserFingerprint();
+        parserFrontmatter = extensions->enableFrontmatter;
+        parserMdx = extensions->enableMdx;
+        parserPlugins = extensions->blockParsers.len > 0 ||
+                        extensions->inlineParsers.len > 0;
+    }
+    uint64_t fingerprint = html ? 0 : parserFingerprint;
+    if (parseFlight) {
+        parseQueued = true;
+        return;
+    }
+    if (parsed && committedRevision == updateRevision &&
+        parsed->fingerprint == fingerprint && parsed->html == html) {
+        return;
+    }
+    int from = 0;
+    bool append = TextViewParseAppend(this, fingerprint, &from);
+
+    bool sync = (!append && len(text) <= kMaxSyncFullReplaceBytes) ||
+                !ExecOnMainThread() || now;
+    if (parserPlugins && !html) {
+
+        if (!extensions) {
+            return;
+        }
+        sync = true;
+    }
+    if (sync) {
+        Arena* arena = ArenaNew();
+        Str source = StrDup(text);
+        MarkdownExtensions flags;
+        flags.enableFrontmatter = parserFrontmatter;
+        flags.enableMdx = parserMdx;
+        MdNode* doc = TextViewParseSource(arena, source, from, html,
+                                          extensions ? extensions : &flags);
+        TextViewCommit(this, app, arena, doc, source, append, from,
+                       updateRevision, fingerprint, kFadeAtFirstFrame);
+        if (!append && app && self.IsValid()) {
+            baselinePending = true;
+
+            TextViewBaselineDetach(this);
+            auto* ack = new TextViewBaselineAck();
+            ack->state = this;
+            baselineAck = ack;
+            ExecPost(MkFunc0(&TextViewBaselineAcked, ack));
+        }
+        return;
+    }
+    auto* job = new TextViewParseJob();
+    job->state = this;
+    job->app = app;
+    job->source = StrDup(text);
+    job->from = from;
+    job->append = append;
+    job->html = html;
+    job->frontmatter = parserFrontmatter;
+    job->mdx = parserMdx;
+    job->fingerprint = fingerprint;
+    job->revision = updateRevision;
+    parseFlight = job;
+    if (!ExecSpawn(MkFunc0(&TextViewParseWork, job),
+                   MkFunc0(&TextViewState::ParseLanded, job))) {
+
+        TextViewParseWork(job);
+        ParseLanded(job);
+    }
+}
+
+void TextViewState::ParseLanded(TextViewParseJob* job) {
+    TextViewState* s = job->state;
+    if (!s) {
+        if (job->arena) ArenaDelete(job->arena);
+        StrFree(job->source);
+        delete job;
+        return;
+    }
+    s->parseFlight = nullptr;
+
+    TextViewCommit(s, job->app, job->arena, job->doc, job->source, job->append,
+                   job->from, job->revision, job->fingerprint,
+                   kFadeAtFirstFrame);
+    App* app = job->app;
+    delete job;
+    if (s->parseQueued || s->committedRevision != s->updateRevision) {
+        s->parseQueued = false;
+        s->StartParse(app, nullptr);
+    }
+}
+
+void TextViewState::ReconcileRangeHighlights(const MdNode* doc, Str source,
+                                             double now, bool tailOnly,
+                                             int tailStart) {
+    RenderedIndex* next = RenderedIndexNew(doc, source);
 
     RecordStreamFade(renderedIndex, next, now);
     if (rangeHighlights) {
-        RangeHighlightFrame* moved =
-            RangeHighlightFrameRemap(rangeHighlights, renderedIndex, next);
+        RangeHighlightFrame* moved = RangeHighlightFrameRemap(
+            rangeHighlights, renderedIndex, next, tailOnly, tailStart);
         RangeHighlightFrameFree(rangeHighlights);
         rangeHighlights = moved;
     }
@@ -56903,7 +60478,7 @@ void TextViewState::ReconcileRangeHighlights(const MdNode* doc,
         TextLeafKey key = {};
         int unchanged = 0;
         if (!reveal.block && renderedIndex &&
-            LeafRemap::New(renderedIndex, next)
+            LeafRemap::New(renderedIndex, next, tailOnly, tailStart)
                 .Leaf(reveal.key, &key, &unchanged) &&
             reveal.offset < unchanged) {
             reveal.key = key;
@@ -56980,6 +60555,12 @@ int TextViewState::StreamFadeFrame(Arena* a, double now,
     if (MotionReduced() || motion.streamFadeMs <= 0) {
         VecClear(fadeSegments);
         return 0;
+    }
+    for (int i = 0; i < len(fadeSegments); i++) {
+        StreamFadeSegment& s = fadeSegments[i];
+        if (s.startedAt < kFadeAtFirstFrame / 2) {
+            s.startedAt = now + (s.startedAt - kFadeAtFirstFrame);
+        }
     }
     Timing timing = Timing::New(motion.streamFadeMs)
                         .Ease(motion.streamFadeEasing);
@@ -57071,6 +60652,8 @@ El* TextView::RangeWashes(El* t, const MdNode* leaf, int lo, int hi,
         t->style.hasBg = false;
         at++;
     }
+
+    t->glyphWashes = true;
     return t->Washes(washes, at);
 }
 
@@ -57140,10 +60723,14 @@ void TextView::RevealFrame(TextViewState* managed) {
                 }
                 float maxY = std::max(viewport->contentH - visible.h, 0.f);
                 managed->scrollY = std::min(std::max(y, 0.f), maxY);
-            } else if (onReveal.IsValid()) {
-                TextViewRevealEvent ev;
-                ev.line = line;
-                ListenerCall(cx->app, cx->win, onReveal, &ev);
+            } else {
+
+                WindowRequestAutoscroll(cx->win, line);
+                if (onReveal.IsValid()) {
+                    TextViewRevealEvent ev;
+                    ev.line = line;
+                    ListenerCall(cx->app, cx->win, onReveal, &ev);
+                }
             }
             if (reveal.block) {
 
@@ -57274,8 +60861,10 @@ El* TextView::PluginBlock(MdNode* n) {
 }
 
 El* TextView::Block(MdNode* n, int depth, bool inList, bool isLast) {
+
+    float gap = Rems(cx, paragraphGap / 16.f);
     if (n->kind == MdKind::Custom) {
-        float pad = (inList || isLast) ? 0.f : paragraphGap;
+        float pad = (inList || isLast) ? 0.f : gap;
         const struct MarkdownBlockRenderer* renderer =
             markdownExtensions.Renderer(n->custom.name);
         El* content = renderer && renderer->fn
@@ -57293,11 +60882,11 @@ El* TextView::Block(MdNode* n, int depth, bool inList, bool isLast) {
     }
 
     if (El* claimed = PluginBlock(n)) {
-        float pad = (inList || isLast) ? 0.f : paragraphGap;
+        float pad = (inList || isLast) ? 0.f : gap;
         return Div(a)->W(kFill)->PadB(pad)->Child(claimed);
     }
 
-    float mb = (inList || isLast) ? 0.f : paragraphGap;
+    float mb = (inList || isLast) ? 0.f : gap;
     switch (n->kind) {
         case MdKind::Paragraph:
             SrcOpen({}, {});
@@ -57313,6 +60902,8 @@ El* TextView::Block(MdNode* n, int depth, bool inList, bool isLast) {
                 font = refine.fontSize;
             }
 
+            font = FontPx(cx, font);
+
             char hashes[8] = {};
             int nh = n->level > 0 && n->level < 8 ? n->level : 1;
             for (int i = 0; i < nh; i++) {
@@ -57320,8 +60911,11 @@ El* TextView::Block(MdNode* n, int depth, bool inList, bool isLast) {
             }
             SrcOpen(SrcCat(a, Str(hashes, nh), StrL(" ")), {});
 
-            El* box = Div(a)->W(kFill)->PadB(5)->Child(
-                Inline(n, font, BlockFg(), HeadingWeight(n->level)));
+            El* box = Div(a)
+                          ->W(kFill)
+                          ->PadB(Rems(cx, 0.3f))
+                          ->Child(Inline(n, font, BlockFg(),
+                                         HeadingWeight(n->level)));
             StyleApplyFields(&box->style, refine,
                              refineFields & ~(uint32_t)StyleFieldFontSize);
             return box;
@@ -57335,7 +60929,7 @@ El* TextView::Block(MdNode* n, int depth, bool inList, bool isLast) {
                             ->W(kFill)
                             ->Fg(textViewStyle.mutedForeground)
                             ->BorderL(3, textViewStyle.border)
-                            ->PadX(16);
+                            ->PadX(Rems(cx, 1.f));
 
             Rgba savedFg = blockFg;
             bool savedSet = blockFgSet;
@@ -57437,6 +61031,8 @@ El* TextView::IntoEl() {
                 managed->text = StrDup(source);
                 managed->revision++;
                 managed->selectionRevision++;
+                managed->updateRevision++;
+                managed->fullUpdateRevision = managed->updateRevision;
             }
             managed->elementTextPtr = source.s;
             managed->elementTextLen = len(source);
@@ -57470,9 +61066,32 @@ El* TextView::IntoEl() {
     }
 
     BaseTextViewStatePush(cx->app, state.id);
-    MdNode* doc = MdParseCached(cx, a, source, html,
-                                html ? nullptr : &markdownExtensions);
 
+    MdNode* doc = nullptr;
+    if (managed) {
+        uint64_t fingerprint =
+            html ? 0 : markdownExtensions.ParserFingerprint();
+        bool stale = !managed->parsed ||
+                     managed->parsed->fingerprint != fingerprint ||
+                     managed->committedRevision != managed->updateRevision;
+        if (stale && !managed->parseFlight) {
+            if (managed->parsed && managed->parsed
+                                           ->fingerprint != fingerprint) {
+
+                managed->fullUpdateRevision = ++managed->updateRevision;
+            }
+            managed
+                ->StartParse(cx->app, cx->win, &markdownExtensions, !cx->win);
+        }
+        doc = managed->parsed ? managed->parsed->doc : nullptr;
+    } else {
+        doc = MdParseCached(cx, a, source, html,
+                            html ? nullptr : &markdownExtensions);
+    }
+    if (!doc) {
+        doc = ArenaNew<MdNode>(a);
+        doc->kind = MdKind::Doc;
+    }
     rangeHighlights = nullptr;
     revealTarget = nullptr;
     revealOut = nullptr;
@@ -57481,11 +61100,6 @@ El* TextView::IntoEl() {
     nStreamFades = 0;
     if (managed) {
         double now = MotionNow(cx);
-        managed->ReconcileRangeHighlights(
-            doc, html ? 0 : markdownExtensions.ParserFingerprint(), now);
-
-        managed->streamFadePending = false;
-        managed->streamFadeReplace = false;
         rangeHighlights = managed->rangeHighlights;
         RevealFrame(managed);
         StreamFadeRange* fades = nullptr;
@@ -57512,7 +61126,7 @@ El* TextView::IntoEl() {
     BaseTextViewStatePop(cx->app);
 
     if (!scrollable && maxLines >= 0) {
-        float cap = baseFont * kLineHeight * (float)maxLines;
+        float cap = FontLen(cx, baseFont * kLineHeight) * (float)maxLines;
         element->LineClamp(
             cap, state.IsValid() ? ListenTo(state, &TextViewState::OnLineClamp)
                                  : Listener{});
@@ -57651,7 +61265,7 @@ TextView* TextView::OnLink(Listener fn) {
     return this;
 }
 
-TextView* TextView::OnLinkWithContext(Listener fn, intptr_t context) {
+TextView* TextView::OnLinkWithContext(Listener fn, int64_t context) {
     onLink = fn;
     onLinkContext = context;
     onLinkHasContext = true;
@@ -58384,7 +61998,7 @@ void TimeFieldState::OnKeyDown(TimeFieldState* self, Ctx* cx,
 }
 
 void TimeFieldState::OnSegmentDown(TimeFieldState* self, Ctx* cx,
-                                   const MouseDownEvent*, intptr_t segment) {
+                                   const MouseDownEvent*, int64_t segment) {
     if (!self) {
         return;
     }
@@ -58487,7 +62101,7 @@ El* TimeField::IntoEl() {
                        ->Child(TextEl(a, editor.Label(a, s)));
         if (!disabled) {
             item->OnMouseDown(
-                ListenTo(state, &TimeFieldState::OnSegmentDown, (intptr_t)s));
+                ListenTo(state, &TimeFieldState::OnSegmentDown, (int64_t)s));
         }
         if (segment) {
             item = segment(segmentUser, item, &segmentState, cx);
@@ -58685,7 +62299,8 @@ ToastStack* ToastStack::Item(Str value, El* child) {
 }
 
 ToastStack* ToastStack::Child(El* child) {
-    Str childId = StrDup(arena, fmt("toast-stack-child-%d", children.len));
+    Str childId = ElementIdNamed(arena, StrL("toast-stack-child"),
+                                 (uint64_t)children.len);
     return Item(childId, child);
 }
 
@@ -58911,45 +62526,21 @@ El* Toggle::New(Ctx* cx, Str id, bool pressed, bool disabled, Listener onChange,
 
 namespace gpui {
 
-static bool ToolbarContains(Bounds container, Bounds item) {
-    float x = item.x + item.w * 0.5f;
-    float y = item.y + item.h * 0.5f;
-    return x >= container.x && x <= container.x + container.w &&
-           y >= container.y && y <= container.y + container.h;
-}
-
-bool ToolbarMoveFocus(Window* win, Bounds container, bool forward) {
-    if (!win || win->focusId == 0 || container.w <= 0 || container.h <= 0) {
+bool ToolbarMoveFocus(Window* win, FocusHandle container, bool forward) {
+    int start = WindowFocusedId(win);
+    if (!start || !container.IsValid()) {
         return false;
     }
 
-    int n = win->focusEls.len;
-    int cur = -1;
-    int count = 0;
-    for (int i = 0; i < n; i++) {
-        const FocusRect& fr = win->focusEls[i];
-        if (!fr.tabStop || !ToolbarContains(container, fr.bounds)) {
-            continue;
-        }
-        if (fr.id == win->focusId) {
-            cur = count;
-        }
-        count++;
-    }
-    if (cur < 0 || count < 2) {
-
-        return false;
-    }
-    int want = forward ? (cur + 1) % count : (cur - 1 + count) % count;
-    int seen = 0;
-    for (int i = 0; i < n; i++) {
-        const FocusRect& fr = win->focusEls[i];
-        if (!fr.tabStop || !ToolbarContains(container, fr.bounds)) {
-            continue;
-        }
-        if (seen++ == want) {
-            WindowSetFocusId(win, fr.id);
+    int at = start;
+    for (int hop = 0; hop <= kToolbarMaxFocusAttempts; hop++) {
+        at = FocusNextFrom(win, at, 0, !forward);
+        if (at != start && WindowFocusContains(win, container.id, at)) {
+            WindowSetFocusId(win, at);
             return true;
+        }
+        if (at == start) {
+            break;
         }
     }
     return false;
@@ -58968,7 +62559,7 @@ void ToolbarState::OnKeyDown(ToolbarState* self, Ctx* cx, const KeyEvent* ev) {
     } else {
         return;
     }
-    ToolbarMoveFocus(cx->win, self->bounds, forward);
+    ToolbarMoveFocus(cx->win, self->focus, forward);
     const_cast<KeyEvent*>(ev)->propagate = false;
     Notify(cx);
 }
@@ -58998,8 +62589,11 @@ El* Toolbar::IntoEl() {
     Entity<ToolbarState> state =
         ElementStateEntity<ToolbarState>(cx, id, StrL("gpui::Toolbar"));
     if (ToolbarState* s = state.Get(cx)) {
+        if (!s->focus.IsValid()) {
+            s->focus = FocusHandleNew(cx);
+        }
         s->disabled = disabled;
-        root->BoundsOut(&s->bounds);
+        root->TrackFocus(s->focus)->TabStop(false);
     }
     return root->Role(AccessibilityRole::Toolbar)
         ->AriaOrientation(AccessibilityOrientation::Horizontal)
@@ -59231,20 +62825,26 @@ void TooltipOverlay::OnHide(TooltipOverlay* self, Ctx* cx, const TickEvent*) {
     Notify(cx);
 }
 
+static const BoxShadow kTooltipShadowMd[2] = {
+    {0, 4.f, 6.f, -1.f, {0, 0, 0, 26}, false},
+    {0, 2.f, 4.f, -2.f, {0, 0, 0, 26}, false},
+};
+
 static El* TooltipTextView(Ctx* cx, Str text) {
     const RuntimeStyle& theme = RuntimeStyleNow(cx->app);
     return Tooltip::New(cx, StrL("tooltip-popup"))
         ->FlexRow()
         ->ItemsCenter()
-        ->Margin(12)
+        ->Margin(Rems(cx, 0.75f))
         ->Bg(theme.popover)
         ->Fg(theme.popoverForeground)
         ->Border(1, theme.border)
-        ->Radius(6)
-        ->PadX(8)
-        ->PadY(2)
+        ->Shadows(kTooltipShadowMd, 2)
+        ->Radius(theme.radius)
+        ->PadX(Rems(cx, 0.5f))
+        ->PadY(Rems(cx, 0.125f))
         ->Font(14)
-        ->Gap(12)
+        ->Gap(Rems(cx, 0.75f))
         ->Child(TextEl(cx->a, text));
 }
 
@@ -59309,20 +62909,50 @@ static TooltipOverlay* TooltipGet(Window* win) {
     return (TooltipOverlay*)EntityGet(win->app, win->tooltip);
 }
 
-static Ctx TooltipContext(Window* win) {
+static Ctx TooltipContext(Window* win, EntityId self) {
     Ctx cx;
     cx.app = win->app;
     cx.win = win;
     cx.a = win->frameArena;
-    cx.self = win->tooltip;
+    cx.self = self;
     return cx;
 }
 
+static TooltipOverlay* TooltipRootOverlay(Window* win) {
+    if (!win || !win->app || !win->rootTooltip.IsValid()) {
+        return nullptr;
+    }
+    return (TooltipOverlay*)EntityGet(win->app, win->rootTooltip);
+}
+
+static TooltipOverlay* TooltipWindowOverlay(Window* win) {
+    if (!win || !win->app || !win->tooltip.IsValid()) {
+        return nullptr;
+    }
+    return (TooltipOverlay*)EntityGet(win->app, win->tooltip);
+}
+
 void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds,
-                        int placement) {
-    TooltipOverlay* overlay = TooltipGet(win);
+                        int placement, bool rootLayer) {
+
+    TooltipOverlay* overlay = rootLayer ? TooltipRootOverlay(win) : nullptr;
+    EntityId id = overlay ? win->rootTooltip : EntityId{};
+    if (!overlay) {
+        overlay = TooltipGet(win);
+        id = win ? win->tooltip : EntityId{};
+    }
     if (!overlay) {
         return;
+    }
+
+    TooltipOverlay* other = overlay == TooltipRootOverlay(win)
+                                ? TooltipWindowOverlay(win)
+                                : TooltipRootOverlay(win);
+    if (other && (other->hasContent || other->hasPending)) {
+        EntityId otherId =
+            other == TooltipRootOverlay(win) ? win->rootTooltip : win->tooltip;
+        Ctx otherCx = TooltipContext(win, otherId);
+        other->Hide(&otherCx);
     }
 
     if (overlay->hasContent && overlay->content.text.s &&
@@ -59334,7 +62964,7 @@ void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds,
         TooltipCancelHide(win, overlay);
         return;
     }
-    Ctx cx = TooltipContext(win);
+    Ctx cx = TooltipContext(win, id);
     TooltipRequest request = TooltipRequest::Text(triggerBounds, text);
 
     if (placement >= (int)gpui::Placement::Top &&
@@ -59345,36 +62975,34 @@ void TooltipRequestShow(Window* win, Str text, Bounds triggerBounds,
 }
 
 void TooltipRequestHide(Window* win) {
-    if (!win || !win->app || !win->tooltip.IsValid()) {
-        return;
+    if (TooltipOverlay* overlay = TooltipWindowOverlay(win)) {
+        Ctx cx = TooltipContext(win, win->tooltip);
+        overlay->RequestHide(win, &cx);
     }
-    TooltipOverlay* overlay =
-        (TooltipOverlay*)EntityGet(win->app, win->tooltip);
-    if (!overlay) {
-        return;
+    if (TooltipOverlay* overlay = TooltipRootOverlay(win)) {
+        Ctx cx = TooltipContext(win, win->rootTooltip);
+        overlay->RequestHide(win, &cx);
     }
-    Ctx cx = TooltipContext(win);
-    overlay->RequestHide(win, &cx);
 }
 
 void TooltipHide(Window* win) {
-    if (!win || !win->app || !win->tooltip.IsValid()) {
-        return;
+    if (TooltipOverlay* overlay = TooltipWindowOverlay(win)) {
+        Ctx cx = TooltipContext(win, win->tooltip);
+        overlay->Hide(&cx);
     }
-    TooltipOverlay* overlay =
-        (TooltipOverlay*)EntityGet(win->app, win->tooltip);
-    if (!overlay) {
-        return;
+    if (TooltipOverlay* overlay = TooltipRootOverlay(win)) {
+        Ctx cx = TooltipContext(win, win->rootTooltip);
+        overlay->Hide(&cx);
     }
-    Ctx cx = TooltipContext(win);
-    overlay->Hide(&cx);
 }
 
 const TooltipOverlay* TooltipShowing(Window* win) {
-    if (!win || !win->app || !win->tooltip.IsValid()) {
-        return nullptr;
+
+    const TooltipOverlay* root = TooltipRootOverlay(win);
+    if (root && (root->hasContent || root->hasPending)) {
+        return root;
     }
-    return (const TooltipOverlay*)EntityGet(win->app, win->tooltip);
+    return TooltipWindowOverlay(win);
 }
 
 }
@@ -59848,12 +63476,12 @@ void TreePerform(TreeState* s, Ctx* cx, TreeAction act) {
 }
 
 void TreeState::OnRowClick(TreeState* self, Ctx* cx, const ClickEvent*,
-                           intptr_t entryIx) {
+                           int64_t entryIx) {
     TreeClickEntry(self, cx, (int)entryIx);
 }
 
 void TreeState::OnRowMouseDown(TreeState* self, Ctx* cx,
-                               const MouseDownEvent* ev, intptr_t entryIx) {
+                               const MouseDownEvent* ev, int64_t entryIx) {
     if (ev->button != MouseButton::Right) {
         return;
     }
@@ -59875,20 +63503,19 @@ El* Tree::New(Ctx* cx) {
     return Div(a);
 }
 
-El* TreeList::New(Ctx* cx, Str id, Entity<TreeState> state, float h,
-                  TreeRowFn row, void* user) {
+static const float kTreeDefaultH = 320;
+
+static El* TreeRows(Ctx* cx, Entity<TreeState> state, TreeRowFn row, void* user,
+                    float viewH) {
     Arena* a = cx->a;
     TreeState* s = state.Get(cx);
-    if (!s || !row) {
-        return Div(a)->H(h);
-    }
-    s->self = state;
-
-    s->viewportH = h;
-
-    VirtualRange range =
-        VirtualListVisibleRows(s->entries.len, s->rowH, s->scrollY, h);
     El* list = Div(a)->FlexCol()->W(kFill);
+    if (!s) {
+        return list;
+    }
+    s->viewportH = viewH;
+    VirtualRange range =
+        VirtualListVisibleRows(s->entries.len, s->rowH, s->scrollY, viewH);
     if (range.first > 0) {
         list->Child(Div(a)->W(kFill)->H((float)range.first * s->rowH));
     }
@@ -59900,7 +63527,7 @@ El* TreeList::New(Ctx* cx, Str id, Entity<TreeState> state, float h,
         if (!it) {
             break;
         }
-        El* wrap = TreeItemEl::New(cx, StrDup(a, fmt("row-%d", i)),
+        El* wrap = TreeItemEl::New(cx, ElementIdInteger(a, (uint64_t)i),
                                    ListenerArg(click, i))
                        ->FlexCol()
                        ->W(kFill);
@@ -59917,13 +63544,47 @@ El* TreeList::New(Ctx* cx, Str id, Entity<TreeState> state, float h,
         list->Child(
             Div(a)->W(kFill)->H((float)(s->entries.len - range.end) * s->rowH));
     }
+    return list;
+}
+
+struct TreeRowsRebuild {
+    Entity<TreeState> state = {};
+    TreeRowFn row = nullptr;
+    void* user = nullptr;
+};
+
+static bool TreeRowsAt(void* data, Ctx* cx, El* box, float height) {
+    auto* r = (TreeRowsRebuild*)data;
+    box->first = nullptr;
+    box->last = nullptr;
+    box->Child(TreeRows(cx, r->state, r->row, r->user, height));
+    return true;
+}
+
+El* TreeList::New(Ctx* cx, Str id, Entity<TreeState> state, float h,
+                  TreeRowFn row, void* user) {
+    Arena* a = cx->a;
+    TreeState* s = state.Get(cx);
+    if (!s || !row) {
+        return Div(a)->W(kFill)->H(h > 0 ? h : kFill);
+    }
+    s->self = state;
+
+    float first = h > 0 ? h : kTreeDefaultH;
+    LaidOutHeight* laid = UseLaidOutHeight(cx, id, first);
+    if (laid) {
+        laid->contentBox = true;
+    }
+    float viewH = laid ? laid->built : first;
+    El* list = TreeRows(cx, state, row, user, viewH);
 
     El* box = Tree::New(cx)
 
                   ->Id(id)
                   ->FlexCol()
                   ->W(kFill)
-                  ->H(h)
+
+                  ->H(h > 0 ? h : kFill)
                   ->ClipY()
                   ->ScrollY(s->scrollY)
                   ->ScrollFromPath()
@@ -59932,6 +63593,13 @@ El* TreeList::New(Ctx* cx, Str id, Entity<TreeState> state, float h,
 
     box->FocusId(HashClickId(id))->FocusRing(false)->FocusOnPress();
     TreeBindKeys(cx, box, state);
+    auto* rebuild = ArenaNew<TreeRowsRebuild>(a);
+    if (rebuild) {
+        rebuild->state = state;
+        rebuild->row = row;
+        rebuild->user = user;
+    }
+    TrackLaidOutHeight(cx, box, laid, rebuild ? &TreeRowsAt : nullptr, rebuild);
     return box;
 }
 
@@ -60096,8 +63764,7 @@ float VirtualListContentSize(const float* sizes, int count) {
 
 float VirtualListPixelFromLogical(const float* sizes, int count, int item,
                                   float into) {
-    if (item < 0) item = 0;
-    if (item > count) item = count;
+    item = ClampI(item, 0, count);
     float pixel = 0;
     if (sizes) {
         for (int i = 0; i < item && i < count; i++) {
@@ -60483,6 +64150,37 @@ static void VirtualListPrePaint(PaintCtx* ctx, El* e, void* user) {
     }
     VirtualListBindRows(ctx, e, paint, &layout, offset, viewport, pad, innerW,
                         innerH);
+
+    Bounds want = {};
+    if (o.handle && !o.logicalScroll && axis == Axis::Vertical &&
+        WindowTakeAutoscroll(paint->win, &want)) {
+        float top = e->y + pad;
+        float bottom = top + innerH;
+        float contentTop = top - offset;
+        float extent = layout.contentSize.h;
+        bool inside = want.x < e->x + e->w && want.x + want.w > e->x &&
+                      want.y >= contentTop - 0.5f &&
+                      want.y + want.h <= contentTop + extent + 0.5f;
+        float delta = 0;
+        if (inside && want.h <= innerH) {
+            if (want.y < top) {
+                delta = want.y - top;
+            } else if (want.y + want.h > bottom) {
+                delta = want.y + want.h - bottom;
+            }
+        } else if (inside) {
+            delta = want.y - top;
+        }
+        float most = extent > innerH ? extent - innerH : 0.f;
+        float next = std::min(std::max(offset + delta, 0.f), most);
+        if (next != offset) {
+            offset = next;
+            o.handle->offset = next;
+            e->scrollY = next;
+            VirtualListBindRows(ctx, e, paint, &layout, offset, viewport, pad,
+                                innerW, innerH);
+        }
+    }
     if (o.logicalScroll && o.sizes) {
         float measured = VirtualListContentSize(o.sizes, o.count);
         if (axis == Axis::Horizontal) {
@@ -60591,29 +64289,29 @@ static float AccordionFontPx(UiSize s) {
     }
 }
 
-static void AccordionPad(UiSize s, float* padY, float* padX) {
+static void AccordionPad(const Ctx* cx, UiSize s, float* padY, float* padX) {
     switch (s) {
         case UiSize::XSmall:
-            *padY = 4;
-            *padX = 6;
+            *padY = Rems(cx, 0.25f);
+            *padX = Rems(cx, 0.375f);
             return;
         case UiSize::Small:
-            *padY = 6;
-            *padX = 8;
+            *padY = Rems(cx, 0.375f);
+            *padX = Rems(cx, 0.5f);
             return;
         case UiSize::Large:
-            *padY = 12;
-            *padX = 16;
+            *padY = Rems(cx, 0.75f);
+            *padX = Rems(cx, 1.f);
             return;
         default:
-            *padY = 8;
-            *padX = 12;
+            *padY = Rems(cx, 0.5f);
+            *padX = Rems(cx, 0.75f);
             return;
     }
 }
 
-static float AccordionTitleGap(UiSize s) {
-    return (s == UiSize::XSmall || s == UiSize::Small) ? 4.f : 8.f;
+static float AccordionTitleGap(const Ctx* cx, UiSize s) {
+    return Rems(cx, (s == UiSize::XSmall || s == UiSize::Small) ? 0.25f : 0.5f);
 }
 
 static El* AccordionRefine(El* e, const AccordionStyle& s) {
@@ -60735,14 +64433,15 @@ El* AccordionItem::IntoEl() {
     IdScope scope(cx, StrDup(a, fmt("%d", index)));
     float font = AccordionFontPx(size);
     float padY = 0, padX = 0;
-    AccordionPad(size, &padY, &padX);
-    El* trig = AccordionTrigger::New(cx, StrDup(a, fmt("trigger-%d", index)),
-                                     open, disabled, onToggle);
+    AccordionPad(cx, size, &padY, &padX);
+    El* trig = AccordionTrigger::New(
+        cx, ElementIdNamed(a, StrL("trigger"), (uint64_t)index), open, disabled,
+        onToggle);
 
     trig->FlexRow()
         ->ItemsCenter()
         ->JustifyBetween()
-        ->Gap(12)
+        ->Gap(Rems(cx, 0.75f))
         ->PadX(padX)
         ->PadY(padY)
         ->W(kFill)
@@ -60755,11 +64454,11 @@ El* AccordionItem::IntoEl() {
     El* left = Div(a)
                    ->FlexRow()
                    ->ItemsCenter()
-                   ->Gap(AccordionTitleGap(size))
+                   ->Gap(AccordionTitleGap(cx, size))
                    ->Flex1()
                    ->MinW(0);
     if (icon != IconName::None) {
-        left->Child(IconEl(a, icon, UiIconPx(size)));
+        left->Child(IconEl(a, icon, UiIconPx(cx, size)));
     }
     if (title) {
         left->Child(title);
@@ -60767,10 +64466,11 @@ El* AccordionItem::IntoEl() {
     trig->Child(left);
 
     if (!disabled) {
-        trig->Child(IconEl(a, IconName::ChevronDown, UiIconPx(UiSize::XSmall))
-                        ->Shrink0()
-                        ->Fg(th.mutedFg)
-                        ->Rotate(open ? 0.5f : 0.f));
+        trig->Child(
+            IconEl(a, IconName::ChevronDown, UiIconPx(cx, UiSize::XSmall))
+                ->Shrink0()
+                ->Fg(th.mutedFg)
+                ->Rotate(open ? 0.5f : 0.f));
     }
     gpui::AccordionItem* it = gpui::AccordionItem::New(cx)->Open(open)->Header(
         gpui::AccordionHeader::New(cx, trig));
@@ -60988,8 +64688,10 @@ El* Alert::IntoEl() {
         col->Child(content);
     } else if (markdown) {
 
-        col->Child(
-            TextView::New(cx, message)->Font(14)->ParagraphGap(3.2f)->IntoEl());
+        col->Child(TextView::New(cx, message)
+                       ->Font(14)
+                       ->ParagraphGap(Rems(cx, 0.2f))
+                       ->IntoEl());
     } else {
         col->Child(TextEl(a, message)->Wrap());
     }
@@ -60998,9 +64700,9 @@ El* Alert::IntoEl() {
     if (onClose.IsValid()) {
 
         float closeIcon =
-            UiIconPx(size < UiSize::Medium ? UiSize(UiSize::Medium) : size);
+            UiIconPx(cx, size < UiSize::Medium ? UiSize(UiSize::Medium) : size);
         El* x = Div(a)
-                    ->Pad(2)
+                    ->Pad(Rems(cx, 0.125f))
                     ->Radius(th.radius)
                     ->ItemsCenter()
                     ->JustifyCenter()
@@ -61038,9 +64740,9 @@ static const float kCardBorder = 1.f;
 
 static const float kEdgeFadeTransitionMs = 200.f;
 
-AttachmentCardMetrics AttachmentMetrics(UiSize size) {
+AttachmentCardMetrics AttachmentMetrics(const Ctx* cx, UiSize size) {
 
-    auto r = [](float rems) { return rems * 16.f; };
+    auto r = [cx](float rems) { return Rems(cx, rems); };
     AttachmentCardMetrics m;
     switch (size) {
         case UiSize::XSmall:
@@ -61169,7 +64871,7 @@ static El* RetryButton(Ctx* cx, Str id, Listener onRetry) {
 El* AttachmentMedia::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
     UiSize resolved = hasSize ? size : UiSize::Medium;
-    AttachmentCardMetrics metrics = AttachmentMetrics(resolved);
+    AttachmentCardMetrics metrics = AttachmentMetrics(cx, resolved);
 
     float radius = flush ? std::max(CardRadius(resolved, th) - 1.f, 0.f)
                    : resolved == UiSize::XSmall ? th.radius * 0.5f
@@ -61208,7 +64910,7 @@ El* AttachmentMedia::IntoEl() {
         box->W(metrics.media)->H(metrics.media);
     }
 
-    box->Font(glyph);
+    box->Font(FontPx(cx, glyph));
     if (axis == Axis::Vertical) {
         box->W(kFill)->Aspect(1.f);
     }
@@ -61349,7 +65051,8 @@ El* AttachmentDescription::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
     Rgba color = (hasStatus && AttachmentStatusIsFailed(status)) ? th.danger
                                                                  : th.mutedFg;
-    float font = AttachmentMetrics(hasSize ? size : UiSize::Medium).description;
+    float font = FontPx(
+        cx, AttachmentMetrics(cx, hasSize ? size : UiSize::Medium).description);
     El* box = Div(a)
                   ->MaxW(kFill)
                   ->MinW(0)
@@ -61442,10 +65145,10 @@ El* AttachmentContent::IntoEl() {
                      ->MinW(0)
 
                      ->Grow(1)
-                     ->Gap(2)
+                     ->Gap(Rems(cx, 0.125f))
                      ->LineHeight(1.25f);
     if (verticalLayout) {
-        column->W(kFill)->PadX(4);
+        column->W(kFill)->PadX(Rems(cx, 0.25f));
     }
     for (int i = 0; i < children.len; i++) {
         const AttachmentContentChild& child = children[i];
@@ -61460,7 +65163,7 @@ El* AttachmentContent::IntoEl() {
                         ->ItemsCenter()
                         ->MaxW(kFill)
                         ->MinW(0)
-                        ->Gap(4)
+                        ->Gap(Rems(cx, 0.25f))
                         ->Child(child.description->IntoEl())
                         ->Child(TextEl(a, StrL("\xC2\xB7"))
                                     ->Font(12)
@@ -61516,9 +65219,9 @@ AttachmentActions* AttachmentActions::LayoutForAxis(Axis axis) {
 }
 
 El* AttachmentActions::IntoEl() {
-    El* row = Div(a)->Flex()->Shrink0()->ItemsCenter()->Gap(4);
+    El* row = Div(a)->Flex()->Shrink0()->ItemsCenter()->Gap(Rems(cx, 0.25f));
     if (verticalLayout) {
-        row->Absolute()->Top(12)->Right(12);
+        row->Absolute()->Top(Rems(cx, 0.75f))->Right(Rems(cx, 0.75f));
     }
 
     row->StopMouseDown();
@@ -61739,7 +65442,7 @@ El* Attachment::IntoEl() {
     bool clickable = hasId && onClick.IsValid();
     bool progressBar = progress >= 0 && AttachmentStatusIsUploading(status) &&
                        axis == Axis::Horizontal;
-    AttachmentCardMetrics metrics = AttachmentMetrics(size);
+    AttachmentCardMetrics metrics = AttachmentMetrics(cx, size);
     float radius = CardRadius(size, th);
     bool flush = axis == Axis::Vertical && !hasContent;
 
@@ -61756,7 +65459,7 @@ El* Attachment::IntoEl() {
                    ->Bg(th.tokens.background)
                    ->Fg(th.foreground)
                    ->LineHeight(1.25f)
-                   ->Font(metrics.text);
+                   ->Font(FontPx(cx, metrics.text));
     if (AttachmentStatusIsPending(status)) {
         card->Dashed();
     }
@@ -61781,7 +65484,7 @@ El* Attachment::IntoEl() {
         card->W(metrics.height)->H(metrics.height);
     } else {
 
-        card->W(120)
+        card->W(Rems(cx, 7.5f))
             ->FlexCol()
             ->ItemsStart()
             ->Gap(metrics.gap)
@@ -61914,8 +65617,8 @@ El* AttachmentGroup::IntoEl() {
                   ->PathId(id)
                   ->W(kFill)
                   ->MinW(0)
-                  ->Gap(12)
-                  ->PadY(4)
+                  ->Gap(Rems(cx, 0.75f))
+                  ->PadY(Rems(cx, 0.25f))
                   ->ClipX()
                   ->ScrollX(offset)
                   ->ScrollId(scrollId)
@@ -61960,9 +65663,13 @@ El* AttachmentGroup::IntoEl() {
         bg.angle = 90.f;
         bg.from = ColorStop{isLeading ? edgeFade : clear, 0.f};
         bg.to = ColorStop{isLeading ? clear : edgeFade, 1.f};
-        El* e =
-            Div(a)->Absolute()->Top(0)->Bottom(0)->W(24)->Opacity(opacity)->Bg(
-                bg);
+        El* e = Div(a)
+                    ->Absolute()
+                    ->Top(0)
+                    ->Bottom(0)
+                    ->W(Rems(cx, 1.5f))
+                    ->Opacity(opacity)
+                    ->Bg(bg);
         return isLeading ? e->Left(0) : e->Right(0);
     };
     El* frame = Div(a)->W(kFill)->MinW(0)->Child(row);
@@ -62254,7 +65961,7 @@ El* AvatarGroup::IntoEl() {
     float step = sz - sz * 0.3f;
     int shown = avatars.len < limit ? avatars.len : limit;
     bool more = ellipsis && avatars.len > limit;
-    float chipLeft = (float)shown * step + 4;
+    float chipLeft = (float)shown * step + Rems(cx, 0.25f);
     float w =
         more ? chipLeft + sz : sz + (shown > 0 ? (float)(shown - 1) * step : 0);
     El* box = Div(a)->H(sz)->W(w);
@@ -62292,11 +65999,11 @@ Badge* Badge::New(Ctx* cx) {
     return b;
 }
 
-Badge* Badge::Count(int n) {
+Badge* Badge::Count(uint64_t n) {
     count = n;
     return this;
 }
-Badge* Badge::Max(int n) {
+Badge* Badge::Max(uint64_t n) {
     max = n;
     return this;
 }
@@ -62361,9 +66068,10 @@ El* Badge::IntoEl() {
             ->Border(1, th.background)
             ->Child(IconEl(a, icon, box * 0.6f));
     } else {
-        int shown = count > max ? max : count;
-        Str txt = count > max ? StrDup(a, fmt("%d+", shown))
-                              : StrDup(a, fmt("%d", shown));
+        uint64_t shown = count > max ? max : count;
+        Str txt = count > max
+                      ? StrDup(a, fmt("%llu+", (unsigned long long)shown))
+                      : StrDup(a, fmt("%llu", (unsigned long long)shown));
 
         float step = 3, top = -3;
         if (size == UiSize::Large) {
@@ -62373,12 +66081,13 @@ El* Badge::IntoEl() {
             step = 4;
             top = -4;
         }
+
         mark->Top(top)
             ->Right(-step * (float)len(txt))
-            ->Pad(2)
-            ->MinW(14)
+            ->Pad(Rems(cx, 0.125f))
+            ->MinW(Rems(cx, 0.875f))
             ->Radius(7)
-            ->Child(TextEl(a, txt)->Font(10)->LineHeight(1.f));
+            ->Child(TextEl(a, txt)->Font(FontPx(cx, 10))->LineHeight(1.f));
     }
     root->Child(mark);
     return root;
@@ -62425,7 +66134,7 @@ El* BreadcrumbItem::IntoEl() {
     if (clickable) {
 
         el->Cursor(CursorKind::Pointer);
-        BindClick(el, StrDup(a, fmt("%d", ix)), onClick);
+        BindClick(el, ElementIdInteger(a, (uint64_t)ix), onClick);
     }
     return el;
 }
@@ -62449,10 +66158,12 @@ Breadcrumb* Breadcrumb::Child(Str label) {
 
 El* Breadcrumb::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
-    El* row = Div(a)->FlexRow()->ItemsCenter()->Gap(6);
+    El* row =
+        Div(a)->FlexRow()->ItemsCenter()->Gap(Rems(cx, 0.375f));
     for (int i = 0; i < items.len; i++) {
         if (i) {
-            row->Child(IconEl(a, IconName::ChevronRight, 14)->Fg(th.mutedFg));
+            row->Child(IconEl(a, IconName::ChevronRight, Rems(cx, 0.875f))
+                           ->Fg(th.mutedFg));
         }
         BreadcrumbItem* it = items[i];
         it->ix = i;
@@ -62501,8 +66212,8 @@ El* BubbleContent::IntoEl() {
                       ->MaxW(kFill)
                       ->Radius(ThemeRadius2xl(th))
                       ->Border(1, th.transparent)
-                      ->PadX(12)
-                      ->PadY(8)
+                      ->PadX(Rems(cx, 0.75f))
+                      ->PadY(Rems(cx, 0.5f))
                       ->Font(14)
                       ->LineHeight(1.625f);
 
@@ -62581,7 +66292,7 @@ BubbleGroup* BubbleGroup::Refine(const Style& s, uint32_t fields) {
 }
 
 El* BubbleGroup::IntoEl() {
-    El* column = Div(a)->FlexCol()->MinW(0)->Gap(8);
+    El* column = Div(a)->FlexCol()->MinW(0)->Gap(Rems(cx, 0.5f));
     if (styleSet) {
         column->Refine(style, styleSet);
     }
@@ -62648,25 +66359,25 @@ El* BubbleReactions::IntoEl() {
                    ->FlexNone()
                    ->ItemsCenter()
                    ->JustifyCenter()
-                   ->Gap(4)
+                   ->Gap(Rems(cx, 0.25f))
                    ->Radius(th.radiusFull)
                    ->Border(3, th.background)
                    ->Bg(th.tokens.muted)
                    ->Fg(th.foreground)
                    ->Font(14);
     if (!hasAction) {
-        pill->PadX(6)->PadY(2);
+        pill->PadX(Rems(cx, 0.375f))->PadY(Rems(cx, 0.125f));
     }
 
     if (side == BubbleReactionSide::Top) {
-        pill->Top(-20);
+        pill->Top(-Rems(cx, 1.25f));
     } else {
-        pill->Bottom(-20);
+        pill->Bottom(-Rems(cx, 1.25f));
     }
     if (alignment == MessageAlignment::Start) {
-        pill->Left(12);
+        pill->Left(Rems(cx, 0.75f));
     } else {
-        pill->Right(12);
+        pill->Right(Rems(cx, 0.75f));
     }
     if (styleSet) {
         pill->Refine(style, styleSet);
@@ -62736,7 +66447,12 @@ El* Bubble::IntoEl() {
     content->alignment = alignment;
     content->hasAlignment = hasAlignment;
 
-    El* root = Div(a)->FlexCol()->MinW(0)->FlexNone()->Gap(4)->MaxWFrac(0.8f);
+    El* root = Div(a)
+                   ->FlexCol()
+                   ->MinW(0)
+                   ->FlexNone()
+                   ->Gap(Rems(cx, 0.25f))
+                   ->MaxWFrac(0.8f);
     if (variant == BubbleVariant::Ghost) {
         root->W(kFill)->MaxWFrac(1.f);
     }
@@ -62865,16 +66581,16 @@ ButtonIcon* ButtonIcon::Size(float value) {
     return this;
 }
 
-static float ButtonIconSizePx(UiSize size, float exact) {
+static float ButtonIconSizePx(const Ctx* cx, UiSize size, float exact) {
     if (exact > 0) return exact;
-    if (size == UiSize::XSmall) return 12.f;
-    if (size == UiSize::Small) return 14.f;
-    if (size == UiSize::Large) return 24.f;
-    return 16.f;
+    if (size == UiSize::XSmall) return Rems(cx, 0.75f);
+    if (size == UiSize::Small) return Rems(cx, 0.875f);
+    if (size == UiSize::Large) return Rems(cx, 1.5f);
+    return Rems(cx, 1);
 }
 
 El* ButtonIcon::IntoEl() {
-    float px = ButtonIconSizePx(size, sizePx);
+    float px = ButtonIconSizePx(cx, size, sizePx);
     if (loading && variant == ButtonIconVariant::Icon) {
         Spinner* wait = Spinner::New(cx)->Size(px);
         if (loadingIcon) {
@@ -63151,7 +66867,7 @@ Button* Button::OnHover(Listener l) {
     onHover = l;
     return this;
 }
-Button* Button::OnClickAction(uint32_t action, intptr_t arg) {
+Button* Button::OnClickAction(uint32_t action, int64_t arg) {
     clickAction = action;
     clickActionArg = arg;
     return this;
@@ -63290,6 +67006,8 @@ El* Button::IntoEl() {
             press = RgbaMixOklab(th.inputBorder, clear, 0.7f);
         }
     }
+
+    Rgba normalFg = fg;
     bool showsSelected = ShowsSelectedStyle();
     if (showsSelected) {
 
@@ -63363,21 +67081,23 @@ El* Button::IntoEl() {
         press = resolved.style.activeBg;
     }
 
-    float h = 32.f;
-    float padX = compact ? 8.f : 10.f;
+    float h = Rems(cx, 2);
+    float padX = Rems(cx, compact ? 0.5f : 0.625f);
     if (size == UiSize::XSmall) {
-        h = 20.f;
-        padX = 4.f;
+        h = Rems(cx, 1.25f);
+        padX = Rems(cx, 0.25f);
     } else if (size == UiSize::Small) {
-        h = 24.f;
-        padX = compact ? 6.f : 8.f;
+        h = Rems(cx, 1.5f);
+        padX = Rems(cx, compact ? 0.375f : 0.5f);
     } else if (size == UiSize::Large) {
-        padX = compact ? 8.f : 12.f;
+        padX = Rems(cx, compact ? 0.5f : 0.75f);
     }
 
     bool iconOnly = !label.s && children.len == 0;
     if (iconOnly) {
-        h = size == UiSize::XSmall ? 20.f : size == UiSize::Small ? 24.f : 32.f;
+        h = Rems(cx, size == UiSize::XSmall  ? 1.25f
+                     : size == UiSize::Small ? 1.5f
+                                             : 2.f);
         padX = 0;
     }
     if (variant == ButtonVariant::Text || variant == ButtonVariant::Link) {
@@ -63391,12 +67111,10 @@ El* Button::IntoEl() {
         padX = 0;
     }
 
-    float gap = (size == UiSize::XSmall || size == UiSize::Small) ? 4.f : 8.f;
+    float gap = Rems(
+        cx, (size == UiSize::XSmall || size == UiSize::Small) ? 0.25f : 0.5f);
 
-    float iconPx = size == UiSize::XSmall  ? 12.f
-                   : size == UiSize::Small ? 14.f
-                   : size == UiSize::Large ? 24.f
-                                           : 16.f;
+    float iconPx = ButtonIconSizePx(cx, size, 0);
     if (sizePx > 0) {
         iconPx = sizePx * 0.75f;
     }
@@ -63435,7 +67153,8 @@ El* Button::IntoEl() {
                 ->TabIndex(tabIndex)
                 ->TabStop(tabStop)
                 ->FocusRing(focusRing)
-                ->FocusLineStyle(focusLine)
+                ->FocusLineStyle(focusLine,
+                                 RgbaOpacity(normalFg, kFocusLineOpacity))
                 ->H(h > 0 ? h : kAuto)
                 ->PadX(padX)
                 ->ItemsCenter()
@@ -63583,9 +67302,9 @@ El* Button::IntoEl() {
     }
     if (dropdown) {
 
-        float caretPx = size == UiSize::XSmall  ? 12.f
-                        : size == UiSize::Small ? 14.f
-                                                : 16.f;
+        float caretPx = Rems(cx, size == UiSize::XSmall  ? 0.75f
+                                 : size == UiSize::Small ? 0.875f
+                                                         : 1.f);
         e->Child(IconEl(a, IconName::ChevronDown, caretPx)
                      ->Fg(RgbaOpacity(fg, 0.75f)));
     }
@@ -63683,20 +67402,20 @@ El* Toggle::IntoEl() {
                    ->ItemsCenter()
                    ->JustifyCenter();
 
-    float h = 32.f;
-    float pad = 8.f;
+    float h = Rems(cx, 2);
+    float pad = Rems(cx, 0.5f);
     float font = 14.f;
     if (size == UiSize::XSmall) {
-        h = 20.f;
-        pad = 2.f;
+        h = Rems(cx, 1.25f);
+        pad = Rems(cx, 0.125f);
         font = 12.f;
     } else if (size == UiSize::Small) {
-        h = 24.f;
-        pad = 4.f;
+        h = Rems(cx, 1.5f);
+        pad = Rems(cx, 0.25f);
         font = 14.f;
     } else if (size == UiSize::Large) {
-        h = 36.f;
-        pad = 12.f;
+        h = Rems(cx, 2.25f);
+        pad = Rems(cx, 0.75f);
         font = 16.f;
     }
     root->MinW(h)->H(h)->PadX(pad)->Corners(
@@ -63706,7 +67425,7 @@ El* Toggle::IntoEl() {
         root->HoverBg(th.tokens.accent)->HoverFg(th.accentFg);
     }
     if (tooltip.s) root->Tip(tooltip)->AriaLabel(tooltip);
-    if (icon != IconName::None) root->Child(IconEl(a, icon, 16.f));
+    if (icon != IconName::None) root->Child(IconEl(a, icon, Rems(cx, 1)));
     if (label.s) root->Child(TextEl(a, label)->Font(font));
     for (El* child : children) root->Child(child);
     return root;
@@ -63771,7 +67490,7 @@ struct ToggleGroupState {
     ~ToggleGroupState() { VecReset(checked); }
 
     static void OnChildClick(ToggleGroupState* self, Ctx* cx, const ClickEvent*,
-                             intptr_t ix) {
+                             int64_t ix) {
         if (ix < 0 || ix >= len(self->checked)) return;
         self->checked[(int)ix] = !self->checked[(int)ix];
         ToggleGroupEvent event{self->checked.els, len(self->checked)};
@@ -63796,7 +67515,7 @@ El* ToggleGroup::IntoEl() {
 
     El* root = gpui::ToggleGroup::New(cx, id, Axis::Horizontal);
     El* row = Div(a)->FlexRow()->ItemsCenter();
-    if (!segmented) row->Gap(8);
+    if (!segmented) row->Gap(Rems(cx, 0.5f));
     int n = items.len;
     for (int i = 0; i < n; i++) {
         Toggle* item = items[i];
@@ -64101,7 +67820,7 @@ struct ButtonGroupState {
     Listener onClick;
 
     static void OnChildClick(ButtonGroupState* self, Ctx* cx, const ClickEvent*,
-                             intptr_t childIndex) {
+                             int64_t childIndex) {
         if (self->disabled) return;
         Vec<int> next = self->selected;
         int at = -1;
@@ -64218,7 +67937,10 @@ namespace component {
 
 static const float kPointerAxisLock = 2.f;
 static const int kScrollSettleMs = 28;
-static const float kItemGap = 16.f;
+
+static float ItemGap(const Ctx* cx) {
+    return Rems(cx, 1.f);
+}
 
 static float AxisValue(Point p, Axis axis) {
     return axis == Axis::Horizontal ? p.x : p.y;
@@ -64238,12 +67960,6 @@ static float AxisEnd(Bounds b, Axis axis) {
 static Point AxisPoint(Axis axis, float value) {
     return axis == Axis::Horizontal ? Point{value, 0} : Point{0, value};
 }
-static float Clampf(float v, float lo, float hi) {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
 CarouselState CarouselState::New(int count) {
     CarouselState state;
     state.itemCount = std::max(0, count);
@@ -64399,7 +68115,7 @@ static Point SnapOffset(const CarouselState* s, Bounds viewport, Bounds item) {
         }
         target += contentInset;
     } else {
-        target = Clampf(target, -MaxSnapOffset(s), 0.f);
+        target = ClampF(target, -MaxSnapOffset(s), 0.f);
     }
     SetAxisValue(&out, s->axis, target);
     return out;
@@ -64463,7 +68179,7 @@ Point CarouselState::LoopItemOffset(int index) const {
         cycles = floorf(cycles + 0.5f);
     else
         cycles = ceilf(cycles - 0.5f);
-    cycles = Clampf(cycles, -1.f, 1.f);
+    cycles = ClampF(cycles, -1.f, 1.f);
     return AxisPoint(axis, loopLayout.cycleExtent * cycles);
 }
 
@@ -64600,26 +68316,26 @@ static void InvalidateScrollSettle(CarouselState* s) {
 
 static void ScheduleTimeout(CarouselState* s, Ctx* cx, int* epoch,
                             void (*fn)(CarouselState*, Ctx*, const TickEvent*,
-                                       intptr_t)) {
+                                       int64_t)) {
     if (!cx || !cx->win) return;
     *epoch = *epoch + 1;
     WindowSetTimeout(cx->win, kScrollSettleMs, ListenTo(s->self, fn, *epoch));
 }
 
 void CarouselState::OnScrollSettle(CarouselState* self, Ctx* cx,
-                                   const TickEvent*, intptr_t epoch) {
+                                   const TickEvent*, int64_t epoch) {
     if (self->scrollSettleEpoch == (int)epoch && self->scrollGesture.active) {
         self->FinishScroll(false, cx);
     }
 }
 void CarouselState::OnIgnoredScrollRecovery(CarouselState* self, Ctx*,
-                                            const TickEvent*, intptr_t epoch) {
+                                            const TickEvent*, int64_t epoch) {
     if (self->scrollSettleEpoch == (int)epoch) {
         self->ignoreScrollUntilQuiet = false;
     }
 }
 void CarouselState::OnWheelBurstEnd(CarouselState* self, Ctx*, const TickEvent*,
-                                    intptr_t epoch) {
+                                    int64_t epoch) {
     if (self->wheelBurstEpoch == (int)epoch) {
         self->wheelBurstActive = false;
     }
@@ -64811,7 +68527,7 @@ int CarouselState::NearestIndex(Point at) const {
 
 static float ClampedOffset(const CarouselState* s, float value) {
     float bound = std::max(MaxSnapOffset(s), 0.f);
-    return Clampf(value, -bound, 0.f);
+    return ClampF(value, -bound, 0.f);
 }
 
 bool CarouselState::NormalizeLoopCoordinate() {
@@ -65095,7 +68811,7 @@ void CarouselState::OnNext(CarouselState* state, Ctx* cx, const ClickEvent*) {
     state->SelectNext(cx);
 }
 void CarouselState::OnSelect(CarouselState* state, Ctx* cx, const ClickEvent*,
-                             intptr_t index) {
+                             int64_t index) {
     state->SelectIndex((int)index, cx);
 }
 
@@ -65257,7 +68973,7 @@ El* Carousel::IntoEl() {
         Div(a)
             ->Id(id)
             ->FlexCol()
-            ->Gap(16)
+            ->Gap(Rems(cx, 1.f))
             ->Role(AccessibilityRole::Region)
             ->AriaLabel(accessibilityLabel.s ? accessibilityLabel
                                              : Tr("Carousel.label"))
@@ -65354,10 +69070,10 @@ El* CarouselContent::IntoEl() {
 
     El* track = Div(a)->Id(StrL("content"))->Flex1()->MinW(0)->MinH(0);
     if (axis == Axis::Vertical) {
-        track->FlexCol()->MarginT(-kItemGap);
+        track->FlexCol()->MarginT(-ItemGap(cx));
         track->ScrollY(-drawn.y);
     } else {
-        track->FlexRow()->MarginL(-kItemGap);
+        track->FlexRow()->MarginL(-ItemGap(cx));
         track->ScrollX(-drawn.x);
     }
     track->HideScrollbar();
@@ -65473,9 +69189,9 @@ El* CarouselItem::IntoEl() {
                    ->Refine(style, styleSet);
     refiner.Apply(root);
     if (axis == Axis::Vertical)
-        root->H(kFill)->PadT(kItemGap);
+        root->H(kFill)->PadT(ItemGap(cx));
     else
-        root->W(kFill)->PadL(kItemGap);
+        root->W(kFill)->PadL(ItemGap(cx));
     CarouselChildren(root, children);
     return root;
 }
@@ -65529,17 +69245,17 @@ El* CarouselControl::IntoEl() {
         btn->Top(0)->Bottom(0);
         btn->style.marginAuto |= kMarginAutoT | kMarginAutoB;
         if (next) {
-            btn->LeftRel(1.f)->MarginL(16);
+            btn->LeftRel(1.f)->MarginL(Rems(cx, 1.f));
         } else {
-            btn->RightRel(1.f)->MarginR(16);
+            btn->RightRel(1.f)->MarginR(Rems(cx, 1.f));
         }
     } else {
         btn->Left(0)->Right(0);
         btn->style.marginAuto |= kMarginAutoL | kMarginAutoR;
         if (next) {
-            btn->TopRel(1.f)->MarginT(16);
+            btn->TopRel(1.f)->MarginT(Rems(cx, 1.f));
         } else {
-            btn->BottomRel(1.f)->MarginB(16);
+            btn->BottomRel(1.f)->MarginB(Rems(cx, 1.f));
         }
     }
     btn->Refine(style, styleSet);
@@ -65569,6 +69285,7 @@ CarouselNext* CarouselNext::New(Ctx* cx, Entity<CarouselState> state) {
 CarouselPagination* CarouselPagination::New(Ctx* cx) {
     CarouselPagination* value = ArenaNew<CarouselPagination>(cx->a);
     value->a = cx->a;
+    value->cx = cx;
     return value;
 }
 CarouselPagination* CarouselPagination::AccessibilityLabel(Str value) {
@@ -65592,7 +69309,7 @@ El* CarouselPagination::IntoEl() {
                    ->FlexRow()
                    ->ItemsCenter()
                    ->JustifyCenter()
-                   ->Gap(8)
+                   ->Gap(Rems(cx, 0.5f))
                    ->Refine(style, styleSet);
     refiner.Apply(root);
     CarouselChildren(root, children);
@@ -65640,7 +69357,7 @@ El* CarouselPaginationItem::IntoEl() {
     for (El* child : children) button->Child(child);
     if (!disabled)
         button->OnClick(
-            ListenTo(state, &CarouselState::OnSelect, (intptr_t)index));
+            ListenTo(state, &CarouselState::OnSelect, (int64_t)index));
     El* root = button->IntoEl()->Refine(style, styleSet);
     refiner.Apply(root);
     return root;
@@ -65653,39 +69370,48 @@ El* CarouselPaginationItem::IntoEl() {
 
 namespace gpui {
 
-bool ChartTooltipContent::TitleText(Arena* a, int index, Str fallback,
+const void* ChartTooltipContent::Datum(int index, const float* own) const {
+    if (data) {
+        return (const uint8_t*)data + (size_t)index * (size_t)dataStride;
+    }
+    return own ? own + index : nullptr;
+}
+
+bool ChartTooltipContent::TitleText(Arena* a, const void* d, Str fallback,
                                     bool hasFallback, Str* out) const {
     if (title) {
-        *out = title(a, index, titleUser);
+        *out = title(a, d, titleUser);
         return true;
     }
     *out = fallback;
     return hasFallback;
 }
 
-Str ChartTooltipContent::ValueText(Arena* a, int index, int row,
-                                   double number) const {
+Str ChartTooltipContent::ValueText(Arena* a, const void* d, int row,
+                                   double number, bool f64) const {
     if (value) {
-        return value(a, index, row, number, valueUser);
+        return value(a, d, row, number, valueUser);
     }
-    return ChartFormatValue(a, number);
+    return ChartFormatValue(a, number, f64);
 }
 
-bool ChartTooltipContent::ValueColor(int index, int row, double number,
+bool ChartTooltipContent::ValueColor(const void* d, int row, double number,
                                      Rgba* out) const {
     if (!valueColor) {
         return false;
     }
-    *out = valueColor(index, row, number, valueColorUser);
+    *out = valueColor(d, row, number, valueColorUser);
     return true;
 }
 
-Str ChartFormatValue(Arena* a, double value) {
-    char buf[64];
+Str ChartFormatValue(Arena* a, double value, bool f64) {
+
+    char buf[400];
     float want = (float)value;
-    for (int decimals = 0; decimals <= 9; decimals++) {
+    for (int decimals = 0; decimals <= (f64 ? 17 : 9); decimals++) {
         snprintf(buf, sizeof(buf), "%.*f", decimals, value);
-        if ((float)strtod(buf, nullptr) == want) {
+        double back = strtod(buf, nullptr);
+        if (f64 ? back == value : (float)back == want) {
             break;
         }
     }
@@ -65695,18 +69421,24 @@ Str ChartFormatValue(Arena* a, double value) {
 namespace component {
 
 plot::Tooltip* ChartTooltipApply(const ChartTooltipContent& content,
-                                 plot::Tooltip* tooltip, int index, Str title,
-                                 bool hasTitle,
+                                 plot::Tooltip* tooltip, const void* d,
+                                 Str title, bool hasTitle,
                                  const ChartTooltipSeriesRow* rows, int count) {
+
+    if (content.content) {
+        return tooltip
+            ->Child(content.content(tooltip->cx, d, content.contentUser));
+    }
     Str text = {};
-    if (content.TitleText(tooltip->a, index, title, hasTitle, &text)) {
+    if (content.TitleText(tooltip->a, d, title, hasTitle, &text)) {
         tooltip->Title(text);
     }
     for (int i = 0; i < count; i++) {
-        tooltip->Row(rows[i].swatch, rows[i].name,
-                     content.ValueText(tooltip->a, index, i, rows[i].value));
+        tooltip->Row(
+            rows[i].swatch, rows[i].name,
+            content.ValueText(tooltip->a, d, i, rows[i].value, rows[i].f64));
         Rgba color = {};
-        if (content.ValueColor(index, i, rows[i].value, &color)) {
+        if (content.ValueColor(d, i, rows[i].value, &color)) {
             tooltip->ValueColor(color);
         }
     }
@@ -65728,6 +69460,16 @@ uint32_t ChartCallerId(const Ctx* cx, const char* file, int line) {
     return IdFoldName(site, fmt("%d", line));
 }
 
+AreaChart* AreaChart::New(Ctx* cx, const double* ys, int n, const char* file,
+                          int line) {
+    float* narrow = (float*)Alloc(cx->a, (int)sizeof(float) * (n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        narrow[i] = (float)ys[i];
+    }
+    AreaChart* c = New(cx, narrow, n, file, line);
+    c->exact = ys;
+    return c;
+}
 AreaChart* AreaChart::New(Ctx* cx, const float* ys, int n, const char* file,
                           int line) {
     Arena* a = cx->a;
@@ -65888,10 +69630,22 @@ AreaChart* AreaChart::TooltipValueColor(ChartTooltipValueColorFn fn,
     tooltipContent.valueColorUser = user;
     return this;
 }
+AreaChart* AreaChart::TooltipContent(ChartTooltipContentFn fn, void* user) {
+    tooltipContent.content = fn;
+    tooltipContent.contentUser = user;
+    return this;
+}
+
+AreaChart* AreaChart::Data(const void* items, int stride) {
+    tooltipContent.data = items;
+    tooltipContent.dataStride = stride;
+    return this;
+}
 
 El* AreaChart::IntoEl() {
     El* e = ChartEl(a, ys, n, stroke, fill, fillBottom, tickMargin);
     ChartSeries* chart = e->Chart();
+    chart->exact = exact;
     chart->labels = labels;
     chart->strokeStyle = strokeStyle;
     chart->overlay = overlay;
@@ -65914,6 +69668,16 @@ El* AreaChart::IntoEl() {
     return e;
 }
 
+LineChart* LineChart::New(Ctx* cx, const double* ys, int n, const char* file,
+                          int line) {
+    float* narrow = (float*)Alloc(cx->a, (int)sizeof(float) * (n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        narrow[i] = (float)ys[i];
+    }
+    LineChart* c = New(cx, narrow, n, file, line);
+    c->exact = ys;
+    return c;
+}
 LineChart* LineChart::New(Ctx* cx, const float* ys, int n, const char* file,
                           int line) {
     Arena* a = cx->a;
@@ -66050,11 +69814,23 @@ LineChart* LineChart::TooltipValueColor(ChartTooltipValueColorFn fn,
     tooltipContent.valueColorUser = user;
     return this;
 }
+LineChart* LineChart::TooltipContent(ChartTooltipContentFn fn, void* user) {
+    tooltipContent.content = fn;
+    tooltipContent.contentUser = user;
+    return this;
+}
+
+LineChart* LineChart::Data(const void* items, int stride) {
+    tooltipContent.data = items;
+    tooltipContent.dataStride = stride;
+    return this;
+}
 
 El* LineChart::IntoEl() {
     Rgba none = {0, 0, 0, 0};
     El* e = ChartEl(a, ys, n, stroke, none, none, tickMargin);
     ChartSeries* chart = e->Chart();
+    chart->exact = exact;
     chart->kind = ChartKind::Line;
     chart->labels = labels;
     chart->xAxis = xAxis;
@@ -66075,6 +69851,16 @@ El* LineChart::IntoEl() {
     return e;
 }
 
+BarChart* BarChart::New(Ctx* cx, const double* ys, int n, const char* file,
+                        int line) {
+    float* narrow = (float*)Alloc(cx->a, (int)sizeof(float) * (n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        narrow[i] = (float)ys[i];
+    }
+    BarChart* c = New(cx, narrow, n, file, line);
+    c->exact = ys;
+    return c;
+}
 BarChart* BarChart::New(Ctx* cx, const float* ys, int n, const char* file,
                         int line) {
     Arena* a = cx->a;
@@ -66186,11 +69972,23 @@ BarChart* BarChart::TooltipValueColor(ChartTooltipValueColorFn fn, void* user) {
     tooltipContent.valueColorUser = user;
     return this;
 }
+BarChart* BarChart::TooltipContent(ChartTooltipContentFn fn, void* user) {
+    tooltipContent.content = fn;
+    tooltipContent.contentUser = user;
+    return this;
+}
+
+BarChart* BarChart::Data(const void* items, int stride) {
+    tooltipContent.data = items;
+    tooltipContent.dataStride = stride;
+    return this;
+}
 
 El* BarChart::IntoEl() {
     Rgba none = {0, 0, 0, 0};
     El* e = ChartEl(a, ys, n, fill, none, none, tickMargin);
     ChartSeries* chart = e->Chart();
+    chart->exact = exact;
     chart->kind = ChartKind::Bar;
     chart->labels = labels;
     chart->xAxis = labelAxis;
@@ -66345,6 +70143,18 @@ CandlestickChart* CandlestickChart::TooltipValueColor(
     tooltipContent.valueColorUser = user;
     return this;
 }
+CandlestickChart* CandlestickChart::TooltipContent(ChartTooltipContentFn fn,
+                                                   void* user) {
+    tooltipContent.content = fn;
+    tooltipContent.contentUser = user;
+    return this;
+}
+
+CandlestickChart* CandlestickChart::Data(const void* items, int stride) {
+    tooltipContent.data = items;
+    tooltipContent.dataStride = stride;
+    return this;
+}
 
 El* CandlestickChart::IntoEl() {
     Rgba none = {0, 0, 0, 0};
@@ -66407,12 +70217,44 @@ static void MoveRadarLabel(El* e, float x, float y) {
     }
 }
 
-static void PaintRadarLabels(PaintCtx* ctx, El* e, void* user) {
-    auto* c = (RadarChart*)user;
-    if (!c || !c->labels || c->n < 3 || c->overlay) {
+static Ctx ChartIdCtx(const PaintCtx* ctx, uint32_t id);
+template <typename C>
+static plot::PlotAppear ChartTrackAppear(const PaintCtx* ctx, const C* chart);
+
+static Rgba RadarPaletteColor(const Theme& th, int ix) {
+    const Rgba palette[5] = {th.chart1, th.chart2, th.chart3, th.chart4,
+                             th.chart5};
+    return palette[ix % 5];
+}
+
+int RadarHoveredIndex(int n, float outerRadius, float labelGap, Point position,
+                      Size size) {
+    if (n <= 0) {
+        return -1;
+    }
+    float dx = position.x - size.w * 0.5f;
+    float dy = position.y - size.h * 0.5f;
+    if (sqrtf(dx * dx + dy * dy) > outerRadius + labelGap) {
+        return -1;
+    }
+
+    const float kTau = 6.2831853f;
+    float angle = fmodf(atan2f(dy, dx) + kTau * 0.25f, kTau);
+    if (angle < 0) {
+        angle += kTau;
+    }
+    return (int)lroundf(angle * (float)n / kTau) % n;
+}
+
+float RadarChart::ResolveOuterRadius(float height) const {
+    return outerRadius > 0 ? outerRadius : height * 0.4f;
+}
+
+static void PaintRadarLabels(PaintCtx* ctx, El* e, RadarChart* c) {
+    if (!c->labels || c->n < 3) {
         return;
     }
-    float radius = c->outerRadius > 0 ? c->outerRadius : e->h * 0.4f;
+    float radius = c->ResolveOuterRadius(e->h);
     float labelRadius = radius + c->labelGap;
     float centerX = e->x + e->w * 0.5f;
     float centerY = e->y + e->h * 0.5f;
@@ -66448,6 +70290,123 @@ static void PaintRadarLabels(PaintCtx* ctx, El* e, void* user) {
     }
 }
 
+static void PaintRadarHover(PaintCtx* ctx, El* e, RadarChart* c) {
+    const ChartSeries* chart = e->Chart();
+    if (!c->interactive || !chart || !ctx->window || !ctx->app ||
+        !ctx->window->frameArena || !c->values || c->n < 3) {
+        return;
+    }
+    int series = 1 + len(c->more);
+    Arena* scratch = GetTempArena();
+    float radius = c->ResolveOuterRadius(e->h);
+    float lo = 0;
+    float hi = 0;
+    ChartRadarDomain(*chart, &lo, &hi);
+    plot::PlotAppear appear = ChartTrackAppear(ctx, c);
+    Size size = {e->w, e->h};
+    Point cursor = {ctx->mouseX - e->x, ctx->mouseY - e->y};
+    bool inside = cursor.x >= 0 && cursor.y >= 0 && cursor.x <= size.w &&
+                  cursor.y <= size.h;
+
+    int index = inside && !appear.IsAppearing()
+                    ? RadarHoveredIndex(c->n, radius, c->labelGap, cursor, size)
+                    : -1;
+    plot::TooltipState live = {};
+    const plot::TooltipState* livePtr = nullptr;
+    if (index >= 0) {
+
+        Point* dots = (Point*)Alloc(scratch, (int)sizeof(Point) * series);
+        float angle = -1.5707963f + 6.2831853f * (float)index / (float)c->n;
+        for (int k = 0; k < series; k++) {
+            const float* vs = k == 0 ? c->values : c->more[k - 1].ys;
+            float r = radius * ChartRadarFraction(lo, hi, vs ? vs[index] : 0);
+            dots[k] = {size.w * 0.5f + r * cosf(angle),
+                       size.h * 0.5f + r * sinf(angle)};
+        }
+        live = plot::TooltipState::New(index, cursor, dots, series);
+        livePtr = &live;
+    }
+    Ctx idCx = ChartIdCtx(ctx, c->id);
+    plot::PlotHover hover = {};
+    Point linger = cursor;
+    if (!plot::TrackHover(&idCx, livePtr, index >= 0 ? &cursor : nullptr,
+                          &hover, &linger)) {
+        return;
+    }
+    const plot::TooltipState& held = hover.State();
+    if (held.index < 0 || held.index >= c->n) {
+        return;
+    }
+    const Theme& th = ThemeNow(ctx->app);
+
+    Ctx buildCx = idCx;
+    buildCx.a = ctx->window->frameArena;
+    plot::Tooltip* tooltip = plot::Tooltip::New(&buildCx, linger, size)->Gap(8);
+    plot::Dot* marks =
+        (plot::Dot*)Alloc(scratch, (int)sizeof(plot::Dot) * series);
+    int nMarks = 0;
+    for (int k = 0; held.dots && k < held.dotCount && k < series; k++) {
+        Rgba fill = k == 0 ? c->stroke : c->more[k - 1].stroke;
+        marks[nMarks] = plot::Dot::New(held.dots[k]);
+        marks[nMarks]
+            .Size(kChartHoverDotSize)
+            ->Halo(kChartHoverHaloSize)
+            ->Stroke(th.background)
+            ->Fill(fill);
+        nMarks++;
+    }
+    tooltip->Dots(marks, nMarks);
+
+    Str title = {};
+    bool hasTitle = false;
+    if (c->labels && c->labels[held.index].kind == RadarLabel::Kind::Text &&
+        c->labels[held.index].text.s) {
+        title = c->labels[held.index].text;
+        hasTitle = true;
+    }
+
+    ChartTooltipSeriesRow* rows = (ChartTooltipSeriesRow*)Alloc(
+        scratch, (int)sizeof(ChartTooltipSeriesRow) * series);
+    int nRows = 0;
+    for (int k = 0; k < series; k++) {
+        const float* vs = k == 0 ? c->values : c->more[k - 1].ys;
+        if (!vs) {
+            continue;
+        }
+        rows[nRows].swatch = k == 0 ? c->stroke : c->more[k - 1].stroke;
+        rows[nRows].name = k == 0 ? c->tooltipName : c->more[k - 1].name;
+        rows[nRows].value = vs[held.index];
+        if (k == 0 && c->exact) {
+            rows[nRows].value = c->exact[held.index];
+            rows[nRows].f64 = true;
+        }
+        nRows++;
+    }
+    ChartTooltipApply(c->tooltipContent, tooltip,
+                      c->tooltipContent.Datum(held.index, c->values), title,
+                      hasTitle, rows, nRows);
+    plot::PlotOverlayAttach(ctx, e, e->Bounds(), tooltip->IntoEl());
+}
+
+static void PaintRadarChart(PaintCtx* ctx, El* e, void* user) {
+    auto* c = (RadarChart*)user;
+    if (!c) {
+        return;
+    }
+    PaintRadarLabels(ctx, e, c);
+    PaintRadarHover(ctx, e, c);
+}
+
+RadarChart* RadarChart::New(Ctx* cx, const double* values, int n,
+                            const char* file, int line) {
+    float* narrow = (float*)Alloc(cx->a, (int)sizeof(float) * (n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        narrow[i] = (float)values[i];
+    }
+    RadarChart* c = New(cx, narrow, n, file, line);
+    c->exact = values;
+    return c;
+}
 RadarChart* RadarChart::New(Ctx* cx, const float* values, int n,
                             const char* file, int line) {
     Arena* a = cx->a;
@@ -66457,16 +70416,46 @@ RadarChart* RadarChart::New(Ctx* cx, const float* values, int n,
     c->id = ChartCallerId(cx, file, line);
     c->values = values;
     c->n = n;
-    c->stroke = ThemeNow(cx->app).blue;
-    c->fill = RgbaOpacity(ThemeNow(cx->app).blue, 0.3f);
+
+    c->stroke = RadarPaletteColor(ThemeNow(cx->app), 0);
+    c->fill = RgbaOpacity(c->stroke, 0.3f);
     return c;
 }
+RadarChart* RadarChart::Value(const float* ys) {
+    ChartSeriesExtra series = {};
+    series.ys = ys;
+    series.stroke = RadarPaletteColor(ThemeNow(cx->app), 1 + len(more));
+    series.fillTop = RgbaOpacity(series.stroke, 0.3f);
+    series.fillBot = series.fillTop;
+    more.Append(a, series);
+    lastFillSet = false;
+    return this;
+}
 RadarChart* RadarChart::Stroke(Rgba c) {
-    stroke = c;
+
+    if (len(more) > 0) {
+        ChartSeriesExtra& last = more[len(more) - 1];
+        last.stroke = c;
+        if (!lastFillSet) {
+            last.fillTop = RgbaOpacity(c, 0.3f);
+            last.fillBot = last.fillTop;
+        }
+    } else {
+        stroke = c;
+        if (!lastFillSet) {
+            fill = RgbaOpacity(c, 0.3f);
+        }
+    }
     return this;
 }
 RadarChart* RadarChart::Fill(Rgba c) {
-    fill = c;
+    if (len(more) > 0) {
+        more[len(more) - 1].fillTop = c;
+        more[len(more) - 1].fillBot = c;
+    } else {
+        fill = c;
+    }
+    lastFillSet = true;
     return this;
 }
 RadarChart* RadarChart::Labels(const char* const* l) {
@@ -66494,13 +70483,12 @@ RadarChart* RadarChart::LabelGap(float v) {
     labelGap = v;
     return this;
 }
+RadarChart* RadarChart::MaxValue(float v) {
+    return Domain(0, v);
+}
 RadarChart* RadarChart::Domain(float lo, float hi) {
     domainMin = lo;
     domainMax = hi;
-    return this;
-}
-RadarChart* RadarChart::Overlay(bool v) {
-    overlay = v;
     return this;
 }
 RadarChart* RadarChart::Dot(bool v) {
@@ -66520,7 +70508,38 @@ RadarChart* RadarChart::Grid(bool v) {
     return this;
 }
 RadarChart* RadarChart::Tooltip(Str name) {
-    tooltipName = name;
+    if (len(more) > 0) {
+        more[len(more) - 1].name = name;
+    } else {
+        tooltipName = name;
+    }
+    return this;
+}
+RadarChart* RadarChart::TooltipTitle(ChartTooltipTitleFn fn, void* user) {
+    tooltipContent.title = fn;
+    tooltipContent.titleUser = user;
+    return this;
+}
+RadarChart* RadarChart::TooltipValue(ChartTooltipValueFn fn, void* user) {
+    tooltipContent.value = fn;
+    tooltipContent.valueUser = user;
+    return this;
+}
+RadarChart* RadarChart::TooltipValueColor(ChartTooltipValueColorFn fn,
+                                          void* user) {
+    tooltipContent.valueColor = fn;
+    tooltipContent.valueColorUser = user;
+    return this;
+}
+RadarChart* RadarChart::TooltipContent(ChartTooltipContentFn fn, void* user) {
+    tooltipContent.content = fn;
+    tooltipContent.contentUser = user;
+    return this;
+}
+
+RadarChart* RadarChart::Data(const void* items, int stride) {
+    tooltipContent.data = items;
+    tooltipContent.dataStride = stride;
     return this;
 }
 RadarChart* RadarChart::Id(Str name) {
@@ -66528,25 +70547,27 @@ RadarChart* RadarChart::Id(Str name) {
     return this;
 }
 El* RadarChart::IntoEl() {
-    Rgba none = {0, 0, 0, 0};
-    El* e = ChartEl(a, values, n, stroke, fill, none, 1);
+    El* e = ChartEl(a, values, n, stroke, fill, fill, 1);
     ChartSeries* chart = e->Chart();
     chart->kind = ChartKind::Radar;
-    chart->overlay = overlay;
     chart->dot = dot;
     chart->radarRadius = outerRadius;
     chart->gridLevels = gridLevels;
     chart->grid = grid;
     chart->domainMin = domainMin;
     chart->domainMax = domainMax;
+    chart->more = more.Flatten(a);
+    chart->nMore = len(more);
 
-    chart->tooltip = interactive;
+    chart->tooltip = false;
     chart->id = id;
     chart->appear = appear.Generation(&chart->appearGeneration);
     chart->name = tooltipName;
+    chart->tooltipContent = tooltipContent;
+    el = e;
+    e->customPaint = PaintRadarChart;
+    e->customUser = this;
     if (labels) {
-        e->customPaint = PaintRadarLabels;
-        e->customUser = this;
         for (int i = 0; i < n; i++) {
             if (labels[i].kind == RadarLabel::Kind::Element && labels[i]
                                                                    .element) {
@@ -67664,10 +71685,11 @@ Checkbox* Checkbox::OnChange(Listener fn) {
 
 El* Checkbox::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
-    float box = size == UiSize::XSmall  ? 12.f
-                : size == UiSize::Small ? 14.f
-                : size == UiSize::Large ? 18.f
-                                        : 16.f;
+
+    float box = Rems(cx, size == UiSize::XSmall  ? 0.75f
+                         : size == UiSize::Small ? 0.875f
+                         : size == UiSize::Large ? 1.125f
+                                                 : 1.f);
 
     Rgba mark = checked ? th.primary : th.inputBorder;
     if (disabled) {
@@ -67696,7 +71718,10 @@ El* Checkbox::IntoEl() {
     }
     if (on > 0.01f) {
         Rgba tick = disabled ? RgbaOpacity(th.primaryFg, 0.5f) : th.primaryFg;
-        ind->Child(IconEl(a, IconName::Check, box - 4)->Fg(tick)->Opacity(on));
+
+        ind->Child(IconEl(a, IconName::Check, box - Rems(cx, 0.25f))
+                       ->Fg(tick)
+                       ->Opacity(on));
     }
 
     El* row = gpui::Checkbox::New(cx, id, state, disabled, onClick)
@@ -67706,7 +71731,7 @@ El* Checkbox::IntoEl() {
                   ->FocusRing(focusRing)
                   ->FlexRow()
                   ->ItemsStart()
-                  ->Gap(8);
+                  ->Gap(Rems(cx, 0.5f));
 
     Str name = accessibilityLabel.s ? accessibilityLabel : label;
     if (name.s) {
@@ -67722,7 +71747,7 @@ El* Checkbox::IntoEl() {
     if (label.s || hint.s || child) {
         ind->MarginT(box * 0.125f);
 
-        El* col = Div(a)->FlexCol()->Gap(4)->LineHeight(1.25f);
+        El* col = Div(a)->FlexCol()->Gap(Rems(cx, 0.25f))->LineHeight(1.25f);
         if (label.s) {
 
             El* text = TextEl(a, label)
@@ -68053,8 +72078,8 @@ static El* Swatch(Ctx* cx, Entity<ColorPickerState> st, Str id, uint32_t hex) {
                             ListenTo(st, &ColorPickerState::OnSwatchClick, hex),
                             ListenTo(st, &ColorPickerState::OnSwatchHover, hex),
                             hex, selected)
-        ->W(20)
-        ->H(20)
+        ->W(Rems(cx, 1.25f))
+        ->H(Rems(cx, 1.25f))
         ->Shrink0()
         ->Bg(c)
         ->Border(1, RgbaDarken(c, 0.1f));
@@ -68073,18 +72098,18 @@ static El* PalettePanel(Ctx* cx, Entity<ColorPickerState> st,
     const uint32_t* row = featured ? featured : owned;
     int n = featured ? nFeatured : 12;
 
-    El* panel = Div(a)->FlexCol()->Gap(12);
-    El* top = Div(a)->FlexRow()->Gap(4);
+    El* panel = Div(a)->FlexCol()->Gap(Rems(cx, 0.75f));
+    El* top = Div(a)->FlexRow()->Gap(Rems(cx, 0.25f));
     for (int i = 0; i < n; i++) {
         top->Child(
             Swatch(cx, st, StrDup(a, fmt("cp-f%d", i)), row[i] & 0xffffffu));
     }
     panel->Child(top);
     panel->Child(Separator::Horizontal(cx)->IntoEl());
-    El* grid = Div(a)->FlexCol()->Gap(4);
+    El* grid = Div(a)->FlexCol()->Gap(Rems(cx, 0.25f));
     for (int r = 0; r <= kNumPaletteHues; r++) {
         const uint32_t* scale = PaletteRow(r);
-        El* line = Div(a)->FlexRow()->Gap(4);
+        El* line = Div(a)->FlexRow()->Gap(Rems(cx, 0.25f));
 
         for (int i = kNumShadcnColumns - 1; i >= 0; i--) {
             line->Child(Swatch(cx, st, StrDup(a, fmt("cp-%d-%d", r, i)),
@@ -68133,11 +72158,12 @@ static El* SliderRow(Ctx* cx, Entity<ColorPickerState> st, Str label, El* track,
     const Theme& th = ThemeNow(cx->app);
     Rgba labelColor = RgbaOpacity(th.foreground, 0.7f);
     ColorPickerState* s = st.Get(cx);
-    El* row = Div(a)->FlexRow()->Gap(8)->ItemsCenter();
-    row->Child(
-        Div(a)->MinW(64)->Child(TextEl(a, label)->Font(12)->Fg(labelColor)));
+    El* row = Div(a)->FlexRow()->Gap(Rems(cx, 0.5f))->ItemsCenter();
+    row->Child(Div(a)
+                   ->MinW(Rems(cx, 4.f))
+                   ->Child(TextEl(a, label)->Font(12)->Fg(labelColor)));
 
-    El* mid = Div(a)->FlexRow()->ItemsCenter()->Flex1()->H(32);
+    El* mid = Div(a)->FlexRow()->ItemsCenter()->Flex1()->H(Rems(cx, 2.f));
     mid->Child(track);
     mid->Child(Slider::New(cx, StrDup(a, fmt("cp-sl%d", slot)),
                            s ? s->sliders.At(slot) : nullptr)
@@ -68147,8 +72173,11 @@ static El* SliderRow(Ctx* cx, Entity<ColorPickerState> st, Str label, El* track,
                    ->IntoEl());
     row->Child(mid);
 
-    row->Child(Div(a)->FlexRow()->W(40)->JustifyEnd()->Child(
-        TextEl(a, value)->Font(12)->Fg(labelColor)));
+    row->Child(Div(a)
+                   ->FlexRow()
+                   ->W(Rems(cx, 2.5f))
+                   ->JustifyEnd()
+                   ->Child(TextEl(a, value)->Font(12)->Fg(labelColor)));
     return row;
 }
 
@@ -68163,7 +72192,7 @@ static El* SliderPanel(Ctx* cx, Entity<ColorPickerState> st) {
     float l = s->sliders.lightness.value.End();
     float alpha = s->sliders.alpha.value.End();
 
-    El* panel = Div(a)->FlexCol()->Gap(8);
+    El* panel = Div(a)->FlexCol()->Gap(Rems(cx, 0.5f));
     panel->Child(SliderRow(cx, st, Tr("ColorPicker.Hue"),
                            StripeTrack(cx, HueAt, h), 0,
                            StrDup(a, fmt("%.0f", (double)(h * 360.f)))));
@@ -68191,19 +72220,20 @@ static El* ColorFieldTrigger(Ctx* cx, const ColorPickerState* s, UiSize size,
                     ->FlexRow()
                     ->ItemsCenter()
                     ->W(kFill)
-                    ->Gap(8)
+                    ->Gap(Rems(cx, 0.5f))
                     ->Bg(th.inputBg)
                     ->Fg(th.foreground)
                     ->Radius(th.radius)
                     ->Border(1, outlineVisible ? th.ring : th.inputBorder);
-    UiInputTextSize(UiInputSize(field, size), size);
-    float sw = 16;
+    UiInputTextSize(UiInputSize(cx, field, size), size);
+
+    float sw = Rems(cx, 1.f);
     if (size == UiSize::XSmall) {
-        sw = 12;
+        sw = Rems(cx, 0.75f);
     } else if (size == UiSize::Small) {
-        sw = 14;
+        sw = Rems(cx, 0.875f);
     } else if (size == UiSize::Large) {
-        sw = 20;
+        sw = Rems(cx, 1.25f);
     }
     El* swatch = Div(a)->W(sw)->H(sw)->Shrink0()->Radius(th.radius / 2.f);
     if (s->hasValue) {
@@ -68227,7 +72257,7 @@ static El* ColorFieldTrigger(Ctx* cx, const ColorPickerState* s, UiSize size,
                 ->Fg(th.mutedFg));
     }
     field->Child(text);
-    field->Child(Caret::New(size).TextColor(th.mutedFg).IntoEl(a));
+    field->Child(Caret::New(size).TextColor(th.mutedFg).IntoEl(cx, a));
     return field;
 }
 
@@ -68247,26 +72277,19 @@ El* ColorPicker::IntoEl() {
     bool hasShown = ColorPickerShown(s, &shownHex);
     Rgba shown = RgbaHex(shownHex);
 
-    float sq = 32;
-    if (size == UiSize::Large) {
-        sq = 44;
-    } else if (size == UiSize::Small) {
-        sq = 20;
-    } else if (size == UiSize::XSmall) {
-        sq = 16;
-    }
+    float sq = UiSizeWithPx(cx, size);
     bool focused =
         s->focus.IsValid() && FocusHandleIsFocused(cx->win, s->focus);
     El* trigger = nullptr;
     if (field) {
         trigger = ColorFieldTrigger(cx, s, size, placeholder, focused);
     } else {
-        trigger = Div(a)->FlexRow()->Gap(8)->ItemsCenter();
+        trigger = Div(a)->FlexRow()->Gap(Rems(cx, 0.5f))->ItemsCenter();
     }
     if (field) {
 
     } else if (icon != IconName::None) {
-        trigger->Child(IconEl(a, icon, UiIconPx(size)));
+        trigger->Child(IconEl(a, icon, UiIconPx(cx, size)));
     } else {
         trigger->Child(Div(a)
                            ->W(sq)
@@ -68290,9 +72313,9 @@ El* ColorPicker::IntoEl() {
 
         pop = Div(a)
                   ->FlexCol()
-                  ->W(288)
-                  ->Gap(12)
-                  ->Pad(2)
+                  ->W(Rems(cx, 18.f))
+                  ->Gap(Rems(cx, 0.75f))
+                  ->Pad(Rems(cx, 0.125f))
                   ->Radius(th.radiusLg)
                   ->Border(1, th.border)
                   ->Bg(th.tokens.background);
@@ -68312,10 +72335,10 @@ El* ColorPicker::IntoEl() {
         if (s->hasPreview) {
             Rgba hovered = RgbaHex(s->preview);
             pop->Child(Separator::Horizontal(cx)->IntoEl());
-            El* row = Div(a)->FlexRow()->Gap(8)->ItemsCenter();
+            El* row = Div(a)->FlexRow()->Gap(Rems(cx, 0.5f))->ItemsCenter();
             row->Child(Div(a)
-                           ->W(20)
-                           ->H(20)
+                           ->W(Rems(cx, 1.25f))
+                           ->H(Rems(cx, 1.25f))
                            ->Shrink0()
                            ->Radius(th.radius)
                            ->Bg(hovered)
@@ -69012,7 +73035,7 @@ static bool ItemMatchesQuery(const CommandState* s, const CommandItem* item,
     return CommandItemMatches(item, query);
 }
 
-static float RowHeight(const CommandState* s, const CommandRow& row) {
+static float RowHeight(const CommandRow& row) {
     switch (row.kind) {
         case CommandRowKind::Separator:
             return kSeparatorRowH;
@@ -69021,17 +73044,73 @@ static float RowHeight(const CommandState* s, const CommandRow& row) {
         case CommandRowKind::Item:
             break;
     }
-    const CommandItem* item = ItemOfMatch(s, row.match);
-    if (item && item->content && item->contentH > 0) {
-        return item->contentH;
-    }
     return kItemRowH;
+}
+
+static void LayoutHashBytes(uint64_t* h, const void* p, int n) {
+    const uint8_t* b = (const uint8_t*)p;
+    for (int i = 0; i < n; i++) {
+        *h ^= b[i];
+        *h *= 1099511628211ull;
+    }
+}
+static void LayoutHashStr(uint64_t* h, Str s) {
+    int n = len(s);
+    LayoutHashBytes(h, &n, (int)sizeof(n));
+    if (n > 0) {
+        LayoutHashBytes(h, s.s, n);
+    }
+}
+
+static bool LayoutHashItem(uint64_t* h, const CommandItem& it) {
+    if (it.content) {
+        return false;
+    }
+    LayoutHashStr(h, it.label);
+    LayoutHashBytes(h, &it.nKeywords, (int)sizeof(it.nKeywords));
+    for (int i = 0; i < it.nKeywords; i++) {
+        LayoutHashStr(h, it.keywords[i]);
+    }
+    uint32_t icon = (uint32_t)it.icon;
+    LayoutHashBytes(h, &icon, (int)sizeof(icon));
+    LayoutHashBytes(h, &it.action, (int)sizeof(it.action));
+    LayoutHashBytes(h, &it.actionArg, (int)sizeof(it.actionArg));
+    LayoutHashStr(h, it.actionContext ? Str(it.actionContext) : Str{});
+    uint8_t flags = (uint8_t)((it.checked ? 1 : 0) | (it.disabled ? 2 : 0));
+    LayoutHashBytes(h, &flags, 1);
+    return true;
+}
+
+static uint64_t ModelLayoutKey(const CommandEntry* entries, int n,
+                               bool searchable, bool filterable) {
+    uint64_t h = 14695981039346656037ull;
+    uint8_t flags = (uint8_t)((searchable ? 1 : 0) | (filterable ? 2 : 0));
+    LayoutHashBytes(&h, &flags, 1);
+    LayoutHashBytes(&h, &n, (int)sizeof(n));
+    for (int i = 0; i < n; i++) {
+        const CommandEntry& e = entries[i];
+        uint8_t kind = (uint8_t)e.kind;
+        LayoutHashBytes(&h, &kind, 1);
+        if (e.kind == CommandEntryKind::Item) {
+            if (!LayoutHashItem(&h, e.item)) {
+                return 0;
+            }
+        } else if (e.kind == CommandEntryKind::Group) {
+            LayoutHashStr(&h, e.group.heading);
+            LayoutHashBytes(&h, &e.group.nItems, (int)sizeof(e.group.nItems));
+            for (int j = 0; j < e.group.nItems; j++) {
+                if (!LayoutHashItem(&h, e.group.items[j])) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return h ? h : 1;
 }
 
 static void UpdateMatches(CommandState* s, Str query) {
     s->rows.len = 0;
     s->matched.len = 0;
-    s->rowSizes.len = 0;
     bool hasUngrouped = false;
     for (int i = 0; i < s->nEntries; i++) {
         if (s->entries[i].kind == CommandEntryKind::Item) {
@@ -69121,9 +73200,6 @@ static void UpdateMatches(CommandState* s, Str query) {
         }
     }
 
-    for (int i = 0; i < s->rows.len; i++) {
-        VecAppend(s->rowSizes, RowHeight(s, s->rows[i]));
-    }
     if (s->selected >= s->matched.len) {
         s->selected = -1;
     }
@@ -69175,6 +73251,51 @@ static void FireSelect(CommandState* s, Ctx* cx, bool hadPrev, IndexPath prev) {
     ListenerCall(cx->app, cx->win, s->onSelect, &ev);
 }
 
+static El* BuildCommandRow(Ctx* cx, CommandState* s, int rowIx,
+                           Entity<CommandState> entity, float itemRadius,
+                           bool interactive);
+
+static void MeasureRows(CommandState* s, Ctx* cx) {
+    float font = s->listFont > 0
+                     ? s->listFont
+                     : RuntimeStyleNow(cx ? cx->app : nullptr).fontSize;
+    uint32_t keymap = KeymapGeneration();
+    float rem = Rems(cx, 1);
+    if (!s->needsMeasure && s->rowSizes.len == s->rows.len &&
+        s->measuredW == s->listW && s->measuredRem == rem &&
+        s->measuredFont == font && s->measuredKeymap == keymap) {
+        return;
+    }
+    s->needsMeasure = false;
+    s->measuredW = s->listW;
+    s->measuredRem = rem;
+    s->measuredFont = font;
+    s->measuredKeymap = keymap;
+    s->measureCount++;
+    s->rowSizes.len = 0;
+    bool canBuild = cx && cx->a && cx->app;
+    PaintCtx* paint = cx && cx->win ? &cx->win->paint : nullptr;
+    for (int i = 0; i < s->rows.len; i++) {
+        const CommandRow& row = s->rows[i];
+        float h = RowHeight(row);
+        if (canBuild && row.kind != CommandRowKind::Separator) {
+            El* made = BuildCommandRow(cx, s, i, {}, -1, false);
+            if (made) {
+
+                El* probe = Div(cx->a)->FlexCol()->Child(made);
+                if (s->listW >= 0) {
+                    probe->W(s->listW);
+                }
+                float got = MeasureEl(paint, probe, font).h;
+                if (got > 0) {
+                    h = got;
+                }
+            }
+        }
+        VecAppend(s->rowSizes, h);
+    }
+}
+
 void CommandInstall(CommandState* s, Ctx* cx, const CommandEntry* entries,
                     int nEntries, bool searchable, bool filterable) {
     if (!s) {
@@ -69190,7 +73311,14 @@ void CommandInstall(CommandState* s, Ctx* cx, const CommandEntry* entries,
 
     IndexPath prev = {};
     bool hadPrev = CommandSelectedIndex(s, &prev);
+
+    uint64_t key = ModelLayoutKey(entries, nEntries, searchable, filterable);
+    if (key == 0 || key != s->layoutKey || queryChanged) {
+        s->needsMeasure = true;
+    }
+    s->layoutKey = key;
     UpdateMatches(s, query);
+    MeasureRows(s, cx);
 
     if (queryChanged) {
         SetApplied(s, query);
@@ -69313,7 +73441,7 @@ static void ConfirmMatch(CommandState* s, Ctx* cx, int matchIx) {
         return;
     }
     IndexPath path = s->matched[matchIx].path;
-    intptr_t data = s->matched[matchIx].data;
+    int64_t data = s->matched[matchIx].data;
 
     if (item->action && cx->win) {
         WindowDispatchAction(cx->win, item->action, item->actionArg);
@@ -69328,7 +73456,7 @@ static void ConfirmMatch(CommandState* s, Ctx* cx, int matchIx) {
 }
 
 void CommandState::OnRowClick(CommandState* self, Ctx* cx, const ClickEvent*,
-                              intptr_t match) {
+                              int64_t match) {
     if (!self) {
         return;
     }
@@ -69337,7 +73465,7 @@ void CommandState::OnRowClick(CommandState* self, Ctx* cx, const ClickEvent*,
 }
 
 void CommandState::OnRowHover(CommandState* self, Ctx* cx, const HoverEvent* ev,
-                              intptr_t match) {
+                              int64_t match) {
     if (!self || !ev || !ev->hovered) {
         return;
     }
@@ -69482,20 +73610,26 @@ struct CommandRowContext {
     float itemRadius = 0;
 };
 
-static float CommandItemRadius(const Theme& th, bool bordered) {
+static float CommandItemRadius(const Ctx* cx, const Theme& th, bool bordered) {
     if (!bordered) {
         return th.radius;
     }
-    float r = th.radiusLg - 16.f * 0.25f - 1.f;
+    float r = th.radiusLg - Rems(cx, 0.25f) - 1.f;
     return r > 0 ? r : 0;
 }
 
 static El* CommandRowEl(void* user, Ctx* cx, int rowIx) {
-    Arena* a = cx->a;
-    const Theme& th = ThemeNow(cx->app);
     CommandRowContext* rowCx = (CommandRowContext*)user;
     Entity<CommandState> entity = rowCx ? rowCx->state : Entity<CommandState>{};
-    CommandState* s = entity.Get(cx);
+    return BuildCommandRow(cx, entity.Get(cx), rowIx, entity,
+                           rowCx ? rowCx->itemRadius : -1, true);
+}
+
+static El* BuildCommandRow(Ctx* cx, CommandState* s, int rowIx,
+                           Entity<CommandState> entity, float itemRadius,
+                           bool interactive) {
+    Arena* a = cx->a;
+    const Theme& th = ThemeNow(cx->app);
     if (!s || rowIx < 0 || rowIx >= s->rows.len) {
         return Div(a);
     }
@@ -69505,8 +73639,11 @@ static El* CommandRowEl(void* user, Ctx* cx, int rowIx) {
             Div(a)->W(kFill)->H(1)->Bg(th.border));
     }
     if (row.kind == CommandRowKind::Heading) {
-        return Div(a)->W(kFill)->PadX(8)->PadY(6)->Child(
-            TextEl(a, row.heading)->Font(12)->Medium()->Fg(th.mutedFg));
+        return Div(a)
+            ->W(kFill)
+            ->PadX(Rems(cx, 0.5f))
+            ->PadY(Rems(cx, 0.375f))
+            ->Child(TextEl(a, row.heading)->Font(12)->Medium()->Fg(th.mutedFg));
     }
 
     int matchIx = row.match;
@@ -69524,20 +73661,24 @@ static El* CommandRowEl(void* user, Ctx* cx, int rowIx) {
                    ->FlexRow()
                    ->W(kFill)
                    ->ItemsCenter()
-                   ->Gap(8)
-                   ->PadX(8)
-                   ->PadY(6)
-                   ->Radius(rowCx ? rowCx->itemRadius : th.radius);
+                   ->Gap(Rems(cx, 0.5f))
+                   ->PadX(Rems(cx, 0.5f))
+                   ->PadY(Rems(cx, 0.375f))
+                   ->Radius(itemRadius >= 0 ? itemRadius : th.radius);
     if (selected) {
         line->Bg(th.tokens.accent);
     }
     if (item->content) {
         line->Child(item->content(cx, item));
     } else {
-        El* content =
-            Div(a)->FlexRow()->Flex1()->Gap(8)->ItemsCenter()->MinW(0);
+        El* content = Div(a)
+                          ->FlexRow()
+                          ->Flex1()
+                          ->Gap(Rems(cx, 0.5f))
+                          ->ItemsCenter()
+                          ->MinW(0);
         if (item->icon != IconName::None) {
-            content->Child(IconEl(a, item->icon, 16)->Fg(iconFg));
+            content->Child(IconEl(a, item->icon, Rems(cx, 1))->Fg(iconFg));
         }
         if (len(item->label) > 0) {
             content->Child(
@@ -69556,11 +73697,12 @@ static El* CommandRowEl(void* user, Ctx* cx, int rowIx) {
             line->Child(kbd->IntoEl());
         } else if (item->checked) {
             line->Child(Div(a)->Flex1());
-            line->Child(IconEl(a, IconName::Check, 14)
+
+            line->Child(IconEl(a, IconName::Check, UiIconPx(cx, UiSize::XSmall))
                             ->Fg(selected ? th.accentFg : th.foreground));
         }
     }
-    if (!disabled) {
+    if (interactive && !disabled) {
         Listener click = ListenTo(entity, &CommandState::OnRowClick, 0);
         Listener hover = ListenTo(entity, &CommandState::OnRowHover, 0);
         line->HoverBg(th.tokens.accent);
@@ -69571,12 +73713,40 @@ static El* CommandRowEl(void* user, Ctx* cx, int rowIx) {
     return line;
 }
 
+struct CommandListProbe {
+    Entity<CommandState> state = {};
+};
+
+static void CommandListPrePaint(PaintCtx* ctx, El* e, void* user) {
+    auto* probe = (CommandListProbe*)user;
+    CommandState* s = probe && ctx ? probe->state.Get(ctx->app) : nullptr;
+    if (!s) {
+        return;
+    }
+    float w = e->w - WindowRemSize(ctx->window) * 0.5f;
+    if (w < 0) {
+        w = 0;
+    }
+    float dw = w - s->listW;
+    bool changed = s->listW < 0 || dw > 0.5f || dw < -0.5f;
+    if (changed) {
+        s->listW = w;
+    }
+    if (e->laidFont > 0 && e->laidFont != s->listFont) {
+        s->listFont = e->laidFont;
+        changed = true;
+    }
+    if (changed && s->rows.len > 0 && ctx->window) {
+        WindowRequestAnimationFrame(ctx->window);
+    }
+}
+
 static El* ui_command_DefaultEmpty(Ctx* cx) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
     return Div(a)
         ->W(kFill)
-        ->PadY(24)
+        ->PadY(Rems(cx, 1.5f))
         ->ItemsCenter()
         ->JustifyCenter()
         ->TextCenter()
@@ -69621,7 +73791,7 @@ El* Command::IntoEl() {
                         ->FlexRow()
                         ->W(kFill)
                         ->Shrink0()
-                        ->PadX(12)
+                        ->PadX(Rems(cx, 0.75f))
                         ->Gap(8)
                         ->ItemsCenter()
                         ->BorderB(1, th.border);
@@ -69641,22 +73811,29 @@ El* Command::IntoEl() {
         box->Child(field);
     }
 
+    float inset = Rems(cx, 0.25f);
+    float listMaxH = maxH >= 0 ? maxH : Rems(cx, 18.75f);
     El* listBox = Div(a)
                       ->Role(AccessibilityRole::ListBox)
                       ->FlexCol()
                       ->W(kFill)
-                      ->MaxH(maxH)
+                      ->MaxH(listMaxH)
                       ->ClipY();
+    CommandListProbe* probe = ArenaNew<CommandListProbe>(a);
+    probe->state = state;
+    listBox->prePaint = &CommandListPrePaint;
+    listBox->customUser = probe;
     if (s->rows.len == 0) {
 
-        listBox->Pad(4);
+        listBox->Pad(inset);
 
         if (!s->loading) {
             listBox->Child(empty ? empty : ui_command_DefaultEmpty(cx));
         }
     } else {
         float content = VirtualListContentSize(s->rowSizes.els, s->rows.len);
-        float viewH = content < maxH - 8 ? content : maxH - 8;
+        float viewMax = listMaxH - inset * 2;
+        float viewH = content < viewMax ? content : viewMax;
         if (s->pendingScroll >= 0) {
             VirtualListScrollToItemDeferred(&s->scroll, s->pendingScroll,
                                             ScrollStrategy::Top);
@@ -69664,14 +73841,14 @@ El* Command::IntoEl() {
         }
         CommandRowContext* rowCx = ArenaNew<CommandRowContext>(a);
         rowCx->state = state;
-        rowCx->itemRadius = CommandItemRadius(th, bordered);
+        rowCx->itemRadius = CommandItemRadius(cx, th, bordered);
         El* list = VirtualList::New(cx, s->rows.len)
                        ->Id(StrL("list"))
                        ->Sizes(s->rowSizes.els)
                        ->ViewH(viewH)
                        ->Handle(&s->scroll)
                        ->Axis(ScrollAxis::Vertical)
-                       ->Pad(4)
+                       ->Pad(inset)
                        ->Row(CommandRowEl, rowCx)
                        ->IntoEl();
         listBox->Child(list);
@@ -69903,7 +74080,8 @@ El* DescriptionList::IntoEl() {
         for (int k = 0; k < count; k++) {
             const DescriptionItem& it = items[itemAt++];
             if (it.separator) {
-                El* separator = Div(a)->H(8)->W(kFill);
+
+                El* separator = Div(a)->H(Rems(cx, 0.5f))->W(kFill);
                 if (bordered) {
                     separator->Bg(th.descListLabel);
                 }
@@ -70098,7 +74276,7 @@ El* DialogContent::IntoEl() {
 
 DialogHeader* DialogHeader::New(Ctx* cx) {
     DialogHeader* part = ArenaNew<DialogHeader>(cx->a);
-    part->root = Div(cx->a)->FlexCol()->Gap(8);
+    part->root = Div(cx->a)->FlexCol()->Gap(Rems(cx, 0.5f));
     return part;
 }
 DialogHeader* DialogHeader::Child(El* child) {
@@ -70141,9 +74319,12 @@ El* DialogDescription::IntoEl() {
 DialogFooter* DialogFooter::New(Ctx* cx) {
     DialogFooter* part = ArenaNew<DialogFooter>(cx->a);
     float radius = ThemeNow(cx->app).radiusLg;
-    part->root =
-        Div(cx->a)->FlexRow()->Gap(8)->JustifyEnd()->LineHeight(1.25f)->Corners(
-            0, 0, radius, radius);
+    part->root = Div(cx->a)
+                     ->FlexRow()
+                     ->Gap(Rems(cx, 0.5f))
+                     ->JustifyEnd()
+                     ->LineHeight(1.25f)
+                     ->Corners(0, 0, radius, radius);
     return part;
 }
 DialogFooter* DialogFooter::Child(El* child) {
@@ -70349,7 +74530,7 @@ Dialog* Dialog::OnOk(Listener fn) {
 
 El* Dialog::Header() {
     const Theme& th = ThemeNow(cx->app);
-    El* head = Div(a)->FlexCol()->W(kFill)->Pad(16)->Gap(8);
+    El* head = Div(a)->FlexCol()->W(kFill)->Pad(16)->Gap(Rems(cx, 0.5f));
     El* ic = nullptr;
     if (icon != IconName::None) {
         ic = IconEl(a, icon, iconSize)->Shrink0();
@@ -70368,8 +74549,12 @@ El* Dialog::Header() {
         El* text = TextEl(a, title)->Font(16)->Semibold()->Fg(th.foreground);
         El* line = text;
         if (ic) {
-            line = Div(a)->FlexRow()->Gap(8)->ItemsCenter()->Child(ic)->Child(
-                text);
+            line = Div(a)
+                       ->FlexRow()
+                       ->Gap(Rems(cx, 0.5f))
+                       ->ItemsCenter()
+                       ->Child(ic)
+                       ->Child(text);
         }
         head->Child(DialogTitle::New(cx)->Child(line)->IntoEl());
     } else if (ic) {
@@ -70396,7 +74581,7 @@ Str Dialog::LayerId(Str base) const {
 
 El* Dialog::Actions() {
     const Theme& th = ThemeNow(cx->app);
-    El* row = Div(a)->W(kFill)->Pad(16)->Gap(8);
+    El* row = Div(a)->W(kFill)->Pad(16)->Gap(Rems(cx, 0.5f));
     if (footerVertical) {
         row->FlexCol();
     } else {
@@ -70453,7 +74638,7 @@ El* Dialog::IntoEl(WinSize size) {
                     ->W(panelW)
                     ->MaxH(panelMaxH)
                     ->FlexCol()
-                    ->MinH(96)
+                    ->MinH(Rems(cx, 6))
                     ->Bg(hasBackground ? background : th.background)
                     ->Border(1, th.border)
                     ->Radius(radius > 0 ? radius : th.radiusLg)
@@ -70759,7 +74944,7 @@ El* DockInvalidPanelRender(Ctx* cx, void* data) {
 
     return Div(a)
         ->SizeFull()
-        ->PadY(24)
+        ->PadY(Rems(cx, 1.5f))
         ->FlexCol()
         ->ItemsCenter()
         ->JustifyCenter()
@@ -70819,9 +75004,10 @@ El* DragPanelPreview::IntoEl() {
         ->Id(StrL("drag-panel"))
 
         ->Cursor(CursorKind::Arrow)
-        ->W(kDockDragPreviewW)
-        ->PadY(4)
-        ->PadX(12)
+
+        ->W(Rems(cx, 6.f))
+        ->PadY(Rems(cx, 0.25f))
+        ->PadX(Rems(cx, 0.75f))
         ->ClipX()
         ->Radius(th.radius)
         ->Border(1, th.border)
@@ -70831,39 +75017,46 @@ El* DragPanelPreview::IntoEl() {
         ->Child(PanelTitle(cx, panel, th.tabFg)->LineHeight(1.f));
 }
 
-static El* ToggleButton(const DockTabGroup* g, DockPlacement p, IconName icon) {
+static El* ToggleButton(const DockTabGroup* g, DockPlacement p, IconName icon,
+                        bool open) {
     Ctx* cx = g->cx;
     Arena* a = cx->a;
-    const Theme& th = ThemeNow(cx->app);
-    return DockBindToggle(g, p,
-                          Div(a)
-                              ->Pad(4)
-                              ->Radius(th.radius * 0.5f)
-                              ->HoverBg(th.tokens.secondary)
-                              ->Child(IconEl(a, icon, 14)->Fg(th.mutedFg)));
+    return DockBindToggle(
+        g, p,
+        component::Button::New(cx, StrDup(a, fmt("toggle-dock-%d", (int)p)))
+            ->Icon(icon)
+            ->WithSize(UiSize::XSmall)
+            ->Ghost()
+            ->TabStop(false)
+            ->Tooltip(open ? Tr("Dock.Collapse") : Tr("Dock.Expand"))
+            ->IntoEl());
 }
 
 static El* RenderToggles(const DockTabGroup* g, bool trailing) {
     Arena* a = g->cx->a;
     DockState* s = g->state.Get(g->cx);
-    El* row = Div(a)->FlexRow()->ItemsCenter()->Shrink0()->Gap(4);
+    El* row =
+        Div(a)->FlexRow()->ItemsCenter()->Shrink0()->Gap(Rems(g->cx, 0.25f));
     if (trailing) {
         if (DockGroupHasToggle(g, DockPlacement::Right)) {
-            row->Child(ToggleButton(g, DockPlacement::Right,
-                                    s->right.open ? IconName::PanelRight
-                                                  : IconName::PanelRightOpen));
+            row->Child(ToggleButton(
+                g, DockPlacement::Right,
+                s->right.open ? IconName::PanelRight : IconName::PanelRightOpen,
+                s->right.open));
         }
         return row;
     }
     if (DockGroupHasToggle(g, DockPlacement::Left)) {
         row->Child(ToggleButton(
             g, DockPlacement::Left,
-            s->left.open ? IconName::PanelLeft : IconName::PanelLeftOpen));
+            s->left.open ? IconName::PanelLeft : IconName::PanelLeftOpen,
+            s->left.open));
     }
     if (DockGroupHasToggle(g, DockPlacement::Bottom)) {
-        row->Child(ToggleButton(g, DockPlacement::Bottom,
-                                s->bottom.open ? IconName::PanelBottom
-                                               : IconName::PanelBottomOpen));
+        row->Child(ToggleButton(
+            g, DockPlacement::Bottom,
+            s->bottom.open ? IconName::PanelBottom : IconName::PanelBottomOpen,
+            s->bottom.open));
     }
     return row;
 }
@@ -70876,9 +75069,8 @@ static bool HasLeadingToggles(const DockTabGroup* g) {
 static El* RenderTools(const DockTabGroup* g) {
     Ctx* cx = g->cx;
     Arena* a = cx->a;
-    const Theme& th = ThemeNow(cx->app);
     DockState* s = g->state.Get(cx);
-    El* row = Div(a)->FlexRow()->ItemsCenter()->Shrink0()->Gap(4);
+    El* row = Div(a)->FlexRow()->ItemsCenter()->Shrink0()->Gap(Rems(cx, 0.25f));
     int activeIx = DockGroupActiveIx(g);
     if (g->collapsed || activeIx < 0) {
         return row;
@@ -70894,16 +75086,18 @@ static El* RenderTools(const DockTabGroup* g) {
     }
 
     if (zoomed || DockPanelControlToolbar(def.zoomable)) {
+
         row->Child(DockBindZoom(
             g, panelIx,
-            Div(a)
-                ->Pad(4)
-                ->Radius(th.radius * 0.5f)
-                ->HoverBg(th.tokens.secondary)
-                ->Child(IconEl(a,
-                               zoomed ? IconName::Minimize : IconName::Maximize,
-                               14)
-                            ->Fg(th.mutedFg))));
+            component::Button::New(cx,
+                                   zoomed ? StrL("zoom-out") : StrL("zoom-in"))
+                ->Icon(zoomed ? IconName::Minimize : IconName::Maximize)
+                ->WithSize(UiSize::XSmall)
+                ->Ghost()
+                ->TabStop(false)
+                ->Selected(zoomed)
+                ->Tooltip(zoomed ? Tr("Dock.Zoom Out") : Tr("Dock.Zoom In"))
+                ->IntoEl()));
     }
 
     Str menuId = StrDup(a, fmt("menu-%d", g->node));
@@ -70960,9 +75154,9 @@ static El* RenderTitleRow(const DockTabGroup* g) {
                   ->JustifyBetween()
                   ->W(kFill)
                   ->H(30)
-                  ->PadY(8)
-                  ->PadL(leading ? 8.f : 12.f)
-                  ->PadR(8);
+                  ->PadY(Rems(cx, 0.5f))
+                  ->PadL(Rems(cx, leading ? 0.5f : 0.75f))
+                  ->PadR(Rems(cx, 0.5f));
     if (hasTitleStyle) {
         row->Bg(titleStyle.background)->Fg(titleStyle.foreground);
     }
@@ -70974,7 +75168,7 @@ static El* RenderTitleRow(const DockTabGroup* g) {
     El* title =
         Div(a)
             ->Flex1()
-            ->MinW(64)
+            ->MinW(Rems(cx, 4.f))
             ->ClipX()
             ->Fg(titleColor)
             ->Child(PanelTitle(cx, def, titleColor)->Font(14)->Truncate());
@@ -70984,7 +75178,8 @@ static El* RenderTitleRow(const DockTabGroup* g) {
             row->Child(suffix->Shrink0());
         }
     }
-    El* tools = Div(a)->FlexRow()->ItemsCenter()->Shrink0()->Gap(4);
+    El* tools =
+        Div(a)->FlexRow()->ItemsCenter()->Shrink0()->Gap(Rems(cx, 0.25f));
     tools->Child(RenderTools(g));
     if (trailing) {
         tools->Child(RenderToggles(g, true));
@@ -71016,7 +75211,7 @@ static El* ui_dock_SkinTabBar(Ctx* cx, void*, const DockTabGroup* g) {
                   ->Bg(th.tokens.tabBar)
                   ->BorderB(1, th.border);
     if (HasLeadingToggles(g)) {
-        bar->Child(RenderToggles(g, false)->PadX(8));
+        bar->Child(RenderToggles(g, false)->PadX(Rems(cx, 0.5f)));
     }
 
     El* strip = DockBindTabStrip(g, Div(a)
@@ -71082,13 +75277,14 @@ static El* ui_dock_SkinTabBar(Ctx* cx, void*, const DockTabGroup* g) {
                             ->TabStop(false)
                             ->IntoEl();
 
-            close->MarginL(-8)->MarginR(8);
+            close->MarginL(-8)->MarginR(Rems(cx, 0.5f));
             tab->Child(DockBindClose(g, i, close));
         }
         strip->Child(tab);
     }
 
-    El* rest = DockBindTabRest(g, Div(a)->Flex1()->H(kFill)->MinW(64));
+    El* rest =
+        DockBindTabRest(g, Div(a)->Flex1()->H(kFill)->MinW(Rems(cx, 4.f)));
     if (DockGroupDroppable(g)) {
         rest->DragOver(kDockPanelDrag, StateStyle().Bg(th.tokens.dropTarget));
     }
@@ -71104,7 +75300,7 @@ static El* ui_dock_SkinTabBar(Ctx* cx, void*, const DockTabGroup* g) {
         }
         bar->Child(RenderTools(g));
         if (DockGroupHasToggle(g, DockPlacement::Right)) {
-            bar->Child(RenderToggles(g, true)->PadX(8));
+            bar->Child(RenderToggles(g, true)->PadX(Rems(cx, 0.5f)));
         }
     }
     return bar;
@@ -71120,7 +75316,7 @@ static El* SkinTabContent(Ctx* cx, void*, const DockTabGroup* g) {
                     ->Bg(ThemeNow(cx->app).tokens.background);
     const DockPanelDef* active = DockGroupPanel(g, DockGroupActiveIx(g));
     if (DockGroupCount(g) > 1 && (!active || active->innerPadding)) {
-        frame->PadT(8);
+        frame->PadT(Rems(cx, 0.5f));
     }
     return frame;
 }
@@ -71231,10 +75427,10 @@ El* EmptyMedia::IntoEl() {
     const Theme& theme = ThemeNow(cx->app);
     El* root =
         Div(a)->FlexCol()->Shrink0()->ItemsCenter()->JustifyCenter()->MarginB(
-            8);
+            Rems(cx, 0.5f));
     if (variant == EmptyMediaVariant::Icon) {
-        root->W(32)
-            ->H(32)
+        root->W(Rems(cx, 2))
+            ->H(Rems(cx, 2))
             ->Radius(theme.radiusLg)
             ->Bg(theme.muted)
             ->Fg(theme.foreground)
@@ -71297,7 +75493,9 @@ El* EmptyDescription::IntoEl() {
 }
 
 EmptyContent* EmptyContent::New(Ctx* cx) {
-    return EmptyPartNew<EmptyContent>(cx);
+    EmptyContent* value = EmptyPartNew<EmptyContent>(cx);
+    value->cx = cx;
+    return value;
 }
 EmptyContent* EmptyContent::Child(El* child) {
     children.Append(a, child);
@@ -71312,10 +75510,10 @@ El* EmptyContent::IntoEl() {
     El* root = Div(a)
                    ->FlexCol()
                    ->W(kFill)
-                   ->MaxW(384)
+                   ->MaxW(Rems(cx, 24))
                    ->MinW(0)
                    ->ItemsCenter()
-                   ->Gap(10)
+                   ->Gap(Rems(cx, 0.625f))
                    ->Font(14);
     root->Refine(style, styleSet);
     refiner.Apply(root);
@@ -71324,7 +75522,9 @@ El* EmptyContent::IntoEl() {
 }
 
 EmptyHeader* EmptyHeader::New(Ctx* cx) {
-    return EmptyPartNew<EmptyHeader>(cx);
+    EmptyHeader* value = EmptyPartNew<EmptyHeader>(cx);
+    value->cx = cx;
+    return value;
 }
 EmptyHeader* EmptyHeader::Media(EmptyMedia* value) {
     media = value;
@@ -71347,10 +75547,10 @@ El* EmptyHeader::IntoEl() {
     El* root = Div(a)
                    ->FlexCol()
                    ->W(kFill)
-                   ->MaxW(384)
+                   ->MaxW(Rems(cx, 24))
                    ->MinW(0)
                    ->ItemsCenter()
-                   ->Gap(8)
+                   ->Gap(Rems(cx, 0.5f))
                    ->Refine(style, styleSet);
     refiner.Apply(root);
     if (media) root->Child(media->IntoEl());
@@ -71390,8 +75590,8 @@ El* Empty::IntoEl() {
                    ->Flex1()
                    ->ItemsCenter()
                    ->JustifyCenter()
-                   ->Gap(16)
-                   ->Pad(24)
+                   ->Gap(Rems(cx, 1))
+                   ->Pad(Rems(cx, 1.5f))
                    ->Radius(theme.radius * 2.f)
 
                    ->Border(0, theme.border)
@@ -71616,7 +75816,7 @@ static El* FieldRender(Ctx* cx, const Field& fld, const FieldProps& props) {
     }
     bool hasLabel = fld.labelIndent;
     if (hasLabel) {
-        El* label = Div(a)->FlexRow()->Gap(4)->ItemsCenter();
+        El* label = Div(a)->FlexRow()->Gap(Rems(cx, 0.25f))->ItemsCenter();
         if (props.horizontal) {
             label->W(lw);
             label->style.flexShrink = 0;
@@ -71907,7 +76107,7 @@ El* GroupBox::IntoEl() {
                   ->FlexCol()
                   ->Id(id)
                   ->W(kFill)
-                  ->Gap(padded ? 12.f : 16.f)
+                  ->Gap(Rems(cx, padded ? 0.75f : 1.f))
                   ->Refine(rootStyle, rootStyleSet);
     if (hasTitle) {
         El* titleContent = titleEl ? titleEl : TextEl(a, title);
@@ -71924,7 +76124,8 @@ El* GroupBox::IntoEl() {
         }
         box->Child(titleBox);
     }
-    El* content = Div(a)->FlexCol()->W(kFill)->Gap(16)->Fg(th.groupBoxFg);
+    El* content =
+        Div(a)->FlexCol()->W(kFill)->Gap(Rems(cx, 1))->Fg(th.groupBoxFg);
     content->Radius(contentRadius >= 0 ? contentRadius : th.radius);
     if (variant == GroupBoxVariant::Fill) {
         content->Bg(th.groupBox);
@@ -71933,7 +76134,7 @@ El* GroupBox::IntoEl() {
         content->Border(1, th.border);
     }
     if (padded) {
-        content->Pad(16);
+        content->Pad(Rems(cx, 1));
     }
     if (hasContentBg) {
         content->Bg(contentBg);
@@ -71949,7 +76150,7 @@ El* GroupBox::IntoEl() {
         content->Child(child);
     }
 
-    El* slot = Div(a)->FlexCol()->W(kFill)->Gap(8)->Child(content);
+    El* slot = Div(a)->FlexCol()->W(kFill)->Gap(Rems(cx, 0.5f))->Child(content);
     if (footer) {
         slot->Child(Div(a)->Font(14)->Fg(th.mutedFg)->Child(footer));
     }
@@ -71970,7 +76171,7 @@ struct InputMenuViewState {
     InputState* input = nullptr;
 
     static void CompletionClick(InputMenuViewState* self, Ctx* cx,
-                                const ClickEvent*, intptr_t ix) {
+                                const ClickEvent*, int64_t ix) {
         if (!self || !self->input || ix < 0 ||
             ix >= self->input->completion.items.len) {
             return;
@@ -71981,7 +76182,7 @@ struct InputMenuViewState {
     }
 
     static void CompletionHover(InputMenuViewState* self, Ctx* cx,
-                                const HoverEvent* event, intptr_t ix) {
+                                const HoverEvent* event, int64_t ix) {
         if (!self || !self->input || !event || !event->hovered || ix < 0 ||
             ix >= self->input->completion.items.len ||
             self->input->completion.selected == ix) {
@@ -71999,7 +76200,7 @@ struct InputMenuViewState {
     }
 
     static void CodeActionClick(InputMenuViewState* self, Ctx* cx,
-                                const ClickEvent*, intptr_t ix) {
+                                const ClickEvent*, int64_t ix) {
         if (!self || !self->input || ix < 0 ||
             ix >= self->input->codeActions.items.len) {
             return;
@@ -72010,7 +76211,7 @@ struct InputMenuViewState {
     }
 
     static void CodeActionHover(InputMenuViewState* self, Ctx* cx,
-                                const HoverEvent* event, intptr_t ix) {
+                                const HoverEvent* event, int64_t ix) {
         if (!self || !self->input || !event || !event->hovered || ix < 0 ||
             ix >= self->input->codeActions.items.len ||
             self->input->codeActions.selected == ix) {
@@ -72152,14 +76353,17 @@ El* CompletionMenu::IntoEl() {
 
     El* list = PopoverSurface(
         cx,
-        Div(a)->FlexCol()->MinW(120)->MaxW(maxW)->MaxH(240)->ClipY()->Pad(4));
+
+        Div(a)->FlexCol()->MinW(120)->MaxW(maxW)->MaxH(240)->ClipY()->Pad(
+            Rems(cx, 0.25f)));
     for (int i = 0; i < editor->completion.items.len; i++) {
         const CompletionItem& item = editor->completion.items[i];
         bool selected = i == editor->completion.selected;
         El* row = Div(a)
                       ->FlexRow()
-                      ->Gap(8)
-                      ->Pad(4)
+
+                      ->Gap(Rems(cx, 0.5f))
+                      ->Pad(Rems(cx, 0.25f))
                       ->ItemsCenter()
                       ->Radius(theme.radius * 0.5f)
                       ->Font(12)
@@ -72205,16 +76409,20 @@ El* CompletionMenu::IntoEl() {
             }
         }
         TextViewStyle textStyle = TextViewStyle::Default();
-        textStyle.WithParagraphGap(8);
-        menu->Child(
-            PopoverSurface(
-                cx,
-                Div(a)->W(configuredMax)->MaxH(240)->ClipY()->PadX(8)->PadY(4))
-                ->Child(TextView::New(cx, documentation)
-                            ->Font(12)
-                            ->Style(textStyle)
-                            ->Selectable()
-                            ->IntoEl()));
+        textStyle.WithParagraphGap(Rems(cx, 0.5f));
+        menu->Child(PopoverSurface(cx,
+
+                                   Div(a)
+                                       ->W(configuredMax)
+                                       ->MaxH(240)
+                                       ->ClipY()
+                                       ->PadX(Rems(cx, 0.5f))
+                                       ->PadY(Rems(cx, 0.25f)))
+                        ->Child(TextView::New(cx, documentation)
+                                    ->Font(12)
+                                    ->Style(textStyle)
+                                    ->Selectable()
+                                    ->IntoEl()));
     }
     return Div(a)
         ->Fixed()
@@ -72264,7 +76472,9 @@ El* CodeActionMenu::IntoEl() {
     if (maxW < 120.f) maxW = 120.f;
     El* list = PopoverSurface(
         cx,
-        Div(a)->FlexCol()->MinW(120)->MaxW(maxW)->MaxH(480)->ClipY()->Pad(4));
+
+        Div(a)->FlexCol()->MinW(120)->MaxW(maxW)->MaxH(480)->ClipY()->Pad(
+            Rems(cx, 0.25f)));
     Entity<InputMenuViewState> view =
         InputMenuView(cx, state, "code-action-menu");
     for (int i = 0; i < state->codeActions.items.len; i++) {
@@ -72272,8 +76482,9 @@ El* CodeActionMenu::IntoEl() {
         El* row = Div(a)
                       ->FlexRow()
                       ->W(kFill)
-                      ->Gap(8)
-                      ->Pad(4)
+
+                      ->Gap(Rems(cx, 0.5f))
+                      ->Pad(Rems(cx, 0.25f))
                       ->ItemsCenter()
                       ->Radius(theme.radius * 0.5f)
                       ->Font(12)
@@ -72319,7 +76530,7 @@ El* DiagnosticPopover::IntoEl() {
         foreground = theme.cyan;
     Rgba background = RgbaMix(theme.background, foreground, 0.8f);
     TextViewStyle textStyle = TextViewStyle::Default();
-    textStyle.WithParagraphGap(8);
+    textStyle.WithParagraphGap(Rems(cx, 0.5f));
     El* body = TextView::New(cx, item.message)
                    ->Font(12)
                    ->Style(textStyle)
@@ -72330,8 +76541,9 @@ El* DiagnosticPopover::IntoEl() {
                       ->MaxW(500)
                       ->MaxH(320)
                       ->ClipY()
-                      ->PadX(4)
-                      ->PadY(2)
+
+                      ->PadX(Rems(cx, 0.25f))
+                      ->PadY(Rems(cx, 0.125f))
                       ->Radius(theme.radius)
                       ->Bg(background)
                       ->Fg(foreground)
@@ -72369,9 +76581,14 @@ El* HoverPopover::IntoEl() {
     if (!editor || len(hover) <= 0) return nullptr;
     const Theme& theme = ThemeNow(cx->app);
     TextViewStyle textStyle = TextViewStyle::Default();
-    textStyle.WithParagraphGap(8);
-    El* surface = PopoverSurface(
-        cx, Div(a)->MinW(200)->MaxW(500)->MaxH(320)->ClipY()->PadX(8)->PadY(4));
+    textStyle.WithParagraphGap(Rems(cx, 0.5f));
+    El* surface = PopoverSurface(cx, Div(a)
+                                         ->MinW(200)
+                                         ->MaxW(500)
+                                         ->MaxH(320)
+                                         ->ClipY()
+                                         ->PadX(Rems(cx, 0.5f))
+                                         ->PadY(Rems(cx, 0.25f)));
     surface
         ->Child(TextView::New(cx, hover)
                     ->Font(12)
@@ -72572,6 +76789,13 @@ static void SynHlUpdate(void* data, const InputEdit* edit, Str text,
     SynHlLexInto(hl->lang, text, &hl->runs, &hl->folds);
 }
 
+static void SynHlUpdateBatch(void* data, const InputEditWithText* edits, int n,
+                             bool folding) {
+    if (n > 0) {
+        SynHlUpdate(data, &edits[n - 1].edit, edits[n - 1].text, folding);
+    }
+}
+
 static void SynHlLexWork(SynHlJob* job) {
     SynHlLexInto(job->lang, Str(job->text, job->len), &job->runs, &job->folds);
 }
@@ -72751,6 +76975,7 @@ static SyntaxInputHighlighter* SynHlEnsure(InputState* s, SyntaxLang lang) {
     s->highlighter.data = hl;
     s->highlighter.language = &SynHlLanguage;
     s->highlighter.update = &SynHlUpdate;
+    s->highlighter.updateBatch = &SynHlUpdateBatch;
     s->highlighter.styles = &SynHlStyles;
     s->highlighter.foldRanges = &SynHlFoldRanges;
     s->highlighter.drop = &SynHlDrop;
@@ -72877,12 +77102,7 @@ El* Highlighter::IntoEl() {
             hl->foreground = th.foreground;
             if (!hl->valid || hl->version != state->docVersion) {
                 if (len(text) <= kSyncLexMaxBytes) {
-                    InputEdit whole = {};
-                    whole.oldEndByte = -1;
-                    whole.newEndByte = len(text);
-                    const InputEdit* edit =
-                        state->hasPendingEdit ? &state->pendingEdit : &whole;
-                    state->highlighter.Update(edit, text, folding);
+                    InputDriveHighlighter(state, folding);
                     hl->valid = true;
                     hl->version = state->docVersion;
                 } else if (!hl->flight) {
@@ -72918,7 +77138,10 @@ El* Highlighter::IntoEl() {
                     }
                 }
             }
-            state->hasPendingEdit = false;
+            if (state->hasPendingEdit) {
+
+                InputSkipHighlighterEdits(state);
+            }
             if (folding) {
                 FoldRange* ranges = nullptr;
                 int nRanges = state->highlighter.FoldRanges(
@@ -72963,6 +77186,8 @@ El* Highlighter::IntoEl() {
     if (state && h > 0) {
         state->viewH = h - editorPad.top - editorPad.bottom;
     }
+
+    style.activeLineBleedL = editorPad.left;
     El* editor = gpui::Editor::New(cx, state, style);
     bool padded = editorPad.left != 0 || editorPad.right != 0 ||
                   editorPad.top != 0 || editorPad.bottom != 0;
@@ -72982,7 +77207,7 @@ El* Highlighter::IntoEl() {
 
         scroller =
             InputBase::New(cx, id, true, AccessibilityRole::MultilineTextInput)
-                ->BindInput(state)
+                ->BindInputText(state)
                 ->FlexCol()
                 ->W(kFill)
                 ->H(h)
@@ -73130,9 +77355,9 @@ El* HoverCard::IntoEl() {
         if (anchor == PopupAnchor::BottomLeft ||
             anchor == PopupAnchor::BottomCenter ||
             anchor == PopupAnchor::BottomRight) {
-            card->Bottom(4);
+            card->Bottom(Rems(cx, 0.25f));
         } else {
-            card->Top(4);
+            card->Top(Rems(cx, 0.25f));
         }
         PopupPlaceContent(card, anchor);
     }
@@ -73293,7 +77518,7 @@ Icon* Icon::Size(float v) {
 }
 
 Icon* Icon::Size(UiSize v) {
-    size = UiIconPx(v);
+    size = UiIconPx(cx, v);
     hasSize = true;
     return this;
 }
@@ -73394,9 +77619,9 @@ El* InputToken::IntoEl() {
         Div(a)
             ->FlexRow()
             ->ItemsCenter()
-            ->Gap(4)
-            ->PadX(4)
-            ->H(context.lineHeight > 0 ? context.lineHeight : 20.f)
+            ->Gap(Rems(cx, 0.25f))
+            ->PadX(Rems(cx, 0.25f))
+            ->H(context.lineHeight > 0 ? context.lineHeight : Rems(cx, 1.25f))
             ->MaxW(context.availableWidth > 0 ? context.availableWidth : kFill)
             ->Radius(th.radius)
             ->Border(1, context.selected ? RgbaOpacity(th.selection, 1.f)
@@ -73407,7 +77632,7 @@ El* InputToken::IntoEl() {
         el->Opacity(0.5f);
     }
     if (hasIcon) {
-        el->Child(IconEl(a, icon, 12)->Shrink0());
+        el->Child(IconEl(a, icon, Rems(cx, 0.75f))->Shrink0());
     }
     el->Child(TextEl(a, context.Token().label)->MinW(0));
     return el;
@@ -73489,7 +77714,7 @@ Str AnyInputState::Value(Arena* a, App* app) const {
     if (kind == AnyInputKind::Otp) {
         OtpState* state = otp.Get(app);
         if (!state) return {};
-        Str value(state->value, state->len);
+        Str value = OtpValue(state);
         return state->masked ? MaskedInputValue(a, value) : StrDup(a, value);
     }
     if (!text) return {};
@@ -73509,69 +77734,34 @@ FocusHandle AnyInputState::FocusHandleOf(const Window* window, App* app) const {
                                                      : FocusHandle{};
 }
 
+static FocusHandle InputFrameFocus(Ctx* cx, InputState* state) {
+    if (!state) return {};
+    if (!state->frameFocus.IsValid()) state->frameFocus = FocusHandleNew(cx);
+    return state->frameFocus;
+}
+
+static bool InputFrameFocused(Ctx* cx, InputState* state, bool disabled) {
+    if (!state || disabled) return false;
+    return state->focused ||
+           FocusHandleContainsFocused(cx->win, InputFrameFocus(cx, state));
+}
+
+static void InputTrackFrameFocus(Ctx* cx, El* frame, InputState* state) {
+    if (!state) return;
+    frame->TrackFocus(InputFrameFocus(cx, state))
+        ->TabStop(false)
+        ->FocusOnPress(false);
+}
+
 bool AnyInputState::operator==(const AnyInputState& other) const {
     return kind == other.kind && text == other.text && otp.id == other.otp.id;
 }
 
 struct InputContextMenuState {
     InputState* state = nullptr;
-    bool disabled = false;
-    EditorContextMenuFn build = nullptr;
-    void* data = nullptr;
-    bool pending = false;
-
-    static void OnMouseDown(InputContextMenuState* self, Ctx* cx,
-                            const MouseDownEvent* event) {
-        InputState* s = self->state;
-        if (!s || !event || event->button != MouseButton::Right ||
-            event->phase != DispatchPhase::Bubble || !s->enableContextMenu) {
-            return;
-        }
-        int offset =
-            InputIndexForPosition(s, &cx->win->paint, event->x, event->y);
-        if (!s->selectedRange.Contains(offset)) {
-            InputMoveTo(s, cx->app, cx->win, offset);
-        }
-        self->pending = true;
-    }
-
-    static void OnMouseUp(InputContextMenuState* self, Ctx* cx,
-                          const MouseUpEvent* event) {
-        if (!event || event->button != MouseButton::Right || !self->pending) {
-            return;
-        }
-        self->pending = false;
-        InputState* s = self->state;
-        if (!s || self->disabled || s->disabled ||
-            BaseIsInDeferredContext(cx->app)) {
-            return;
-        }
-        NativeMenu* menu = NativeMenu::New(cx);
-        if (self->build) {
-            menu = self->build(cx, menu, self->data);
-        } else {
-
-            gpui::NativeMenu rows;
-            InputDefaultNativeMenu(s, &rows);
-            for (int i = 0; i < rows.items.len; i++) {
-                const gpui::NativeMenuItem& row = rows.items[i];
-                if (row.kind == gpui::NativeMenuItemKind::Separator) {
-                    menu->Separator();
-                    continue;
-                }
-                Str label = Tr(fmt("Input.%s", row.label).s);
-                menu->MenuWithDisabled(label, row.disabled, i + 1);
-            }
-            menu->OnSelect(Listen(cx, &InputContextMenuState::OnSelect));
-        }
-        if (menu && !menu->IsEmpty()) {
-            menu->Show(event->x, event->y);
-            WindowStopPropagation(cx);
-        }
-    }
 
     static void OnSelect(InputContextMenuState* self, Ctx* cx,
-                         const ClickEvent*, intptr_t id) {
+                         const ClickEvent*, int64_t id) {
         InputState* s = self->state;
         if (!s) {
             return;
@@ -73587,25 +77777,264 @@ struct InputContextMenuState {
     }
 };
 
+struct InputContextMenu {
+    InputState* state = nullptr;
+    bool disabled = false;
+    EditorContextMenuFn build = nullptr;
+    void* data = nullptr;
+    EntityId selection = {};
+
+    static void Drop(void* user) { delete (InputContextMenu*)user; }
+
+    static void Show(void* user, gpui::NativeMenu*,
+                     const InputContextMenuCapabilities&, Point position,
+                     App* app, Window* win) {
+        auto* self = (InputContextMenu*)user;
+        InputState* s = self ? self->state : nullptr;
+        if (!s || self->disabled || !win) {
+            return;
+        }
+        Ctx cx = {};
+        cx.app = app;
+        cx.win = win;
+        cx.a = win->frameArena;
+        cx.self = self->selection;
+        NativeMenu* menu = NativeMenu::New(&cx);
+        if (self->build) {
+            menu = self->build(&cx, menu, self->data);
+        } else {
+
+            gpui::NativeMenu rows;
+            InputDefaultNativeMenu(s, &rows);
+            for (int i = 0; i < rows.items.len; i++) {
+                const gpui::NativeMenuItem& row = rows.items[i];
+                if (row.kind == gpui::NativeMenuItemKind::Separator) {
+                    menu->Separator();
+                    continue;
+                }
+                Str label = Tr(fmt("Input.%s", row.label).s);
+                menu->MenuWithDisabled(label, row.disabled, i + 1);
+            }
+            menu->OnSelect(Listen(&cx, &InputContextMenuState::OnSelect));
+        }
+        if (menu && !menu->IsEmpty()) {
+            menu->Show(position.x, position.y);
+        }
+    }
+};
+
 static void BindInputContextMenu(Ctx* cx, El* e, Str id, InputState* state,
                                  bool disabled, EditorContextMenuFn build,
                                  void* data) {
-    if (!state || disabled) {
+    (void)e;
+    if (!state) {
         return;
     }
-    Entity<InputContextMenuState> menuState =
+    Entity<InputContextMenuState> selection =
         ElementStateEntity<InputContextMenuState>(
             cx, id, StrL("component::InputContextMenu"));
-    InputContextMenuState* menu = menuState.Get(cx);
+    if (InputContextMenuState* st = selection.Get(cx)) {
+        st->state = state;
+    }
+    auto* menu = state->contextMenuHandler == &InputContextMenu::Show
+                     ? (InputContextMenu*)state->contextMenuData
+                     : nullptr;
     if (!menu) {
-        return;
+        menu = new InputContextMenu();
+        InputOnContextMenu(state, &InputContextMenu::Show, menu,
+                           &InputContextMenu::Drop);
     }
     menu->state = state;
     menu->disabled = disabled;
     menu->build = build;
     menu->data = data;
-    e->OnMouseDown(ListenTo(menuState, &InputContextMenuState::OnMouseDown));
-    e->OnMouseUp(ListenTo(menuState, &InputContextMenuState::OnMouseUp));
+    menu->selection = selection.id;
+}
+
+struct InputTouchSelectionState {
+    InputState* state = nullptr;
+
+    static void Act(InputTouchSelectionState* self, Ctx* cx,
+                    InputAction action) {
+        if (self->state) {
+            InputPerform(self->state, cx->app, cx->win, action, false);
+            Notify(cx);
+        }
+    }
+    static void OnCut(InputTouchSelectionState* self, Ctx* cx,
+                      const ClickEvent*) {
+        Act(self, cx, InputAction::Cut);
+    }
+    static void OnCopy(InputTouchSelectionState* self, Ctx* cx,
+                       const ClickEvent*) {
+        Act(self, cx, InputAction::Copy);
+        if (self->state) {
+            InputCloseEditMenu(self->state, cx->app, cx->win);
+        }
+    }
+    static void OnPaste(InputTouchSelectionState* self, Ctx* cx,
+                        const ClickEvent*) {
+        Act(self, cx, InputAction::Paste);
+    }
+    static void OnSelectAll(InputTouchSelectionState* self, Ctx* cx,
+                            const ClickEvent*) {
+        if (self->state) {
+            InputSelectAllFromEditMenu(self->state, cx->app, cx->win);
+            Notify(cx);
+        }
+    }
+
+    static void Press(InputTouchSelectionState* self, Ctx* cx,
+                      const MouseDownEvent* ev, SelectionEdge edge) {
+        if (!self->state || !ev || ev->button != MouseButton::Left) {
+            return;
+        }
+        WindowPreventDefault(cx);
+        WindowStopPropagation(cx);
+        InputBeginEdgeDrag(self->state, cx->app, cx->win, edge, {ev->x, ev->y});
+        Notify(cx);
+    }
+    static void OnStartDown(InputTouchSelectionState* self, Ctx* cx,
+                            const MouseDownEvent* ev) {
+        Press(self, cx, ev, SelectionEdge::Start);
+    }
+    static void OnEndDown(InputTouchSelectionState* self, Ctx* cx,
+                          const MouseDownEvent* ev) {
+        Press(self, cx, ev, SelectionEdge::End);
+    }
+    static void OnDragMove(InputTouchSelectionState* self, Ctx* cx,
+                           const DragMoveEvent* ev) {
+        if (self->state && ev && self->state->touchDragging) {
+            InputUpdateEdgeDrag(self->state, cx->app, cx->win,
+                                {ev->event.x, ev->event.y});
+            Notify(cx);
+        }
+    }
+    static void OnUp(InputTouchSelectionState* self, Ctx* cx,
+                     const MouseUpEvent*) {
+        if (self->state && self->state->touchDragging) {
+            InputEndEdgeDrag(self->state, cx->app, cx->win);
+            Notify(cx);
+        }
+    }
+};
+
+struct InputTouchHandlesPaint {
+    InputState* state = nullptr;
+    Rgba color = {};
+};
+
+static void PaintInputTouchHandles(PaintCtx* ctx, El*, void* user) {
+    auto* p = (InputTouchHandlesPaint*)user;
+    TouchSelectionSnapshot snap = {};
+    if (!p || !ctx->window ||
+        !InputTouchSelection(p->state, ctx->window, &snap) || snap.IsEmpty()) {
+        return;
+    }
+    Rgba c = PaintFade(ctx, p->color);
+    for (SelectionEdge edge : {SelectionEdge::Start, SelectionEdge::End}) {
+        if (!snap.IsEdgeVisible(edge)) {
+            continue;
+        }
+        Bounds caret = snap.Edge(edge);
+        Bounds bar = TouchHandle::BarBounds(caret);
+        Bounds knob = TouchHandle::KnobBounds(edge, caret);
+        FillRound(ctx, bar.x, bar.y, bar.w, bar.h, 0, c);
+        FillRound(ctx, knob.x, knob.y, knob.w, knob.h,
+                  TouchHandle::kKnobSize * 0.5f, c);
+    }
+}
+
+static void InputTouchSelectionLayer(Ctx* cx, El* e, Str id,
+                                     InputState* state) {
+    TouchSelectionSnapshot snap = {};
+    if (!state || !cx->win || !InputTouchSelection(state, cx->win, &snap)) {
+        return;
+    }
+    Entity<InputTouchSelectionState> ent =
+        ElementStateEntity<InputTouchSelectionState>(
+            cx, id, StrL("component::InputTouchSelection"));
+    InputTouchSelectionState* st = ent.Get(cx);
+    if (!st) {
+        return;
+    }
+    st->state = state;
+    Arena* a = cx->a;
+    const Theme& th = ThemeNow(cx->app);
+
+    if (!snap.IsEmpty()) {
+        auto* paint = ArenaNew<InputTouchHandlesPaint>(a);
+        paint->state = state;
+        paint->color = th.selection;
+        paint->color.a = 255;
+        WinSize size = WindowSize(cx->win);
+        Bounds window = {0, 0, size.dipW, size.dipH};
+        El* handles =
+            Div(a)->Fixed()->Left(0)->Top(0)->W(window.w)->H(window.h);
+        handles->customPaint = &PaintInputTouchHandles;
+        handles->customUser = paint;
+        for (SelectionEdge edge : {SelectionEdge::Start, SelectionEdge::End}) {
+            Bounds caret = snap.Edge(edge);
+            if (!snap.IsEdgeVisible(edge) ||
+                !window.Contains({caret.x, caret.y})) {
+                continue;
+            }
+            Bounds hit = TouchHandle::HitBounds(edge, caret);
+            bool start = edge == SelectionEdge::Start;
+            El* knob = Div(a)
+                           ->Fixed()
+                           ->Left(hit.x)
+                           ->Top(hit.y)
+                           ->W(hit.w)
+                           ->H(hit.h)
+                           ->PathClick(start ? StrL("touch-handle-start")
+                                             : StrL("touch-handle-end"))
+                           ->SuppressTextSelection()
+                           ->StopMouseDown();
+            knob->OnMouseDown(
+                start ? ListenTo(ent, &InputTouchSelectionState::OnStartDown)
+                      : ListenTo(ent, &InputTouchSelectionState::OnEndDown));
+            knob->OnDragMove(
+                ListenTo(ent, &InputTouchSelectionState::OnDragMove));
+            knob->OnMouseUp(ListenTo(ent, &InputTouchSelectionState::OnUp));
+            knob->OnMouseUpOut(ListenTo(ent, &InputTouchSelectionState::OnUp));
+            handles->Child(knob);
+        }
+        e->Child(handles->DeferredLayer(kPaintLayerPopup));
+    }
+
+    InputContextMenuCapabilities caps = InputContextMenuCapabilities::Of(state);
+    bool editable = caps.IsEditable();
+    bool copyable = caps.IsCopyable();
+
+    bool pasteable = editable;
+    Str text = InputValue(state);
+    Selection sel = state->selectedRange;
+    bool allSelected =
+        sel.start == 0 && sel.end == len(text) && state->extraCursors.len == 0;
+    bool selectable = len(text) > 0 && !allSelected;
+    TouchSelectionOverlay* overlay =
+        TouchSelectionOverlay::New(cx, StrL("input-touch-selection"))
+            ->Snapshot(snap);
+    if (editable && copyable) {
+        overlay->Item(Tr("Input.Cut"),
+                      ListenTo(ent, &InputTouchSelectionState::OnCut));
+    }
+    if (copyable) {
+        overlay->Item(Tr("Input.Copy"),
+                      ListenTo(ent, &InputTouchSelectionState::OnCopy));
+    }
+    if (pasteable) {
+        overlay->Item(Tr("Input.Paste"),
+                      ListenTo(ent, &InputTouchSelectionState::OnPaste));
+    }
+    if (selectable) {
+        overlay->Item(Tr("Input.Select All"),
+                      ListenTo(ent, &InputTouchSelectionState::OnSelectAll));
+    }
+    if (El* menu = overlay->IntoEl()) {
+        e->Child(menu);
+    }
 }
 
 Editor* Editor::New(Ctx* cx, InputState* state) {
@@ -73771,6 +78200,7 @@ El* Editor::IntoEl() {
     if (disabled) element->Opacity(0.5f);
     if (styleFields) element->Refine(style, styleFields);
 
+    InputTouchSelectionLayer(cx, element, id, state);
     BindInputContextMenu(cx, element, id, state, disabled, contextMenu,
                          contextMenuData);
     return element;
@@ -73903,29 +78333,29 @@ Input* Input::OnToggleMask(Listener fn) {
     return this;
 }
 
-static const float kInputHeight = 32;
+static const float kInputHeightRems = 2;
 static const float kInputPadX = 10;
 static const float kInputPadY = 8;
 static const float kInputGap = 6;
 static const float kInputTextSize = 14;
 
-static void InputSizeMetrics(UiSize size, float* h, float* padX, float* padY,
-                             float* font) {
-    *h = kInputHeight;
+static void InputSizeMetrics(const Ctx* cx, UiSize size, float* h, float* padX,
+                             float* padY, float* font) {
+    *h = Rems(cx, kInputHeightRems);
     *padX = kInputPadX;
     *padY = kInputPadY;
     *font = kInputTextSize;
     if (size == UiSize::Large) {
-        *h = 44;
+        *h = Rems(cx, 2.75f);
         *padX = 12;
         *padY = 10;
         *font = 16;
     } else if (size == UiSize::Small) {
-        *h = 24;
+        *h = Rems(cx, 1.5f);
         *padX = 8;
         *padY = 2;
     } else if (size == UiSize::XSmall) {
-        *h = 20;
+        *h = Rems(cx, 1.25f);
         *padX = 4;
         *padY = 0;
         *font = 12;
@@ -74065,7 +78495,8 @@ El* Input::IntoEl() {
     if (col) {
         col->Child(TextEl(a, label)->Font(12)->Fg(th.foreground));
     }
-    bool focused = state && state->focused && !disabled;
+    bool inputFocused = state && state->focused && !disabled;
+    bool focused = InputFrameFocused(cx, state, disabled);
     if (state) {
         bool editable = !disabled && !readonly && !state->readonly;
         state->pasteHandler = editable ? onPaste : nullptr;
@@ -74076,12 +78507,12 @@ El* Input::IntoEl() {
             state, tokenRenderer ? tokenRenderer : &DefaultInputTokenRender,
             tokenRendererUser, tokenClick, tokenClickUser, secret);
     }
-    if (focused && !readonly && !(state && state->readonly)) {
+    if (inputFocused && !readonly && !(state && state->readonly)) {
         WindowSetTextContentType(
             cx->win, InputNativeContentType(hasContentType, contentType));
     }
     float h = 0, padX = 0, padY = 0, font = 0;
-    InputSizeMetrics(size, &h, &padX, &padY, &font);
+    InputSizeMetrics(cx, size, &h, &padX, &padY, &font);
     InputEditorStyle editor;
     editor.foreground = hasTextColor ? textColor : th.foreground;
     editor.mutedForeground = th.mutedFg;
@@ -74115,6 +78546,7 @@ El* Input::IntoEl() {
                     ->ItemsCenter()
 
                     ->ClipX();
+    if (!disabled) InputTrackFrameFocus(cx, field, state);
     if (state) {
         if (state->placeholder.s) {
             field->AriaPlaceholder(state->placeholder);
@@ -74188,6 +78620,7 @@ El* Input::IntoEl() {
             field->OnClick(onChange);
         }
     }
+    InputTouchSelectionLayer(cx, field, id, state);
     BindInputContextMenu(cx, field, id, state, disabled, contextMenu,
                          contextMenuData);
     if (!col) {
@@ -74281,10 +78714,10 @@ Textarea* Textarea::OnPaste(InputPasteFn fn, void* data) {
 
 El* Textarea::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
-    bool focused = state && state->focused && !disabled;
+    bool focused = InputFrameFocused(cx, state, disabled);
 
     float inputH = 0, padX = 0, padY = 0, font = 0;
-    InputSizeMetrics(size, &inputH, &padX, &padY, &font);
+    InputSizeMetrics(cx, size, &inputH, &padX, &padY, &font);
     InputEditorStyle editor;
     editor.foreground = th.foreground;
     editor.mutedForeground = th.mutedFg;
@@ -74317,7 +78750,7 @@ El* Textarea::IntoEl() {
 
     float h = (height > 0 || height == kFill)
                   ? height
-                  : (float)shownRows * 20.f + 2 * padY + 2;
+                  : (float)shownRows * Rems(cx, 1.25f) + 2 * padY + 2;
 
     if (state && h > 0) {
         state->viewH = h - 2 * padY;
@@ -74335,6 +78768,7 @@ El* Textarea::IntoEl() {
 
                   ->ScrollFromPath()
                   ->Child(gpui::Textarea::New(cx, state, editor));
+    if (interactive) InputTrackFrameFocus(cx, box, state);
     if (accessibilityId.s) {
         box->AccessibilityId(accessibilityId);
     }
@@ -74357,6 +78791,7 @@ El* Textarea::IntoEl() {
     if (ariaLabel.s) {
         box->AriaLabel(ariaLabel);
     }
+    InputTouchSelectionLayer(cx, box, id, state);
     BindInputContextMenu(cx, box, id, state, disabled, contextMenu,
                          contextMenuData);
 
@@ -74418,7 +78853,7 @@ NumberInput* NumberInput::Step(double value) {
     hasNumberStep = true;
     return this;
 }
-NumberInput* NumberInput::StepBy(NumberStepByValueFn fn, intptr_t arg) {
+NumberInput* NumberInput::StepBy(NumberStepByValueFn fn, int64_t arg) {
     numberStep = NumberStep::ByValue(fn, arg);
     hasNumberStep = true;
     return this;
@@ -74459,17 +78894,18 @@ NumberInput* NumberInput::OnDec(Listener fn) {
 }
 El* NumberInput::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
-    float h = 32, btn = 32, font = 14;
+
+    float h = Rems(cx, 2.f), btn = Rems(cx, 2.f), font = 14;
     if (size == UiSize::Large) {
-        h = 44;
-        btn = 32;
+        h = Rems(cx, 2.75f);
+        btn = Rems(cx, 2.f);
         font = 16;
     } else if (size == UiSize::Small) {
-        h = 24;
-        btn = 24;
+        h = Rems(cx, 1.5f);
+        btn = Rems(cx, 1.5f);
     } else if (size == UiSize::XSmall) {
-        h = 20;
-        btn = 24;
+        h = Rems(cx, 1.25f);
+        btn = Rems(cx, 1.5f);
         font = 12;
     }
     Rgba border = disabled ? RgbaOpacity(th.inputBorder, 0.5f) : th.inputBorder;
@@ -74590,7 +79026,7 @@ OtpInput* OtpInput::New(Ctx* cx, Str id, Entity<OtpState> state) {
     o->id = id;
     o->state = state;
     if (OtpState* s = state.Get(cx)) {
-        o->value = s->value;
+        o->value = OtpValue(s).s;
         o->len = s->len;
         o->slots = s->length;
         o->masked = s->masked;
@@ -74639,14 +79075,14 @@ OtpInput* OtpInput::OnFocus(Listener fn) {
 El* OtpInput::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
 
-    float cell = 32, text = UiInputFontPx(size);
+    float cell = Rems(cx, 2.f), text = UiInputFontPx(size);
     if (cellPx > 0) {
         cell = cellPx;
         text = cellPx * 0.5f;
     } else if (size == UiSize::Large) {
-        cell = 44;
+        cell = Rems(cx, 2.75f);
     } else if (size == UiSize::Small || size == UiSize::XSmall) {
-        cell = 24;
+        cell = Rems(cx, 1.5f);
     }
     int nGroups = groups < 1 ? 1 : (groups > slots ? slots : groups);
     int per = (slots + nGroups - 1) / nGroups;
@@ -74661,14 +79097,14 @@ El* OtpInput::IntoEl() {
                   ->FocusRing(focusRing)
                   ->FlexRow()
                   ->ItemsCenter()
-                  ->Gap(20);
+                  ->Gap(Rems(cx, 1.25f));
     if (onFocus.IsValid() && !disabled) {
         row->OnClick(onFocus);
     }
     El* group = nullptr;
     for (int i = 0; i < slots; i++) {
         if (i % per == 0) {
-            group = Div(a)->FlexRow()->ItemsCenter()->Gap(4);
+            group = Div(a)->FlexRow()->ItemsCenter()->Gap(Rems(cx, 0.25f));
             row->Child(group);
         }
         El* box = Div(a)
@@ -74691,7 +79127,7 @@ El* OtpInput::IntoEl() {
             } else {
                 Str ch(value + i, 1);
                 box->Child(TextEl(a, StrDup(a, ch))
-                               ->Font(text)
+                               ->Font(cellPx > 0 ? FontPx(cx, text) : text)
                                ->LineHeight(1.f)
                                ->Fg(fg));
             }
@@ -74901,15 +79337,15 @@ El* SearchPanel::IntoEl() {
                     ->Id(id)
                     ->FlexCol()
                     ->W(kFill)
-                    ->PadY(8)
-                    ->PadX(12)
-                    ->Gap(4)
+                    ->PadY(Rems(cx, 0.5f))
+                    ->PadX(Rems(cx, 0.75f))
+                    ->Gap(Rems(cx, 0.25f))
                     ->Bg(th.tokens.popover)
                     ->BorderB(1, th.border)
                     ->Radius(th.radius * 0.5f)
                     ->OnKeyDown(ListenTo(ent, &SearchPanelState::OnKey));
 
-    El* row = Div(a)->FlexRow()->W(kFill)->Gap(8)->ItemsCenter();
+    El* row = Div(a)->FlexRow()->W(kFill)->Gap(Rems(cx, 0.5f))->ItemsCenter();
     El* caseBtn = Button::New(cx, StrL("case-insensitive"))
                       ->Text()
                       ->Compact()
@@ -74918,7 +79354,7 @@ El* SearchPanel::IntoEl() {
                       ->Selected(!ss->caseInsensitive)
                       ->OnClick(ListenTo(ent, &SearchPanelState::OnToggleCase))
                       ->IntoEl();
-    El* queryBox = Div(a)->FlexRow()->Flex1()->Gap(4);
+    El* queryBox = Div(a)->FlexRow()->Flex1()->Gap(Rems(cx, 0.25f));
     queryBox->Child(Input::New(cx, StrL("q"), &st->query)
                         ->WithSize(UiSize::Small)
                         ->FocusRing(false)
@@ -74952,10 +79388,10 @@ El* SearchPanel::IntoEl() {
                    ->IntoEl());
     row->Child(TextEl(a, SearchMatcherLabel(a, &ss->matcher))
                    ->Font(14)
-                   ->MinW(64)
+                   ->MinW(Rems(cx, 4.f))
                    ->Fg(hasMatches ? th.foreground : th.mutedFg));
 
-    row->Child(Div(a)->W(28));
+    row->Child(Div(a)->W(Rems(cx, 1.75f)));
     row->Child(Button::New(cx, StrL("close"))
                    ->Ghost()
                    ->WithSize(UiSize::XSmall)
@@ -74965,7 +79401,8 @@ El* SearchPanel::IntoEl() {
     panel->Child(row);
 
     if (ss->replaceMode && allowReplace) {
-        El* row2 = Div(a)->FlexRow()->W(kFill)->Gap(8)->ItemsCenter();
+        El* row2 =
+            Div(a)->FlexRow()->W(kFill)->Gap(Rems(cx, 0.5f))->ItemsCenter();
 
         float w = st->queryBounds.w > 1 ? st->queryBounds.w : kFill;
         El* rep = Input::New(cx, StrL("r"), &st->replacement)
@@ -75133,10 +79570,13 @@ El* InputGroupButton::RenderInGroup(bool disabled) {
 
         button->WithSize(UiSize::Medium);
         button->contentTextPx = 14.f;
-        button->contentLineH = 20.f;
-        button->contentGap = size == UiSize::XSmall ? 4.f : 6.f;
 
-        button->contentIconPx = size == UiSize::XSmall ? 14.f : 16.f;
+        button->contentLineH = 20.f;
+        button->contentGap = Rems(cx, size == UiSize::XSmall ? 0.25f : 0.375f);
+
+        button->contentIconPx =
+            UiIconPx(cx, size == UiSize::XSmall ? UiSize(UiSize::Small)
+                                                : UiSize(UiSize::Medium));
     } else {
         button->WithSize(size);
     }
@@ -75167,13 +79607,14 @@ El* InputGroupButton::RenderInGroup(bool disabled) {
         el->Border(1, th.transparent);
     }
     if (compact) {
-        float side = size == UiSize::XSmall ? 24.f : 32.f;
+
+        float side = Rems(cx, size == UiSize::XSmall ? 1.5f : 2.f);
         float radius = size == UiSize::XSmall ? th.radius * 0.5f : th.radius;
         el->H(side)->Radius(radius);
         if (iconOnly) {
             el->W(side)->Pad(0);
         } else {
-            el->PadX(size == UiSize::XSmall ? 8.f : 10.f);
+            el->PadX(Rems(cx, size == UiSize::XSmall ? 0.5f : 0.625f));
         }
     }
     refiner.Apply(el);
@@ -75206,8 +79647,12 @@ static El* InputGroupAddonChildEl(Arena* a, El* child) {
 El* InputGroupText::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
 
-    El* row =
-        Div(a)->FlexRow()->Gap(8)->ItemsCenter()->Font(14)->Fg(th.mutedFg);
+    El* row = Div(a)
+                  ->FlexRow()
+                  ->Gap(Rems(cx, 0.5f))
+                  ->ItemsCenter()
+                  ->Font(14)
+                  ->Fg(th.mutedFg);
     refiner.Apply(row);
     for (El* c : children) {
         if (c) {
@@ -75256,12 +79701,12 @@ El* InputGroupAddon::IntoEl() {
 El* InputGroupAddon::RenderInGroup(bool disabled) {
     const Theme& th = ThemeNow(cx->app);
     float inputH = 0, inputPx = 0, inputPy = 0, inputFont = 0;
-    InputSizeMetrics(size, &inputH, &inputPx, &inputPy, &inputFont);
+    InputSizeMetrics(cx, size, &inputH, &inputPx, &inputPy, &inputFont);
 
     El* row = Div(a)
                   ->Id(id)
                   ->FlexRow()
-                  ->Gap(8)
+                  ->Gap(Rems(cx, 0.5f))
                   ->ItemsCenter()
                   ->Shrink0()
                   ->JustifyCenter()
@@ -75270,20 +79715,20 @@ El* InputGroupAddon::RenderInGroup(bool disabled) {
                   ->Fg(th.mutedFg)
                   ->Cursor(CursorKind::IBeam);
     bool compact = size == UiSize::XSmall || size == UiSize::Small;
-    row->PadY(compact ? 0.f : 6.f);
+    row->PadY(compact ? 0.f : Rems(cx, 0.375f));
     switch (alignment) {
         case InputGroupAddonAlignment::InlineStart:
-            row->PadL(6);
+            row->PadL(Rems(cx, 0.375f));
             break;
         case InputGroupAddonAlignment::InlineEnd:
-            row->PadR(6);
+            row->PadR(Rems(cx, 0.375f));
             break;
 
         case InputGroupAddonAlignment::BlockStart:
-            row->W(kFill)->JustifyStart()->PadX(inputPx)->PadT(8);
+            row->W(kFill)->JustifyStart()->PadX(inputPx)->PadT(Rems(cx, 0.5f));
             break;
         case InputGroupAddonAlignment::BlockEnd:
-            row->W(kFill)->JustifyStart()->PadX(inputPx)->PadB(8);
+            row->W(kFill)->JustifyStart()->PadX(inputPx)->PadB(Rems(cx, 0.5f));
             break;
     }
     refiner.Apply(row);
@@ -75439,11 +79884,12 @@ El* InputGroup::IntoEl() {
         frame->AriaLabel(ariaLabel);
     }
     if (!multiline && !blockStart && !blockEnd) {
-        float h = size == UiSize::Large    ? 44.f
-                  : size == UiSize::Small  ? 24.f
-                  : size == UiSize::XSmall ? 20.f
-                                           : 32.f;
-        frame->H(h);
+
+        float h = size == UiSize::Large    ? 2.75f
+                  : size == UiSize::Small  ? 1.5f
+                  : size == UiSize::XSmall ? 1.25f
+                                           : 2.f;
+        frame->H(Rems(cx, h));
     }
     refiner.Apply(frame);
     if (groupDisabled) {
@@ -75487,16 +79933,16 @@ El* InputGroup::IntoEl() {
         controlEl = input->IntoEl()->Flex1();
 
         if (inlineStart) {
-            controlEl->PadL(8);
+            controlEl->PadL(Rems(cx, 0.5f));
         }
         if (inlineEnd) {
-            controlEl->PadR(8);
+            controlEl->PadR(Rems(cx, 0.5f));
         }
         controlStyle.Apply(controlEl);
         row->Child(controlEl);
     } else if (textarea) {
         controlEl = textarea->IntoEl();
-        controlEl->Flex1()->MinH(64);
+        controlEl->Flex1()->MinH(Rems(cx, 4.f));
         controlStyle.Apply(controlEl);
         row->Child(controlEl);
     }
@@ -75807,9 +80253,9 @@ El* DivInspector::Render(const InspectorPick& p, Ctx* cx) {
         cx->win->input = &jsonInput;
     }
 
-    El* box = Div(a)->FlexCol()->W(kFill)->GapY(12)->Flex1();
+    El* box = Div(a)->FlexCol()->W(kFill)->GapY(Rems(cx, 0.75f))->Flex1();
 
-    El* head = Div(a)->FlexRow()->W(kFill)->ItemsCenter()->GapX(8);
+    El* head = Div(a)->FlexRow()->W(kFill)->ItemsCenter()->GapX(Rems(cx, 0.5f));
     head->Child(Div(a)->Flex1()->Child(
         TextEl(a, StrL("JSON Styles"))->Font(14)->Fg(th.foreground)));
     head->Child(Button::New(cx, StrL("style-reset"))
@@ -75818,7 +80264,7 @@ El* DivInspector::Render(const InspectorPick& p, Ctx* cx) {
                     ->OnClick(Listen(cx, &DivInspector::OnReset))
                     ->IntoEl());
     box->Child(head);
-    El* body = Div(a)->FlexCol()->W(kFill)->GapY(4)->Flex1();
+    El* body = Div(a)->FlexCol()->W(kFill)->GapY(Rems(cx, 0.25f))->Flex1();
     body->Child(Textarea::New(cx, StrL("style-json"), &jsonInput)
                     ->H(kFill)
                     ->OnFocus(Listen(cx, &DivInspector::OnFocus))
@@ -75871,13 +80317,13 @@ El* Inspector::IntoEl() {
                   ->FlexRow()
                   ->W(kFill)
                   ->H(kTitleBarHeight)
-                  ->PadX(8)
-                  ->Gap(8)
+                  ->PadX(Rems(cx, 0.5f))
+                  ->Gap(Rems(cx, 0.5f))
                   ->ItemsCenter()
                   ->JustifyBetween()
                   ->Bg(th.tokens.titleBar)
                   ->BorderB(1, th.titleBarBorder);
-    El* left = Div(a)->FlexRow()->Gap(8)->ItemsCenter();
+    El* left = Div(a)->FlexRow()->Gap(Rems(cx, 0.5f))->ItemsCenter();
     left->Child(Button::New(cx, StrL("inspect"))
                     ->Icon(IconName::Search)
                     ->Ghost()
@@ -75893,7 +80339,12 @@ El* Inspector::IntoEl() {
                    ->IntoEl());
     panel->Child(bar);
 
-    El* body = Div(a)->FlexCol()->Flex1()->W(kFill)->Pad(12)->Gap(12);
+    El* body = Div(a)
+                   ->FlexCol()
+                   ->Flex1()
+                   ->W(kFill)
+                   ->Pad(Rems(cx, 0.75f))
+                   ->Gap(Rems(cx, 0.75f));
     if (!st->hasPick) {
         body->Child(TextEl(a, StrL("Pick an element to inspect it."))
                         ->Font(14)
@@ -76243,9 +80694,9 @@ El* Kbd::IntoEl() {
     }
 
     El* e = Div(a)
-                ->PadX(4)
-                ->PadY(2)
-                ->MinW(20)
+                ->PadX(Rems(cx, 0.25f))
+                ->PadY(Rems(cx, 0.125f))
+                ->MinW(Rems(cx, 1.25f))
                 ->ItemsCenter()
                 ->JustifyCenter()
                 ->Radius(th.radius * 0.5f)
@@ -76777,6 +81228,10 @@ ListItem* ListItem::Confirmed(bool v) {
     confirmed = v;
     return this;
 }
+ListItem* ListItem::CheckIcon(IconName icon) {
+    checkIcon = icon;
+    return this;
+}
 ListItem* ListItem::Disabled(bool v) {
     disabled = v;
     return this;
@@ -76799,9 +81254,11 @@ El* ListItem::IntoEl(Str id, Listener onClick, Listener onMouseDown) {
                   ->AriaDisabled(disabled)
                   ->FlexRow()
                   ->W(kFill)
-                  ->PadX(8)
-                  ->PadY(4)
-                  ->Gap(8)
+                  ->PadX(Rems(cx, 0.75f))
+                  ->PadY(Rems(cx, 0.25f))
+                  ->Gap(Rems(cx, 0.25f))
+                  ->Font(16)
+                  ->Fg(disabled ? th.mutedFg : th.foreground)
                   ->ItemsCenter()
                   ->JustifyBetween()
                   ->Radius(th.radius);
@@ -76824,12 +81281,29 @@ El* ListItem::IntoEl(Str id, Listener onClick, Listener onMouseDown) {
                               th.listActiveBorder, th.tokens.accent, true);
         row->Bg(st.bg);
     }
+
+    El* content =
+        Div(a)->FlexRow()->W(kFill)->ItemsCenter()->JustifyBetween()->Gap(
+            Rems(cx, 0.25f));
+    El* children = Div(a)->W(kFill);
     if (child) {
-        row->Child(child);
+        children->Child(child);
     }
-    if (confirmed) {
-        row->Child(IconEl(a, IconName::Check, 16)->Fg(th.foreground));
+    content->Child(children);
+    if (checkIcon != IconName::None) {
+        El* slot = Div(a)
+                       ->FlexRow()
+                       ->W(Rems(cx, 1.25f))
+                       ->ItemsCenter()
+                       ->JustifyCenter()
+                       ->Shrink0();
+        if (confirmed) {
+            slot->Child(IconEl(a, checkIcon, UiIconPx(cx, UiSize::Small))
+                            ->Fg(th.mutedFg));
+        }
+        content->Child(slot);
     }
+    row->Child(content);
     if (!disabled && secondarySelected) {
 
         row->Child(ListActiveOverlay(a, th.selection, row->style.radius));
@@ -76932,6 +81406,10 @@ List* List::Empty(El* e) {
     empty = e;
     return this;
 }
+
+static const float kListSearchRowRems = 2;
+static const float kListDefaultH = 320;
+
 List* List::H(float px) {
     h = px;
     return this;
@@ -76939,23 +81417,35 @@ List* List::H(float px) {
 
 El* ListLoadingView(Ctx* cx, float h) {
     Arena* a = cx->a;
-    El* body = Div(a)->FlexCol()->W(kFill)->PadY(10)->Gap(12);
+
+    El* body = Div(a)
+                   ->FlexCol()
+                   ->W(kFill)
+                   ->PadY(Rems(cx, 0.625f))
+                   ->Gap(Rems(cx, 0.75f));
     if (h > 0) {
         body->H(h);
     }
     for (int i = 0; i < 3; i++) {
-        body->Child(
-            Div(a)
-                ->FlexCol()
-                ->W(kFill)
-                ->PadX(8)
-                ->Gap(6)
+        body->Child(Div(a)
+                        ->FlexCol()
+                        ->W(kFill)
 
-                ->ItemsStart()
-                ->ClipX()
-                ->Child(Skeleton::New(cx)->W(192)->H(20)->IntoEl())
-                ->Child(
-                    Skeleton::New(cx)->Secondary()->W(256)->H(12)->IntoEl()));
+                        ->PadX(Rems(cx, 0.75f))
+                        ->PadY(Rems(cx, 0.25f))
+                        ->Gap(Rems(cx, 0.375f))
+
+                        ->ItemsStart()
+                        ->ClipX()
+                        ->Child(Skeleton::New(cx)
+                                    ->W(Rems(cx, 12.f))
+                                    ->H(Rems(cx, 1.25f))
+                                    ->IntoEl())
+                        ->Child(Skeleton::New(cx)
+                                    ->Secondary()
+                                    ->W(Rems(cx, 16.f))
+                                    ->H(Rems(cx, 0.75f))
+                                    ->IntoEl()));
     }
     return body;
 }
@@ -76963,14 +81453,31 @@ El* ListLoadingView(Ctx* cx, float h) {
 static El* ui_list_DefaultEmpty(Ctx* cx, float h) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
-    return Div(a)
-        ->FlexCol()
-        ->W(kFill)
-        ->H(h)
-        ->ItemsCenter()
+    El* box = Div(a)->FlexCol()->W(kFill);
+    if (h > 0) {
+        box->H(h);
+    } else {
+        box->Flex1()->MinH(0);
+    }
+    return box->ItemsCenter()
         ->JustifyCenter()
-        ->Child(IconEl(a, IconName::Inbox, 48)
+        ->Child(IconEl(a, IconName::Inbox, Rems(cx, 3.f))
                     ->Fg(RgbaOpacity(th.mutedFg, 0.6f)));
+}
+
+static bool ListViewportAt(void* data, Ctx* cx, El*, float height) {
+    auto* s = (ListState*)data;
+    s->viewportH = height;
+    int total = ListRowCount(s);
+    const float* sizes = ListRowHeights(s);
+    VirtualRange range =
+        sizes ? VirtualListVisibleRange(sizes, total, s->scrollY, height)
+              : VirtualListVisibleRows(total, s->rowH, s->scrollY, height);
+    if (!s->loading && s->count > 0 && ListShouldLoadMore(s, range.end) &&
+        s->onLoadMore.IsValid()) {
+        ListRequestLoadMore(s, cx);
+    }
+    return false;
 }
 
 El* List::IntoEl() {
@@ -77027,11 +81534,36 @@ El* List::IntoEl() {
 
     El* inner = Div(a)->FlexCol()->W(kFill);
     root->Child(inner);
+
+    bool fill = h <= 0;
+    if (fill) {
+
+        root->H(kFill)->MinH(0);
+        inner->Flex1()->MinH(0);
+    }
+
+    float searchH = search ? Rems(cx, kListSearchRowRems) : 0;
+    float first = h > 0 ? h : kListDefaultH;
+    LaidOutHeight* laid = UseLaidOutHeight(cx, id, first);
+    if (laid) {
+        laid->contentBox = true;
+        laid->inset = searchH + padding * 2;
+    }
+    float viewH = laid ? laid->built : first;
+    if (s) {
+        TrackLaidOutHeight(cx, root, laid, &ListViewportAt, s);
+    } else {
+        TrackLaidOutHeight(cx, root, laid);
+    }
     if (search) {
 
-        El* searchRow =
-            Div(a)->FlexRow()->W(kFill)->H(32)->ItemsCenter()->BorderB(
-                1, th.border);
+        El* searchRow = Div(a)
+                            ->FlexRow()
+                            ->W(kFill)
+                            ->H(searchH)
+                            ->Shrink0()
+                            ->ItemsCenter()
+                            ->BorderB(1, th.border);
 
         InputSetPlaceholder(search, searchPlaceholder.s
                                         ? searchPlaceholder
@@ -77053,13 +81585,14 @@ El* List::IntoEl() {
         return root;
     }
 
-    s->viewportH = h;
+    s->viewportH = viewH;
 
     if (s->loading) {
         El* loadingView = delegate.renderLoading
                               ? delegate.renderLoading(cx, delegate.data)
                               : loading;
-        inner->Child(loadingView ? loadingView : ListLoadingView(cx, h));
+        inner->Child(loadingView ? loadingView
+                                 : ListLoadingView(cx, fill ? 0 : viewH));
         return root;
     }
 
@@ -77076,7 +81609,8 @@ El* List::IntoEl() {
         El* emptyView = delegate.renderEmpty
                             ? delegate.renderEmpty(cx, delegate.data)
                             : empty;
-        inner->Child(emptyView ? emptyView : ui_list_DefaultEmpty(cx, h));
+        inner
+            ->Child(emptyView ? emptyView : ui_list_DefaultEmpty(cx, fill ? 0 : viewH));
         return root;
     }
 
@@ -77124,8 +81658,8 @@ El* List::IntoEl() {
     int total = ListRowCount(s);
     const float* sizes = ListRowHeights(s);
     VirtualRange range =
-        sizes ? VirtualListVisibleRange(sizes, total, s->scrollY, h)
-              : VirtualListVisibleRows(total, s->rowH, s->scrollY, h);
+        sizes ? VirtualListVisibleRange(sizes, total, s->scrollY, viewH)
+              : VirtualListVisibleRows(total, s->rowH, s->scrollY, viewH);
     struct ListVirtualUser {
         ListState* s = nullptr;
         ListDelegate delegate = {};
@@ -77140,7 +81674,8 @@ El* List::IntoEl() {
     VirtualListOpts opts;
     opts.count = total;
     opts.rowH = s->rowH;
-    opts.viewH = h;
+
+    opts.viewH = fill ? 0 : viewH;
     opts.sizes = sizes;
     opts.scrollY = s->scrollY;
     opts.pad = padding;
@@ -77177,7 +81712,13 @@ El* List::IntoEl() {
     };
     opts.user = rows;
     opts.onScroll = ListenTo(state, &ListState::OnScroll);
-    El* body = gpui::VirtualList::New(cx, StrL("body"), opts)->ScrollFromPath();
+
+    El* body = gpui::VirtualList::New(cx, StrL("body"), opts)
+                   ->ScrollFromPath()
+                   ->OnScroll(opts.onScroll);
+    if (fill) {
+        body->Flex1()->MinH(0);
+    }
     if (!scrollbarVisible) {
         body->HideScrollbar();
     }
@@ -77480,8 +82021,8 @@ El* MarkerIcon::IntoEl() {
 
     El* row = Div(a)
                   ->FlexRow()
-                  ->W(16)
-                  ->H(16)
+                  ->W(Rems(cx, 1))
+                  ->H(Rems(cx, 1))
                   ->FlexNone()
                   ->ItemsCenter()
                   ->JustifyCenter();
@@ -77563,7 +82104,8 @@ El* MarkerContent::IntoEl() {
         if (animate) {
             ShimmerText* text = ShimmerText::New(cx, child.text);
 
-            text->Id(fmt("marker-loading-text-%d", i));
+            text->Id(ElementIdNamed(cx->a, StrL("marker-loading-text"),
+                                    (uint64_t)i));
             text->WithShimmerStyle(shimmerStyle);
             if (hasFg) {
                 text->Fg(fg);
@@ -77692,8 +82234,8 @@ El* Marker::IntoEl() {
                   ->FlexRow()
                   ->ItemsCenter()
                   ->W(kFill)
-                  ->MinH(16)
-                  ->Gap(8)
+                  ->MinH(Rems(cx, 1))
+                  ->Gap(Rems(cx, 0.5f))
                   ->Font(14)
                   ->LineHeight(1.5f)
                   ->Fg(th.mutedFg);
@@ -77710,11 +82252,16 @@ El* Marker::IntoEl() {
             break;
     }
     if (variant == MarkerVariant::Border) {
-        row->BorderB(1, th.border)->PadB(8);
+        row->BorderB(1, th.border)->PadB(Rems(cx, 0.5f));
     }
     if (variant == MarkerVariant::Separator &&
         align != MarkerAlignment::Start) {
-        El* rule = Div(a)->Flex1()->MinW(0)->H(1)->MarginR(4)->Bg(th.border);
+        El* rule = Div(a)
+                       ->Flex1()
+                       ->MinW(0)
+                       ->H(1)
+                       ->MarginR(Rems(cx, 0.25f))
+                       ->Bg(th.border);
         if (separatorStyleSet) {
             rule->Refine(separatorStyle, separatorStyleSet);
         }
@@ -77744,7 +82291,12 @@ El* Marker::IntoEl() {
         }
     }
     if (variant == MarkerVariant::Separator && align != MarkerAlignment::End) {
-        El* rule = Div(a)->Flex1()->MinW(0)->H(1)->MarginL(4)->Bg(th.border);
+        El* rule = Div(a)
+                       ->Flex1()
+                       ->MinW(0)
+                       ->H(1)
+                       ->MarginL(Rems(cx, 0.25f))
+                       ->Bg(th.border);
         if (separatorStyleSet) {
             rule->Refine(separatorStyle, separatorStyleSet);
         }
@@ -77933,12 +82485,12 @@ PopupMenu* PopupMenu::ActionContext(const char* ctx) {
     return this;
 }
 
-PopupMenu* PopupMenu::MenuWithAction(Str label, uint32_t action, intptr_t arg) {
+PopupMenu* PopupMenu::MenuWithAction(Str label, uint32_t action, int64_t arg) {
     Menu(label);
     return Action(action, arg);
 }
 
-PopupMenu* PopupMenu::Action(uint32_t action, intptr_t arg) {
+PopupMenu* PopupMenu::Action(uint32_t action, int64_t arg) {
     if (items.len > 0) {
         MenuItem* it = &items[items.len - 1];
         it->action = action;
@@ -77986,7 +82538,7 @@ PopupMenu* PopupMenu::ExternalLinkIcon(bool v) {
 }
 
 static void OnPopupLinkClick(PopupMenuState* state, Ctx* cx, const ClickEvent*,
-                             intptr_t hrefPtr) {
+                             int64_t hrefPtr) {
     const Str* href = (const Str*)hrefPtr;
     if (href && href->s) {
         OpenUrl(*href);
@@ -78009,25 +82561,34 @@ El* PopupMenu::IntoEl() {
         }
     }
 
-    float menuW = minW;
+    float menuW = minW > 0 ? minW : Rems(cx, 8.f);
+
+    float icon = UiIconPx(cx, UiSize::XSmall);
+    float gap = Rems(cx, 0.25f);
+    float kbdPadX = Rems(cx, 0.25f);
+    float kbdMinW = Rems(cx, 1.25f);
     if (cx->win) {
         for (const MenuItem& it : items) {
             if (!it.label.s || it.kind == MenuItemKind::Separator) {
                 continue;
             }
-            Size label = MeasureText(&cx->win->paint, it.label, 14, 0);
 
-            float need = 26 + label.w;
+            Size label =
+                MeasureText(&cx->win->paint, it.label, Rems(cx, 0.875f), 0);
+
+            float need = 2 + Rems(cx, 0.5f) + 16 + label.w;
             if (leftGutter) {
-                need += 18;
+                need += icon + gap;
             }
             if (it.kbd.s) {
-                Size key = MeasureText(&cx->win->paint, it.kbd, 12, 0);
-                need += (key.w + 8 > 20 ? key.w + 8 : 20) + 4;
+                Size key =
+                    MeasureText(&cx->win->paint, it.kbd, Rems(cx, 0.75f), 0);
+                float kbdW = key.w + kbdPadX * 2;
+                need += (kbdW > kbdMinW ? kbdW : kbdMinW) + gap;
             }
             if ((!SideIsLeft(checkSide) && it.checked) || it.submenu ||
                 (it.isLink && externalLinkIcon)) {
-                need += 18;
+                need += icon + gap;
             }
             if (need > menuW) {
                 menuW = need;
@@ -78079,7 +82640,13 @@ El* PopupMenu::IntoEl() {
         row.handler = it.onClick;
         PopupMenuAddRow(s, row);
     }
-    El* rows = Div(a)->Id(StrL("items"))->FlexCol()->W(kFill)->Pad(4)->Gap(2);
+
+    El* rows = Div(a)
+                   ->Id(StrL("items"))
+                   ->FlexCol()
+                   ->W(kFill)
+                   ->Pad(Rems(cx, 0.25f))
+                   ->Gap(Rems(cx, 0.125f));
     if (scrollable) {
         rows->ClipY()
             ->MaxH(maxH)
@@ -78100,8 +82667,10 @@ El* PopupMenu::IntoEl() {
                 continue;
             }
 
-            rows->Child(Div(a)->W(kFill)->PadY(2)->Child(
-                Div(a)->W(kFill)->H(2)->Bg(th.border)));
+            rows->Child(Div(a)
+                            ->W(kFill)
+                            ->PadY(Rems(cx, 0.125f))
+                            ->Child(Div(a)->W(kFill)->H(2)->Bg(th.border)));
             continue;
         }
         bool lit =
@@ -78116,7 +82685,7 @@ El* PopupMenu::IntoEl() {
                 ->W(kFill)
                 ->MinH(itemH)
                 ->PadX(8)
-                ->Gap(4)
+                ->Gap(gap)
                 ->ItemsCenter()
                 ->JustifyBetween()
                 ->Radius(radius)
@@ -78128,11 +82697,11 @@ El* PopupMenu::IntoEl() {
 
         bool muted = it.disabled || it.kind == MenuItemKind::Label;
         Rgba fg = muted ? th.mutedFg : th.foreground;
-        El* left = Div(a)->FlexRow()->Flex1()->Gap(4)->ItemsCenter();
+        El* left = Div(a)->FlexRow()->Flex1()->Gap(gap)->ItemsCenter();
         if (leftGutter) {
 
             if (it.icon != IconName::None || it.iconSvg.s || it.iconPath.s) {
-                El* ic = IconEl(a, it.icon, 14)->Fg(fg);
+                El* ic = IconEl(a, it.icon, icon)->Fg(fg);
                 if (it.iconSvg.s) {
                     ic->iconSvg = it.iconSvg;
                 } else if (it.iconPath.s) {
@@ -78140,9 +82709,9 @@ El* PopupMenu::IntoEl() {
                 }
                 left->Child(ic);
             } else if (SideIsLeft(checkSide) && it.checked) {
-                left->Child(IconEl(a, IconName::Check, 14)->Fg(fg));
+                left->Child(IconEl(a, IconName::Check, icon)->Fg(fg));
             } else {
-                left->Child(Div(a)->W(14)->H(14)->Shrink0());
+                left->Child(Div(a)->W(icon)->H(icon)->Shrink0());
             }
         }
         if (it.element) {
@@ -78178,21 +82747,23 @@ El* PopupMenu::IntoEl() {
         if (kbdEl) {
 
             row->Child(Div(a)
-                           ->PadX(4)
-                           ->PadY(2)
-                           ->MinW(20)
+
+                           ->PadX(kbdPadX)
+                           ->PadY(Rems(cx, 0.125f))
+                           ->MinW(kbdMinW)
                            ->ItemsCenter()
                            ->JustifyCenter()
                            ->Child(kbdEl));
         }
         if (it.isLink && externalLinkIcon) {
-            row->Child(IconEl(a, IconName::ExternalLink, 12)->Fg(th.mutedFg));
+            row->Child(IconEl(a, IconName::ExternalLink, Rems(cx, 0.75f))
+                           ->Fg(th.mutedFg));
         }
         if (!SideIsLeft(checkSide) && it.checked) {
-            row->Child(IconEl(a, IconName::Check, 14)->Fg(fg));
+            row->Child(IconEl(a, IconName::Check, icon)->Fg(fg));
         }
         if (it.submenu) {
-            row->Child(IconEl(a, IconName::ChevronRight, 14)->Fg(fg));
+            row->Child(IconEl(a, IconName::ChevronRight, icon)->Fg(th.mutedFg));
         }
         if (it.kind != PopupMenuItem::Label && !it.disabled) {
             if (it.submenu) {
@@ -78201,7 +82772,7 @@ El* PopupMenu::IntoEl() {
                 row->OnHover(ListenerArg(submenuHover, i));
             } else if (it.isLink && it.href.s) {
                 BindClick(row, StrDup(a, fmt("%d", i)),
-                          ListenerArg(linkClick, (intptr_t)&it.href));
+                          ListenerArg(linkClick, (int64_t)&it.href));
                 row->OnHover(ListenerArg(hover, i));
             } else {
                 BindClick(row, StrDup(a, fmt("%d", i)), ListenerArg(click, i));
@@ -78222,7 +82793,7 @@ El* PopupMenu::IntoEl() {
                 subState->side = s->side;
             }
             El* sub = it.submenu->IntoEl();
-            sub->Absolute()->Top(-4);
+            sub->Absolute()->Top(-Rems(cx, 0.25f));
             if (s && SideIsLeft(s->side)) {
                 sub->Right(menuW - 8);
             } else {
@@ -78284,7 +82855,7 @@ El* DropdownMenu::IntoEl() {
 
             trigger
                 ->OnClick(ListenTo(menu->state, &PopupMenuState::OnTriggerClick,
-                                   (intptr_t)st->open));
+                                   (int64_t)st->open));
         }
         wrap->Child(trigger);
     }
@@ -78436,13 +83007,13 @@ void AppMenuBarSelect(AppMenuBarState* s, Ctx* cx, int ix) {
 }
 
 void AppMenuBarState::OnMenuClick(AppMenuBarState* self, Ctx* cx,
-                                  const ClickEvent*, intptr_t ix) {
+                                  const ClickEvent*, int64_t ix) {
 
     AppMenuBarSelect(self, cx, self->selected == (int)ix ? -1 : (int)ix);
 }
 
 void AppMenuBarState::OnMenuHover(AppMenuBarState* self, Ctx* cx,
-                                  const HoverEvent* ev, intptr_t ix) {
+                                  const HoverEvent* ev, int64_t ix) {
     if (!ev->hovered || self->selected < 0 || self->selected == (int)ix) {
         return;
     }
@@ -78521,7 +83092,8 @@ El* AppMenuBar::IntoEl() {
                        ->AriaLabel(items[i].title)
                        ->AriaSelected(isOpen)
                        ->FlexRow()
-                       ->H(24)
+
+                       ->H(Rems(cx, 1.5f))
                        ->PadX(8)
                        ->ItemsCenter()
                        ->Radius(th.radius)
@@ -78804,7 +83376,7 @@ struct MessageScrollerRowCtx {
 static El* MessageScrollerRow(void* user, Ctx* cx, int index) {
     MessageScrollerRowCtx* rc = (MessageScrollerRowCtx*)user;
     Arena* a = cx->a;
-    El* row = Div(a)->W(kFill)->MinW(0)->PadX(12);
+    El* row = Div(a)->W(kFill)->MinW(0)->PadX(Rems(cx, 0.75f));
     if (rc->insetL > 0) {
 
         row->PadL(rc->insetL);
@@ -78814,7 +83386,7 @@ static El* MessageScrollerRow(void* user, Ctx* cx, int index) {
     }
 
     if (index + 1 < rc->count) {
-        row->PadB(32);
+        row->PadB(Rems(cx, 2.f));
     }
     if (index == 0 && rc->padTop > 0) {
         row->PadT(rc->padTop);
@@ -78839,15 +83411,15 @@ El* MessageScroller::IntoEl() {
     }
 
     int count = st->heights.len;
-    float viewH = h > 0 ? h : 192.f;
 
-    float insetL = 0, insetR = 0, padTop = 8, padBottom = 8;
+    float py2 = Rems(cx, 0.5f);
+    float insetL = 0, insetR = 0, padTop = py2, padBottom = py2;
     if (listStyleSet & StyleFieldPad) {
         insetL = listStyle.pad.left;
         insetR = listStyle.pad.right;
 
-        padTop = 8 + listStyle.pad.top;
-        padBottom = 8 + listStyle.pad.bottom;
+        padTop = py2 + listStyle.pad.top;
+        padBottom = py2 + listStyle.pad.bottom;
     }
 
     if (st->followTail) {
@@ -78866,7 +83438,6 @@ El* MessageScroller::IntoEl() {
                    ->Id(id)
                    ->Sizes(st->heights.els)
                    ->MeasureRows(st->needsMeasure.els)
-                   ->ViewH(viewH)
                    ->Handle(&st->handle)
                    ->Axis(ScrollAxis::Vertical)
                    ->Scroll(HashClickId(id),
@@ -78902,7 +83473,8 @@ El* MessageScroller::IntoEl() {
     El* viewport = Div(a)
                        ->Role(AccessibilityRole::Log)
                        ->W(kFill)
-                       ->H(viewH)
+                       ->H(kFill)
+                       ->MinH(0)
                        ->MinW(0)
                        ->Child(list);
 
@@ -78913,8 +83485,7 @@ El* MessageScroller::IntoEl() {
                 ->Left(0)
                 ->Right(0)
                 ->Bottom(0)
-
-                ->H(48)
+                ->H(Rems(cx, 3.f))
                 ->Opacity(fadeVisibility)
                 ->Bg(BackgroundLinear(
                     180.f, ColorStopAt(RgbaOpacity(bottomFade, 0.f), 0.f),
@@ -78924,8 +83495,14 @@ El* MessageScroller::IntoEl() {
         viewport->Refine(contentStyle, contentStyleSet);
     }
 
-    El* root = Div(a)->PathId(id)->W(kFill)->H(viewH)->ClipX()->ClipY()->Child(
-        viewport);
+    El* root = Div(a)
+                   ->PathId(id)
+                   ->W(kFill)
+                   ->H(h > 0 ? h : kFill)
+                   ->MinH(0)
+                   ->ClipX()
+                   ->ClipY()
+                   ->Child(viewport);
     if (jumpButton && jumpVisibility > 0) {
 
         Button* button = Button::New(cx, StrL("jump-to-latest"))
@@ -78953,7 +83530,7 @@ El* MessageScroller::IntoEl() {
                         ->Left(0)
                         ->Right(0)
 
-                        ->Bottom(8 + jumpVisibility * 8)
+                        ->Bottom(Rems(cx, 0.5f + jumpVisibility * 0.5f))
                         ->Flex()
                         ->JustifyCenter()
                         ->Opacity(jumpVisibility)
@@ -78996,7 +83573,7 @@ MessageGroup* MessageGroup::Refine(const Style& s, uint32_t fields) {
 }
 
 El* MessageGroup::IntoEl() {
-    El* column = Div(a)->FlexCol()->MinW(0)->Gap(8);
+    El* column = Div(a)->FlexCol()->MinW(0)->Gap(Rems(cx, 0.5f));
     if (styleSet) {
         column->Refine(style, styleSet);
     }
@@ -79032,7 +83609,7 @@ El* MessageAvatar::IntoEl() {
     El* slot = Div(a)
                    ->FlexRow()
                    ->ItemsCenter()
-                   ->MinW(32)
+                   ->MinW(Rems(cx, 2))
                    ->FlexNone()
                    ->JustifyCenter()
                    ->SelfEnd()
@@ -79093,13 +83670,13 @@ static El* MessageMetaRow(Arena* a, Ctx* cx, bool contentInset,
                   ->ItemsCenter()
                   ->MaxW(kFill)
                   ->MinW(0)
-                  ->Gap(4)
+                  ->Gap(Rems(cx, 0.25f))
                   ->Font(12)
                   ->LineHeight(1.25f)
                   ->Medium()
                   ->Fg(th.mutedFg);
     if (!hasContentInset || contentInset) {
-        row->PadX(12);
+        row->PadX(Rems(cx, 0.75f));
     }
     if (styleSet) {
         row->Refine(style, styleSet);
@@ -79150,13 +83727,8 @@ MessageContent* MessageContent::Refine(const Style& s, uint32_t fields) {
 }
 
 El* MessageContent::IntoEl() {
-    El* column = Div(a)
-                     ->FlexCol()
-                     ->W(kFill)
-                     ->MaxW(kFill)
-                     ->MinW(0)
-
-                     ->Gap(10);
+    El* column = Div(a)->FlexCol()->W(kFill)->MaxW(kFill)->MinW(0)->Gap(
+        Rems(cx, 0.625f));
     column->ItemsStart();
     if (alignment == MessageAlignment::End) {
         column->ItemsEnd();
@@ -79275,12 +83847,7 @@ El* Message::IntoEl() {
     bool hasAvatar = avatar != nullptr;
     bool hasGhostBubble = content && content->hasGhostBubble;
 
-    El* root = Div(a)
-                   ->FlexCol()
-                   ->W(kFill)
-                   ->MinW(0)
-
-                   ->Gap(10);
+    El* root = Div(a)->FlexCol()->W(kFill)->MinW(0)->Gap(Rems(cx, 0.625f));
     root->ItemsStart();
     if (alignment == MessageAlignment::End) {
         root->ItemsEnd();
@@ -79289,14 +83856,15 @@ El* Message::IntoEl() {
         root->Refine(style, styleSet);
     }
 
-    El* row = Div(a)->FlexRow()->W(kFill)->MinW(0)->ItemsEnd()->Gap(8);
+    El* row =
+        Div(a)->FlexRow()->W(kFill)->MinW(0)->ItemsEnd()->Gap(Rems(cx, 0.5f));
     if (alignment == MessageAlignment::End) {
         row->FlexRowReverse();
     }
     if (avatar) {
         row->Child(avatar->IntoEl());
     }
-    El* stack = Div(a)->FlexCol()->W(kFill)->MinW(0)->Gap(10);
+    El* stack = Div(a)->FlexCol()->W(kFill)->MinW(0)->Gap(Rems(cx, 0.625f));
     stack->ItemsStart();
     if (alignment == MessageAlignment::End) {
         stack->ItemsEnd();
@@ -79318,10 +83886,10 @@ El* Message::IntoEl() {
         El* el = footer->WithInheritedContentInset(!hasGhostBubble)->IntoEl();
 
         if (hasAvatar && alignment == MessageAlignment::Start) {
-            el->MarginL(40);
+            el->MarginL(Rems(cx, 2.5f));
         }
         if (hasAvatar && alignment == MessageAlignment::End) {
-            el->MarginR(40);
+            el->MarginR(Rems(cx, 2.5f));
         }
         root->Child(el);
     }
@@ -79359,11 +83927,10 @@ static NativeMenuItem* PushItem(NativeMenu* m) {
     return &m->items[m->items.len - 1];
 }
 
-NativeMenu* NativeMenu::Menu(Str label, intptr_t id) {
+NativeMenu* NativeMenu::Menu(Str label, int64_t id) {
     return MenuWithDisabled(label, false, id);
 }
-NativeMenu* NativeMenu::MenuWithDisabled(Str label, bool disabled,
-                                         intptr_t id) {
+NativeMenu* NativeMenu::MenuWithDisabled(Str label, bool disabled, int64_t id) {
     NativeMenuItem* it = PushItem(this);
     if (it) {
         it->kind = NativeMenuItemKind::Item;
@@ -79373,7 +83940,7 @@ NativeMenu* NativeMenu::MenuWithDisabled(Str label, bool disabled,
     }
     return this;
 }
-NativeMenu* NativeMenu::MenuWithCheck(Str label, bool checked, intptr_t id) {
+NativeMenu* NativeMenu::MenuWithCheck(Str label, bool checked, int64_t id) {
     NativeMenuItem* it = PushItem(this);
     if (it) {
         it->kind = NativeMenuItemKind::Item;
@@ -79383,7 +83950,7 @@ NativeMenu* NativeMenu::MenuWithCheck(Str label, bool checked, intptr_t id) {
     }
     return this;
 }
-NativeMenu* NativeMenu::MenuWithIcon(Str label, IconName icon, intptr_t id) {
+NativeMenu* NativeMenu::MenuWithIcon(Str label, IconName icon, int64_t id) {
     NativeMenuItem* it = PushItem(this);
     if (it) {
         it->kind = NativeMenuItemKind::Item;
@@ -79394,7 +83961,7 @@ NativeMenu* NativeMenu::MenuWithIcon(Str label, IconName icon, intptr_t id) {
     return this;
 }
 NativeMenu* NativeMenu::MenuWithIcon(Str label, component::Icon* icon,
-                                     intptr_t id) {
+                                     int64_t id) {
     NativeMenuItem* it = PushItem(this);
     if (it) {
         it->kind = NativeMenuItemKind::Item;
@@ -79508,11 +84075,11 @@ static bool ShowNative(NativeMenu* m, float x, float y) {
     Window* win = m->cx->win;
 
     int count = NativeMenuSelectable(m, nullptr, 1 << 20);
-    intptr_t* ids = nullptr;
+    int64_t* ids = nullptr;
     if (count > 0) {
         auto** table =
             (const NativeMenuItem**)malloc((size_t)count * sizeof(void*));
-        ids = (intptr_t*)malloc((size_t)count * sizeof(intptr_t));
+        ids = (int64_t*)malloc((size_t)count * sizeof(int64_t));
         if (!table || !ids) {
             free(table);
             free(ids);
@@ -79526,7 +84093,7 @@ static bool ShowNative(NativeMenu* m, float x, float y) {
     }
 
     int chosen = PlatShowMenu(win, plat, nItems, x, y, dark);
-    intptr_t command = 0;
+    int64_t command = 0;
     if (chosen > 0 && chosen <= count && ids) {
         command = ids[chosen - 1];
     }
@@ -79653,13 +84220,13 @@ const NativeMenuItem* NativeMenuFallbackRow(const NativeMenuFallback* f,
 }
 
 static void OnFallbackConfirm(PopupMenuState* self, Ctx* cx, const ClickEvent*,
-                              intptr_t row) {
+                              int64_t row) {
     NativeMenuFallback* f = NativeMenuFallbackOf(cx->win);
     const NativeMenuItem* it = NativeMenuFallbackRow(f, cx->self, (int)row);
     if (!it) {
         return;
     }
-    intptr_t id = it->id;
+    int64_t id = it->id;
     Listener select = f->onSelect;
     PopupMenuDismissAll(self, cx);
     f->open = false;
@@ -80126,12 +84693,12 @@ void NotificationSystemResponse(Str tag) {
     Entity<NotificationListState> e;
     e.id = list;
     WindowPost(win, ListenTo(e, &NotificationListState::OnSystemResponse,
-                             (intptr_t)id));
+                             (int64_t)id));
 }
 
 void NotificationListState::OnSystemResponse(NotificationListState* self,
                                              Ctx* cx, const ClickEvent*,
-                                             intptr_t idArg) {
+                                             int64_t idArg) {
     int id = (int)idArg;
     Listener onClick = {};
     NotificationSystemState* state = SysState(cx->app);
@@ -80449,13 +85016,13 @@ bool NotificationAdvance(NotificationListState* s, Ctx* cx, int deltaMs) {
 }
 
 void NotificationListState::OnCloseClick(NotificationListState* self, Ctx* cx,
-                                         const ClickEvent*, intptr_t id) {
+                                         const ClickEvent*, int64_t id) {
     NotificationDismiss(self, cx, (int)id);
     Notify(cx);
 }
 
 void NotificationListState::OnItemClick(NotificationListState* self, Ctx* cx,
-                                        const ClickEvent* ev, intptr_t id) {
+                                        const ClickEvent* ev, int64_t id) {
     int at = NotificationIndexOf(self, (int)id);
     if (at < 0 || !ev) {
         return;
@@ -80477,7 +85044,7 @@ void NotificationListState::OnItemClick(NotificationListState* self, Ctx* cx,
 }
 
 void NotificationListState::OnHover(NotificationListState* self, Ctx* cx,
-                                    const HoverEvent* ev, intptr_t anchor) {
+                                    const HoverEvent* ev, int64_t anchor) {
 
     int ix = (int)anchor;
     if (ix < 0 || ix >= 8 || self->stackHovered[ix] == ev->hovered) {
@@ -80685,18 +85252,19 @@ El* NotificationList::IntoEl() {
             }
 
             Listener close = ListenTo(
-                state, &NotificationListState::OnCloseClick, (intptr_t)item.id);
+                state, &NotificationListState::OnCloseClick, (int64_t)item.id);
             Listener click = ListenTo(
-                state, &NotificationListState::OnItemClick, (intptr_t)item.id);
+                state, &NotificationListState::OnItemClick, (int64_t)item.id);
             El* card = gpui::Toast::New(cx, StrL("notification"))
                            ->TransitionStatus(entry.status)
                            ->IntoEl()
                            ->FlexRow()
                            ->Group()
                            ->W(kFill)
-                           ->Gap(12)
-                           ->PadY(14)
-                           ->PadX(16)
+
+                           ->Gap(Rems(cx, 0.75f))
+                           ->PadY(Rems(cx, 0.875f))
+                           ->PadX(Rems(cx, 1.f))
                            ->Border(1, th.border)
                            ->Bg(th.tokens.popover)
                            ->Radius(th.radiusLg)
@@ -80728,12 +85296,17 @@ El* NotificationList::IntoEl() {
             }
             bool hasIcon = iconName != IconName::None;
             if (hasIcon) {
-                card->Child(Div(a)->Absolute()->Top(18)->Left(16)->Child(
-                    IconEl(a, iconName, 16)->Fg(iconFg)));
+
+                card->Child(Div(a)
+                                ->Absolute()
+                                ->Top(18)
+                                ->Left(Rems(cx, 1.f))
+                                ->Child(IconEl(a, iconName, Rems(cx, 1.f))
+                                            ->Fg(iconFg)));
             }
             El* body = Div(a)->FlexCol()->Flex1()->ClipX()->ClipY();
             if (hasIcon) {
-                body->PadL(24);
+                body->PadL(Rems(cx, 1.5f));
             }
             if (len(item.title) > 0) {
                 body->Child(TextEl(a, item.title)
@@ -80761,7 +85334,7 @@ El* NotificationList::IntoEl() {
                 El* action = EntityRender(cx->app, cx->win, a, item.action);
                 if (action) {
 
-                    card->Child(Div(a)->PadR(14)->Child(action));
+                    card->Child(Div(a)->PadR(Rems(cx, 0.875f))->Child(action));
                 }
             }
             El* closeButton = component::Button::New(cx, StrL("close"))
@@ -80773,8 +85346,9 @@ El* NotificationList::IntoEl() {
                                   ->StopClick();
             card->Child(Div(a)
                             ->Absolute()
-                            ->Top(4)
-                            ->Right(4)
+
+                            ->Top(Rems(cx, 0.25f))
+                            ->Right(Rems(cx, 0.25f))
                             ->GroupHoverVisible()
                             ->Child(closeButton));
             layer->Child(Div(a)
@@ -80800,16 +85374,19 @@ namespace gpui {
 namespace component {
 
 void PaginationMenuState::OnItem(PaginationMenuState* self, Ctx* cx,
-                                 const ClickEvent* ev, intptr_t ix) {
+                                 const ClickEvent* ev, int64_t ix) {
     if (!self->onChange.IsValid()) {
         return;
     }
-    ListenerCall(cx->app, cx->win,
-                 ListenerFill(self->onChange, self->firstPage + (int)ix), ev);
+    ListenerCall(
+        cx->app, cx->win,
+        ListenerFill(self->onChange, (int64_t)(self->firstPage + (int64_t)ix)),
+        ev);
 }
 
-void PaginationEllipsisMenuPages(int hiddenStart, int hiddenEnd,
-                                 int currentPage, int* start, int* end) {
+void PaginationEllipsisMenuPages(int64_t hiddenStart, int64_t hiddenEnd,
+                                 int64_t currentPage, int64_t* start,
+                                 int64_t* end) {
     if (hiddenEnd - hiddenStart <= kMaxEllipsisMenuPages) {
         *start = hiddenStart;
         *end = hiddenEnd;
@@ -80822,7 +85399,7 @@ void PaginationEllipsisMenuPages(int hiddenStart, int hiddenEnd,
     }
 }
 
-Pagination* Pagination::New(Ctx* cx, int page, int total) {
+Pagination* Pagination::New(Ctx* cx, int64_t page, int64_t total) {
     Arena* a = cx->a;
     Pagination* p = ArenaNew<Pagination>(a);
     p->a = a;
@@ -80835,18 +85412,18 @@ Pagination* Pagination::Id(Str s) {
     id = s;
     return this;
 }
-Pagination* Pagination::CurrentPage(int value) {
+Pagination* Pagination::CurrentPage(int64_t value) {
     page = value < 1 ? 1 : value;
     return this;
 }
-Pagination* Pagination::TotalPages(int value) {
+Pagination* Pagination::TotalPages(int64_t value) {
     total = value < 1 ? 1 : value;
     if (page > total) {
         page = total;
     }
     return this;
 }
-Pagination* Pagination::VisiblePages(int n) {
+Pagination* Pagination::VisiblePages(int64_t n) {
     visiblePages = n;
     return this;
 }
@@ -80877,13 +85454,14 @@ El* Pagination::IntoEl() {
     st.disabled = disabled;
     El* row = gpui::Pagination::New(cx, base)
                   ->FlexRow()
-                  ->PadX(8)
-                  ->PadY(8)
-                  ->Gap(4)
+
+                  ->PadX(Rems(cx, 0.5f))
+                  ->PadY(Rems(cx, 0.5f))
+                  ->Gap(Rems(cx, 0.25f))
                   ->ItemsCenter();
 
-    int prevPage = PaginationPrevPage(&st);
-    int nextPage = PaginationNextPage(&st);
+    int64_t prevPage = PaginationPrevPage(&st);
+    int64_t nextPage = PaginationNextPage(&st);
     bool hasPrev = prevPage != 0;
     bool hasNext = nextPage != 0;
     Button* prev = Button::New(cx, StrL("prev"))
@@ -80905,16 +85483,18 @@ El* Pagination::IntoEl() {
         next->Label(Tr("Pagination.next"))->IconRight(IconName::ChevronRight);
     }
     if (hasPrev && onChange.IsValid()) {
-        prev->OnClick(ListenerArg(onChange, prevPage));
+        prev->OnClick(ListenerArg(onChange, (int64_t)prevPage));
     }
     if (hasNext && onChange.IsValid()) {
-        next->OnClick(ListenerArg(onChange, nextPage));
+        next->OnClick(ListenerArg(onChange, (int64_t)nextPage));
     }
     row->Child(prev->IntoEl());
     if (!compact) {
-        int visible = st.visiblePages < 5 ? 5 : st.visiblePages;
-        int64_t wanted = (int64_t)visible + 2;
-        int cap = st.totalPages < wanted ? st.totalPages : (int)wanted;
+        int64_t visible = st.visiblePages < 5 ? 5 : st.visiblePages;
+        int64_t wanted = visible + 2;
+
+        int64_t buttons = st.totalPages < wanted ? st.totalPages : wanted;
+        int cap = buttons > INT_MAX ? INT_MAX : (int)buttons;
         PaginationItem* items =
             (PaginationItem*)Alloc(a, (int)sizeof(PaginationItem) * cap);
         int n = PaginationItems(&st, items, cap);
@@ -80937,12 +85517,13 @@ El* Pagination::IntoEl() {
                                       ->MinW(55)
                                       ->MaxH(240)
                                       ->Scrollable();
-                int first = 0;
-                int end = 0;
+                int64_t first = 0;
+                int64_t end = 0;
                 PaginationEllipsisMenuPages(items[i].from, items[i].to + 1,
                                             page, &first, &end);
-                for (int p = first; p < end; p++) {
-                    menu->MenuWithCheck(StrDup(a, fmt("%d", p)), p == page);
+                for (int64_t p = first; p < end; p++) {
+                    menu->MenuWithCheck(StrDup(a, fmt("%lld", (long long)p)),
+                                        p == page);
                 }
                 Entity<PaginationMenuState> ment =
                     ElementStateEntity<PaginationMenuState>(
@@ -80963,11 +85544,12 @@ El* Pagination::IntoEl() {
             }
             bool selected = items[i].page == page;
 
-            Button* b = Button::New(cx, StrDup(a, fmt("%d", items[i].page)))
-                            ->Label(StrDup(a, fmt("%d", items[i].page)))
-                            ->Compact()
-                            ->WithSize(size)
-                            ->Disabled(disabled);
+            Button* b =
+                Button::New(cx, ElementIdInteger(a, (uint64_t)items[i].page))
+                    ->Label(StrDup(a, fmt("%lld", (long long)items[i].page)))
+                    ->Compact()
+                    ->WithSize(size)
+                    ->Disabled(disabled);
             if (selected) {
                 b->Outline();
             } else {
@@ -80975,7 +85557,7 @@ El* Pagination::IntoEl() {
             }
             if (onChange.IsValid() &&
                 PaginationCanRequest(&st, items[i].page)) {
-                b->OnClick(ListenerArg(onChange, items[i].page));
+                b->OnClick(ListenerArg(onChange, (int64_t)items[i].page));
             }
             row->Child(b->IntoEl());
         }
@@ -81245,12 +85827,7 @@ Tooltip* Tooltip::Child(El* value) {
 }
 
 Tooltip* Tooltip::Progress(float value) {
-    if (value < 0) {
-        value = 0;
-    }
-    if (value > 1) {
-        value = 1;
-    }
+    value = ClampF(value, 0, 1);
     progress = value;
     return this;
 }
@@ -81310,16 +85887,19 @@ El* Tooltip::IntoEl() {
         root->Child(shown.IntoEl(cx));
     }
 
-    El* content = Div(a)->FlexCol()->Gap(4)->Font(12);
+    El* content = Div(a)->FlexCol()->Gap(Rems(cx, 0.25f))->Font(12);
     if (hasTitle || rows.len > 0) {
         if (hasTitle) {
             content->Child(TextEl(a, title)->Semibold());
         }
         bool swatched = TooltipHasSwatches(rows);
         for (const TooltipRow& row : rows) {
-            El* left = Div(a)->FlexRow()->ItemsCenter()->Gap(6);
+            El* left = Div(a)->FlexRow()->ItemsCenter()->Gap(Rems(cx, 0.375f));
             if (swatched) {
-                El* swatch = Div(a)->W(8)->H(8)->Radius(theme.radius * .5f);
+                El* swatch = Div(a)
+                                 ->W(Rems(cx, 0.5f))
+                                 ->H(Rems(cx, 0.5f))
+                                 ->Radius(theme.radius * .5f);
                 if (row.hasColor) {
                     swatch->Bg(row.color);
                 }
@@ -81334,7 +85914,7 @@ El* Tooltip::IntoEl() {
                                ->FlexRow()
                                ->ItemsCenter()
                                ->JustifyBetween()
-                               ->Gap(12)
+                               ->Gap(Rems(cx, 0.75f))
                                ->Child(left)
                                ->Child(value));
         }
@@ -81349,7 +85929,7 @@ El* Tooltip::IntoEl() {
         PopoverSurface(cx, content)
             ->Absolute()
             ->MinW(150)
-            ->Pad(8)
+            ->Pad(Rems(cx, 0.5f))
             ->Opacity(overlay);
         if (cursor.x < within.w * .5f) {
             content->Left(cursor.x + gap);
@@ -81364,6 +85944,16 @@ El* Tooltip::IntoEl() {
     }
     root->Child(content->Deferred());
     return root;
+}
+
+void PlotOverlayAttach(PaintCtx* ctx, El* plot, Bounds bounds, El* overlay) {
+    if (!ctx || !plot || !overlay) {
+        return;
+    }
+
+    LayoutEl(ctx, overlay, bounds.x, bounds.y, bounds.w, bounds.h,
+             plot->laidFont, plot->style.color);
+    plot->Child(overlay);
 }
 
 }
@@ -81629,6 +86219,25 @@ Popover* Popover::ContentBuilder(El* (*fn)(void* user, Ctx* cx), void* user) {
     contentUser = user;
     return this;
 }
+Popover* Popover::Child(El* e) {
+    if (e) {
+        children.Append(a, e);
+    }
+    return this;
+}
+Popover* Popover::Appearance(bool v) {
+    appearance = v;
+    return this;
+}
+Popover* Popover::Refine(const Style& s, uint32_t fields) {
+    StyleApplyFields(&style, s, fields);
+    styleSet |= fields;
+    return this;
+}
+Popover* Popover::RefineWith(ElRefiner r) {
+    refiner = r;
+    return this;
+}
 Popover* Popover::New(Ctx* cx, Str id) {
     Popover* p = New(cx);
     p->id = id;
@@ -81647,8 +86256,8 @@ Popover* Popover::OnClose(Listener fn) {
     onClose = fn;
     return this;
 }
-Popover* Popover::TriggerStyle(const Style& style, uint32_t fields) {
-    triggerStyle = style;
+Popover* Popover::TriggerStyle(const Style& s, uint32_t fields) {
+    triggerStyle = s;
     triggerStyleSet = fields;
     return this;
 }
@@ -81724,12 +86333,7 @@ void ArrowPoints(Bounds surface, Bounds trigger, gpui::Placement side,
     float half = depth < span ? depth : span;
     float inset = radius + half < span ? radius + half : span;
     float center = target;
-    if (center < start + inset) {
-        center = start + inset;
-    }
-    if (center > end - inset) {
-        center = end - inset;
-    }
+    center = ClampF(center, start + inset, end - inset);
     switch (side) {
         case Placement::Bottom:
             out[0] = {center - half, surface.y};
@@ -81837,33 +86441,44 @@ El* Popover::IntoEl() {
     if (triggerButton) {
         trigger = triggerButton->Open(triggerButton->open || isOpen)->IntoEl();
     }
-    if (isOpen && contentFn) {
-        content = contentFn(contentUser, cx);
-    }
     const Theme& th = ThemeNow(cx->app);
-    float arrowSize = arrow ? kPopoverArrowSize : 0.f;
-    float gap = (hasOffset ? offset : kPopoverOffset) + arrowSize;
+    float arrowSize = arrow ? Rems(cx, kPopoverArrowRems) : 0.f;
+    float gap = (hasOffset ? offset : Rems(cx, kPopoverOffsetRems)) + arrowSize;
     PopoverArrowState* arrowState = nullptr;
-    if (isOpen && content && arrow) {
+    El* surface = nullptr;
+    if (isOpen) {
+        if (contentFn) {
+            content = contentFn(contentUser, cx);
+        }
+
+        surface = Div(a)->Id(StrL("content"))->FlexCol();
+        if (appearance) {
+            PopoverSurface(cx, surface)->Pad(Rems(cx, 0.75f));
+        }
+        surface->Child(content);
+        for (El* child : children) {
+            surface->Child(child);
+        }
+        if (styleSet) {
+            surface->Refine(style, styleSet);
+        }
+        refiner.Apply(surface);
+    }
+    if (surface && arrow) {
         arrowState = ArenaNew<PopoverArrowState>(a);
         arrowState->anchor = anchor;
         arrowState->size = arrowSize;
         arrowState->radius = th.radius;
 
-        bool solid = content->style.hasBg && !content->style.bg.gradient;
-        arrowState->background = solid ? content->style.bg.color : th.popover;
+        bool solid = (styleSet & StyleFieldBg) && !style.bg.gradient;
+        arrowState->background = solid ? style.bg.color : th.popover;
 
-        if (content->style.border > 0) {
-            arrowState->outline = true;
-            arrowState->ring = content->style.borderColor;
-        } else if (content->style.shadowCount > 0) {
-            arrowState->outline = true;
-            arrowState->ring = RgbaOpacity(th.foreground, 0.1f);
-        }
+        arrowState->outline = appearance;
+        arrowState->ring = RgbaOpacity(th.foreground, 0.1f);
         El* canvas = Div(a)->Absolute()->Left(0)->Top(0)->W(kFill)->H(kFill);
         canvas->customPaint = &PaintPopoverArrow;
         canvas->customUser = arrowState;
-        content->Child(canvas);
+        surface->Child(canvas);
     }
     El* root = gpui::Popover::New(cx, popId, st, button)
                    ->Anchor(anchor)
@@ -81874,7 +86489,7 @@ El* Popover::IntoEl() {
                    ->OnOpenChange(onOpenChange)
                    ->OnDismiss(onClose)
                    ->Trigger(trigger)
-                   ->Content(isOpen ? content : nullptr)
+                   ->Content(surface)
                    ->IntoEl();
 
     if (triggerStyleSet) {
@@ -82055,22 +86670,12 @@ static void PaintCircleProgress(PaintCtx* ctx, El* e, void* user) {
     Rgba col = p->hasColor ? p->color : ThemeNow(ctx->app).foreground;
     CanvasEllipse(ctx, cx, cy, r, r, sw, RgbaOpacity(col, 0.2f));
     float v = p->value;
-    if (v < 0) {
-        v = 0;
-    }
-    if (v > 100) {
-        v = 100;
-    }
+    v = ClampF(v, 0, 100);
     if (v <= 0) {
         return;
     }
     float from = p->startValue;
-    if (from < 0) {
-        from = 0;
-    }
-    if (from > v) {
-        from = v;
-    }
+    from = ClampF(from, 0, v);
 
     float start = -kPi * 0.5f + 2.f * kPi * (from / 100.f);
     float sweep = 2.f * kPi * ((v - from) / 100.f);
@@ -82253,78 +86858,78 @@ static QuestionnaireMetrics Metrics(UiSize size, App* app) {
     return m;
 }
 
-static El* ApplyTextToken(El* e, const TextStyleToken& token) {
-    e->Font(token.size);
+static El* ApplyTextToken(const Ctx* cx, El* e, const TextStyleToken& token) {
+    e->Font(FontPx(cx, token.size));
     if (token.size > 0) {
         e->LineHeight(token.lineHeight / token.size);
     }
     return e->Weight(token.weight);
 }
 
-static El* TextStyle(El* e, UiSize size, App* app) {
-    const TypographyTokens& t = ui_questionnaire_Tokens(app).typography;
+static El* TextStyle(El* e, UiSize size, const Ctx* cx) {
+    const TypographyTokens& t = ui_questionnaire_Tokens(cx->app).typography;
     switch (size) {
         case UiSize::XSmall:
-            return ApplyTextToken(e, t.xs);
+            return ApplyTextToken(cx, e, t.xs);
         case UiSize::Small:
-            return ApplyTextToken(e, t.sm);
+            return ApplyTextToken(cx, e, t.sm);
         case UiSize::Large:
-            return ApplyTextToken(e, t.lg);
+            return ApplyTextToken(cx, e, t.lg);
         case UiSize::Size:
-            return e->Font(size.pixels);
+            return e->Font(FontPx(cx, size.pixels));
         default:
-            return ApplyTextToken(e, t.md);
+            return ApplyTextToken(cx, e, t.md);
     }
 }
 
-static El* SecondaryTextStyle(El* e, UiSize size, App* app) {
-    const TypographyTokens& t = ui_questionnaire_Tokens(app).typography;
+static El* SecondaryTextStyle(El* e, UiSize size, const Ctx* cx) {
+    const TypographyTokens& t = ui_questionnaire_Tokens(cx->app).typography;
     switch (size) {
         case UiSize::XSmall:
         case UiSize::Small:
-            return ApplyTextToken(e, t.xs);
+            return ApplyTextToken(cx, e, t.xs);
         case UiSize::Large:
-            return ApplyTextToken(e, t.md);
+            return ApplyTextToken(cx, e, t.md);
         case UiSize::Size:
-            return e->Font(size.pixels * 0.875f);
+            return e->Font(FontPx(cx, size.pixels * 0.875f));
         default:
-            return ApplyTextToken(e, t.sm);
+            return ApplyTextToken(cx, e, t.sm);
     }
 }
 
-static El* ProgressTextStyle(El* e, UiSize size, App* app) {
-    const TypographyTokens& t = ui_questionnaire_Tokens(app).typography;
+static El* ProgressTextStyle(El* e, UiSize size, const Ctx* cx) {
+    const TypographyTokens& t = ui_questionnaire_Tokens(cx->app).typography;
     switch (size) {
         case UiSize::Large:
-            ApplyTextToken(e, t.sm);
+            ApplyTextToken(cx, e, t.sm);
             break;
         case UiSize::Size:
-            e->Font(size.pixels * 0.75f);
+            e->Font(FontPx(cx, size.pixels * 0.75f));
             break;
         default:
-            ApplyTextToken(e, t.xs);
+            ApplyTextToken(cx, e, t.xs);
             break;
     }
     return e->Weight(FontWeight::Medium);
 }
 
-static El* TitleTextStyle(El* e, UiSize size, App* app) {
-    const TypographyTokens& t = ui_questionnaire_Tokens(app).typography;
+static El* TitleTextStyle(El* e, UiSize size, const Ctx* cx) {
+    const TypographyTokens& t = ui_questionnaire_Tokens(cx->app).typography;
     switch (size) {
         case UiSize::XSmall:
-            ApplyTextToken(e, t.sm);
+            ApplyTextToken(cx, e, t.sm);
             break;
         case UiSize::Small:
-            ApplyTextToken(e, t.md);
+            ApplyTextToken(cx, e, t.md);
             break;
         case UiSize::Large:
-            ApplyTextToken(e, t.xl);
+            ApplyTextToken(cx, e, t.xl);
             break;
         case UiSize::Size:
-            e->Font(size.pixels * 1.125f);
+            e->Font(FontPx(cx, size.pixels * 1.125f));
             break;
         default:
-            ApplyTextToken(e, t.lg);
+            ApplyTextToken(cx, e, t.lg);
             break;
     }
     return e->Weight(FontWeight::Medium);
@@ -82508,7 +87113,7 @@ El* QuestionnaireProgress::IntoEl() {
                                   ->AriaMaxNumericValue((float)progress.total)
                                   ->AriaNumericValue((float)progress.current)
                                   ->Fg(colors.mutedForeground),
-                              resolved, cx->app);
+                              resolved, cx);
     RefineWith(e, this);
     if (children.len == 0) {
         e->Child(TextEl(a, label));
@@ -82516,7 +87121,7 @@ El* QuestionnaireProgress::IntoEl() {
     return AddChildren(e, this);
 }
 
-using TextStyleFn = El* (*)(El*, UiSize, App*);
+using TextStyleFn = El* (*)(El*, UiSize, const Ctx*);
 
 static El* ItemTextPart(QuestionnairePart* part, Str fallback, TextStyleFn fn,
                         Rgba color, bool closesItemGap) {
@@ -82533,7 +87138,7 @@ static El* ItemTextPart(QuestionnairePart* part, Str fallback, TextStyleFn fn,
         return nullptr;
     }
     UiSize resolved = QuestionnaireResolveSize(cx->app, part);
-    El* e = fn(Div(part->a)->W(kFill)->Fg(color), resolved, cx->app);
+    El* e = fn(Div(part->a)->W(kFill)->Fg(color), resolved, cx);
 
     if (closesItemGap && len(d->description) == 0) {
         e->MarginB(Metrics(resolved, cx->app).itemGap);
@@ -82560,8 +87165,8 @@ El* QuestionnaireTitle::IntoEl() {
                         true);
 }
 
-static El* DescriptionTextStyle(El* e, UiSize size, App* app) {
-    return SecondaryTextStyle(e, size, app);
+static El* DescriptionTextStyle(El* e, UiSize size, const Ctx* cx) {
+    return SecondaryTextStyle(e, size, cx);
 }
 
 QuestionnaireDescription* QuestionnaireDescription::New(
@@ -82763,13 +87368,13 @@ El* QuestionnaireChoice::IntoEl() {
             TextStyle(Div(a)
                           ->Fg(colors.foreground)
                           ->Child(TextEl(a, definition->accessibilityLabel)),
-                      resolved, app));
+                      resolved, cx));
         if (len(definition->description) > 0) {
             content->Child(SecondaryTextStyle(
                 Div(a)
                     ->Fg(colors.mutedForeground)
                     ->Child(TextEl(a, definition->description)),
-                resolved, app));
+                resolved, cx));
         }
     }
     AddChildren(content, this);
@@ -82796,7 +87401,7 @@ El* QuestionnaireChoice::IntoEl() {
                 ->Border(1, colors.input)
                 ->Fg(colors.mutedForeground)
                 ->Mono()
-                ->Font(m.shortcutTextSize)
+                ->Font(FontPx(cx, m.shortcutTextSize))
                 ->Weight(FontWeight::Medium)
                 ->Radius(m.shortcutRadius)
                 ->Child(TextEl(a, KbdFormatStr(cx, stroke))->LineHeight(1.f));
@@ -82848,9 +87453,8 @@ QuestionnaireChoiceDescription* QuestionnaireChoiceDescription::New(Ctx* cx) {
 
 El* QuestionnaireChoiceDescription::IntoEl() {
     const ColorTokens& colors = ui_questionnaire_Tokens(cx->app).colors;
-    El* e =
-        SecondaryTextStyle(Div(a)->Fg(colors.mutedForeground),
-                           hasSize ? size : UiSize(UiSize::Medium), cx->app);
+    El* e = SecondaryTextStyle(Div(a)->Fg(colors.mutedForeground),
+                               hasSize ? size : UiSize(UiSize::Medium), cx);
     return AddChildren(RefineWith(e, this), this);
 }
 
@@ -82926,7 +87530,7 @@ El* QuestionnaireError::IntoEl() {
             ->Role(AccessibilityRole::Alert)
             ->MarginT(tokens.spacing.sm)
             ->Fg(tokens.colors.destructive),
-        resolved, cx->app);
+        resolved, cx);
     RefineWith(e, this);
     if (children.len == 0) {
         e->Child(TextEl(a, StrDup(a, QuestionnaireErrorText(*error))));
@@ -82961,7 +87565,7 @@ enum class QuestionnaireAction : uint8_t {
 };
 
 static void ActionClick(QuestionnaireState* self, Ctx* cx, const ClickEvent*,
-                        intptr_t action) {
+                        int64_t action) {
     switch ((QuestionnaireAction)action) {
         case QuestionnaireAction::Previous:
             self->GoPrevious(cx);
@@ -83012,7 +87616,7 @@ static El* ActionPart(QuestionnairePart* part, QuestionnaireAction action,
     Button* button =
         Button::New(cx, ui_questionnaire_ElementId(cx, part->state, Str(name)))
             ->WithSize(QuestionnaireResolveSize(cx->app, part))
-            ->OnClick(ListenTo(part->state, &ActionClick, (intptr_t)action));
+            ->OnClick(ListenTo(part->state, &ActionClick, (int64_t)action));
     if (outline) {
         button->Outline();
     }
@@ -83144,10 +87748,10 @@ Radio* Radio::OnChange(Listener fn) {
 El* Radio::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
 
-    float box = size == UiSize::Small    ? 14.f
-                : size == UiSize::XSmall ? 12.f
-                : size == UiSize::Large  ? 18.f
-                                         : 16.f;
+    float box = Rems(cx, size == UiSize::Small    ? 0.875f
+                         : size == UiSize::XSmall ? 0.75f
+                         : size == UiSize::Large  ? 1.125f
+                                                  : 1.f);
     Rgba border = checked ? th.primary : th.inputBorder;
     Rgba fill = checked ? th.primary : th.inputBg;
     if (disabled) {
@@ -83165,7 +87769,8 @@ El* Radio::IntoEl() {
                   ->Shrink0();
     if (checked) {
         Rgba tick = disabled ? RgbaOpacity(th.primaryFg, 0.5f) : th.primaryFg;
-        dot->Child(IconEl(a, IconName::Check, box - 5)->Fg(tick));
+        dot->Child(IconEl(a, IconName::Check, box - Rems(cx, 0.3125f))
+                       ->Fg(tick));
     }
 
     El* row = gpui::Radio::New(cx, id, checked, disabled, onClick)
@@ -83174,7 +87779,7 @@ El* Radio::IntoEl() {
                   ->FocusRing(focusRing)
                   ->FlexRow()
                   ->ItemsStart()
-                  ->Gap(8);
+                  ->Gap(Rems(cx, 0.5f));
 
     Str name = accessibilityLabel.s ? accessibilityLabel : label;
     if (name.s) {
@@ -83184,7 +87789,7 @@ El* Radio::IntoEl() {
     row->Child(dot);
     if (label.s || hint.s || children.len > 0) {
         dot->MarginT(box * 0.125f);
-        El* col = Div(a)->FlexCol()->Gap(4)->LineHeight(1.25f);
+        El* col = Div(a)->FlexCol()->Gap(Rems(cx, 0.25f))->LineHeight(1.25f);
         if (label.s) {
 
             El* text = TextEl(a, label)
@@ -83260,7 +87865,7 @@ El* RadioGroup::IntoEl() {
 
     El* group = gpui::RadioGroup::New(
         cx, id, horizontal ? Axis::Horizontal : Axis::Vertical);
-    El* base = Div(cx->a)->Gap(12);
+    El* base = Div(cx->a)->Gap(Rems(cx, 0.75f));
     group->Child(base);
     if (horizontal) {
         base->FlexRow()->W(kFill)->FlexWrap();
@@ -83292,7 +87897,7 @@ namespace gpui {
 namespace component {
 
 void RatingState::OnStarHover(RatingState* self, Ctx* cx, const HoverEvent* ev,
-                              intptr_t ix) {
+                              int64_t ix) {
 
     int v = ev->hovered ? (int)ix : 0;
     if (self->hoveredValue == v) {
@@ -83303,7 +87908,7 @@ void RatingState::OnStarHover(RatingState* self, Ctx* cx, const HoverEvent* ev,
 }
 
 void RatingState::OnStarClick(RatingState* self, Ctx* cx, const ClickEvent*,
-                              intptr_t ix) {
+                              int64_t ix) {
 
     int v = self->value >= (int)ix ? (int)ix - 1 : (int)ix;
     self->value = v;
@@ -83376,10 +87981,13 @@ El* Rating::IntoEl() {
         bool filled = i <= shown;
 
         bool lit = filled || hovered >= i;
-        El* star = Div(a)->Pad(2)->Shrink0()->Child(
-            IconEl(a, filled ? IconName::StarFill : IconName::Star,
-                   UiIconPx(size))
-                ->Fg(lit ? activeC : th.foreground));
+        El* star =
+            Div(a)
+                ->Pad(Rems(cx, 0.125f))
+                ->Shrink0()
+                ->Child(IconEl(a, filled ? IconName::StarFill : IconName::Star,
+                               UiIconPx(cx, size))
+                            ->Fg(lit ? activeC : th.foreground));
         if (!disabled) {
 
             BindPathClick(star, StrDup(a, fmt("%d", i)),
@@ -83550,11 +88158,19 @@ El* WindowStateLayers(Ctx* cx) {
     return layers;
 }
 
-static void* WindowStateBuild(Window* window, App*) {
-    return WindowLayersOf(window);
+static void* WindowStateBuild(Window* window, App* app) {
+    WindowLayers* layers = new WindowLayers();
+    layers->app = app;
+    layers->win = window;
+    return layers;
+}
+
+static void WindowStateDrop(void* state) {
+    delete (WindowLayers*)state;
 }
 
 static void WindowStatePrepare(void*, Ctx* cx) {
+    WindowSetRemSize(cx->win, ThemeNow(cx->app).fontSize);
     UiSelectionFrameBegin(cx->app);
 }
 
@@ -83588,9 +88204,8 @@ static El* WindowStateRender(void*, Ctx* cx) {
 }
 
 const RootPlugin kWindowStatePlugin = {
-    &WindowStateBuild,    nullptr,
-    &WindowStatePrepare,  &WindowStateStyle,
-    &WindowStateDecorate, &WindowStateRender,
+    &WindowStateBuild, &WindowStateDrop,     &WindowStatePrepare,
+    &WindowStateStyle, &WindowStateDecorate, &WindowStateRender,
 };
 
 void RootInit(App* app) {
@@ -84103,14 +88718,14 @@ El* SearchableListItemElement::IntoEl() {
         Div(a)
             ->PathId(StrDup(a, fmt("searchable-list-item-%d", (int)index)))
             ->FlexRow()
-            ->Gap(4)
-            ->PadY(4)
-            ->PadX(8)
+            ->Gap(Rems(cx, 0.25f))
+            ->PadY(Rems(cx, 0.25f))
+            ->PadX(Rems(cx, 0.5f))
             ->Radius(th.radius)
             ->Fg(disabled ? th.mutedFg : th.foreground)
             ->ItemsCenter()
             ->JustifyBetween();
-    UiListSize(row, size);
+    UiListSize(cx, row, size);
     if (!disabled && !selected) {
         row->HoverBg(BackgroundOpacity(th.tokens.accent, 0.7f));
     }
@@ -84130,11 +88745,11 @@ El* SearchableListItemElement::IntoEl() {
                     ->FlexRow()
                     ->W(kFill)
                     ->MinW(0)
-                    ->Gap(4)
+                    ->Gap(Rems(cx, 0.25f))
                     ->ItemsCenter()
                     ->JustifyBetween()
                     ->Child(left);
-    El* check = IconEl(a, checkIcon, UiIconPx(UiSize::XSmall))
+    El* check = IconEl(a, checkIcon, UiIconPx(cx, UiSize::XSmall))
                     ->Shrink0()
                     ->Fg(th.foreground);
     if (!checked) {
@@ -84380,7 +88995,7 @@ bool SearchableListClick(SearchableListState* s, int index) {
 }
 
 void SearchableListState::OnRowClick(SearchableListState* self, Ctx* cx,
-                                     const ClickEvent*, intptr_t match) {
+                                     const ClickEvent*, int64_t match) {
     int m = (int)match;
     if (m < 0 || m >= self->matches.len) {
         return;
@@ -84529,8 +89144,13 @@ El* SearchableList::IntoEl() {
     SearchableListSearch(s, items, nItems, query ? InputValue(query) : Str{});
 
     if (query) {
-        El* row =
-            Div(a)->FlexRow()->W(kFill)->H(32)->PadX(4)->Gap(8)->ItemsCenter();
+        El* row = Div(a)
+                      ->FlexRow()
+                      ->W(kFill)
+                      ->H(Rems(cx, 2))
+                      ->PadX(4)
+                      ->Gap(8)
+                      ->ItemsCenter();
         row->Child(IconEl(a, IconName::Search, 16)->Fg(th.mutedFg));
         row->Child(Div(a)->Flex1()->Child(Input::New(cx, StrL("query"), query)
                                               ->Appearance(false)
@@ -84569,11 +89189,14 @@ El* SearchableList::IntoEl() {
             if (custom) {
                 rows->Child(custom);
             } else if (sections[it.section].s) {
-                rows->Child(
-                    Div(a)->W(kFill)->Shrink0()->PadX(8)->PadY(2)->Child(
-                        TextEl(a, sections[it.section])
-                            ->Font(14)
-                            ->Fg(th.mutedFg)));
+                rows->Child(Div(a)
+                                ->W(kFill)
+                                ->Shrink0()
+                                ->PadX(Rems(cx, 0.5f))
+                                ->PadY(Rems(cx, 0.125f))
+                                ->Child(TextEl(a, sections[it.section])
+                                            ->Font(14)
+                                            ->Fg(th.mutedFg)));
             }
             lastSection = it.section;
         }
@@ -84589,7 +89212,7 @@ El* SearchableList::IntoEl() {
 
         El* label = Div(a)->FlexRow()->Gap(8)->ItemsCenter()->MinW(0);
         if (it.icon != IconName::None) {
-            label->Child(IconEl(a, it.icon, UiIconPx(UiSize::Small))
+            label->Child(IconEl(a, it.icon, UiIconPx(cx, UiSize::Small))
                              ->Fg(th.mutedFg));
         }
 
@@ -84650,8 +89273,11 @@ El* SearchableList::IntoEl() {
     box->Child(rows);
     if (footer) {
 
-        box->Child(
-            Div(a)->W(kFill)->BorderT(1, th.border)->Pad(4)->Child(footer));
+        box->Child(Div(a)
+                       ->W(kFill)
+                       ->BorderT(1, th.border)
+                       ->Pad(Rems(cx, 0.25f))
+                       ->Child(footer));
     }
 
     if (!inSelect) {
@@ -84765,18 +89391,15 @@ Caret Caret::TextColor(Rgba value) const {
     return out;
 }
 
-float Caret::IconSize() const {
-    if (size == UiSize::XSmall) {
-        return 12;
+float Caret::IconSize(const Ctx* cx) const {
+    if (size == UiSize::XSmall || size == UiSize::Small) {
+        return UiIconPx(cx, size);
     }
-    if (size == UiSize::Small) {
-        return 14;
-    }
-    return 16;
+    return UiIconPx(cx, UiSize::Medium);
 }
 
-El* Caret::IntoEl(Arena* a) const {
-    El* out = IconEl(a, IconName::ChevronDown, IconSize());
+El* Caret::IntoEl(const Ctx* cx, Arena* a) const {
+    El* out = IconEl(a, IconName::ChevronDown, IconSize(cx));
     if (hasColor) {
         out->Fg(color);
     }
@@ -85271,16 +89894,16 @@ El* Select::IntoEl() {
         owner->WatchBlur(cx->win);
     }
 
-    float h = 32, padX = 10, font = 14;
+    float h = UiInputHeight(cx, UiSize::Medium), padX = 10, font = 14;
     if (size == UiSize::Large) {
-        h = 44;
+        h = UiInputHeight(cx, UiSize::Large);
         padX = 12;
         font = 16;
     } else if (size == UiSize::Small) {
-        h = 24;
+        h = UiInputHeight(cx, UiSize::Small);
         padX = 8;
     } else if (size == UiSize::XSmall) {
-        h = 20;
+        h = UiInputHeight(cx, UiSize::XSmall);
         padX = 4;
         font = 12;
     }
@@ -85294,11 +89917,14 @@ El* Select::IntoEl() {
                   ->W(width)
                   ->H(h)
                   ->PadX(padX)
-                  ->Gap(4)
+                  ->Gap(Rems(cx, 0.25f))
                   ->ItemsCenter()
                   ->JustifyBetween();
-    if (triggerBoundsOut) {
-        box->BoundsOut(triggerBoundsOut);
+
+    Bounds* triggerOut =
+        triggerBoundsOut ? triggerBoundsOut : (s ? &s->triggerBounds : nullptr);
+    if (triggerOut) {
+        box->BoundsOut(triggerOut);
     }
     if (triggerStyleSet) {
         box->Refine(triggerStyle, triggerStyleSet);
@@ -85331,9 +89957,10 @@ El* Select::IntoEl() {
                            ->StopClick());
         } else if (icon != IconName::None) {
 
-            box->Child(IconEl(a, icon, 12)->Fg(th.mutedFg));
+            box->Child(IconEl(a, icon, UiIconPx(cx, UiSize::XSmall))
+                           ->Fg(th.mutedFg));
         } else {
-            box->Child(Caret::New(size).TextColor(th.mutedFg).IntoEl(a));
+            box->Child(Caret::New(size).TextColor(th.mutedFg).IntoEl(cx, a));
         }
     }
     if (!disabled && !open) {
@@ -85353,6 +89980,9 @@ El* Select::IntoEl() {
         }
     }
 
+    float autoMenuW = triggerOut && triggerOut->w > 0 ? triggerOut->w
+                      : width > 0                     ? width
+                                                      : Rems(cx, 15.f);
     El* menu = nullptr;
     if (open) {
 
@@ -85361,7 +89991,7 @@ El* Select::IntoEl() {
                 ->InSelect(true)
                 ->Items(items, nItems)
 
-                ->W(menuWidth > 0 ? menuWidth : (width > 0 ? width : 240))
+                ->W(menuWidth > 0 ? menuWidth : autoMenuW)
                 ->CheckIcon(checkIcon)
                 ->WithSize(size);
         if (sections) {
@@ -85370,9 +90000,8 @@ El* Select::IntoEl() {
         if (query) {
             list->OnQueryFocus(onQueryFocus);
         }
-        if (menuMaxH > 0) {
-            list->MaxH(menuMaxH);
-        }
+
+        list->MaxH(menuMaxH > 0 ? menuMaxH : Rems(cx, 20.f));
         if (footer) {
             list->Footer(footer);
         }
@@ -85486,7 +90115,7 @@ El* Separator::IntoEl() {
         }
         root->Child(lineEl);
     } else {
-        root->FlexRow()->W(kFill)->H(label.s ? 24.f : 1.f);
+        root->FlexRow()->W(kFill)->H(label.s ? Rems(cx, 1.5f) : 1.f);
 
         El* lineEl = Div(a)->H(1);
         if (label.s) {
@@ -85507,7 +90136,7 @@ El* Separator::IntoEl() {
                         ->Font(12)
                         ->Fg(th.mutedFg)
                         ->Bg(th.tokens.background)
-                        ->PadX(8));
+                        ->PadX(Rems(cx, 0.5f)));
     }
     return root;
 }
@@ -85685,7 +90314,7 @@ bool SettingGroupIsResettable(const SettingGroup* g, Str query) {
 }
 
 void SettingsState::OnPageClick(SettingsState* self, Ctx* cx, const ClickEvent*,
-                                intptr_t page) {
+                                int64_t page) {
     self->page = (int)page;
     self->group = -1;
     self->deferredScrollGroup = -1;
@@ -85693,7 +90322,7 @@ void SettingsState::OnPageClick(SettingsState* self, Ctx* cx, const ClickEvent*,
 }
 
 void SettingsState::OnGroupClick(SettingsState* self, Ctx* cx,
-                                 const ClickEvent*, intptr_t packed) {
+                                 const ClickEvent*, int64_t packed) {
     self->page = (int)(packed / 64);
     self->group = (int)(packed % 64);
     self->deferredScrollGroup = self->group;
@@ -85731,7 +90360,18 @@ static const float kStackedLayoutMaxWidth = 480;
 struct SettingsContainerQuery {
     Entity<SettingsState> state = {};
     Axis layout = Axis::Horizontal;
+
+    Settings* settings = nullptr;
+    Ctx cx = {};
+    int selected = -1;
+    Str query = {};
+    int scrollGroup = -1;
+
+    int fieldsLen = 0;
 };
+
+static void SettingsBuildPage(Ctx* cx, Settings* s, El* pane, int selected,
+                              Str query, Axis pageLayout, int scrollGroup);
 
 static void SettingsContainerPrePaint(PaintCtx* ctx, El* e, void* user) {
     auto* q = (SettingsContainerQuery*)user;
@@ -85739,19 +90379,37 @@ static void SettingsContainerPrePaint(PaintCtx* ctx, El* e, void* user) {
     if (!st) {
         return;
     }
+
+    if (LayoutInScratchPass()) {
+        return;
+    }
     st->containerWidth = e->w;
     Axis want =
         e->w <= kStackedLayoutMaxWidth ? Axis::Vertical : Axis::Horizontal;
-    if (want != q->layout && ctx->window) {
-        WindowRequestAnimationFrame(ctx->window);
+    if (want == q->layout) {
+        return;
     }
+    q->layout = want;
+    if (!q->settings) {
+        return;
+    }
+    if (st->fields.len > q->fieldsLen) {
+        VecRemoveAtN(st->fields, q->fieldsLen, st->fields.len - q->fieldsLen);
+    }
+    e->first = nullptr;
+    e->last = nullptr;
+    Ctx cx = q->cx;
+    SettingsBuildPage(&cx, q->settings, e, q->selected, q->query, want,
+                      q->scrollGroup);
+    IdsCollectChildren(e);
+    LayoutEl(ctx, e, e->x, e->y, e->w, e->h, e->laidFont, e->style.color);
 }
 
 static int DropdownIndex(const SearchableListState* st) {
     return st && st->selected.len > 0 ? st->selected[0] : -1;
 }
 
-static SettingBinding* FieldAt(SettingsState* self, intptr_t ix) {
+static SettingBinding* FieldAt(SettingsState* self, int64_t ix) {
     if (!self || ix < 0 || ix >= self->fields.len) {
         return nullptr;
     }
@@ -85759,7 +90417,7 @@ static SettingBinding* FieldAt(SettingsState* self, intptr_t ix) {
 }
 
 void SettingsState::OnFieldClick(SettingsState* self, Ctx* cx,
-                                 const ClickEvent*, intptr_t ix) {
+                                 const ClickEvent*, int64_t ix) {
     SettingBinding* f = FieldAt(self, ix);
     if (!f) {
         return;
@@ -85776,7 +90434,7 @@ void SettingsState::OnFieldClick(SettingsState* self, Ctx* cx,
 }
 
 void SettingsState::OnDropdownPick(SettingsState* self, Ctx* cx,
-                                   const ClickEvent*, intptr_t packed) {
+                                   const ClickEvent*, int64_t packed) {
     SettingBinding* f = FieldAt(self, packed / kDropdownOptionsMax);
     if (!f || f->kind != SettingFieldKind::Dropdown) {
         return;
@@ -85788,7 +90446,7 @@ void SettingsState::OnDropdownPick(SettingsState* self, Ctx* cx,
 }
 
 void SettingsState::OnFieldReset(SettingsState* self, Ctx* cx,
-                                 const ClickEvent*, intptr_t ix) {
+                                 const ClickEvent*, int64_t ix) {
     SettingBinding* f = FieldAt(self, ix);
     if (!f) {
         return;
@@ -85818,7 +90476,7 @@ void SettingsState::OnFieldReset(SettingsState* self, Ctx* cx,
 }
 
 static void ResetBinding(SettingsState* self, Ctx* cx, const ClickEvent* ev,
-                         intptr_t ix) {
+                         int64_t ix) {
     SettingBinding* f = FieldAt(self, ix);
     if (!f) {
         return;
@@ -85834,12 +90492,12 @@ static void ResetBinding(SettingsState* self, Ctx* cx, const ClickEvent* ev,
 }
 
 void SettingsState::OnResetPage(SettingsState* self, Ctx* cx,
-                                const ClickEvent* ev, intptr_t) {
+                                const ClickEvent* ev, int64_t) {
     if (!self) {
         return;
     }
     for (int i = 0; i < self->fields.len; i++) {
-        ResetBinding(self, cx, ev, (intptr_t)i);
+        ResetBinding(self, cx, ev, (int64_t)i);
     }
 }
 
@@ -86196,14 +90854,14 @@ static FieldEl ui_setting_RenderField(Ctx* cx, Settings* s, const SettingItem& i
     b.hasDefault = it.hasDefault;
 
     b.onReset = it.onReset;
-    intptr_t ix = (intptr_t)st->fields.len;
+    int64_t ix = (int64_t)st->fields.len;
     VecAppend(st->fields, b);
 
     Listener click = ListenTo(s->state, &SettingsState::OnFieldClick, ix);
 
     float w = it.fieldW > 0 ? it.fieldW
               : options.layout == Axis::Horizontal
-                  ? (it.field == SettingFieldKind::Input ? 256.f : 128.f)
+                  ? Rems(cx, it.field == SettingFieldKind::Input ? 16.f : 8.f)
                   : kFill;
     switch (it.field) {
         case SettingFieldKind::Switch:
@@ -86303,7 +90961,7 @@ static El* ui_setting_RenderItem(Ctx* cx, Settings* s, const SettingItem& it, St
     IdScope scope(cx, id);
 
     Axis layout = pageLayout == Axis::Vertical ? Axis::Vertical : it.layout;
-    El* line = Div(a)->Id(id)->W(kFill)->Gap(12);
+    El* line = Div(a)->Id(id)->W(kFill)->Gap(Rems(cx, 0.75f));
     if (it.disabled) {
         line->Opacity(0.5f);
     }
@@ -86365,8 +91023,140 @@ static El* ui_setting_RenderItem(Ctx* cx, Settings* s, const SettingItem& it, St
     return line;
 }
 
-El* Settings::IntoEl() {
+static void SettingsBuildPage(Ctx* cx, Settings* s, El* pane, int selected,
+                              Str query, Axis pageLayout, int scrollGroup) {
+    Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
+    Entity<SettingsState> state = s->state;
+    SettingsState* st = state.Get(cx);
+    GroupBoxVariant groupVariant = s->groupVariant;
+    const SettingPage& p = s->pages[selected];
+
+    bool anyDirty = false;
+    SettingsPageScroll* scroll = ArenaNew<SettingsPageScroll>(a);
+    scroll->state = state;
+
+    El* body =
+        Div(a)
+            ->Id(StrL("page-body"))
+            ->FlexCol()
+            ->W(kFill)
+            ->Flex1()
+            ->MinH(0)
+            ->PadX(Rems(cx, 1.f))
+            ->ClipY()
+            ->ScrollY(st ? st->scrollY : 0)
+            ->ScrollId((int)IdFoldName(cx->path, fmt("page-%d", selected)))
+            ->OnScroll(ListenTo(state, &SettingsState::OnPageScroll));
+    int g = -1;
+    for (const SettingGroup& grp : p.groups) {
+        g++;
+        if (!SettingGroupMatches(&grp, query)) {
+            continue;
+        }
+
+        GroupBoxVariant variant = grp.hasVariant ? grp.variant : groupVariant;
+        bool padded = variant != GroupBoxVariant::Normal;
+
+        El* box = Div(a)
+                      ->FlexCol()
+                      ->W(kFill)
+                      ->Gap(Rems(cx, padded ? 0.75f : 1.f))
+                      ->PadY(Rems(cx, 1.f));
+        if (grp.title.s) {
+
+            El* title = Div(a)
+                            ->FlexCol()
+                            ->Gap(Rems(cx, 0.25f))
+                            ->Fg(th.mutedFg)
+                            ->LineHeight(1.25f);
+            title->Child(TextEl(a, grp.title)->Wrap());
+            if (grp.description.s) {
+                title->Child(TextEl(a, grp.description)
+                                 ->Font(14)
+                                 ->Fg(th.mutedFg)
+                                 ->Wrap());
+            }
+            box->Child(title);
+        }
+
+        El* card = Div(a)
+                       ->FlexCol()
+                       ->W(kFill)
+                       ->Gap(Rems(cx, 1.f))
+                       ->Radius(th.radius)
+                       ->Fg(th.groupBoxFg);
+        if (variant == GroupBoxVariant::Outline) {
+            card->Pad(Rems(cx, 1.f))->Border(1, th.border);
+        } else if (variant == GroupBoxVariant::Fill) {
+            card->Pad(Rems(cx, 1.f))->Bg(th.groupBox);
+        }
+        int itemIx = -1;
+        for (const SettingItem& it : grp.items) {
+            itemIx++;
+            if (!SettingItemMatches(&it, query)) {
+                continue;
+            }
+            card->Child(ui_setting_RenderItem(
+                cx, s, it, StrDup(a, fmt("%d-%d-%d", selected, g, itemIx)),
+                selected, g, itemIx, pageLayout, p.resettable, &anyDirty));
+        }
+
+        El* slot =
+            Div(a)->FlexCol()->W(kFill)->Gap(Rems(cx, 0.5f))->Child(card);
+        if (grp.footer) {
+            slot->Child(Div(a)->Font(14)->Fg(th.mutedFg)->Child(grp.footer));
+        }
+        box->Child(slot);
+        grp.refiner.Apply(box);
+        if (g == scrollGroup) {
+            scroll->target = box;
+        }
+        body->Child(box);
+    }
+
+    El* head = Div(a)
+                   ->FlexCol()
+                   ->W(kFill)
+                   ->Pad(Rems(cx, 1.f))
+                   ->Gap(Rems(cx, 0.75f))
+                   ->BorderB(1, th.border);
+    El* titleRow = Div(a)->FlexRow()->W(kFill)->ItemsCenter()->JustifyBetween();
+    El* titleCell = Div(a)->FlexRow()->ItemsCenter()->Gap(Rems(cx, 0.25f));
+
+    titleCell->Child(TextEl(a, p.title)->Fg(th.foreground));
+    if (p.titleSuffix) {
+        titleCell->Child(p.titleSuffix);
+    } else if (p.titleSuffixFn) {
+        if (El* suffix = p.titleSuffixFn(p.titleSuffixUser, cx))
+            titleCell->Child(suffix);
+    }
+    titleRow->Child(titleCell);
+
+    if (anyDirty) {
+        titleRow->Child(
+            Button::New(cx, StrL("reset-all"))
+                ->Icon(IconName::Undo2)
+                ->Tooltip(Tr("Settings.Reset All"))
+                ->Ghost()
+                ->WithSize(UiSize::Small)
+                ->OnClick(ListenTo(state, &SettingsState::OnResetPage, 0))
+                ->IntoEl());
+    }
+    head->Child(titleRow);
+    if (p.description.s) {
+        head->Child(TextEl(a, p.description)->Font(14)->Fg(th.mutedFg)->Wrap());
+    }
+    if (st && scroll->target) {
+        st->pendingScrollGroup = scrollGroup;
+    }
+    body->customPaint = &SettingsPageScrollPaint;
+    body->customUser = scroll;
+    pane->Child(head);
+    pane->Child(body);
+}
+
+El* Settings::IntoEl() {
     SettingsState* st = state.Get(cx);
     Str query = st ? InputValue(&st->search) : Str{};
 
@@ -86428,7 +91218,7 @@ El* Settings::IntoEl() {
                 ->DefaultOpen(p.defaultOpen)
                 ->Active(pageActive)
                 ->OnClick(
-                    ListenTo(state, &SettingsState::OnPageClick, (intptr_t)i));
+                    ListenTo(state, &SettingsState::OnPageClick, (int64_t)i));
         if (p.icon != IconName::None) {
             item->Icon(p.icon);
         }
@@ -86444,7 +91234,7 @@ El* Settings::IntoEl() {
                     SidebarMenuItem::New(cx, group.title)
                         ->Active(i == selected && selectedGroup == g)
                         ->OnClick(ListenTo(state, &SettingsState::OnGroupClick,
-                                           (intptr_t)i * 64 + (intptr_t)g)));
+                                           (int64_t)i * 64 + (int64_t)g)));
             }
         }
         menu->Child(item);
@@ -86470,13 +91260,8 @@ El* Settings::IntoEl() {
     pane->customUser = query_;
     if (selected >= 0 && selected < pages.len &&
         PageHasMatchingGroup(pages[selected], query)) {
-        const SettingPage& p = pages[selected];
-
-        bool anyDirty = false;
 
         int scrollGroup = -1;
-        SettingsPageScroll* scroll = ArenaNew<SettingsPageScroll>(a);
-        scroll->state = state;
         if (st) {
             uint32_t queryKey = IdFoldName(0, query);
             bool changed =
@@ -86491,122 +91276,14 @@ El* Settings::IntoEl() {
                               : (changed ? st->group : -1);
             st->deferredScrollGroup = -1;
         }
-
-        El* body =
-            Div(a)
-                ->Id(StrL("page-body"))
-                ->FlexCol()
-                ->W(kFill)
-                ->Flex1()
-                ->MinH(0)
-                ->PadX(16)
-                ->ClipY()
-                ->ScrollY(st ? st->scrollY : 0)
-                ->ScrollId((int)IdFoldName(cx->path, fmt("page-%d", selected)))
-                ->OnScroll(ListenTo(state, &SettingsState::OnPageScroll));
-        int g = -1;
-        for (const SettingGroup& grp : p.groups) {
-            g++;
-            if (!SettingGroupMatches(&grp, query)) {
-                continue;
-            }
-
-            GroupBoxVariant variant =
-                grp.hasVariant ? grp.variant : groupVariant;
-            bool padded = variant != GroupBoxVariant::Normal;
-
-            El* box = Div(a)
-                          ->FlexCol()
-                          ->W(kFill)
-                          ->Gap(padded ? 12.f : 16.f)
-                          ->PadY(16);
-            if (grp.title.s) {
-
-                El* title = Div(a)
-                                ->FlexCol()
-                                ->Gap(4)
-                                ->Fg(th.mutedFg)
-                                ->LineHeight(1.25f);
-                title->Child(TextEl(a, grp.title)->Wrap());
-                if (grp.description.s) {
-                    title->Child(TextEl(a, grp.description)
-                                     ->Font(14)
-                                     ->Fg(th.mutedFg)
-                                     ->Wrap());
-                }
-                box->Child(title);
-            }
-
-            El* card =
-                Div(a)->FlexCol()->W(kFill)->Gap(16)->Radius(th.radius)->Fg(
-                    th.groupBoxFg);
-            if (variant == GroupBoxVariant::Outline) {
-                card->Pad(16)->Border(1, th.border);
-            } else if (variant == GroupBoxVariant::Fill) {
-                card->Pad(16)->Bg(th.groupBox);
-            }
-            int itemIx = -1;
-            for (const SettingItem& it : grp.items) {
-                itemIx++;
-                if (!SettingItemMatches(&it, query)) {
-                    continue;
-                }
-                card->Child(ui_setting_RenderItem(
-                    cx, this, it,
-                    StrDup(a, fmt("%d-%d-%d", selected, g, itemIx)), selected,
-                    g, itemIx, pageLayout, p.resettable, &anyDirty));
-            }
-
-            El* slot = Div(a)->FlexCol()->W(kFill)->Gap(8)->Child(card);
-            if (grp.footer) {
-                slot->Child(
-                    Div(a)->Font(14)->Fg(th.mutedFg)->Child(grp.footer));
-            }
-            box->Child(slot);
-            grp.refiner.Apply(box);
-            if (g == scrollGroup) {
-                scroll->target = box;
-            }
-            body->Child(box);
-        }
-
-        El* head = Div(a)->FlexCol()->W(kFill)->Pad(16)->Gap(12)->BorderB(
-            1, th.border);
-        El* titleRow =
-            Div(a)->FlexRow()->W(kFill)->ItemsCenter()->JustifyBetween();
-        El* titleCell = Div(a)->FlexRow()->ItemsCenter()->Gap(4);
-
-        titleCell->Child(TextEl(a, p.title)->Fg(th.foreground));
-        if (p.titleSuffix) {
-            titleCell->Child(p.titleSuffix);
-        } else if (p.titleSuffixFn) {
-            if (El* suffix = p.titleSuffixFn(p.titleSuffixUser, cx))
-                titleCell->Child(suffix);
-        }
-        titleRow->Child(titleCell);
-
-        if (anyDirty) {
-            titleRow->Child(
-                Button::New(cx, StrL("reset-all"))
-                    ->Icon(IconName::Undo2)
-                    ->Tooltip(Tr("Settings.Reset All"))
-                    ->Ghost()
-                    ->WithSize(UiSize::Small)
-                    ->OnClick(ListenTo(state, &SettingsState::OnResetPage, 0))
-                    ->IntoEl());
-        }
-        head->Child(titleRow);
-        if (p.description.s) {
-            head->Child(
-                TextEl(a, p.description)->Font(14)->Fg(th.mutedFg)->Wrap());
-        }
-        if (st && scroll->target) {
-            st->pendingScrollGroup = scrollGroup;
-        }
-        body->customPaint = &SettingsPageScrollPaint;
-        body->customUser = scroll;
-        pane->Child(head);
-        pane->Child(body);
+        query_->settings = this;
+        query_->cx = *cx;
+        query_->selected = selected;
+        query_->query = query;
+        query_->scrollGroup = scrollGroup;
+        query_->fieldsLen = st ? st->fields.len : 0;
+        SettingsBuildPage(cx, this, pane, selected, query, pageLayout,
+                          scrollGroup);
     }
 
     return component::Resizable::New(cx, id)
@@ -86747,9 +91424,9 @@ El* Sheet::IntoEl(WinSize win) {
                    ->FlexRow()
                    ->W(kFill)
                    ->Shrink0()
-                   ->PadL(16)
-                   ->PadR(12)
-                   ->PadY(8)
+                   ->PadL(Rems(cx, 1.f))
+                   ->PadR(Rems(cx, 0.75f))
+                   ->PadY(Rems(cx, 0.5f))
                    ->ItemsCenter()
                    ->JustifyBetween();
     head->Child(
@@ -86791,8 +91468,8 @@ El* Sheet::IntoEl(WinSize win) {
                            ->FlexRow()
                            ->W(kFill)
                            ->Shrink0()
-                           ->PadX(16)
-                           ->PadY(12)
+                           ->PadX(Rems(cx, 1.f))
+                           ->PadY(Rems(cx, 0.75f))
                            ->ItemsCenter()
                            ->JustifyBetween()
                            ->Child(footer));
@@ -86868,12 +91545,7 @@ ShimmerStyle ShimmerStyle::Spread(ShimmerSpread value) const {
     }
     if (value.kind == ShimmerSpread::Kind::Relative) {
         float f = value.value;
-        if (f < 0.05f) {
-            f = 0.05f;
-        }
-        if (f > 1.f) {
-            f = 1.f;
-        }
+        f = ClampF(f, 0.05f, 1.f);
         out.spread = ShimmerSpread::Relative(f);
         return out;
     }
@@ -87294,8 +91966,9 @@ El* SidebarMenuItem::IntoEl(Str id) {
                   ->FlexRow()
                   ->W(kFill)
                   ->Shrink0()
-                  ->Pad(8)
-                  ->Gap(8)
+
+                  ->Pad(Rems(cx, 0.5f))
+                  ->Gap(Rems(cx, 0.5f))
                   ->ItemsCenter()
                   ->Radius(th.radius)
                   ->Font(14)
@@ -87327,8 +92000,9 @@ El* SidebarMenuItem::IntoEl(Str id) {
             row->Tip(label);
         }
     } else {
-        row->H(28);
-        El* mid = Div(a)->FlexRow()->Flex1()->Gap(8)->JustifyBetween();
+        row->H(Rems(cx, 1.75f));
+        El* mid =
+            Div(a)->FlexRow()->Flex1()->Gap(Rems(cx, 0.5f))->JustifyBetween();
 
         El* labelBox = Div(a)->FlexRow()->Flex1();
         StyleApplyFields(&labelBox->style, labelStyle, labelStyleSet);
@@ -87369,14 +92043,19 @@ El* SidebarMenuItem::IntoEl(Str id) {
     root->Child(row);
 
     if (isOpen) {
-        El* sub = Div(a)->FlexCol()->Gap(4)->PadY(2)->PadL(10)->BorderL(
-            1, th.sidebarBorder);
+
+        El* sub = Div(a)
+                      ->FlexCol()
+                      ->Gap(Rems(cx, 0.25f))
+                      ->PadY(Rems(cx, 0.125f))
+                      ->PadL(Rems(cx, 0.625f))
+                      ->BorderL(1, th.sidebarBorder);
         for (int i = 0; i < children.len; i++) {
             children[i]->collapsed = collapsed;
             sub->Child(children[i]->IntoEl(StrDup(a, fmt("%d", i))));
         }
 
-        root->Child(Div(a)->PadL(14)->W(kFill)->Child(sub));
+        root->Child(Div(a)->PadL(Rems(cx, 0.875f))->W(kFill)->Child(sub));
     }
     return root;
 }
@@ -87407,7 +92086,7 @@ SidebarMenu* SidebarMenu::Refine(const Style& v, uint32_t fields) {
 
 El* SidebarMenu::IntoEl(Str id) {
     IdScope scope(cx, id);
-    El* col = Div(a)->FlexCol()->W(kFill)->Gap(8);
+    El* col = Div(a)->FlexCol()->W(kFill)->Gap(Rems(cx, 0.5f));
     StyleApplyFields(&col->style, style, styleSet);
     refiner.Apply(col);
     for (int i = 0; i < items.len; i++) {
@@ -87450,14 +92129,15 @@ El* SidebarGroup::IntoEl(Str id) {
         col->Child(Div(a)
                        ->FlexRow()
                        ->Shrink0()
-                       ->H(32)
-                       ->PadX(8)
+
+                       ->H(Rems(cx, 2.f))
+                       ->PadX(Rems(cx, 0.5f))
                        ->ItemsCenter()
                        ->Radius(th.radius)
                        ->Child(TextEl(a, label)->Font(12)->Fg(
                            RgbaOpacity(th.sidebarFg, 0.7f))));
     }
-    El* inner = Div(a)->FlexCol()->W(kFill)->Gap(8);
+    El* inner = Div(a)->FlexCol()->W(kFill)->Gap(Rems(cx, 0.5f));
     for (int i = 0; i < children.len; i++) {
         inner
             ->Child(children[i].Render(cx, StrDup(a, fmt("%d", i)), collapsed));
@@ -87474,8 +92154,9 @@ static El* SidebarBand(Ctx* cx, const ArenaVec<El*>& children, bool selected,
     El* row = Div(a)
                   ->FlexRow()
                   ->W(kFill)
-                  ->Gap(8)
-                  ->Pad(8)
+
+                  ->Gap(Rems(cx, 0.5f))
+                  ->Pad(Rems(cx, 0.5f))
                   ->ItemsCenter()
                   ->JustifyBetween()
                   ->Radius(th.radius)
@@ -87557,7 +92238,7 @@ SidebarFooter* SidebarFooter::Refine(const Style& v, uint32_t fields) {
 }
 El* SidebarFooter::IntoEl() {
 
-    El* base = Div(a)->FlexRow()->Gap(8)->W(kFill);
+    El* base = Div(a)->FlexRow()->Gap(Rems(cx, 0.5f))->W(kFill);
     StyleApplyFields(&base->style, style, styleSet);
     refiner.Apply(base);
     for (int i = 0; i < len(children); i++) {
@@ -87772,15 +92453,18 @@ El* Sidebar::IntoEl() {
     if (iconCollapsed) {
         root->W(kSidebarCollapsedWidth);
     }
+
+    float r2 = Rems(cx, 0.5f);
+    float r3 = Rems(cx, 0.75f);
     if (iconCollapsed) {
-        root->Gap(8);
+        root->Gap(r2);
     }
     if (header) {
-        El* box = Div(a)->FlexRow()->W(kFill)->Gap(8);
+        El* box = Div(a)->FlexRow()->W(kFill)->Gap(r2);
         if (iconCollapsed) {
-            box->PadT(8)->PadX(8);
+            box->PadT(r2)->PadX(r2);
         } else {
-            box->PadT(12)->PadX(12);
+            box->PadT(r3)->PadX(r3);
         }
         box->Child(header);
         root->Child(box);
@@ -87788,19 +92472,19 @@ El* Sidebar::IntoEl() {
     El* body = Div(a)->FlexCol()->W(kFill)->Flex1()->MinH(0);
     El* inner = Div(a)->FlexCol()->W(kFill)->Shrink0();
     if (iconCollapsed) {
-        inner->Pad(8);
+        inner->Pad(r2);
     } else {
-        inner->PadX(12);
+        inner->PadX(r3);
     }
     for (int i = 0; i < this->content.len; i++) {
 
         El* box = Div(a)->FlexCol()->W(kFill)->Child(this->content[i].Render(
             cx, StrDup(a, fmt("%d", i)), iconCollapsed));
         if (i == 0) {
-            box->PadT(12);
+            box->PadT(r3);
         }
         if (i + 1 == this->content.len) {
-            box->PadB(12);
+            box->PadB(r3);
         }
         inner->Child(box);
     }
@@ -87817,11 +92501,11 @@ El* Sidebar::IntoEl() {
     body->Child(viewport);
     root->Child(body);
     if (footer) {
-        El* box = Div(a)->FlexRow()->W(kFill)->PadX(iconCollapsed ? 8.f : 12.f);
+        El* box = Div(a)->FlexRow()->W(kFill)->PadX(iconCollapsed ? r2 : r3);
         if (iconCollapsed) {
-            box->PadT(8);
+            box->PadT(r2);
         }
-        box->PadB(12);
+        box->PadB(r3);
         box->Child(footer);
         root->Child(box);
     }
@@ -87860,6 +92544,7 @@ Skeleton* Skeleton::New(Ctx* cx) {
     Skeleton* s = ArenaNew<Skeleton>(a);
     s->a = a;
     s->cx = cx;
+    s->h = Rems(cx, 1.f);
     return s;
 }
 
@@ -87965,9 +92650,10 @@ El* Slider::IntoEl() {
     if (state && !disabled) {
         state->onChange = onChange;
     }
-    const float kBar = 6.f;
-    const float kThumb = 16.f;
-    const float kH = 24.f;
+
+    const float kBar = Rems(cx, 0.375f);
+    const float kThumb = Rems(cx, 1);
+    const float kH = Rems(cx, 1.5f);
 
     const float kRingWidth = 3.f;
     const float kRingOpacity = 0.5f;
@@ -88179,7 +92865,7 @@ Spinner* Spinner::Id(Str v) {
 El* Spinner::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
 
-    float dim = px > 0 ? px : UiIconPx(size);
+    float dim = px > 0 ? px : UiIconPx(cx, size);
 
     float turn = 0;
     if (!MotionReduced()) {
@@ -88245,7 +92931,8 @@ El* StatusBar::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
 
     auto region = [&]() {
-        return Div(a)->FlexRow()->ClipX()->ClipY()->ItemsCenter()->Gap(8);
+        return Div(a)->FlexRow()->ClipX()->ClipY()->ItemsCenter()->Gap(
+            Rems(cx, 0.5f));
     };
     bool hasLeft = left.len > 0;
     bool hasRight = right.len > 0;
@@ -88254,9 +92941,9 @@ El* StatusBar::IntoEl() {
                   ->W(kFill)
                   ->Shrink0()
                   ->ItemsCenter()
-                  ->Gap(8)
-                  ->PadY(4)
-                  ->PadX(8)
+                  ->Gap(Rems(cx, 0.5f))
+                  ->PadY(Rems(cx, 0.25f))
+                  ->PadX(Rems(cx, 0.5f))
                   ->Bg(th.tokens.statusBar)
                   ->BorderT(1, th.statusBarBorder);
     if (hasLeft) {
@@ -88407,9 +93094,9 @@ static El* StepperTrigger(Arena* a, const Theme& th, StepperItem* it) {
 
     El* trig = Div(a);
     if (it->layout == Axis::Horizontal) {
-        trig->FlexCol()->Gap(4);
+        trig->FlexCol()->Gap(Rems(it->cx, 0.25f));
     } else {
-        trig->FlexRow()->Gap(8);
+        trig->FlexRow()->Gap(Rems(it->cx, 0.5f));
     }
     trig->ItemsStart();
     if (it->textCenter) {
@@ -88426,7 +93113,7 @@ static El* StepperTrigger(Arena* a, const Theme& th, StepperItem* it) {
 El* StepperItem::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
     El* root = Div(a)
-                   ->Id(StrDup(a, fmt("stepper-item-%d", step)))
+                   ->Id(ElementIdNamed(a, StrL("stepper-item"), (uint64_t)step))
                    ->Role(AccessibilityRole::ListItem)
                    ->AriaPositionInSet(step + 1)
                    ->AriaDisabled(disabled);
@@ -88446,7 +93133,7 @@ El* StepperItem::IntoEl() {
     refiner.Apply(root);
     El* trig = StepperTrigger(a, th, this);
     if (!disabled) {
-        BindClick(trig, StrDup(a, fmt("trigger-%d", step)),
+        BindClick(trig, ElementIdNamed(a, StrL("trigger"), (uint64_t)step),
                   ListenerFill(onClick, step));
     }
     root->Child(trig);
@@ -88685,7 +93372,7 @@ El* Switch::IntoEl() {
                           nullptr, name, tabIndex, tabStop, focus)
             ->FlexRow()
             ->ItemsCenter()
-            ->Gap(8);
+            ->Gap(Rems(cx, 0.5f));
     root->Child(track);
     if (label.s) {
 
@@ -88695,7 +93382,7 @@ El* Switch::IntoEl() {
         root->Child(TextEl(a, label)
                         ->Font(labelFont)
 
-                        ->LineHeight(trackH / labelFont)
+                        ->LineHeight(FontPx(cx, trackH) / labelFont)
                         ->MinW(0)
                         ->Wrap()
                         ->Fg(disabled ? th.mutedFg : th.foreground));
@@ -88749,7 +93436,7 @@ static const SyntaxLangDef kLangs[] = {
      "throw true try typedef typeid typename union using virtual volatile "
      "while NULL",
      "auto bool char char8_t char16_t char32_t double float int long short "
-     "signed unsigned void wchar_t size_t ssize_t ptrdiff_t intptr_t uintptr_t "
+     "signed unsigned void wchar_t size_t ssize_t ptrdiff_t int64_t uintptr_t "
      "int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t",
      "//", true, false, false, false, false, true, false, false, false, false},
 
@@ -89698,7 +94385,7 @@ TabBar* TabBar::New(Ctx* cx, Str id) {
     t->a = a;
     t->cx = cx;
     t->id = id;
-    t->lastEmptySpace = Div(a)->W(12)->Shrink0();
+    t->lastEmptySpace = Div(a)->W(Rems(cx, 0.75f))->Shrink0();
     return t;
 }
 TabBar* TabBar::Child(component::Tab* child) {
@@ -89958,7 +94645,7 @@ static El* TabMenuButton(TabBar* tabs, const Theme&, float) {
         if (it.label.s) {
             menu->MenuWithCheck(it.label, i == tabs->selected);
         } else if (it.icon != IconName::None) {
-            menu->Element(IconEl(cx->a, it.icon, 16));
+            menu->Element(IconEl(cx->a, it.icon, Rems(cx, 1.f)));
             menu->Checked(i == tabs->selected);
         } else {
             menu->MenuWithCheck(Tr("Dock.Unnamed"), i == tabs->selected);
@@ -90106,7 +94793,7 @@ El* TabBar::IntoEl() {
                       ->JustifyCenter()
                       ->Shrink0()
                       ->H(kFill)
-                      ->Gap(4)
+                      ->Gap(Rems(cx, 0.25f))
                       ->Radius(radius);
 
         StyleApplyFields(&tab->style, item.style, item.styleSet);
@@ -90160,7 +94847,7 @@ El* TabBar::IntoEl() {
         if (item.icon != IconName::None) {
 
             inner->W(innerH * 1.25f)
-                ->Child(IconEl(a, item.icon, UiIconPx(size))->Fg(st.fg));
+                ->Child(IconEl(a, item.icon, UiIconPx(cx, size))->Fg(st.fg));
         } else {
             if (padX > 0) {
                 inner->PadX(padX);
@@ -90469,7 +95156,7 @@ TableRow* TableRow::Child(TableCellEl* c) {
 
 El* TableRow::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
-    Str rowId = StrDup(a, fmt("row-%d", ix));
+    Str rowId = ElementIdNamed(a, StrL("row"), (uint64_t)ix);
     El* row = gpui::TableRow::New(cx, rowId, ix + 1)->W(kFill)->FlexRow();
     if (hasBg) {
         row->Bg(bg);
@@ -90515,7 +95202,8 @@ El* TableGroup::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
     El* g = nullptr;
     if (kind == TableGroupKind::Header) {
-        g = gpui::TableHeader::New(cx, StrDup(a, fmt("header-%d", ix)))
+        g = gpui::TableHeader::New(
+                cx, ElementIdNamed(a, StrL("table-header"), (uint64_t)ix))
                 ->W(kFill)
                 ->FlexCol()
                 ->Bg(th.tokens.tableHead)
@@ -90525,7 +95213,7 @@ El* TableGroup::IntoEl() {
     } else if (kind == TableGroupKind::Footer) {
 
         g = Div(a)
-                ->Id(StrDup(a, fmt("footer-%d", ix)))
+                ->Id(ElementIdNamed(a, StrL("table-footer"), (uint64_t)ix))
                 ->W(kFill)
                 ->FlexCol()
                 ->Bg(th.tokens.tableFoot)
@@ -90533,7 +95221,8 @@ El* TableGroup::IntoEl() {
                 ->BorderT(1, th.tableRowBorder);
         refiner.Apply(g);
     } else {
-        g = gpui::TableBody::New(cx, StrDup(a, fmt("body-%d", ix)))
+        g = gpui::TableBody::New(
+                cx, ElementIdNamed(a, StrL("table-body"), (uint64_t)ix))
                 ->W(kFill)
                 ->FlexCol();
         refiner.Apply(g);
@@ -90560,7 +95249,8 @@ TableCaption* TableCaption::Child(El* e) {
 
 El* TableCaption::IntoEl() {
     Edges p = UiTableCellPadding(size);
-    El* e = gpui::TableCaption::New(cx, StrDup(a, fmt("caption-%d", ix)))
+    El* e = gpui::TableCaption::New(
+                cx, ElementIdNamed(a, StrL("table-caption"), (uint64_t)ix))
                 ->W(kFill)
                 ->FlexRow()
                 ->JustifyCenter()
@@ -90743,12 +95433,7 @@ void DataTable::DumpRange(int lo, int hi, Vec<Str>* heads, Vec<Str>* cells) {
     if (!cells) {
         return;
     }
-    if (lo < 0) {
-        lo = 0;
-    }
-    if (lo > nRows) {
-        lo = nRows;
-    }
+    lo = ClampI(lo, 0, nRows);
     if (hi > nRows) {
         hi = nRows;
     }
@@ -90772,7 +95457,8 @@ DataTable* DataTable::GroupHeader(const TableGroupCell* cells, int n) {
     return this;
 }
 
-static El* SortIcon(Arena* a, const Theme& th, ColumnSort sort) {
+static El* SortIcon(Ctx* cx, const Theme& th, ColumnSort sort) {
+    Arena* a = cx->a;
     IconName name = IconName::ChevronsUpDown;
     bool on = true;
     switch (sort) {
@@ -90791,7 +95477,7 @@ static El* SortIcon(Arena* a, const Theme& th, ColumnSort sort) {
         ->Radius(th.radius * 0.5f)
         ->HoverBg(th.tokens.secondary)
         ->Child(
-            IconEl(a, name, 12)
+            IconEl(a, name, Rems(cx, 0.75f))
                 ->Fg(on ? th.secondaryFg : RgbaOpacity(th.secondaryFg, 0.5f)));
 }
 
@@ -90890,7 +95576,7 @@ static El* LoadingRow(Ctx* cx, UiSize size, bool header) {
     El* row = Div(a)
                   ->FlexRow()
                   ->W(kFill)
-                  ->Gap(12)
+                  ->Gap(Rems(cx, 0.75f))
                   ->H(rowH)
                   ->ClipX()
                   ->PadT(pad.top)
@@ -90907,13 +95593,13 @@ static El* LoadingRow(Ctx* cx, UiSize size, bool header) {
 
     row->Child(Div(a)
                    ->FlexRow()
-                   ->Gap(12)
+                   ->Gap(Rems(cx, 0.75f))
                    ->Flex1()
                    ->ItemsCenter()
-                   ->Child(bar(96))
-                   ->Child(bar(192))
-                   ->Child(bar(64)));
-    row->Child(bar(96));
+                   ->Child(bar(Rems(cx, 6)))
+                   ->Child(bar(Rems(cx, 12)))
+                   ->Child(bar(Rems(cx, 4))));
+    row->Child(bar(Rems(cx, 6)));
     return row;
 }
 
@@ -90933,7 +95619,7 @@ static El* LastEmptyColEl(Ctx* cx, El* (*fn)(Ctx*, void*), void* data) {
             return e;
         }
     }
-    return Div(cx->a)->FlexRow()->W(12)->Shrink0();
+    return Div(cx->a)->FlexRow()->W(Rems(cx, 0.75f))->Shrink0();
 }
 
 static El* WrapContextMenu(Ctx* cx, Str id, El* box, const TableState* s,
@@ -90956,6 +95642,18 @@ static El* WrapContextMenu(Ctx* cx, Str id, El* box, const TableState* s,
         ->IntoEl();
 }
 
+static bool DataTableAt(void* data, Ctx* cx, El* box, float) {
+    auto* table = (DataTable*)data;
+    table->cx = cx;
+    El* fresh = table->IntoEl();
+    if (!fresh) {
+        return false;
+    }
+    box->first = fresh->first;
+    box->last = fresh->last;
+    return true;
+}
+
 El* DataTable::IntoEl() {
     El* box = BuildEl();
     if (!contextMenu) {
@@ -90969,7 +95667,7 @@ static El* RowHeaderCell(Ctx* cx, Entity<TableState> state, int row,
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
     El* e = Div(a)
-                ->W(12)
+                ->W(Rems(cx, 0.75f))
                 ->H(kFill)
                 ->Shrink0()
                 ->BorderR(1, th.tableRowBorder)
@@ -90982,8 +95680,8 @@ static El* RowHeaderCell(Ctx* cx, Entity<TableState> state, int row,
     if (TableSelectedRow(s) == row) {
         e->Bg(th.tokens.tableActive);
     }
-    BindPathClick(e, StrDup(a, fmt("row-header-%d", row)),
-                  ListenTo(state, &TableState::OnRowClick, (intptr_t)row));
+    BindPathClick(e, ElementIdNamed(a, StrL("row-header"), (uint64_t)row),
+                  ListenTo(state, &TableState::OnRowClick, (int64_t)row));
     return e;
 }
 
@@ -91060,6 +95758,20 @@ El* DataTable::BuildEl() {
     if (bordered) {
         box->Radius(th.radius)->Border(1, th.border);
     }
+
+    bool fill = h <= 0;
+    if (fill) {
+        box->H(kFill);
+    }
+    float headsH = (float)(groupHeaders.len + 1) * rowHeight;
+    float first = h > 0 ? h : (cx->win ? WindowSize(cx->win).dipH : 0.f);
+    LaidOutHeight* laid = UseLaidOutHeight(cx, id, first);
+    if (laid) {
+        laid->contentBox = true;
+        laid->inset = headsH;
+    }
+    float viewH = laid ? laid->built : first;
+    TrackLaidOutHeight(cx, box, laid, &DataTableAt, this);
 
     if (s && s->loading) {
         El* loading = hasDelegate && delegate.renderLoading
@@ -91208,7 +95920,8 @@ El* DataTable::BuildEl() {
                                                    : 14.f)
                                         ->LineHeight(1.f));
         if (col.selectable) {
-            BindPathClick(content, StrDup(a, fmt("col-header-%d", c)),
+            BindPathClick(content,
+                          ElementIdNamed(a, StrL("col-header"), (uint64_t)c),
                           ListenerArg(headClick, c));
         }
 
@@ -91221,8 +95934,9 @@ El* DataTable::BuildEl() {
         }
         if (col.sortable && s && s->sortable) {
 
-            El* icon = SortIcon(a, th, TableSortOf(s, c));
-            BindPathClick(icon, StrDup(a, fmt("icon-sort-%d", c)),
+            El* icon = SortIcon(cx, th, TableSortOf(s, c));
+            BindPathClick(icon,
+                          ElementIdNamed(a, StrL("icon-sort"), (uint64_t)c),
                           ListenerArg(sortClick, c));
             content->Child(icon);
         }
@@ -91257,10 +95971,10 @@ El* DataTable::BuildEl() {
                     : Div(a)
                           ->FlexCol()
                           ->W(kFill)
-                          ->H(h > 0 ? h : 160)
+                          ->H(viewH > 0 ? viewH : 160)
                           ->ItemsCenter()
                           ->JustifyCenter()
-                          ->Child(IconEl(a, IconName::Inbox, 48)
+                          ->Child(IconEl(a, IconName::Inbox, Rems(cx, 3))
                                       ->Fg(RgbaOpacity(th.mutedFg, 0.6f))));
         return box;
     }
@@ -91275,15 +95989,21 @@ El* DataTable::BuildEl() {
         gpui::TableBody::New(cx, StrL("body"))->FlexCol()->W(kFill);
 
     VirtualRange range = {0, nRows};
-    if (s && h > 0) {
-        s->viewportH = h;
-        range = VirtualListVisibleRows(nRows, s->rowH, s->scrollY, h);
+    if (s && viewH > 0) {
+        s->viewportH = viewH;
+        range = VirtualListVisibleRows(nRows, s->rowH, s->scrollY, viewH);
 
-        bodyFixed->H(h)->ClipY()->ScrollY(s->scrollY)->ScrollFromPath();
+        float bodyH = viewH;
+        float rowsH = (float)nRows * s->rowH;
+        if (fill && !stripe && rowsH < bodyH) {
+            bodyH = rowsH;
+        }
+
+        bodyFixed->H(bodyH)->ClipY()->ScrollY(s->scrollY)->ScrollFromPath();
         bodyFixed->OnScroll(ListenTo(state, &TableState::OnScroll));
         bodyFixed->noScrollbar = true;
         ScrollableMask::Apply(bodyFixed, Axis::Vertical);
-        bodyScroll->H(h)
+        bodyScroll->H(bodyH)
             ->ClipY()
             ->ScrollY(s->scrollY)
             ->ScrollX(s->scrollX)
@@ -91322,10 +96042,10 @@ El* DataTable::BuildEl() {
                             ? delegate.renderTr(cx, data, r)
                             : nullptr;
         if (!rowScroll) {
-            rowScroll =
-                gpui::TableRow::New(cx, StrDup(a, fmt("row-%d", r)), r + 1);
+            rowScroll = gpui::TableRow::New(
+                cx, ElementIdNamed(a, StrL("row"), (uint64_t)r), r + 1);
         }
-        rowScroll->PathClick(StrDup(a, fmt("row-%d", r)))
+        rowScroll->PathClick(ElementIdNamed(a, StrL("row"), (uint64_t)r))
             ->Role(AccessibilityRole::Row)
             ->AriaRowIndex(r + 1)
             ->FlexRow()
@@ -91333,7 +96053,7 @@ El* DataTable::BuildEl() {
             ->BorderB(1, th.tableRowBorder);
         El* rows[2] = {rowFixed, rowScroll};
         for (El* row : rows) {
-            if (s && h > 0) {
+            if (s && viewH > 0) {
 
                 row->H(s->rowH);
             }
@@ -91409,7 +96129,8 @@ El* DataTable::BuildEl() {
         }
         rowScroll->Child(LastEmptyColEl(cx, lastEmptyCol, data));
         if (s && s->rowSelectable && !s->cellSelectable) {
-            BindPathClick(rowScroll, StrDup(a, fmt("row-%d", r)),
+            BindPathClick(rowScroll,
+                          ElementIdNamed(a, StrL("row"), (uint64_t)r),
                           ListenerArg(rowClick, r));
             rowScroll->OnMouseDown(ListenerArg(rowDown, r));
             BindPathClick(rowFixed, StrDup(a, fmt("row-fixed-%d", r)),
@@ -91419,15 +96140,15 @@ El* DataTable::BuildEl() {
         bodyFixed->Child(rowFixed);
         bodyScroll->Child(rowScroll);
     }
-    if (s && h > 0 && range.end < nRows) {
+    if (s && viewH > 0 && range.end < nRows) {
         float pad = (float)(nRows - range.end) * s->rowH;
         bodyFixed->Child(Div(a)->H(pad));
         bodyScroll->Child(Div(a)->W(kFill)->H(pad));
     }
 
     int extraRows =
-        stripe && s && h > 0
-            ? TableExtraRowsNeeded(h, (float)nRows * s->rowH, s->rowH)
+        stripe && s && viewH > 0
+            ? TableExtraRowsNeeded(viewH, (float)nRows * s->rowH, s->rowH)
             : 0;
     float colsW = 0;
     for (int d = nFixed; extraRows > 0 && d < nColumns; d++) {
@@ -91442,7 +96163,7 @@ El* DataTable::BuildEl() {
                             ->H(s->rowH)
                             ->BorderB(1, th.tableRowBorder);
         El* fillScroll = Div(a)
-                             ->Id(StrDup(a, fmt("row-%d", r)))
+                             ->Id(ElementIdNamed(a, StrL("row"), (uint64_t)r))
                              ->FlexRow()
                              ->Shrink0()
                              ->H(s->rowH)
@@ -91602,8 +96323,8 @@ El* Tag::IntoEl() {
     float font = tiny ? 10.f : (size == UiSize::Large ? 14.f : 12.f);
     float r = radius >= 0 ? radius : (tiny ? th.radius * 0.5f : th.radius);
     El* root = Div(a)
-                   ->PadX(tiny ? 6.f : 10.f)
-                   ->PadY(tiny ? 2.f : 4.f)
+                   ->PadX(Rems(cx, tiny ? 0.375f : 0.625f))
+                   ->PadY(Rems(cx, tiny ? 0.125f : 0.25f))
                    ->Radius(r)
                    ->Bg(bg)
                    ->Border(1, bd)
@@ -95534,14 +100255,14 @@ Calendar* Calendar::OnYear(Listener fn) {
     return this;
 }
 
-static float CalendarCellSize(UiSize size) {
+static float CalendarCellSize(const Ctx* cx, UiSize size) {
     if (size == UiSize::Small) {
-        return 28;
+        return Rems(cx, 1.75f);
     }
     if (size == UiSize::Large) {
-        return 40;
+        return Rems(cx, 2.5f);
     }
-    return 32;
+    return Rems(cx, 2);
 }
 
 static float CalendarWidth(UiSize size) {
@@ -95581,7 +100302,7 @@ static El* ThemedCalendarItem(void* user, Ctx* cx, El* item,
         "Calendar.month.November",
         "Calendar.month.December",
     };
-    float cellSize = CalendarCellSize(self->size);
+    float cellSize = CalendarCellSize(cx, self->size);
 
     float itemFont = self->size == UiSize::Small ? 12.f : 14.f;
     switch (st.kind) {
@@ -95593,7 +100314,7 @@ static El* ThemedCalendarItem(void* user, Ctx* cx, El* item,
                                st.kind == CalendarItemKind::Previous
                                    ? IconName::ChevronLeft
                                    : IconName::ChevronRight,
-                               16)
+                               Rems(cx, 1))
                             ->Fg(on ? th.foreground : th.mutedFg));
             if (on) {
                 item->HoverBg(th.secondaryHover)
@@ -95701,7 +100422,9 @@ El* Calendar::IntoEl() {
         }
         El* root = calendar->IntoEl()->W(width);
         if (!bare) {
-            root->Pad(12)->Border(1, th.border)->Radius(th.radiusLg);
+            root->Pad(Rems(cx, 0.75f))
+                ->Border(1, th.border)
+                ->Radius(th.radiusLg);
         }
         StyleApplyFields(&root->style, style, styleSet);
         return root;
@@ -95712,7 +100435,7 @@ El* Calendar::IntoEl() {
     o.month = month;
     o.numberOfMonths = numberOfMonths;
     o.view = view;
-    o.cellSize = CalendarCellSize(size);
+    o.cellSize = CalendarCellSize(cx, size);
     o.selected = {selectedYear ? selectedYear : year,
                   selectedMonth ? selectedMonth : month, day};
     o.rangeEnd = rangeEnd;
@@ -95734,7 +100457,7 @@ El* Calendar::IntoEl() {
     o.user = this;
     El* root = gpui::Calendar::New(cx, StrL("calendar"), o)->W(width);
     if (!bare) {
-        root->Pad(12)->Border(1, th.border)->Radius(th.radiusLg);
+        root->Pad(Rems(cx, 0.75f))->Border(1, th.border)->Radius(th.radiusLg);
     }
     StyleApplyFields(&root->style, style, styleSet);
     return root;
@@ -95779,7 +100502,7 @@ Date DateRangePresetValue::IntoDate() const {
 }
 
 DateRangePreset DateRangePreset::Single(Str label, LocalDate date,
-                                        intptr_t arg) {
+                                        int64_t arg) {
     DateRangePreset out;
     out.label = label;
     out.value = DateRangePresetValue::Single(date);
@@ -95789,7 +100512,7 @@ DateRangePreset DateRangePreset::Single(Str label, LocalDate date,
 }
 
 DateRangePreset DateRangePreset::Range(Str label, LocalDate start,
-                                       LocalDate end, intptr_t arg) {
+                                       LocalDate end, int64_t arg) {
     DateRangePreset out;
     out.label = label;
     out.value = DateRangePresetValue::Range(start, end);
@@ -95928,10 +100651,11 @@ struct TimeFieldLook {
 static El* ThemedTimeSegment(void* user, El* segment,
                              const TimeFieldSegmentState* state, Ctx* cx) {
     TimeFieldLook* look = (TimeFieldLook*)user;
-    segment->PadX(2);
+    segment->PadX(Rems(cx, 0.125f));
     if (state->Segment() == TimeSegment::Period) {
         TimeFieldSegmentClearChildren(segment);
-        segment->MarginL(4)->Child(TimePeriodLabel(cx->a, state->Value() == 1));
+        segment->MarginL(Rems(cx, 0.25f))
+            ->Child(TimePeriodLabel(cx->a, state->Value() == 1));
     }
     segment->Radius(look->segmentRadius);
     if (state->IsSelected()) {
@@ -95965,9 +100689,9 @@ El* TimeField::IntoEl() {
         ->Fg(fg)
         ->Border(1, invalid ? th.danger : th.inputBorder)
         ->Radius(th.radius)
-        ->PadX(4);
+        ->PadX(Rems(cx, 0.25f));
     UiInputTextSize(root, size);
-    UiInputH(root, size);
+    UiInputH(cx, root, size);
     if (disabled) {
         root->Opacity(0.5f);
     }
@@ -96484,7 +101208,7 @@ void DatePickerState::OnToggle(DatePickerState* self, Ctx* cx,
 }
 
 void DatePickerState::OnOpenChange(DatePickerState* self, Ctx* cx,
-                                   const ClickEvent*, intptr_t open) {
+                                   const ClickEvent*, int64_t open) {
     SetOpen(self, open != 0, cx);
 }
 
@@ -96716,16 +101440,16 @@ static El* RetainedDatePickerIntoEl(DatePicker* self) {
     Listener setOpen = ListenTo(self->state, &DatePickerState::OnOpenChange);
     Listener clear = ListenTo(self->state, &DatePickerState::OnClear);
 
-    float height = 32, padX = 10, font = 14;
+    float height = Rems(cx, 2), padX = 10, font = 14;
     if (self->size == UiSize::Large) {
-        height = 44;
+        height = Rems(cx, 2.75f);
         padX = 12;
         font = 16;
     } else if (self->size == UiSize::Small) {
-        height = 24;
+        height = Rems(cx, 1.5f);
         padX = 8;
     } else if (self->size == UiSize::XSmall) {
-        height = 20;
+        height = Rems(cx, 1.25f);
         padX = 4;
         font = 12;
     }
@@ -96767,7 +101491,7 @@ static El* RetainedDatePickerIntoEl(DatePicker* self) {
                          ->FlexRow()
                          ->W(kFill)
                          ->MinW(0)
-                         ->Gap(4)
+                         ->Gap(Rems(cx, 0.25f))
                          ->ItemsCenter()
                          ->JustifyBetween()
                          ->Child(text);
@@ -96781,8 +101505,9 @@ static El* RetainedDatePickerIntoEl(DatePicker* self) {
                                   ->IntoEl()
                                   ->StopClick());
         } else {
-            triggerRow
-                ->Child(IconEl(a, IconName::Calendar, 12)->Fg(th.mutedFg));
+            triggerRow->Child(
+                IconEl(a, IconName::Calendar, UiIconPx(cx, UiSize::XSmall))
+                    ->Fg(th.mutedFg));
         }
     }
     trigger->Child(triggerRow);
@@ -96796,9 +101521,14 @@ static El* RetainedDatePickerIntoEl(DatePicker* self) {
 
     El* popup = nullptr;
     if (state->open) {
-        El* content = Div(a)->FlexRow()->Gap(12)->ItemsStart();
+        El* content = Div(a)->FlexRow()->Gap(Rems(cx, 0.75f))->ItemsStart();
         if (self->presets && self->presetsCount > 0) {
-            El* list = Div(a)->FlexCol()->Gap(8)->PadY(4)->JustifyEnd();
+
+            El* list = Div(a)
+                           ->FlexCol()
+                           ->Gap(Rems(cx, 0.5f))
+                           ->PadY(Rems(cx, 0.25f))
+                           ->JustifyEnd();
             for (int i = 0; i < self->presetsCount; i++) {
                 const DateRangePreset& preset = self->presets[i];
                 uint32_t key =
@@ -96836,9 +101566,9 @@ static El* RetainedDatePickerIntoEl(DatePicker* self) {
             El* row = Div(a)
                           ->FlexRow()
                           ->ItemsCenter()
-                          ->MarginT(compact ? 8.f : 12.f)
-                          ->PadT(compact ? 8.f : 12.f)
-                          ->Gap(12)
+                          ->MarginT(Rems(cx, compact ? 0.5f : 0.75f))
+                          ->PadT(Rems(cx, compact ? 0.5f : 0.75f))
+                          ->Gap(Rems(cx, 0.75f))
                           ->JustifyBetween()
                           ->BorderT(1, th.border);
             row->Child(TextEl(a, Tr("DatePicker.time"))
@@ -96852,7 +101582,7 @@ static El* RetainedDatePickerIntoEl(DatePicker* self) {
         }
         content->Child(column);
         popup = Div(a)
-                    ->Pad(12)
+                    ->Pad(Rems(cx, 0.75f))
                     ->Border(1, th.border)
                     ->Radius(std::min(th.radius * 2.f, 8.f))
                     ->Bg(th.tokens.background)
@@ -96896,16 +101626,16 @@ El* DatePicker::IntoEl() {
         title = FormatDate(a, format, year, month, day);
     }
 
-    float height = 32, padX = 10, font = 14;
+    float height = Rems(cx, 2), padX = 10, font = 14;
     if (size == UiSize::Large) {
-        height = 44;
+        height = Rems(cx, 2.75f);
         padX = 12;
         font = 16;
     } else if (size == UiSize::Small) {
-        height = 24;
+        height = Rems(cx, 1.5f);
         padX = 8;
     } else if (size == UiSize::XSmall) {
-        height = 20;
+        height = Rems(cx, 1.25f);
         padX = 4;
         font = 12;
     }
@@ -96914,7 +101644,7 @@ El* DatePicker::IntoEl() {
                       ->W(width)
                       ->H(height)
                       ->PadX(padX)
-                      ->Gap(4)
+                      ->Gap(Rems(cx, 0.25f))
                       ->ItemsCenter()
                       ->JustifyBetween();
     if (appearance) {
@@ -96936,7 +101666,9 @@ El* DatePicker::IntoEl() {
                            ->IntoEl()
                            ->StopClick());
     } else if (open) {
-        trigger->Child(IconEl(a, IconName::Calendar, 12)->Fg(th.mutedFg));
+        trigger
+            ->Child(IconEl(a, IconName::Calendar, UiIconPx(cx, UiSize::XSmall))
+                        ->Fg(th.mutedFg));
     }
     if (!open && !disabled) {
         BindClick(trigger, StrL("input"), onToggle);
@@ -96966,9 +101698,14 @@ El* DatePicker::IntoEl() {
                                  ->OnYearToggle(onYearToggle)
                                  ->OnMonth(onMonth)
                                  ->OnYear(onYear);
-        El* content = Div(a)->FlexRow()->Gap(12)->ItemsStart();
+        El* content = Div(a)->FlexRow()->Gap(Rems(cx, 0.75f))->ItemsStart();
         if (presets && presetsCount > 0) {
-            El* list = Div(a)->FlexCol()->Gap(8)->PadY(4)->JustifyEnd();
+
+            El* list = Div(a)
+                           ->FlexCol()
+                           ->Gap(Rems(cx, 0.5f))
+                           ->PadY(Rems(cx, 0.25f))
+                           ->JustifyEnd();
             for (int i = 0; i < presetsCount; i++) {
                 const DateRangePreset& preset = presets[i];
                 list->Child(component::Button::New(
@@ -96983,7 +101720,7 @@ El* DatePicker::IntoEl() {
         }
         content->Child(calendar->IntoEl());
         popup = Div(a)
-                    ->Pad(12)
+                    ->Pad(Rems(cx, 0.75f))
                     ->Border(1, th.border)
                     ->Radius(std::min(th.radius * 2.f, 8.f))
                     ->Bg(th.tokens.background)
@@ -97029,7 +101766,7 @@ static El* ControlIcon(Ctx* cx, IconName icon, int clickId) {
         ->Click(clickId)
         ->HoverBg(isClose ? th.danger : th.secondaryHover)
         ->HoverFg(isClose ? th.dangerFg : th.secondaryFg)
-        ->Child(IconEl(a, icon, UiIconPx(UiSize::Small)));
+        ->Child(IconEl(a, icon, UiIconPx(cx, UiSize::Small)));
 }
 
 static El* WindowControls(Ctx* cx) {
@@ -97108,7 +101845,8 @@ El* ToolbarItem::IntoEl(Ctx* cx, UiSize size) const {
         return content;
     }
     El* built = build(control, size);
-    return UiInputH(Div(cx->a)->FlexRow()->ItemsCenter(), size)->Child(built);
+    return UiInputH(cx, Div(cx->a)->FlexRow()->ItemsCenter(), size)
+        ->Child(built);
 }
 
 ToolbarGroup* ToolbarGroup::New(Ctx* cx, Str id) {
@@ -97197,15 +101935,24 @@ El* Toolbar::IntoEl() {
     switch (size.kind) {
         case UiSize::Kind::XSmall:
 
-            root->H(28)->Pad(4)->Gap(4)->Font(12);
+            root->H(Rems(cx, 1.75f))
+                ->Pad(Rems(cx, 0.25f))
+                ->Gap(Rems(cx, 0.25f))
+                ->Font(12);
             break;
         case UiSize::Kind::Small:
 
-            root->H(32)->Pad(4)->Gap(4)->Font(14);
+            root->H(Rems(cx, 2.f))
+                ->Pad(Rems(cx, 0.25f))
+                ->Gap(Rems(cx, 0.25f))
+                ->Font(14);
             break;
         default:
 
-            root->H(48)->Pad(8)->Gap(8)->Font(14);
+            root->H(Rems(cx, 3.f))
+                ->Pad(Rems(cx, 0.5f))
+                ->Gap(Rems(cx, 0.5f))
+                ->Font(14);
             break;
     }
     for (const ToolbarItem& item : items) {
@@ -97234,13 +101981,27 @@ Tooltip* Tooltip::New(Ctx* cx, Str text) {
 
 El* Tooltip::IntoEl() {
     const Theme& th = ThemeNow(cx->app);
-    return gpui::Tooltip::New(cx, StrL("tooltip"))
-        ->PadX(8)
-        ->H(28)
-        ->ItemsCenter()
-        ->Radius(6)
-        ->Bg(th.foreground)
-        ->Child(TextEl(a, text)->Font(12)->Fg(th.background));
+    Rgba ink = Rgba8(0, 0, 0, 26);
+    BoxShadow shadowMd[2] = {
+        {0, 4.f, 6.f, -1.f, ink, false},
+        {0, 2.f, 4.f, -2.f, ink, false},
+    };
+    El* popup = gpui::Tooltip::New(cx, StrL("tooltip-popup"))
+                    ->FlexRow()
+                    ->ItemsCenter()
+                    ->JustifyBetween()
+                    ->Margin(Rems(cx, 0.75f))
+                    ->Bg(th.tokens.popover)
+                    ->Fg(th.popoverFg)
+                    ->Border(1, th.border)
+                    ->Shadows(shadowMd, 2)
+                    ->Radius(th.radius)
+                    ->PadY(Rems(cx, 0.125f))
+                    ->PadX(Rems(cx, 0.5f))
+                    ->Font(14)
+                    ->Gap(Rems(cx, 0.75f))
+                    ->Child(Div(a)->Child(TextEl(a, text)));
+    return Div(a)->Child(popup);
 }
 
 }
@@ -97445,9 +102206,9 @@ static El* TreeRow(void* user, Ctx* cx, int ix, const TreeEntry& entry,
                   ->W(kFill)
                   ->H(s->rowH)
 
-                  ->PadR(12)
+                  ->PadR(Rems(cx, 0.75f))
                   ->PadL(12 + (float)it->depth * 16)
-                  ->Gap(8)
+                  ->Gap(Rems(cx, 0.5f))
                   ->ItemsCenter()
                   ->Radius(th.radius);
 
@@ -97465,7 +102226,7 @@ static El* TreeRow(void* user, Ctx* cx, int ix, const TreeEntry& entry,
         IconName ic = !it->folder    ? IconName::File
                       : it->expanded ? IconName::FolderOpen
                                      : IconName::Folder;
-        row->Child(IconEl(a, ic, 16)
+        row->Child(IconEl(a, ic, Rems(cx, 1.f))
                        ->Fg(it->disabled ? th.mutedFg : th.foreground));
     }
 
@@ -97489,7 +102250,7 @@ static El* TreeRow(void* user, Ctx* cx, int ix, const TreeEntry& entry,
 
 El* Tree::IntoEl() {
     if (!state.Get(cx)) {
-        return Div(a)->H(h);
+        return Div(a)->W(kFill)->H(h > 0 ? h : kFill);
     }
     return TreeList::New(cx, id, state, h, &TreeRow, this);
 }
@@ -97864,23 +102625,22 @@ WindowLayers::~WindowLayers() {
 }
 
 WindowLayers* WindowLayersOf(Window* win) {
-    if (!win) {
+
+    Root* root = Root::Read(win);
+    if (!root) {
         return nullptr;
     }
-
-    uint32_t key = (uint32_t)HashClickId(StrL("gpui-window-layers"));
-    void* p = WindowKeyedState(win, key, new WindowLayers(),
-                               &EntityDropT<WindowLayers>);
-    WindowLayers* layers = (WindowLayers*)p;
-    if (layers && !layers->win) {
-        layers->app = win->app;
-        layers->win = win;
-    }
-    return layers;
+    return (WindowLayers*)root->Plugin(&component::kWindowStatePlugin);
 }
 
 static WindowLayers* LayersOf(Ctx* cx) {
-    return cx ? WindowLayersOf(cx->win) : nullptr;
+    WindowLayers* layers = cx ? WindowLayersOf(cx->win) : nullptr;
+    if (!layers) {
+        Panic(
+            "component window state is missing; call component::Init "
+            "before KitOpenWindow");
+    }
+    return layers;
 }
 
 void WindowOpenDialog(Ctx* cx, EntityId view, bool overlay) {
@@ -99222,13 +103982,7 @@ struct DropdownOp {
 };
 
 static bool component_shell_basic_dropdown_button_IsBlank(Str text) {
-    for (int i = 0; i < len(text); i++) {
-        char c = text.s[i];
-        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f' &&
-            c != '\v')
-            return false;
-    }
-    return true;
+    return len(StrTrim(text)) == 0;
 }
 
 static bool component_shell_basic_dropdown_button_Construct(PayloadBuild* build, const ComponentArgument* args, int) {
@@ -99307,7 +104061,7 @@ static El* component_shell_basic_dropdown_button_Materialize(MaterializeRequest*
                                     ->Label(payload->label);
     if (request->onClick)
         action->OnClick(
-            Listen(cx, &ScriptView::OnClick, (intptr_t)request->onClick));
+            Listen(cx, &ScriptView::OnClick, (int64_t)request->onClick));
     component::DropdownButton* dropdown =
         component::DropdownButton::New(cx, payload->id)
             ->Button_(action)
@@ -99561,7 +104315,7 @@ static bool NonnegativeUsize(const ComponentArgument& argument, double* out) {
 
 static bool component_shell_carousel_NonemptyId(const ComponentArgument& argument) {
     return argument.kind == shell::ComponentArgumentKind::String &&
-           len(StrTrimAscii(argument.string)) != 0;
+           len(StrTrim(argument.string)) != 0;
 }
 
 static Entity<CarouselState> StateOf(MaterializeRequest* request,
@@ -100149,9 +104903,9 @@ static bool Rows(MaterializeRequest* request, shell::ComponentCallback callback,
     return true;
 }
 
-static const float* Values(Arena* a, const Row* rows, int n) {
-    float* values = (float*)Alloc(a, (int)sizeof(float) * (n > 0 ? n : 1));
-    for (int i = 0; i < n; i++) values[i] = (float)rows[i].value;
+static const double* Values(Arena* a, const Row* rows, int n) {
+    double* values = (double*)Alloc(a, (int)sizeof(double) * (n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) values[i] = rows[i].value;
     return values;
 }
 static const char* const* Labels(Arena* a, const Row* rows, int n) {
@@ -100175,7 +104929,7 @@ static El* component_shell_chart_mod_Render(MaterializeRequest* request, const c
             ->Child(TextEl(a, StrDup(a, fmt("Failed to build %s data: %s",
                                             Str(kind), error))));
     }
-    const float* values = Values(a, data, n);
+    const double* values = Values(a, data, n);
     Str id = request->elementId;
     if (strcmp(kind, "BarChart") == 0) {
 
@@ -100270,7 +105024,7 @@ static El* component_shell_chart_mod_Render(MaterializeRequest* request, const c
 
         component::PieChart* chart = component::PieChart::New(cx)->Id(id);
         Rgba color = ThemeNow(cx->app).chart2;
-        for (int i = 0; i < n; i++) chart->Slice(values[i], color);
+        for (int i = 0; i < n; i++) chart->Slice((float)values[i], color);
         bool labels = false;
         EachMethod<Op>(request, [&](const Op& op) {
             switch (op.kind) {
@@ -100789,20 +105543,8 @@ static El* component_shell_chat_Materialize(MaterializeRequest* request) {
                     scroller->WithJumpButtonLabel(op.text);
             });
 
-            ElRefiner style = request->TakeStyle();
-            float h = scroller->h > 0 ? scroller->h : 192.f;
-            if (style.IsSet()) {
-                El* probe = Div(cx->a);
-                style.Apply(probe);
-                if (probe->style.height > 0 && probe->style.height != kAuto)
-                    h = probe->style.height;
-            }
-            LaidOutHeight* laid = UseLaidOutHeight(cx, payload->id, h);
-            scroller->H(laid ? laid->built : h);
             El* root = scroller->IntoEl();
-            root->H(kFill);
-            style.Apply(root);
-            TrackLaidOutHeight(cx, root, laid);
+            request->TakeStyle().Apply(root);
             return root;
         }
     }
@@ -100811,7 +105553,7 @@ static El* component_shell_chat_Materialize(MaterializeRequest* request) {
 }
 
 static bool NonEmptyId(Str id) {
-    return len(StrTrimAscii(id)) > 0;
+    return len(StrTrim(id)) > 0;
 }
 
 static bool ConstructAttachment(PayloadBuild* build,
@@ -101022,7 +105764,7 @@ static bool RecordScrollerJumpButton(PayloadBuild* b,
 static bool RecordJumpButtonLabel(PayloadBuild* build,
                                   const ComponentArgument* args, int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build->Fail(
             StrL("MessageScroller.jump_button_label expects non-empty text"));
     }
@@ -101462,19 +106204,15 @@ static El* MaterializeTree(MaterializeRequest* request) {
     }
 
     ElRefiner style = request->TakeStyle();
-    float h = 320;
+    float h = 0;
     if (style.IsSet()) {
         El* probe = Div(cx->a);
         style.Apply(probe);
         if (probe->style.height > 0 && probe->style.height != kAuto)
             h = probe->style.height;
     }
-    LaidOutHeight* laid = UseLaidOutHeight(cx, payload->id, h);
-    if (laid) h = laid->built;
     El* root = TreeList::New(cx, payload->id, host->native, h, &Row, nullptr);
-    root->H(kFill);
     style.Apply(root);
-    TrackLaidOutHeight(cx, root, laid);
     return root;
 }
 
@@ -101482,8 +106220,7 @@ static bool component_shell_collections_tree_ConstructItem(PayloadBuild* build, 
                           int count) {
     if (count != 2 || args[0].kind != shell::ComponentArgumentKind::String ||
         args[1].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0 ||
-        len(StrTrimAscii(args[1].string)) == 0)
+        len(StrTrim(args[0].string)) == 0 || len(StrTrim(args[1].string)) == 0)
         return build->Fail(StrL("TreeItem expects non-empty id and label"));
     ItemPayload* payload = build->New<ItemPayload>();
     payload->id = args[0].string;
@@ -101502,7 +106239,7 @@ static bool RecordExpanded(PayloadBuild* build, const ComponentArgument* args,
 static bool ConstructTree(PayloadBuild* build, const ComponentArgument* args,
                           int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0)
+        len(StrTrim(args[0].string)) == 0)
         return build->Fail(StrL("Tree expects non-empty id"));
     build->New<TreePayload>()->id = args[0].string;
     return true;
@@ -101652,9 +106389,9 @@ static El* component_shell_command_command_MaterializeItem(MaterializeRequest* r
     if (content.IsSet()) {
 
         item->content = &BuildItemContent;
-        item->data = (intptr_t)NewDeferredSlot(request, content,
-                                               "Failed to render CommandItem "
-                                               "content");
+        item->data = (int64_t)NewDeferredSlot(request, content,
+                                              "Failed to render CommandItem "
+                                              "content");
     }
     shell::ComponentChild* children = nullptr;
     int count = 0;
@@ -101829,7 +106566,7 @@ static bool IsText(const ComponentArgument* args, int count) {
     return count == 1 && args[0].kind == shell::ComponentArgumentKind::String;
 }
 static bool component_shell_command_command_IsNonEmptyText(const ComponentArgument* args, int count) {
-    return IsText(args, count) && len(StrTrimAscii(args[0].string)) != 0;
+    return IsText(args, count) && len(StrTrim(args[0].string)) != 0;
 }
 
 static bool component_shell_command_command_ConstructItem(PayloadBuild* build, const ComponentArgument* args,
@@ -102207,7 +106944,7 @@ static bool ShowMenu(void* user, Window*, App*, Str* error, Arena* a) {
             menu->Separator();
             continue;
         }
-        intptr_t action = (intptr_t)shell::ShellActionOf(entry.item.action);
+        int64_t action = (int64_t)shell::ShellActionOf(entry.item.action);
         if (entry.item.disabled)
             menu->MenuWithDisabled(entry.item.label, true, action);
         else if (entry.item.checked)
@@ -102291,7 +107028,7 @@ static El* MaterializeTrigger(MaterializeRequest* request) {
 
 static bool component_shell_command_native_menu_IsNonEmptyText(const ComponentArgument& arg) {
     return arg.kind == shell::ComponentArgumentKind::String &&
-           len(StrTrimAscii(arg.string)) != 0;
+           len(StrTrim(arg.string)) != 0;
 }
 
 static bool component_shell_command_native_menu_ConstructItem(PayloadBuild* build, const ComponentArgument* args,
@@ -102609,7 +107346,7 @@ bool RegisterCompoundCollapsible(shell::ComponentRegistry* registry,
 namespace gpui::component_shell::compound::common {
 
 bool NonemptyId(Str id, const char* component, Str* error) {
-    if (len(StrTrimAscii(id)) > 0) return true;
+    if (len(StrTrim(id)) > 0) return true;
     *error = fmt("%s(id) expects a nonempty string id", Str(component));
     return false;
 }
@@ -102638,6 +107375,10 @@ bool FiniteF32(double value, Str label, float* out, Str* error) {
 
 int UsizeInt(uint64_t value) {
     return value > (uint64_t)INT_MAX ? INT_MAX : (int)value;
+}
+
+int64_t UsizeInt64(uint64_t value) {
+    return value > (uint64_t)INT64_MAX ? INT64_MAX : (int64_t)value;
 }
 
 }
@@ -102767,13 +107508,13 @@ static El* component_shell_compound_pagination_Materialize(MaterializeRequest* r
     EachMethod<PaginationOp>(request, [&](const PaginationOp& op) {
         switch (op.kind) {
             case PaginationOp::Current:
-                pagination->CurrentPage(common::UsizeInt(op.value));
+                pagination->CurrentPage(common::UsizeInt64(op.value));
                 break;
             case PaginationOp::Total:
-                pagination->TotalPages(common::UsizeInt(op.value));
+                pagination->TotalPages(common::UsizeInt64(op.value));
                 break;
             case PaginationOp::Visible:
-                pagination->VisiblePages(common::UsizeInt(op.value));
+                pagination->VisiblePages(common::UsizeInt64(op.value));
                 break;
             case PaginationOp::Compact:
                 pagination->Compact();
@@ -103282,7 +108023,7 @@ static El* component_shell_controls_action_MaterializeButton(MaterializeRequest*
     });
     if (request->onClick)
         button->OnClick(
-            Listen(cx, &ScriptView::OnClick, (intptr_t)request->onClick));
+            Listen(cx, &ScriptView::OnClick, (int64_t)request->onClick));
 
     El** children = nullptr;
     int count = 0;
@@ -103658,8 +108399,8 @@ static bool RecordTagFlag(PayloadBuild* build, const ComponentArgument*, int) {
     return true;
 }
 
-static int BadgeCount(double value) {
-    return value > (double)INT_MAX ? INT_MAX : (int)value;
+static uint64_t BadgeCount(double value) {
+    return value >= 18446744073709551616.0 ? UINT64_MAX : (uint64_t)value;
 }
 
 static El* MaterializeBadge(MaterializeRequest* request) {
@@ -103981,7 +108722,7 @@ static El* MaterializeLink(MaterializeRequest* request) {
     EachMethod<LinkOp>(request, [&](const LinkOp& op) { link->Href(op.href); });
     if (request->onClick)
         link->OnOpen(
-            Listen(cx, &ScriptView::OnClick, (intptr_t)request->onClick));
+            Listen(cx, &ScriptView::OnClick, (int64_t)request->onClick));
     El** children = nullptr;
     int count = 0;
     if (!request->TakeChildren(&children, &count)) return nullptr;
@@ -104290,23 +109031,14 @@ static El* component_shell_data_table_mod_Render(MaterializeRequest* request, St
     });
 
     El* host = Div(a)->W(kFill)->H(kFill);
-
-    float chrome = table->rowHeight + (table->bordered ? 2.f : 0.f);
-    float body = -1;
     if (style.IsSet()) {
         style.Apply(host);
         float h = host->style.height;
-        if (h > 0) body = h - chrome;
+        float body = h - table->rowHeight - (table->bordered ? 2.f : 0.f);
+        if (h > 0 && body > 0) table->H(body);
     }
-    LaidOutHeight* laid = UseLaidOutHeight(cx, request->elementId, body);
-    if (laid) {
-        laid->contentBox = true;
-        laid->inset = chrome;
-        body = laid->built;
-    }
-    if (body > 0) table->H(body);
-    host->Child(table->IntoEl());
-    TrackLaidOutHeight(cx, host, laid);
+
+    host->Child(table->IntoEl()->H(kFill));
     return host;
 }
 
@@ -104400,7 +109132,7 @@ static bool component_shell_data_table_mod_NewState(shell::StateBuild* build, co
     for (int i = 0; i < columns.count; i++) {
         const ComponentArgument& column = columns.items[i];
         if (column.kind != shell::ComponentArgumentKind::String ||
-            len(StrTrimAscii(column.string)) == 0)
+            len(StrTrim(column.string)) == 0)
             return build->Fail(
                 StrL("DataTableState columns must be non-empty strings"));
     }
@@ -104609,23 +109341,14 @@ static El* component_shell_delegate_collections_list_Render(MaterializeRequest* 
     component::List* list = component::List::New(cx, payload->id, host->state)
                                 ->WithDelegate(native);
 
-    float h = list->h;
     if (style.IsSet()) {
         El* probe = Div(cx->a);
         style.Apply(probe);
         if (probe->style.height > 0 && probe->style.height != kAuto)
-            h = probe->style.height;
+            list->H(probe->style.height);
     }
-    LaidOutHeight* laid = UseLaidOutHeight(cx, payload->id, h);
-    if (laid) {
-        laid->contentBox = true;
-        h = laid->built;
-    }
-    list->H(h);
     El* root = list->IntoEl();
-    root->H(kFill);
     style.Apply(root);
-    TrackLaidOutHeight(cx, root, laid);
     return root;
 }
 
@@ -104652,7 +109375,7 @@ static bool component_shell_delegate_collections_list_Construct(PayloadBuild* bu
     if (count != 3 || args[0].kind != shell::ComponentArgumentKind::String ||
         args[1].kind != shell::ComponentArgumentKind::Callback ||
         args[2].kind != shell::ComponentArgumentKind::Callback ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build
             ->Fail(StrL("List expects a non-empty id, rows callback, and row "
                         "renderer"));
@@ -104930,7 +109653,7 @@ static bool component_shell_delegate_combobox_mod_Construct(PayloadBuild* build,
         args[1].kind != shell::ComponentArgumentKind::Callback ||
         args[2].kind != shell::ComponentArgumentKind::Callback ||
         args[3].kind != shell::ComponentArgumentKind::Callback ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build
             ->Fail(StrL("Combobox expects id, rows, on_change, and on_confirm "
                         "callbacks"));
@@ -105264,7 +109987,7 @@ static bool component_shell_delegate_select_mod_Construct(PayloadBuild* build, c
         args[1].kind != shell::ComponentArgumentKind::Callback ||
         args[2].kind != shell::ComponentArgumentKind::Callback ||
         args[3].kind != shell::ComponentArgumentKind::Callback ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build
             ->Fail(StrL("Select expects id, rows callback, row renderer, and "
                         "selection callback"));
@@ -106761,7 +111484,7 @@ static El* component_shell_input_group_mod_MaterializeButton(MaterializeRequest*
     });
     if (request->onClick)
         button->OnClick(
-            Listen(cx, &ScriptView::OnClick, (intptr_t)request->onClick));
+            Listen(cx, &ScriptView::OnClick, (int64_t)request->onClick));
 
     button->refiner = request->TakeStyle();
     El** children = nullptr;
@@ -106881,7 +111604,7 @@ template <Part P, const char* Name>
 static bool component_shell_input_group_mod_ConstructId(PayloadBuild* build, const ComponentArgument* args,
                         int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build->Fail(fmt("%s expects one nonempty string id", Str(Name)));
     }
     PartPayload* payload = build->New<PartPayload>();
@@ -107572,7 +112295,7 @@ static El* component_shell_layout_resizable_MaterializeGroup(MaterializeRequest*
 static bool component_shell_layout_resizable_ConstructGroup(PayloadBuild* build, const ComponentArgument* args,
                            int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build->Fail(StrL("Resizable expects a non-empty id"));
     }
     build->New<Id>()->value = args[0].string;
@@ -107816,7 +112539,7 @@ static bool component_shell_layout_textarea_RecordBool(PayloadBuild* build, cons
 static bool component_shell_layout_textarea_RecordAriaLabel(PayloadBuild* build, const ComponentArgument* args,
                             int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build->Fail(StrL("Textarea.aria_label expects non-empty text"));
     }
     Op* op = build->New<Op>();
@@ -107936,6 +112659,25 @@ bool Register(shell::ComponentRegistry* registry, shell::RegistryError* error) {
     return true;
 }
 
+void MountWindowRoot(App* app, Window* window,
+                     shell::ComponentWindowBuild build, void* data) {
+    if (!app || !window || !build) return;
+    EntityId inner = build(window, app, data);
+    Entity<Root> root = Root::New(app, window, inner);
+    window->root = root.id;
+    AppInvalidate(window);
+}
+
+Window* OpenWindowWithRoot(App* app,
+                           const shell::ComponentWindowOptions& options,
+                           shell::ComponentWindowBuild build, void* data) {
+    Window* window = WindowOpen(app, options.title, options.dipW, options.dipH,
+                                options.opts);
+    if (!window) return nullptr;
+    MountWindowRoot(app, window, build, data);
+    return window;
+}
+
 static void Initializer(App* app) {
     Init(app);
 }
@@ -107952,6 +112694,7 @@ const shell::FrozenComponentRegistry* Components() {
         return &frozen;
     }
     registry.WithInitializer(&Initializer);
+    registry.WithWindowOpener(&OpenWindowWithRoot);
     if (!Register(&registry, &error)) {
         Arena* a = ArenaNew();
         logf("gpui-component-shell: %s\n",
@@ -108258,8 +113001,7 @@ static bool component_shell_lifecycle_menu_ConstructItem(PayloadBuild* build, co
                           int count) {
     if (count != 2 || args[0].kind != shell::ComponentArgumentKind::String ||
         args[1].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0 ||
-        len(StrTrimAscii(args[1].string)) == 0)
+        len(StrTrim(args[0].string)) == 0 || len(StrTrim(args[1].string)) == 0)
         return build->Fail(StrL("MenuItem expects non-empty label and action"));
     ItemSpec* item = build->New<ItemSpec>();
     item->label = args[0].string;
@@ -108278,7 +113020,7 @@ template <int Which>
 static bool component_shell_lifecycle_menu_ConstructLabel(PayloadBuild* build, const ComponentArgument* args,
                            int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0)
+        len(StrTrim(args[0].string)) == 0)
         return build->Fail(Which == 0 ? StrL("Menu expects a non-empty label")
                                       : StrL("MenuBar expects a non-empty "
                                              "label"));
@@ -108395,7 +113137,7 @@ static bool component_shell_lifecycle_tooltip_Construct(PayloadBuild* build, con
             ->Fail(StrL("Tooltip(id, label, text) expects three "
                         "strings"));
     for (int i = 0; i < 3; i++) {
-        if (len(StrTrimAscii(args[i].string)) == 0)
+        if (len(StrTrim(args[i].string)) == 0)
             return build
                 ->Fail(StrL("Tooltip id, label, and text must not be "
                             "empty"));
@@ -108555,7 +113297,7 @@ static bool component_shell_media_editor_RecordBool(PayloadBuild* build, const C
 static bool component_shell_media_editor_RecordAriaLabel(PayloadBuild* build, const ComponentArgument* args,
                             int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build->Fail(StrL("Editor.aria_label expects non-empty text"));
     }
     Op* op = build->New<Op>();
@@ -108648,7 +113390,7 @@ static bool component_shell_media_image_EscapesRoot(Str path) {
 
 bool AssetPath(Str path, Str* out, Str* error) {
 
-    path = StrTrimAscii(path);
+    path = StrTrim(path);
     if (len(path) == 0) {
         *error = StrL("Image path must not be empty");
         return false;
@@ -108764,7 +113506,7 @@ static bool component_shell_navigation_icon_EscapesRoot(Str path) {
 
 bool IconPath(Str path, Str* error) {
 
-    if (len(StrTrimAscii(path)) == 0) {
+    if (len(StrTrim(path)) == 0) {
         *error = StrL("Icon path must not be empty");
         return false;
     }
@@ -109011,7 +113753,7 @@ static El* MaterializeMenuItem(MaterializeRequest* request) {
     item->Active(request->selected)->Disabled(request->disabled);
     if (request->onClick)
         item->OnClick(
-            Listen(cx, &ScriptView::OnClick, (intptr_t)request->onClick));
+            Listen(cx, &ScriptView::OnClick, (int64_t)request->onClick));
     shell::ComponentChild* children = nullptr;
     int count = 0;
     if (!request->TakeTypedChildren(&children, &count)) return nullptr;
@@ -109143,7 +113885,7 @@ static El* component_shell_navigation_sidebar_MaterializeToggle(MaterializeReque
     });
     if (request->onClick)
         toggle->OnClick(
-            Listen(cx, &ScriptView::OnClick, (intptr_t)request->onClick));
+            Listen(cx, &ScriptView::OnClick, (int64_t)request->onClick));
     El** children = nullptr;
     int count = 0;
     if (!request->TakeChildren(&children, &count)) return nullptr;
@@ -109480,8 +114222,7 @@ static bool component_shell_overlays_dropdown_menu_Construct(PayloadBuild* build
     if (count != 2 || args[0].kind != shell::ComponentArgumentKind::String ||
         args[1].kind != shell::ComponentArgumentKind::String)
         return build->Fail(StrL("DropdownMenu(id, label) expects two strings"));
-    if (len(StrTrimAscii(args[0].string)) == 0 ||
-        len(StrTrimAscii(args[1].string)) == 0)
+    if (len(StrTrim(args[0].string)) == 0 || len(StrTrim(args[1].string)) == 0)
         return build->Fail(StrL("DropdownMenu id and label must not be empty"));
     DropdownMenuPayload* payload = build->New<DropdownMenuPayload>();
     payload->id = args[0].string;
@@ -109496,7 +114237,7 @@ static bool component_shell_overlays_dropdown_menu_RecordItem(PayloadBuild* buil
         return build
             ->Fail(StrL("DropdownMenu.item(label, callback) expects a "
                         "string and callback"));
-    if (len(StrTrimAscii(args[0].string)) == 0)
+    if (len(StrTrim(args[0].string)) == 0)
         return build->Fail(StrL("DropdownMenu.item label must not be empty"));
     MenuItemOp* op = build->New<MenuItemOp>();
     op->label = args[0].string;
@@ -109649,7 +114390,7 @@ static bool component_shell_overlays_hover_card_Construct(PayloadBuild* build, c
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String)
         return build->Fail(StrL("HoverCard(id) expects a string"));
 
-    if (len(StrTrimAscii(args[0].string)) == 0)
+    if (len(StrTrim(args[0].string)) == 0)
         return build->Fail(StrL("HoverCard id must not be empty"));
     build->New<HoverCardPayload>()->id = args[0].string;
     return true;
@@ -109818,23 +114559,8 @@ struct PopoverOp {
     ComponentArgument callback = {};
 };
 
-struct PopoverContent {
-    DeferredSlot* slot = nullptr;
-    bool appearance = true;
-    ElRefiner style = {};
-    El** children = nullptr;
-    int count = 0;
-};
-
 static El* component_shell_overlays_popover_BuildContent(void* user, Ctx* cx) {
-    PopoverContent* content = (PopoverContent*)user;
-    El* surface = Div(cx->a)->Id(StrL("content"))->FlexCol();
-    if (content->appearance) component::PopoverSurface(cx, surface)->Pad(12);
-    surface->Child(BuildDeferredSlot(content->slot, cx));
-    for (int i = 0; i < content->count; i++)
-        surface->Child(content->children[i]);
-    content->style.Apply(surface);
-    return surface;
+    return BuildDeferredSlot((DeferredSlot*)user, cx);
 }
 
 static void component_shell_overlays_popover_RunOpenChange(const shell::ComponentEventBinding* binding,
@@ -109856,8 +114582,7 @@ static El* component_shell_overlays_popover_Materialize(MaterializeRequest* requ
     if (!factory.IsSet())
         return request->Fail(StrL("Popover requires content(element)"));
     Ctx* cx = request->cx;
-    PopoverContent* content = ArenaNew<PopoverContent>(cx->a);
-    content->slot =
+    DeferredSlot* slot =
         NewDeferredSlot(request, factory, "Failed to render Popover content");
     component::Popover* popover = component::Popover::New(cx, payload->id);
     popover
@@ -109877,7 +114602,7 @@ static El* component_shell_overlays_popover_Materialize(MaterializeRequest* requ
                 popover->Open(op.value);
                 break;
             case PopoverOp::Appearance:
-                content->appearance = op.value;
+                popover->Appearance(op.value);
                 break;
             case PopoverOp::OverlayClosable:
                 popover->OverlayClosable(op.value);
@@ -109888,11 +114613,13 @@ static El* component_shell_overlays_popover_Materialize(MaterializeRequest* requ
                 break;
         }
     });
-    popover->ContentBuilder(&component_shell_overlays_popover_BuildContent, content);
+    popover->ContentBuilder(&component_shell_overlays_popover_BuildContent, slot);
 
-    content->style = request->TakeStyle();
-    if (!request->TakeChildren(&content->children, &content->count))
-        return nullptr;
+    popover->RefineWith(request->TakeStyle());
+    El** children = nullptr;
+    int count = 0;
+    if (!request->TakeChildren(&children, &count)) return nullptr;
+    for (int i = 0; i < count; i++) popover->Child(children[i]);
     return popover->IntoEl();
 }
 
@@ -109901,8 +114628,7 @@ static bool component_shell_overlays_popover_Construct(PayloadBuild* build, cons
     if (count != 2 || args[0].kind != shell::ComponentArgumentKind::String ||
         args[1].kind != shell::ComponentArgumentKind::String)
         return build->Fail(StrL("Popover(id, label) expects two strings"));
-    if (len(StrTrimAscii(args[0].string)) == 0 ||
-        len(StrTrimAscii(args[1].string)) == 0)
+    if (len(StrTrim(args[0].string)) == 0 || len(StrTrim(args[1].string)) == 0)
         return build->Fail(StrL("Popover id and label must not be empty"));
     PopoverPayload* payload = build->New<PopoverPayload>();
     payload->id = args[0].string;
@@ -110367,7 +115093,7 @@ static El* component_shell_questionnaire_mod_MaterializeRoot(MaterializeRequest*
 
 static bool NonBlank(const ComponentArgument& argument) {
     return argument.kind == shell::ComponentArgumentKind::String &&
-           len(StrTrimAscii(argument.string)) != 0;
+           len(StrTrim(argument.string)) != 0;
 }
 
 static bool ConstructChoice(PayloadBuild* build, const ComponentArgument* args,
@@ -110792,15 +115518,13 @@ static bool NewOtpState(shell::StateBuild* build, const ComponentArgument* args,
     if (!PositiveUsize(args, count, "OtpState", &length, &error))
         return build->Fail(error);
 
-    if (length > 64)
-        return build->Fail(StrL("OtpState length cannot exceed 64 cells"));
     EntityState<OtpState>* state = build->New<EntityState<OtpState>>();
     state->app = build->app;
     state->entity = EntityNewState<OtpState>(build->app);
     OtpState* otp = state->entity.Get(build->app);
     if (!otp) return build->Fail(StrL("OtpState could not be created"));
     otp->self = state->entity;
-    otp->length = (int)length;
+    otp->length = length > (uint64_t)INT32_MAX ? INT32_MAX : (int)length;
     otp->focus = FocusHandleNew(build->app);
     return true;
 }
@@ -111381,7 +116105,7 @@ static bool ConstructScrollbar(PayloadBuild* build,
                                const ComponentArgument* args, int count) {
     if (count != 2 || args[0].kind != shell::ComponentArgumentKind::String ||
         args[1].kind != shell::ComponentArgumentKind::Entity ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build
             ->Fail(StrL("Scrollbar expects a non-empty window-unique id and "
                         "ScrollbarHandle"));
@@ -111890,7 +116614,7 @@ template <int Which>
 static bool component_shell_settings_mod_ConstructText(PayloadBuild* build, const ComponentArgument* args,
                           int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build
             ->Fail(Which == 0   ? StrL("SettingItem expects non-empty "
                                        "title")
@@ -111955,7 +116679,7 @@ template <TextOp::Kind K>
 static bool component_shell_settings_mod_RecordText(PayloadBuild* build, const ComponentArgument* args,
                        int count) {
     if (count != 1 || args[0].kind != shell::ComponentArgumentKind::String ||
-        len(StrTrimAscii(args[0].string)) == 0) {
+        len(StrTrim(args[0].string)) == 0) {
         return build
             ->Fail(fmt("%s expects non-empty text",
                        Str(K == TextOp::Title ? "title" : "description")));
@@ -113548,7 +118272,7 @@ static int IndexInt(double value) {
 }
 
 static bool component_shell_typed_compound_mod_NonemptyId(PayloadBuild* build, Str id, const char* callable) {
-    if (len(StrTrimAscii(id)) > 0) return true;
+    if (len(StrTrim(id)) > 0) return true;
     return build
         ->Fail(fmt("%s(id) expects a nonempty string id", Str(callable)));
 }
@@ -114882,7 +119606,7 @@ static El* MaterializeNotification(MaterializeRequest* request) {
 
 static bool component_shell_window_effects_mod_IsNonEmptyText(const ComponentArgument& arg) {
     return arg.kind == shell::ComponentArgumentKind::String &&
-           len(StrTrimAscii(arg.string)) != 0;
+           len(StrTrim(arg.string)) != 0;
 }
 
 template <int N>
@@ -115152,12 +119876,7 @@ void FrameSamplerReset(FrameSampler* s) {
 }
 
 void FrameSamplerSetCapacity(FrameSampler* s, int capacity) {
-    if (capacity < 1) {
-        capacity = 1;
-    }
-    if (capacity > kFpsCapacity) {
-        capacity = kFpsCapacity;
-    }
+    capacity = ClampI(capacity, 1, kFpsCapacity);
     s->capacity = capacity;
     if (s->n > capacity) {
         int drop = s->n - capacity;
@@ -115328,12 +120047,7 @@ float FrameSamplerPercentileDraw(const FrameSampler* s, float percentile) {
         }
         draws[j + 1] = v;
     }
-    if (percentile < 0) {
-        percentile = 0;
-    }
-    if (percentile > 1) {
-        percentile = 1;
-    }
+    percentile = ClampF(percentile, 0, 1);
     int last = s->n - 1;
     int rank = (int)lroundf(percentile * (float)last);
     if (rank > last) {
@@ -115745,12 +120459,7 @@ static void PaintFpsTrace(PaintCtx* ctx, El* e, void* user) {
     for (int i = 0; i < s->n; i++) {
         float secs = s->samples[i].drawSecs;
         float ratio = secs / axisMax;
-        if (ratio < 0) {
-            ratio = 0;
-        }
-        if (ratio > 1) {
-            ratio = 1;
-        }
+        ratio = ClampF(ratio, 0, 1);
         px[i] = e->x + slot * (float)(leading + i) + slot * 0.5f;
         py[i] = e->y + e->h * (1.f - ratio);
         colors[i] = RgbaOpacity(FpsLevelColor(style, secs, self->frameBudget),
@@ -139954,11 +144663,11 @@ static const char* ValidateSchema(const ArgumentSchema& schema, bool topLevel) {
         case SchemaKind::Element:
             return nullptr;
         case SchemaKind::Entity:
-            if (len(StrTrimAscii(S(schema.text))) == 0)
+            if (len(StrTrim(S(schema.text))) == 0)
                 return "entity kind must not be empty";
             return nullptr;
         case SchemaKind::Callback:
-            if (len(StrTrimAscii(S(schema.text))) == 0)
+            if (len(StrTrim(S(schema.text))) == 0)
                 return "callback signature must not be empty";
             return nullptr;
         case SchemaKind::Enum: {
@@ -140075,7 +144784,7 @@ bool ComponentRegistry::Open(uint32_t apiVersion, const char* module,
     for (const char* name : kRuntimeModuleSpecifiers) {
         if (module && strcmp(name, module) == 0) reserved = true;
     }
-    if (!module || len(StrTrimAscii(Str(module))) == 0 || reserved) {
+    if (!module || len(StrTrim(Str(module))) == 0 || reserved) {
         RegistryError e;
         e.kind = RegistryErrorKind::InvalidModuleSpecifier;
         e.component = module;
@@ -140087,6 +144796,10 @@ bool ComponentRegistry::Open(uint32_t apiVersion, const char* module,
 
 void ComponentRegistry::WithInitializer(ComponentInitializer value) {
     initializer = value;
+}
+
+void ComponentRegistry::WithWindowOpener(ComponentWindowOpener value) {
+    windowOpener = value;
 }
 
 bool ComponentRegistry::HasExport(const char* name) const {
@@ -140246,6 +144959,7 @@ void ComponentRegistry::Freeze(FrozenComponentRegistry* out) {
     VecReset(out->states);
     out->moduleSpecifier = moduleSpecifier;
     out->initializer = initializer;
+    out->windowOpener = windowOpener;
     for (int i = 0; i < len(descriptors); i++)
         VecAppend(out->descriptors, descriptors[i]);
     for (int i = 0; i < len(states); i++) VecAppend(out->states, states[i]);
@@ -140255,6 +144969,7 @@ void ComponentRegistry::Freeze(FrozenComponentRegistry* out) {
     VecReset(stateKinds);
     moduleSpecifier = nullptr;
     initializer = nullptr;
+    windowOpener = nullptr;
 }
 
 FrozenComponentRegistry::~FrozenComponentRegistry() {
@@ -143824,6 +148539,22 @@ bool ShellParseInvocation(const char* const* arguments, int count,
     return true;
 }
 
+Window* ShellOpenWindow(App* app, const FrozenComponentRegistry* components,
+                        const ComponentWindowOptions& options,
+                        ComponentWindowBuild build, void* data) {
+    if (!app || !build) return nullptr;
+
+    ComponentWindowOpener open =
+        components ? components->WindowOpener() : nullptr;
+    if (open) return open(app, options, build, data);
+    Window* window = WindowOpen(app, options.title, options.dipW, options.dipH,
+                                options.opts);
+    if (!window) return nullptr;
+    window->root = build(window, app, data);
+    AppInvalidate(window);
+    return window;
+}
+
 }
 
 #line 1 "src/shell/input_tokens.cpp"
@@ -144677,12 +149408,17 @@ static Str TrimSpace(Str value) {
     return value;
 }
 
+static float ShellRemSize() {
+    shell::ScopeHostContext host = shell::ScopeCurrentHost();
+    return host.IsSet() ? WindowRemSize(host.GetWindow()) : 16.f;
+}
+
 static bool ApplyNullary(El* element, Str name) {
-    return shell::ApplyNullaryStyle(element, name);
+    return shell::ApplyNullaryStyle(element, name, ShellRemSize());
 }
 
 static bool ApplyParam(El* e, const shell::SpecOp& op, ShellError* error) {
-    return shell::ApplyParamStyle(e, op, error);
+    return shell::ApplyParamStyle(e, op, error, ShellRemSize());
 }
 
 static uint32_t StyleFieldsFor(Str name) {
@@ -145168,7 +149904,7 @@ static El* NumberStepButton(Ctx* cx, ShellRuntime* runtime,
 }
 
 static Listener ClickListener(Ctx* cx, shell::CallbackId callback) {
-    return callback ? Listen(cx, &ScriptView::OnClick, (intptr_t)callback)
+    return callback ? Listen(cx, &ScriptView::OnClick, (int64_t)callback)
                     : Listener{};
 }
 
@@ -145208,12 +149944,13 @@ struct ShellTokenUser {
 static El* ShellRenderToken(Ctx* cx, const InlineTokenContext* ctx,
                             void* user) {
     ShellTokenUser* values = (ShellTokenUser*)user;
-    if (values && values->runtime && values->render) {
-        El* el = values->runtime->RenderInlineToken(
-            values->render, ctx, InputValue(values->state), cx);
-        if (el) return el;
-    }
-    return component::InputToken::New(cx, *ctx)->IntoEl();
+
+    if (!values || !values->runtime || !values->render) return nullptr;
+    El* el = values->runtime->RenderInlineToken(values->render, ctx,
+                                                InputValue(values->state), cx);
+    if (el) return el;
+
+    return Div(cx->a)->Child(TextEl(cx->a, ctx->span.token.label));
 }
 
 static void ShellClickToken(const InlineTokenClickEvent* ev, Ctx* cx,
@@ -145280,7 +150017,7 @@ static uint32_t LazyListKey(Str id) {
 }
 
 static void OnLazyListScroll(ScriptView*, Ctx* cx, const ScrollEvent* event,
-                             intptr_t key) {
+                             int64_t key) {
     LazyListState* state = KeyedState<LazyListState>(cx, (uint32_t)key);
     if (!state || !event) return;
     state->offset = event->offsetY;
@@ -145316,7 +150053,7 @@ static El* LazyListElement(Ctx* cx, ShellRuntime* runtime,
     int count = spec->itemCount;
     int scrollId = HashClickId(spec->id);
     PaintCtx* paint = cx->win ? &cx->win->paint : nullptr;
-    Listener onScroll = Listen(cx, &OnLazyListScroll, (intptr_t)key);
+    Listener onScroll = Listen(cx, &OnLazyListScroll, (int64_t)key);
 
     MaterialVirtualUser* user = ArenaNew<MaterialVirtualUser>(cx->a);
     user->runtime = runtime;
@@ -145457,7 +150194,7 @@ static El* WireDockCommands(Ctx* cx, El* element,
 
                 element
                     ->OnClick(ListenTo(region->state, &DockState::OnToggleSide,
-                                       (intptr_t)placement));
+                                       (int64_t)placement));
                 element->TabStop(false);
             }
         } else if (StrEq(op.name, StrL("resize_dock")) && region) {
@@ -145761,7 +150498,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
             if (behavior.hasTextScrollable)
                 view->Scrollable(behavior.textScrollable);
             view->OnLinkWithContext(Listen(cx, &ScriptView::OnTextLink),
-                                    (intptr_t)behavior.onLinkClick);
+                                    (int64_t)behavior.onLinkClick);
 
             view->ImageSource(DocumentImageSource,
                               DocumentImagesFor(cx, component.policy));
@@ -145896,7 +150633,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
                 root->TrackFocus(binding->triggerFocus);
             SelectInitKeys();
             Listener action =
-                Listen(cx, &ScriptView::OnSelectAction, (intptr_t)binding);
+                Listen(cx, &ScriptView::OnSelectAction, (int64_t)binding);
             root->KeyContext(SelectContext())
                 ->OnAction(action::SelectUp(), action)
                 ->OnAction(action::SelectDown(), action)
@@ -145905,7 +150642,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
 
             if (!behavior.disabled && behavior.onOpenChange)
                 root->OnAccessibilityDefault(Listen(
-                    cx, &ScriptView::OnSelectActivate, (intptr_t)binding));
+                    cx, &ScriptView::OnSelectActivate, (int64_t)binding));
             return root;
         }
         case shell::ComponentKind::DatePicker: {
@@ -145920,7 +150657,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
                 toggle->value = !open;
                 DatePickerBindKeys(
                     cx, root, id,
-                    Listen(cx, &ScriptView::OnBoundBool, (intptr_t)toggle),
+                    Listen(cx, &ScriptView::OnBoundBool, (int64_t)toggle),
                     Listener{}, open, behavior.disabled);
             }
             return root;
@@ -145946,7 +150683,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
                     : nullptr;
             if (state && !behavior.disabled) {
                 state->onChange = Listen(cx, &ScriptView::OnSliderEvent,
-                                         (intptr_t)(uint32_t)retained->id);
+                                         (int64_t)(uint32_t)retained->id);
             }
             if (component.kind == shell::ComponentKind::Slider)
                 return Slider::New(cx, behavior.disabled ? nullptr : state,
@@ -145973,7 +150710,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
             state->disabled = behavior.disabled;
             InstallShellTokens(cx, runtime, state, behavior, false);
             state->onChange = Listen(cx, &ScriptView::OnInputEvent,
-                                     (intptr_t)(uint32_t)retained->id);
+                                     (int64_t)(uint32_t)retained->id);
             Str nativeId =
                 StrDup(cx->a, fmt("gpui-shell-%s-%u",
                                   textarea ? StrL("textarea") : StrL("input"),
@@ -145982,7 +150719,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
                 InputBase::New(cx, nativeId, !behavior.disabled,
                                textarea ? AccessibilityRole::MultilineTextInput
                                         : AccessibilityRole::TextInput)
-                    ->BindInput(behavior.disabled ? nullptr : state)
+                    ->BindInputText(behavior.disabled ? nullptr : state)
                     ->Flex()
                     ->W(kFill);
             if (textarea) {
@@ -146002,7 +150739,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
             if (!state) return Div(cx->a);
             state->disabled = behavior.disabled;
             state->onChange = Listen(cx, &ScriptView::OnInputEvent,
-                                     (intptr_t)(uint32_t)retained->id);
+                                     (int64_t)(uint32_t)retained->id);
             Str nativeId =
                 StrDup(cx->a, fmt("gpui-shell-number-input-%u", retained->id));
             return NumberInput::New(cx, nativeId, state);
@@ -146016,7 +150753,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
             if (!state) return Div(cx->a);
             state->disabled = behavior.disabled;
             state->onChange = Listen(cx, &ScriptView::OnOtpEvent,
-                                     (intptr_t)(uint32_t)retained->id);
+                                     (int64_t)(uint32_t)retained->id);
             Str nativeId =
                 StrDup(cx->a, fmt("gpui-shell-otp-%u", retained->id));
             return OtpInput::New(cx, nativeId, retained->otp);
@@ -146063,7 +150800,7 @@ static El* shell_materialize_Construct(Ctx* cx, ShellRuntime* runtime,
                     opts.scrollY = at->y;
                     opts.scrollId = HashClickId(list->id);
                     opts.onScroll =
-                        Listen(cx, &ScriptView::OnScrollPosition, (intptr_t)at);
+                        Listen(cx, &ScriptView::OnScrollPosition, (int64_t)at);
                 }
             }
             return VirtualList::New(cx, list->id, opts);
@@ -146243,7 +150980,7 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
         if (!state) return Div(cx->a);
         state->disabled = behavior.disabled;
         state->onChange = Listen(cx, &ScriptView::OnOtpEvent,
-                                 (intptr_t)(uint32_t)retained->id);
+                                 (int64_t)(uint32_t)retained->id);
         Str nativeId = StrDup(cx->a, fmt("gpui-shell-otp-%u", retained->id));
         element = OtpInput::New(cx, nativeId, retained->otp);
         const shell::SpecNode* cellStyle =
@@ -146269,7 +151006,7 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
             if (i < state->len) {
                 cell->Child(TextEl(cx->a, state->masked
                                               ? StrL("•")
-                                              : Str(state->value + i, 1)));
+                                              : Str(state->value.els + i, 1)));
             } else if (i == active && caret && caretStyle) {
                 El* mark = Div(cx->a);
                 ApplyStyleNode(cx->a, caretStyle, mark, &ignored, error);
@@ -146290,12 +151027,12 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
         if (!state) return Div(cx->a);
         state->disabled = behavior.disabled;
         state->onChange = Listen(cx, &ScriptView::OnInputEvent,
-                                 (intptr_t)(uint32_t)retained->id);
+                                 (int64_t)(uint32_t)retained->id);
         Str nativeId =
             StrDup(cx->a, fmt("gpui-shell-number-input-%u", retained->id));
         Listener onStep = behavior.onStep
                               ? Listen(cx, &ScriptView::OnNumberStep,
-                                       (intptr_t)behavior.onStep)
+                                       (int64_t)behavior.onStep)
                               : Listener{};
         NumberStep amount = NumberStep::Fixed(retained->number.step);
         const NumberStep* step =
@@ -146339,7 +151076,7 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
         element->TrackFocus(state->focus)
             ->OnAccessibilityDecrement(decrement)
             ->OnAccessibilityIncrement(increment)
-            ->OnKeyDown(Listen(cx, &ScriptView::OnNumberKey, (intptr_t)key));
+            ->OnKeyDown(Listen(cx, &ScriptView::OnNumberKey, (int64_t)key));
         double numeric = 0;
         if (NumberParseValue(InputValue(state), &numeric))
             element->AriaNumericValue((float)numeric);
@@ -146361,7 +151098,7 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
             ResizablePanelGroup::New(cx, node->component.text, {}, axis);
         if (behavior.onResize) {
             group->OnResize(
-                Listen(cx, &ScriptView::OnResize, (intptr_t)behavior.onResize));
+                Listen(cx, &ScriptView::OnResize, (int64_t)behavior.onResize));
         }
         for (shell::SpecId childId : node->children) {
             const shell::SpecNode* childNode = specs->Node(childId);
@@ -146431,10 +151168,10 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
             if (open && content) popover->Content(content);
             if (behavior.onOpenChange)
                 popover->OnOpenChange(Listen(cx, &ScriptView::OnOpenChange,
-                                             (intptr_t)behavior.onOpenChange));
+                                             (int64_t)behavior.onOpenChange));
             if (behavior.onDismiss)
                 popover->OnDismiss(Listen(cx, &ScriptView::OnClick,
-                                          (intptr_t)behavior.onDismiss));
+                                          (int64_t)behavior.onDismiss));
             element = popover->IntoEl();
             if (open)
                 CancelBindKeys(cx, element, "Popover", node->component.text,
@@ -146532,7 +151269,7 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
         HoverCard* card = HoverCard::New(cx, node->component.text, state);
         if (behavior.onOpenChange)
             card->OnOpenChange(Listen(cx, &ScriptView::OnOpenChange,
-                                      (intptr_t)behavior.onOpenChange));
+                                      (int64_t)behavior.onOpenChange));
         if (trigger) card->Trigger(trigger);
         if (content && card->IsOpen()) {
             PopupPlaceContent(content, behavior.hasAnchor
@@ -146629,7 +151366,11 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
         if (focus && focus->kind == shell::RetainedKind::Focus)
             element->TrackFocus(focus->focus);
     }
-    if (behavior.tooltip) element->Tip(behavior.tooltip);
+    if (behavior.tooltip) {
+
+        element->Tip(behavior.tooltip);
+        element->rootTooltip = true;
+    }
     element->TabIndex(behavior.tabIndex)->TabStop(behavior.tabStop);
     if (behavior.scrollX || behavior.scrollY ||
         node->component.kind == shell::ComponentKind::Scrollbar) {
@@ -146653,7 +151394,7 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
             element->ScrollY(at ? at->y : 0);
         if (at)
             element->OnScroll(
-                Listen(cx, &ScriptView::OnScrollPosition, (intptr_t)at));
+                Listen(cx, &ScriptView::OnScrollPosition, (int64_t)at));
 
         if (behavior.scrollbar) {
             if (element->style.width == kAuto && element->style.widthFrac == 0)
@@ -146682,42 +151423,42 @@ static El* MaterializeNode(Ctx* cx, ShellRuntime* runtime,
     }
     if (behavior.onHover)
         element->OnHover(
-            Listen(cx, &ScriptView::OnHover, (intptr_t)behavior.onHover));
+            Listen(cx, &ScriptView::OnHover, (int64_t)behavior.onHover));
     if (behavior.onMouseMove)
         element->OnMouseMove(Listen(cx, &ScriptView::OnMouseMove,
-                                    (intptr_t)behavior.onMouseMove));
+                                    (int64_t)behavior.onMouseMove));
 
     if (behavior.keyContext) element->KeyContext(behavior.keyContext);
     if (behavior.onKeyDown)
         element->OnKeyDown(
-            Listen(cx, &ScriptView::OnScriptKey, (intptr_t)behavior.onKeyDown));
+            Listen(cx, &ScriptView::OnScriptKey, (int64_t)behavior.onKeyDown));
     if (behavior.onKeyUp)
         element->OnKeyUp(
-            Listen(cx, &ScriptView::OnScriptKey, (intptr_t)behavior.onKeyUp));
+            Listen(cx, &ScriptView::OnScriptKey, (int64_t)behavior.onKeyUp));
     if (behavior.hasMouseDown) {
         auto* buttons = ArenaNew<ShellMouseButtonBinding>(cx->a);
         *buttons = behavior.mouseDown;
         element->OnMouseDown(
-            Listen(cx, &ScriptView::OnScriptMouseDown, (intptr_t)buttons));
+            Listen(cx, &ScriptView::OnScriptMouseDown, (int64_t)buttons));
     }
     if (behavior.hasMouseUp) {
         auto* buttons = ArenaNew<ShellMouseButtonBinding>(cx->a);
         *buttons = behavior.mouseUp;
         element->OnMouseUp(
-            Listen(cx, &ScriptView::OnScriptMouseUp, (intptr_t)buttons));
+            Listen(cx, &ScriptView::OnScriptMouseUp, (int64_t)buttons));
     }
     if (behavior.onMouseDownOut)
         element->OnMouseDownOut(Listen(cx, &ScriptView::OnScriptMouseDownOut,
-                                       (intptr_t)behavior.onMouseDownOut));
+                                       (int64_t)behavior.onMouseDownOut));
     if (behavior.onScrollWheel)
         element->OnScrollWheel(Listen(cx, &ScriptView::OnScriptScrollWheel,
-                                      (intptr_t)behavior.onScrollWheel));
+                                      (int64_t)behavior.onScrollWheel));
     for (int i = 0; i < behavior.actionCount; i++) {
 
         auto* bound = ArenaNew<ShellActionBinding>(cx->a);
         *bound = behavior.actions[i];
         element->OnAction(bound->action, Listen(cx, &ScriptView::OnScriptAction,
-                                                (intptr_t)bound));
+                                                (int64_t)bound));
     }
     element = WireDockCommands(cx, element, behavior);
     bool lazyList =
@@ -148194,7 +152935,7 @@ Str PolicyApplication(const Policy* policy) {
 
 void PolicySetApplication(Policy* policy, Str name) {
     if (!policy) return;
-    Str trimmed = StrTrimAscii(name);
+    Str trimmed = StrTrim(name);
     StrFree(policy->application);
     policy->application = StrDup(
         trimmed && len(trimmed) > 0 ? trimmed : Str(kDefaultApplication));
@@ -148419,11 +153160,7 @@ EntityHandle RetainedStore::CreateOtp(int length, Str value, bool masked,
     state->length = length;
     state->masked = masked;
     state->focus = FocusHandleNew(app);
-    int n = len(value);
-    if (n > (int)sizeof(state->value) - 1) n = (int)sizeof(state->value) - 1;
-    if (n > 0) memcpy(state->value, value.s, (size_t)n);
-    state->len = n;
-    state->value[n] = 0;
+    OtpSetValue(state, value);
     return Push(entry);
 }
 
@@ -148601,6 +153338,20 @@ void RetainedStore::Clear(Vec<CallbackId>* callbacks) {
 
 namespace gpui {
 
+static const int kToastTickMs = 50;
+
+static const int kToastVisibleLimit = 3;
+
+static const int kToastPriority = kPopupPriority + 1;
+
+static const float kToastWidth = 320.f;
+
+static const float kTooltipEnterMs = 150.f;
+
+static const float kTooltipSlideMs = 200.f;
+
+static const float kTooltipSameRow = 10.f;
+
 static uint32_t ShellRootWindowKey() {
     return (uint32_t)HashClickId(StrL("gpui-shell-root"));
 }
@@ -148614,6 +153365,11 @@ static ShellRootWindowState* RootWindowState(Window* window) {
     return (ShellRootWindowState*)WindowKeyedState(
         window, ShellRootWindowKey(), new ShellRootWindowState(),
         &EntityDropT<ShellRootWindowState>);
+}
+
+static EntityId ShellRootWindowStateRoot(Window* window) {
+    ShellRootWindowState* state = RootWindowState(window);
+    return state ? state->root : EntityId{};
 }
 
 const char* ToastLevelName(ToastLevel level) {
@@ -148666,139 +153422,118 @@ bool ToastLevelFromName(Str name, ToastLevel* out) {
     return true;
 }
 
-static void RebuildScriptOverlay(Ctx* cx, Entity<ScriptView> content) {
-    if (ScriptView* view = content.Get(cx->app)) view->dirty = true;
+static SemanticThemeTokens RootTokens(const App* app) {
+    const BaseTheme* theme = BaseThemeGlobal(app);
+    return theme ? theme->tokens : SemanticThemeTokens{};
 }
 
-ShellRoot::~ShellRoot() {
-    if (app && content.IsValid()) EntityDrop(app, content);
+static Rgba BackdropColor() {
+    return Rgba8(0, 0, 0, 128);
 }
 
-Entity<ShellRoot> ShellRoot::New(App* app, EntityId content) {
-    Entity<ShellRoot> root = EntityNew<ShellRoot>(app);
-    if (ShellRoot* state = root.Get(app)) {
-        state->app = app;
-        state->content = content;
+static Rgba LevelColor(ToastLevel level, const ColorTokens& colors) {
+    switch (level) {
+        case ToastLevel::Info:
+            return colors.border;
+        case ToastLevel::Success:
+            return colors.primary;
+        case ToastLevel::Warning:
+            return colors.accentForeground;
+        case ToastLevel::Error:
+            return colors.destructive;
     }
-    return root;
+    return colors.border;
 }
 
-El* ShellRoot::Render(ShellRoot* self, Ctx* cx) {
-    if (!self) return Div(cx->a)->SizeFull();
-    if (ShellRootWindowState* state = RootWindowState(cx->win))
-        state->root = cx->self;
-    El* content = self->content.IsValid()
-                      ? EntityRender(cx->app, cx->win, cx->a, self->content)
-                      : nullptr;
-
-    El* hud = nullptr;
-    if (self->fpsHudVisible) {
-
-        auto* slot = KeyedState<Entity<FpsMonitor>>(
-            cx, (uint32_t)HashClickId(StrL("gpui-fps-monitor")));
-        if (slot) {
-            if (!slot->IsValid()) *slot = EntityNew<FpsMonitor>(cx);
-
-            FpsOverlayOpts opts;
-            opts.anchor = self->fpsHud.anchor;
-            if (self->fpsHud.hasFrameBudget) {
-                opts.frameBudget = self->fpsHud.frameBudget;
-            }
-            hud = FpsOverlayEl(cx, *slot, opts);
-        }
-    }
-
-    const BaseTheme* base = BaseThemeGlobal(cx->app);
-    float baseSize =
-        base ? base->tokens.typography.md.size : TypographyTokens{}.md.size;
-
-    El* body = content ? content : Div(cx->a)->SizeFull();
-    if (hud) body = Div(cx->a)->FlexCol()->SizeFull()->Child(body)->Child(hud);
-    return RootSurface(cx, nullptr, body)->Font(baseSize);
+static bool shell_root_OverlayMutationAllowed(const char* operation) {
+    if (!shell::ScopeHasCurrent()) return true;
+    ScopePhase phase = shell::ScopeCurrentPhase();
+    if (ScopePhaseAllowsNotify(phase)) return true;
+    logf(
+        "gpui-shell: `%s` is not allowed during the `%s` phase; overlays may "
+        "only be opened or closed while handling an event or a task\n",
+        Str(operation), Str(ScopePhaseName(phase)));
+    return false;
 }
 
-ShellRoot* ShellRootOf(Window* window, App* app) {
-    ShellRootWindowState* state = RootWindowState(window);
-    if (!state || !state->root.IsValid() || state->root != window->root)
-        return nullptr;
-    return Entity<ShellRoot>{state->root}.Get(app);
+static void RebuildScriptOverlay(App* app, EntityId content, bool isScript) {
+    if (!isScript) return;
+    if (ScriptView* view = Entity<ScriptView>{content}.Get(app))
+        view->dirty = true;
 }
 
-static void NotifyRoot(Ctx* cx) {
-    ShellRootWindowState* state = RootWindowState(cx->win);
-    if (state && state->root.IsValid())
-        NotifyEntity(cx->app, state->root, cx->win);
+static void RestoreOverlayFocus(Window* win, FocusHandle restore) {
+    if (!FocusHandleRestore(win, restore)) WindowSetFocusId(win, 0);
 }
 
-static void RestoreOverlayFocus(Ctx* cx, FocusHandle restore) {
-    if (!FocusHandleRestore(cx->win, restore)) WindowSetFocusId(cx->win, 0);
+static void NotifyRoot(App* app, ShellRoot* root, Window* win) {
+    ShellRootWindowState* state = RootWindowState(win);
+    if (root && state && state->root.IsValid())
+        NotifyEntity(app, state->root, win);
 }
+
+static bool CloseTopDialog(App* app, Window* win, ShellRoot* root);
 
 struct ShellDialogLayer {
     App* app = nullptr;
-    Entity<ScriptView> content = {};
+    EntityId root = {};
+    EntityId content = {};
+    bool isScript = false;
     DialogOptions options = {};
     FocusHandle focus = {};
     FocusHandle restore = {};
 
+    int index = 0;
+    bool topmost = false;
+
     ~ShellDialogLayer() {
-        if (app && content.IsValid()) EntityDrop(app, content.id);
+        if (app && content.IsValid()) EntityDrop(app, content);
     }
 
     static void Close(ShellDialogLayer* self, Ctx* cx, const void*) {
         if (!self) return;
-        FocusHandle restore = self->restore;
-        WindowCloseDialog(cx);
-        RestoreOverlayFocus(cx, restore);
+        ShellRoot* root = Entity<ShellRoot>{self->root}.Get(cx->app);
+        if (root) CloseTopDialog(cx->app, cx->win, root);
     }
 
     static void OnBackdrop(ShellDialogLayer* self, Ctx* cx,
                            const MouseDownEvent* event) {
         if (!self || !event || event->button != MouseButton::Left ||
-            !self->options.backdropDismissable)
+            !self->options.backdropDismissable || !self->topmost)
             return;
-        WindowLayers* layers = WindowLayersOf(cx->win);
-        bool topmost = layers && layers->dialogs.len > 0 &&
-                       layers->dialogs[layers->dialogs.len - 1]
-                               .view == cx->self;
-        if (!topmost) return;
         WindowStopPropagation(cx);
         Close(self, cx, event);
     }
 
     static El* Render(ShellDialogLayer* self, Ctx* cx) {
-        RebuildScriptOverlay(cx, self->content);
-        const Theme& theme = ThemeNow(cx->app);
-        WindowLayers* layers = WindowLayersOf(cx->win);
-        bool topmost = layers && layers->dialogs.len > 0 &&
-                       layers->dialogs[layers->dialogs.len - 1]
-                               .view == cx->self;
+        RebuildScriptOverlay(cx->app, self->content, self->isScript);
+        SemanticThemeTokens tokens = RootTokens(cx->app);
+        const ColorTokens& colors = tokens.colors;
         El* backdrop = nullptr;
-        if (topmost) {
-            backdrop =
+        if (self->topmost) {
 
+            backdrop =
                 DialogBackdrop::New(cx)
                     ->Absolute()
                     ->Top(0)
                     ->Left(0)
                     ->Right(0)
                     ->Bottom(0)
-                    ->Bg(Rgba8(0, 0, 0, 128))
+                    ->Bg(BackdropColor())
                     ->OnMouseDown(Listen(cx, &ShellDialogLayer::OnBackdrop));
         }
-        El* child =
-            self->content.IsValid()
-                ? EntityRender(cx->app, cx->win, cx->a, self->content.id)
-                : nullptr;
+        El* child = self->content.IsValid()
+                        ? EntityRender(cx->app, cx->win, cx->a, self->content)
+                        : nullptr;
 
         El* surface = Div(cx->a)
                           ->FlexCol()
                           ->StopMouseDown()
-                          ->Bg(theme.popover)
-                          ->Fg(theme.popoverFg)
-                          ->Border(1, theme.border)
-                          ->Radius(theme.radiusLg)
-                          ->Pad(16)
+                          ->Bg(colors.surface)
+                          ->Fg(colors.surfaceForeground)
+                          ->Border(1, colors.border)
+                          ->Radius(tokens.radius.lg)
+                          ->Pad(tokens.spacing.lg)
                           ->Child(child ? child : Div(cx->a));
         El* popup = Div(cx->a)
                         ->Absolute()
@@ -148811,7 +153546,8 @@ struct ShellDialogLayer {
                         ->JustifyCenter()
                         ->Child(surface);
         Str trap = StrDup(cx->a, fmt("shell-dialog-%d", cx->self.index));
-        if (topmost && self->options.escapeDismissable)
+
+        if (self->topmost && self->options.escapeDismissable)
             DialogBindKeys(cx, popup, trap, {}, {},
                            Listen(cx, &ShellDialogLayer::Close));
         return Dialog::New(cx)
@@ -148819,102 +153555,165 @@ struct ShellDialogLayer {
             ->Backdrop(backdrop)
             ->Popup(popup)
             ->IntoEl()
-            ->DeferredLayer((int)(10 + (layers ? layers->dialogs.len : 0)));
+            ->Deferred()
+            ->ZIndex(10 + self->index);
     }
 };
 
-int ShellRootOpenDialog(Ctx* cx, Entity<ScriptView> content,
-                        DialogOptions options) {
-    if (!cx || !content.IsValid() || !ShellRootOf(cx->win, cx->app)) return 0;
+static ShellDialogLayer* DialogLayerAt(App* app, ShellRoot* root, int index) {
+    if (!root || index < 0 || index >= len(root->dialogs)) return nullptr;
+    return Entity<ShellDialogLayer>{root->dialogs[index].layer}.Get(app);
+}
+
+static int OpenDialog(Ctx* cx, EntityId content, bool isScript,
+                      DialogOptions options) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (!root || !content.IsValid() || !shell_root_OverlayMutationAllowed("open_dialog"))
+        return 0;
     Entity<ShellDialogLayer> layer = EntityNew<ShellDialogLayer>(cx->app);
     ShellDialogLayer* state = layer.Get(cx);
     if (!state) return 0;
     state->app = cx->app;
+    state->root = ShellRootWindowStateRoot(cx->win);
     state->content = content;
+    state->isScript = isScript;
     state->options = options;
     state->focus = FocusHandleNew(cx);
     state->restore = WindowFocused(cx->win);
-    WindowOpenDialog(cx, layer.id, true);
+    ShellDialogEntry entry;
+    entry.layer = layer.id;
+    if (!VecAppend(root->dialogs, entry)) {
+        state->content = {};
+        EntityDrop(cx->app, layer.id);
+        return 0;
+    }
     FocusHandleFocus(cx->win, state->focus);
-    return WindowDialogCount(cx);
+    NotifyRoot(cx->app, root, cx->win);
+    return len(root->dialogs);
 }
 
-bool ShellRootCloseDialog(Ctx* cx) {
-    if (!cx || !ShellRootOf(cx->win, cx->app)) return false;
-    WindowLayers* layers = WindowLayersOf(cx->win);
-    if (!layers || layers->dialogs.len == 0) return false;
-    Entity<ShellDialogLayer> layer{layers->dialogs[layers->dialogs.len - 1]
-                                       .view};
-    ShellDialogLayer* state = layer.Get(cx);
+static bool CloseTopDialog(App* app, Window* win, ShellRoot* root) {
+    if (!root || len(root->dialogs) == 0) return false;
+    if (!shell_root_OverlayMutationAllowed("close_dialog")) return false;
+    int top = len(root->dialogs) - 1;
+    ShellDialogLayer* state = DialogLayerAt(app, root, top);
     FocusHandle restore = state ? state->restore : FocusHandle{};
-    WindowCloseDialog(cx);
-    RestoreOverlayFocus(cx, restore);
+    EntityId layer = root->dialogs[top].layer;
+    root->dialogs.len--;
+    EntityDrop(app, layer);
+    RestoreOverlayFocus(win, restore);
+    NotifyRoot(app, root, win);
     return true;
 }
 
+int ShellRootOpenDialog(Ctx* cx, Entity<ScriptView> content,
+                        DialogOptions options) {
+    return OpenDialog(cx, content.id, true, options);
+}
+
+int ShellRootOpenDialogView(Ctx* cx, EntityId content, DialogOptions options) {
+    return OpenDialog(cx, content, false, options);
+}
+
+bool ShellRootCloseDialog(Ctx* cx) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    return root && CloseTopDialog(cx->app, cx->win, root);
+}
+
 int ShellRootCloseAllDialogs(Ctx* cx) {
-    if (!cx || !ShellRootOf(cx->win, cx->app)) return 0;
-    WindowLayers* layers = WindowLayersOf(cx->win);
-    int count = layers ? layers->dialogs.len : 0;
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (!root || !shell_root_OverlayMutationAllowed("close_all_dialogs")) return 0;
+    int count = len(root->dialogs);
     if (count == 0) return 0;
-    ShellDialogLayer* first = Entity<ShellDialogLayer>{layers->dialogs[0].view}
-                                  .Get(cx);
+
+    ShellDialogLayer* first = DialogLayerAt(cx->app, root, 0);
     FocusHandle restore = first ? first->restore : FocusHandle{};
-    WindowCloseAllDialogs(cx);
-    RestoreOverlayFocus(cx, restore);
+    while (len(root->dialogs) > 0) {
+        EntityId layer = root->dialogs[len(root->dialogs) - 1].layer;
+        root->dialogs.len--;
+        EntityDrop(cx->app, layer);
+    }
+    RestoreOverlayFocus(cx->win, restore);
+    NotifyRoot(cx->app, root, cx->win);
     return count;
 }
 
 bool ShellRootHasDialog(Ctx* cx) {
-    return cx && ShellRootOf(cx->win, cx->app) && WindowHasActiveDialog(cx);
+    return ShellRootDialogCount(cx) > 0;
 }
+
+int ShellRootDialogCount(Ctx* cx) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    return root ? len(root->dialogs) : 0;
+}
+
+EntityId ShellRootTopmostDialog(Ctx* cx) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    ShellDialogLayer* top =
+        root ? DialogLayerAt(cx->app, root, len(root->dialogs) - 1) : nullptr;
+    return top ? top->content : EntityId{};
+}
+
+static bool CloseSheet(App* app, Window* win, ShellRoot* root);
 
 struct ShellSheetLayer {
     App* app = nullptr;
-    Entity<ScriptView> content = {};
-    component::SheetPlacement placement = component::SheetPlacement::Right;
+    EntityId root = {};
+    EntityId content = {};
+    bool isScript = false;
+    Placement placement = Placement::Right;
     FocusHandle focus = {};
     FocusHandle restore = {};
 
     ~ShellSheetLayer() {
-        if (app && content.IsValid()) EntityDrop(app, content.id);
+        if (app && content.IsValid()) EntityDrop(app, content);
     }
 
     static void Close(ShellSheetLayer* self, Ctx* cx, const void*) {
         if (!self) return;
-        FocusHandle restore = self->restore;
-        WindowCloseSheet(cx);
-        RestoreOverlayFocus(cx, restore);
+        ShellRoot* root = Entity<ShellRoot>{self->root}.Get(cx->app);
+        if (root) CloseSheet(cx->app, cx->win, root);
     }
 
     static El* Render(ShellSheetLayer* self, Ctx* cx) {
-        RebuildScriptOverlay(cx, self->content);
-        const Theme& theme = ThemeNow(cx->app);
-        El* child =
-            self->content.IsValid()
-                ? EntityRender(cx->app, cx->win, cx->a, self->content.id)
-                : nullptr;
+        RebuildScriptOverlay(cx->app, self->content, self->isScript);
+        SemanticThemeTokens tokens = RootTokens(cx->app);
+        const ColorTokens& colors = tokens.colors;
+        El* child = self->content.IsValid()
+                        ? EntityRender(cx->app, cx->win, cx->a, self->content)
+                        : nullptr;
         WinSize size = WindowSize(cx->win);
         El* surface = Div(cx->a)
                           ->FlexCol()
+                          ->StopMouseDown()
                           ->Absolute()
-                          ->Bg(theme.popover)
-                          ->Fg(theme.popoverFg)
-                          ->Border(1, theme.border)
-                          ->Pad(16)
+                          ->Bg(colors.surface)
+                          ->Fg(colors.surfaceForeground)
+                          ->Pad(tokens.spacing.lg)
                           ->Child(child ? child : Div(cx->a));
+
         switch (self->placement) {
-            case component::SheetPlacement::Left:
-                surface->Top(0)->Bottom(0)->Left(0)->W(size.dipW / 3.f);
+            case Placement::Left:
+                surface->Top(0)->Bottom(0)->Left(0)->WFrac(1.f / 3.f)->BorderR(
+                    1, colors.border);
                 break;
-            case component::SheetPlacement::Right:
-                surface->Top(0)->Bottom(0)->Right(0)->W(size.dipW / 3.f);
+            case Placement::Right:
+                surface->Top(0)->Bottom(0)->Right(0)->WFrac(1.f / 3.f)->BorderL(
+                    1, colors.border);
                 break;
-            case component::SheetPlacement::Top:
-                surface->Top(0)->Left(0)->Right(0)->H(size.dipH / 3.f);
+            case Placement::Top:
+                surface->Left(0)
+                    ->Right(0)
+                    ->Top(0)
+                    ->H(size.dipH / 3.f)
+                    ->BorderB(1, colors.border);
                 break;
-            case component::SheetPlacement::Bottom:
-                surface->Bottom(0)->Left(0)->Right(0)->H(size.dipH / 3.f);
+            case Placement::Bottom:
+                surface->Left(0)
+                    ->Right(0)
+                    ->Bottom(0)
+                    ->H(size.dipH / 3.f)
+                    ->BorderT(1, colors.border);
                 break;
         }
         return Sheet::New(cx)
@@ -148925,141 +153724,430 @@ struct ShellSheetLayer {
                           ->Left(0)
                           ->Right(0)
                           ->Bottom(0)
-                          ->Bg(Rgba8(0, 0, 0, 128)))
+                          ->Bg(BackdropColor()))
             ->Surface(surface)
             ->RequestClose(Listen(cx, &ShellSheetLayer::Close))
             ->IntoEl()
-            ->DeferredLayer(5);
+            ->Deferred();
     }
 };
 
-bool ShellRootOpenSheet(Ctx* cx, Entity<ScriptView> content,
-                        component::SheetPlacement placement) {
-    if (!cx || !content.IsValid() || !ShellRootOf(cx->win, cx->app))
+static bool CloseSheet(App* app, Window* win, ShellRoot* root) {
+    if (!root || !root->sheet.IsValid()) return false;
+    if (!shell_root_OverlayMutationAllowed("close_sheet")) return false;
+    ShellSheetLayer* state = Entity<ShellSheetLayer>{root->sheet}.Get(app);
+    FocusHandle restore = state ? state->restore : FocusHandle{};
+    EntityId layer = root->sheet;
+    root->sheet = {};
+    EntityDrop(app, layer);
+    RestoreOverlayFocus(win, restore);
+    NotifyRoot(app, root, win);
+    return true;
+}
+
+static bool OpenSheet(Ctx* cx, EntityId content, bool isScript,
+                      Placement placement) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (!root || !content.IsValid() || !shell_root_OverlayMutationAllowed("open_sheet"))
         return false;
+
     FocusHandle restore = WindowFocused(cx->win);
-    WindowLayers* layers = WindowLayersOf(cx->win);
-    if (layers && layers->hasSheet) {
-        ShellSheetLayer* current = Entity<ShellSheetLayer>{layers->sheet.view}
-                                       .Get(cx);
+    if (root->sheet.IsValid()) {
+        ShellSheetLayer* current = Entity<ShellSheetLayer>{root->sheet}
+                                       .Get(cx->app);
         if (current) restore = current->restore;
+        EntityId outgoing = root->sheet;
+        root->sheet = {};
+        EntityDrop(cx->app, outgoing);
     }
     Entity<ShellSheetLayer> layer = EntityNew<ShellSheetLayer>(cx->app);
     ShellSheetLayer* state = layer.Get(cx);
     if (!state) return false;
     state->app = cx->app;
+    state->root = ShellRootWindowStateRoot(cx->win);
     state->content = content;
+    state->isScript = isScript;
     state->placement = placement;
     state->focus = FocusHandleNew(cx);
     state->restore = restore;
-    WinSize size = WindowSize(cx->win);
-    float extent = (placement == component::SheetPlacement::Left ||
-                    placement == component::SheetPlacement::Right)
-                       ? size.dipW / 3.f
-                       : size.dipH / 3.f;
-    WindowOpenSheetAt(cx, layer.id, placement, extent);
+    root->sheet = layer.id;
     FocusHandleFocus(cx->win, state->focus);
+    NotifyRoot(cx->app, root, cx->win);
     return true;
+}
+
+bool ShellRootOpenSheet(Ctx* cx, Entity<ScriptView> content,
+                        Placement placement) {
+    return OpenSheet(cx, content.id, true, placement);
+}
+
+bool ShellRootOpenSheetView(Ctx* cx, EntityId content, Placement placement) {
+    return OpenSheet(cx, content, false, placement);
 }
 
 bool ShellRootCloseSheet(Ctx* cx) {
-    if (!cx || !ShellRootOf(cx->win, cx->app)) return false;
-    WindowLayers* layers = WindowLayersOf(cx->win);
-    if (!layers || !layers->hasSheet) return false;
-    ShellSheetLayer* state = Entity<ShellSheetLayer>{layers->sheet.view}
-                                 .Get(cx);
-    FocusHandle restore = state ? state->restore : FocusHandle{};
-    WindowCloseSheet(cx);
-    RestoreOverlayFocus(cx, restore);
-    return true;
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    return root && CloseSheet(cx->app, cx->win, root);
 }
 
 bool ShellRootHasSheet(Ctx* cx) {
-    return cx && ShellRootOf(cx->win, cx->app) && WindowHasActiveSheet(cx);
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    return root && root->sheet.IsValid();
 }
 
-static component::NotificationType NotificationTypeFor(ToastLevel level) {
-    switch (level) {
-        case ToastLevel::Info:
-            return component::NotificationType::Info;
-        case ToastLevel::Success:
-            return component::NotificationType::Success;
-        case ToastLevel::Warning:
-            return component::NotificationType::Warning;
-        case ToastLevel::Error:
-            return component::NotificationType::Error;
+EntityId ShellRootSheet(Ctx* cx) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    ShellSheetLayer* sheet =
+        root ? Entity<ShellSheetLayer>{root->sheet}.Get(cx->app) : nullptr;
+    return sheet ? sheet->content : EntityId{};
+}
+
+int64_t ShellRootNowMs() {
+    return (int64_t)(TimeNow() * 1000.0);
+}
+
+static void FreeToastId(ShellToastId* id) {
+    StrFree(id->text);
+    id->text = {};
+}
+
+static void FreeToastValue(ShellToastValue* value) {
+    StrFree(value->title);
+    StrFree(value->description);
+    *value = {};
+}
+
+static void ArmToastClock(ShellRoot* root, Window* win) {
+    if (root->toastTimer || !win) return;
+    root->toastWindow = win;
+    root->toastTimer = WindowSetInterval(
+        win, kToastTickMs,
+        ListenTo(Entity<ShellRoot>{ShellRootWindowStateRoot(win)},
+                 &ShellRoot::OnToastTick));
+}
+
+static void AdvanceToasts(App* app, Window* win, ShellRoot* root,
+                          int64_t nowMs) {
+
+    bool paused = root->toastState.IsExpanded();
+    ToastAdvance<ShellToastId, ShellToastValue> advanced =
+        root->toasts.Advance(nowMs, paused);
+    for (int i = 0; i < len(advanced.removed); i++) {
+        FreeToastId(&advanced.removed[i].id);
+        FreeToastValue(&advanced.removed[i].value);
     }
-    return component::NotificationType::Info;
+    bool changed = advanced.changed;
+    VecReset(advanced.presented);
+    VecReset(advanced.ending);
+    VecReset(advanced.removed);
+    if (root->toasts.IsEmpty() && root->toastTimer) {
+
+        WindowCancelTimer(root->toastWindow, root->toastTimer);
+        root->toastTimer = 0;
+        root->toastWindow = nullptr;
+    }
+    if (changed) NotifyRoot(app, root, win);
+}
+
+void ShellRoot::OnToastTick(ShellRoot* self, Ctx* cx, const TickEvent*) {
+    if (self) AdvanceToasts(cx->app, cx->win, self, ShellRootNowMs());
+}
+
+static bool DismissToastKey(ShellRoot* root, uint32_t key, int64_t nowMs) {
+    for (int i = 0; i < root->toasts.Len(); i++) {
+        const ManagedToast<ShellToastId, ShellToastValue>* entry = root->toasts
+                                                                       .At(i);
+        if (entry->id.key == key &&
+            entry->status != ToastTransitionStatus::Ending)
+            return root->toasts.Dismiss(entry->id, nowMs);
+    }
+    return false;
+}
+
+void ShellRoot::OnToastClick(ShellRoot* self, Ctx* cx, const ClickEvent*,
+                             int64_t key) {
+    if (self && DismissToastKey(self, (uint32_t)key, ShellRootNowMs()))
+        NotifyRoot(cx->app, self, cx->win);
+}
+
+bool ShellRootPushToast(Ctx* cx, const ToastRequest& request) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (!root || !request.title || !shell_root_OverlayMutationAllowed("push_toast"))
+        return false;
+    ShellToastId id;
+    TempStr text = request.hasId ? StrDupTemp(request.id) : TempStr{};
+    if (!request.hasId) {
+        root->nextToastOrdinal++;
+        text =
+            fmt("shell-toast-%llu", (unsigned long long)root->nextToastOrdinal);
+    }
+    id.key = (uint32_t)HashClickId(text);
+    id.text = text;
+
+    const ShellToastId* existing = nullptr;
+    for (int i = 0; i < root->toasts.Len(); i++) {
+        if (root->toasts.At(i)->id == id) existing = &root->toasts.At(i)->id;
+    }
+    id.text = existing ? existing->text : StrDup(Str(text));
+    ShellToastValue value;
+    value.title = StrDup(request.title);
+    value.description =
+        request.description ? StrDup(request.description) : Str{};
+    value.level = request.level;
+    ToastOptions options = request.hasTimeout
+                               ? ToastOptions::Timeout(request.timeoutMs)
+                               : ToastOptions::Persistent();
+    ShellToastValue replaced;
+    bool hadReplaced = false;
+    if (!root->toasts.Push(id, value, options, ShellRootNowMs(), &replaced,
+                           &hadReplaced)) {
+        if (!existing) FreeToastId(&id);
+        FreeToastValue(&value);
+        return false;
+    }
+    if (hadReplaced) FreeToastValue(&replaced);
+    ArmToastClock(root, cx->win);
+    NotifyRoot(cx->app, root, cx->win);
+    return true;
+}
+
+bool ShellRootRemoveToast(Ctx* cx, Str id) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (!root || !id) return false;
+    ShellToastId key;
+    key.key = (uint32_t)HashClickId(id);
+    key.text = id;
+    bool dismissed = root->toasts.Dismiss(key, ShellRootNowMs());
+    if (dismissed) NotifyRoot(cx->app, root, cx->win);
+    return dismissed;
+}
+
+void ShellRootClearToasts(Ctx* cx) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (!root) return;
+    Vec<ShellToastId> changed = root->toasts.DismissAll(ShellRootNowMs());
+    bool any = len(changed) > 0;
+    VecReset(changed);
+    if (any) NotifyRoot(cx->app, root, cx->win);
+}
+
+int ShellRootToastCount(Ctx* cx) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    return root ? root->toasts.Len() : 0;
+}
+
+void ShellRootAdvanceToasts(Ctx* cx, int64_t nowMs) {
+    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
+    if (root) AdvanceToasts(cx->app, cx->win, root, nowMs);
+}
+
+static El* ToastLayer(ShellRoot* self, Ctx* cx, const SemanticThemeTokens& t) {
+    if (self->toasts.IsEmpty()) return nullptr;
+    ToastVisible<ShellToastId, ShellToastValue> visible[16];
+    int count = self->toasts.Visible(kToastVisibleLimit, visible, 16);
+    if (count > 16) count = 16;
+    ToastStack* stack =
+        ToastStack::New(cx, StrL("shell-toasts"), &self->toastState);
+    for (int i = 0; i < count; i++) {
+        const ShellToastId& id = *visible[i].id;
+        const ShellToastValue& toast = *visible[i].value;
+        Str name = StrDup(cx->a, id.text);
+        El* body =
+            Toast::New(cx, name)
+                ->TransitionStatus(visible[i].status)
+                ->IntoEl()
+                ->StopMouseDown()
+                ->OnClick(Listen(cx, &ShellRoot::OnToastClick, (int64_t)id.key))
+                ->FlexCol()
+                ->Gap(t.spacing.xxs)
+                ->Pad(t.spacing.md)
+                ->Radius(t.radius.md)
+                ->Bg(t.colors.surface)
+                ->Fg(t.colors.surfaceForeground)
+                ->Border(1, LevelColor(toast.level, t.colors))
+                ->Child(TextEl(cx->a, StrDup(cx->a, toast.title)));
+        if (toast.description) {
+            body->Child(
+                Div(cx->a)
+                    ->Fg(t.colors.mutedForeground)
+                    ->Child(TextEl(cx->a, StrDup(cx->a, toast.description))));
+        }
+        stack->Item(name, body);
+    }
+    return stack->Placement(Anchor::TopRight)
+        ->Focus(self->toastFocus)
+        ->IntoEl()
+        ->FlexCol()
+        ->Absolute()
+        ->Top(t.spacing.lg)
+        ->Right(t.spacing.lg)
+        ->W(kToastWidth)
+        ->Deferred()
+        ->ZIndex(kToastPriority);
+}
+
+static El* RenderTooltip(Ctx* cx, El* view, const TooltipTransition& transition,
+                         void*) {
+    El* element = Div(cx->a)->Child(view);
+    if (transition.kind == TooltipTransitionKind::Switch) {
+        if (fabsf(transition.current.y - transition.previous.y) >=
+            kTooltipSameRow)
+            return element;
+        float travelled = (transition.current.x + transition.current.w / 2.f) -
+                          (transition.previous.x + transition.previous.w / 2.f);
+        return EffectTransition::New(cx, kTooltipSlideMs)
+            ->Ease(&EaseInOutCubic)
+            ->SlideX(-travelled, 0.f)
+            ->Apply(element,
+                    StrDup(cx->a, fmt("shell-tooltip-slide-%llu",
+                                      (unsigned long long)transition.epoch)));
+    }
+    return EffectTransition::New(cx, kTooltipEnterMs)
+        ->Ease(&EaseOutCubic)
+        ->SlideY(4.f, 0.f)
+        ->Fade(0.f, 1.f)
+        ->Apply(element,
+                StrDup(cx->a, fmt("shell-tooltip-enter-%llu",
+                                  (unsigned long long)transition.epoch)));
+}
+
+ShellRoot::~ShellRoot() {
+    for (int i = 0; app && i < len(dialogs); i++)
+        EntityDrop(app, dialogs[i].layer);
+    VecReset(dialogs);
+    if (app && sheet.IsValid()) EntityDrop(app, sheet);
+    for (int i = 0; i < len(toasts.entries); i++) {
+        FreeToastId(&toasts.entries[i].id);
+        FreeToastValue(&toasts.entries[i].value);
+    }
+    VecReset(toasts.entries);
+    VecReset(toastState.entries);
+    VecReset(toastState.heights);
+    if (app && content.IsValid()) EntityDrop(app, content);
+    if (app && tooltipOverlay.IsValid()) EntityDrop(app, tooltipOverlay);
+}
+
+void ShellRoot::BlurOnBackgroundPress(ShellRoot*, Ctx* cx,
+                                      const MouseDownEvent* event) {
+    Window* win = cx ? cx->win : nullptr;
+    if (!win || !event || event->button != MouseButton::Left) return;
+
+    if (WindowDefaultPrevented(win)) return;
+
+    InputState* field = InputAtPosition(&win->paint, event->x, event->y);
+    if (field && !field->disabled) return;
+    if (!win->focusId && !win->input) return;
+    if (FocusTrapActive(win)) return;
+    if (win->input) InputBlur(win->input, cx->app, win);
+    WindowSetFocusId(win, 0);
+}
+
+Entity<ShellRoot> ShellRoot::New(App* app, EntityId content) {
+    Entity<ShellRoot> root = EntityNew<ShellRoot>(app);
+    if (ShellRoot* state = root.Get(app)) {
+        state->app = app;
+        state->content = content;
+        state->toasts = ToastManager<ShellToastId, ShellToastValue>::New(
+            ToastMotion::Sonner());
+        state->toastFocus = FocusHandleNew(app);
+
+        Entity<TooltipOverlay> tooltip = EntityNew<TooltipOverlay>(app);
+        if (TooltipOverlay* overlay = tooltip.Get(app))
+            overlay->RenderWith(&RenderTooltip);
+        state->tooltipOverlay = tooltip.id;
+    }
+    return root;
+}
+
+El* ShellRoot::Render(ShellRoot* self, Ctx* cx) {
+    if (!self) return Div(cx->a)->SizeFull();
+    if (ShellRootWindowState* state = RootWindowState(cx->win))
+        state->root = cx->self;
+    SemanticThemeTokens tokens = RootTokens(cx->app);
+
+    El* root = Div(cx->a)
+                   ->FlexCol()
+                   ->SizeFull()
+                   ->Font(tokens.typography.md.size)
+                   ->Bg(tokens.colors.background)
+                   ->Fg(tokens.colors.foreground);
+    root->OnMouseDown(Listen(cx, &ShellRoot::BlurOnBackgroundPress));
+
+    root->Child(TextSelectionLayer::New(cx));
+    if (El* content = self->content.IsValid()
+                          ? EntityRender(cx->app, cx->win, cx->a, self->content)
+                          : nullptr)
+        root->Child(content);
+    if (self->sheet.IsValid()) {
+        if (El* sheet = EntityRender(cx->app, cx->win, cx->a, self->sheet))
+            root->Child(sheet);
+    }
+    int top = len(self->dialogs) - 1;
+    for (int i = 0; i <= top; i++) {
+        ShellDialogLayer* layer = DialogLayerAt(cx->app, self, i);
+        if (!layer) continue;
+        layer->index = i;
+        layer->topmost = i == top;
+        if (El* dialog =
+                EntityRender(cx->app, cx->win, cx->a, self->dialogs[i].layer))
+            root->Child(dialog);
+    }
+    if (El* toasts = ToastLayer(self, cx, tokens)) root->Child(toasts);
+
+    if (self->fpsHudVisible) {
+
+        auto* slot = KeyedState<Entity<FpsMonitor>>(
+            cx, (uint32_t)HashClickId(StrL("gpui-fps-monitor")));
+        if (slot) {
+            if (!slot->IsValid()) *slot = EntityNew<FpsMonitor>(cx);
+            FpsOverlayOpts opts;
+            opts.anchor = self->fpsHud.anchor;
+            if (self->fpsHud.hasFrameBudget) {
+                opts.frameBudget = self->fpsHud.frameBudget;
+            }
+            root->Child(FpsOverlayEl(cx, *slot, opts));
+        }
+    }
+
+    if (self->tooltipOverlay.IsValid() && cx->win &&
+        cx->win->root == cx->self) {
+        cx->win->rootTooltip = self->tooltipOverlay;
+        if (El* tooltip =
+                EntityRender(cx->app, cx->win, cx->a, self->tooltipOverlay))
+            root->Child(tooltip);
+    }
+    return root;
+}
+
+ShellRoot* ShellRootOf(Window* window, App* app) {
+    ShellRootWindowState* state = RootWindowState(window);
+    if (!state || !state->root.IsValid()) return nullptr;
+
+    if (state->root != window->root) return nullptr;
+    return Entity<ShellRoot>{state->root}.Get(app);
 }
 
 bool ShellRootShowFpsMonitor(Ctx* cx, const FpsHudRequest& request) {
     ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
-    if (!root) return false;
+    if (!root || !shell_root_OverlayMutationAllowed("show_fps_monitor")) return false;
     root->fpsHud = request;
     root->fpsHudVisible = true;
-    NotifyRoot(cx);
+    NotifyRoot(cx->app, root, cx->win);
     return true;
 }
 
 bool ShellRootHideFpsMonitor(Ctx* cx) {
     ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
-    if (!root || !root->fpsHudVisible) return false;
+    if (!root || !shell_root_OverlayMutationAllowed("hide_fps_monitor")) return false;
+    if (!root->fpsHudVisible) return false;
     root->fpsHudVisible = false;
-    NotifyRoot(cx);
+    NotifyRoot(cx->app, root, cx->win);
     return true;
 }
 
 bool ShellRootFpsMonitorVisible(Ctx* cx) {
     ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
     return root && root->fpsHudVisible;
-}
-
-bool ShellRootPushToast(Ctx* cx, const ToastRequest& request) {
-    ShellRoot* root = cx ? ShellRootOf(cx->win, cx->app) : nullptr;
-    if (!root || !request.title) return false;
-    Str id = request.id;
-    if (!request.hasId) {
-        root->nextToastOrdinal++;
-        id = StrDup(cx->a, fmt("shell-toast-%llu", root->nextToastOrdinal));
-    }
-    component::Notification toast = component::Notification::New();
-    toast.Id1<ShellRoot>(id)
-        .Title(request.title)
-        .Message(request.description)
-        .WithType(NotificationTypeFor(request.level));
-    component::NotificationListState* list = WindowNotifications(cx).Get(cx);
-    if (list) {
-        list->width = 320;
-        list->maxItems = 3;
-    }
-    return WindowPushNotification(cx, toast, request.timeoutMs) != 0;
-}
-
-bool ShellRootRemoveToast(Ctx* cx, Str id) {
-    if (!cx || !id || !ShellRootOf(cx->win, cx->app)) return false;
-    Entity<component::NotificationListState> handle = WindowNotifications(cx);
-    component::NotificationListState* list = handle.Get(cx);
-    uint32_t key = (uint32_t)HashClickId(id);
-    bool found = false;
-    for (int i = 0; i < list->items.len; i++) {
-        const component::Notification& item = list->items[i];
-        if (item.identityType == component::NotificationTypeOf<ShellRoot>() &&
-            item.identityHasKey && item.identityKey == key) {
-            found = true;
-            break;
-        }
-    }
-    if (found) WindowRemoveNotification1<ShellRoot>(cx, key);
-    return found;
-}
-
-void ShellRootClearToasts(Ctx* cx) {
-    if (cx && ShellRootOf(cx->win, cx->app)) WindowClearNotifications(cx);
-}
-
-int ShellRootToastCount(Ctx* cx) {
-    return cx && ShellRootOf(cx->win, cx->app) ? WindowNotificationCount(cx)
-                                               : 0;
 }
 
 }
@@ -149162,7 +154250,7 @@ struct ShellTaskDriver {
     ShellRuntime* runtime = nullptr;
 
     static void OnTimer(ShellTaskDriver* self, Ctx* cx, const TickEvent*,
-                        intptr_t id) {
+                        int64_t id) {
         if (self && self->runtime) {
             self->runtime->ResumeTask((uint32_t)id, cx);
         }
@@ -152901,7 +157989,7 @@ static JSValue NativeChildView(JSContext* ctx, JSValueConst, int argc,
     return JS_NewUint32(ctx, id);
 }
 
-static bool OverlayMutationAllowed(JSContext* ctx, const char* api) {
+static bool shell_runtime_OverlayMutationAllowed(JSContext* ctx, const char* api) {
     if (shell::ScopeHasCurrent() &&
         ScopePhaseAllowsNotify(shell::ScopeCurrentPhase()))
         return true;
@@ -153006,7 +158094,7 @@ static bool DialogOptionsFromJs(JSContext* ctx, JSValueConst value,
 static JSValue NativeOpenDialog(JSContext* ctx, JSValueConst, int argc,
                                 JSValueConst* argv) {
     const char* api = "window.open_dialog(content, options)";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     uint32_t token = 0;
     DialogOptions options;
     if (argc < 1 || JS_ToUint32(ctx, &token, argv[0]) < 0 ||
@@ -153030,7 +158118,7 @@ static JSValue NativeOpenDialog(JSContext* ctx, JSValueConst, int argc,
 static JSValue NativeCloseDialog(JSContext* ctx, JSValueConst, int,
                                  JSValueConst*) {
     const char* api = "window.close_dialog()";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     ShellRuntimeImpl* impl = nullptr;
     Ctx native = {};
     if (!OverlayHost(ctx, api, &impl, &native)) return JS_EXCEPTION;
@@ -153040,7 +158128,7 @@ static JSValue NativeCloseDialog(JSContext* ctx, JSValueConst, int,
 static JSValue NativeCloseAllDialogs(JSContext* ctx, JSValueConst, int,
                                      JSValueConst*) {
     const char* api = "window.close_all_dialogs()";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     ShellRuntimeImpl* impl = nullptr;
     Ctx native = {};
     if (!OverlayHost(ctx, api, &impl, &native)) return JS_EXCEPTION;
@@ -153057,9 +158145,9 @@ static JSValue NativeHasDialog(JSContext* ctx, JSValueConst, int,
 }
 
 static bool SheetPlacementFromJs(JSContext* ctx, JSValueConst value,
-                                 component::SheetPlacement* out) {
+                                 Placement* out) {
     if (JS_IsUndefined(value) || JS_IsNull(value)) {
-        *out = component::SheetPlacement::Right;
+        *out = Placement::Right;
         return true;
     }
     Arena* arena = ArenaNew();
@@ -153067,13 +158155,13 @@ static bool SheetPlacementFromJs(JSContext* ctx, JSValueConst value,
     bool ok = JsString(ctx, value, arena, &name);
     if (ok) {
         if (StrEq(name, StrL("left")))
-            *out = component::SheetPlacement::Left;
+            *out = Placement::Left;
         else if (StrEq(name, StrL("right")))
-            *out = component::SheetPlacement::Right;
+            *out = Placement::Right;
         else if (StrEq(name, StrL("top")))
-            *out = component::SheetPlacement::Top;
+            *out = Placement::Top;
         else if (StrEq(name, StrL("bottom")))
-            *out = component::SheetPlacement::Bottom;
+            *out = Placement::Bottom;
         else {
             JS_ThrowTypeError(ctx,
                               "unknown sheet placement `%.*s`; expected left, "
@@ -153091,8 +158179,8 @@ static JSValue NativeOpenSheet(JSContext* ctx, JSValueConst, int argc,
     const char* api = JS_IsUndefined(argc > 0 ? argv[0] : JS_UNDEFINED)
                           ? "window.open_sheet(content)"
                           : "window.open_sheet_at(placement, content)";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
-    component::SheetPlacement placement;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    Placement placement;
     uint32_t token = 0;
     if (!SheetPlacementFromJs(ctx, argc > 0 ? argv[0] : JS_UNDEFINED,
                               &placement) ||
@@ -153115,7 +158203,7 @@ static JSValue NativeOpenSheet(JSContext* ctx, JSValueConst, int argc,
 static JSValue NativeCloseSheet(JSContext* ctx, JSValueConst, int,
                                 JSValueConst*) {
     const char* api = "window.close_sheet()";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     ShellRuntimeImpl* impl = nullptr;
     Ctx native = {};
     if (!OverlayHost(ctx, api, &impl, &native)) return JS_EXCEPTION;
@@ -153138,7 +158226,7 @@ static bool OptionalStringProperty(JSContext* ctx, JSValueConst object,
 static JSValue NativeShowFpsMonitor(JSContext* ctx, JSValueConst, int argc,
                                     JSValueConst* argv) {
     const char* kApi = "show_fps_monitor(options)";
-    if (!OverlayMutationAllowed(ctx, kApi)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, kApi)) return JS_EXCEPTION;
     ShellRuntimeImpl* impl = nullptr;
     Ctx native = {};
     if (!OverlayHost(ctx, kApi, &impl, &native)) return JS_EXCEPTION;
@@ -153204,7 +158292,7 @@ static JSValue NativeShowFpsMonitor(JSContext* ctx, JSValueConst, int argc,
 static JSValue NativeHideFpsMonitor(JSContext* ctx, JSValueConst, int,
                                     JSValueConst*) {
     const char* kApi = "hide_fps_monitor()";
-    if (!OverlayMutationAllowed(ctx, kApi)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, kApi)) return JS_EXCEPTION;
     ShellRuntimeImpl* impl = nullptr;
     Ctx native = {};
     if (!OverlayHost(ctx, kApi, &impl, &native)) return JS_EXCEPTION;
@@ -153234,7 +158322,7 @@ static bool OptionalStringProperty(JSContext* ctx, JSValueConst object,
 static JSValue NativePushToast(JSContext* ctx, JSValueConst, int argc,
                                JSValueConst* argv) {
     const char* api = "window.push_toast(options)";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     if (argc < 1 || !JS_IsObject(argv[0]))
         return JS_ThrowTypeError(
             ctx, "%s expects an object, such as { title: \"Saved\" }", api);
@@ -153274,7 +158362,7 @@ static JSValue NativePushToast(JSContext* ctx, JSValueConst, int argc,
         if (JS_IsException(timeout))
             ok = false;
         else if (JS_IsNull(timeout))
-            toast.timeoutMs = 0;
+            toast.hasTimeout = false;
         else if (!JS_IsUndefined(timeout)) {
             double value = 0;
             if (JS_ToFloat64(ctx, &value, timeout) < 0 || !isfinite(value) ||
@@ -153304,7 +158392,7 @@ static JSValue NativePushToast(JSContext* ctx, JSValueConst, int argc,
 static JSValue NativeRemoveToast(JSContext* ctx, JSValueConst, int argc,
                                  JSValueConst* argv) {
     const char* api = "window.remove_toast(id)";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     Arena* arena = ArenaNew();
     Str id;
     bool ok = argc >= 1 && JsString(ctx, argv[0], arena, &id);
@@ -153319,7 +158407,7 @@ static JSValue NativeRemoveToast(JSContext* ctx, JSValueConst, int argc,
 static JSValue NativeClearToasts(JSContext* ctx, JSValueConst, int,
                                  JSValueConst*) {
     const char* api = "window.clear_toasts()";
-    if (!OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
+    if (!shell_runtime_OverlayMutationAllowed(ctx, api)) return JS_EXCEPTION;
     ShellRuntimeImpl* impl = nullptr;
     Ctx native = {};
     if (!OverlayHost(ctx, api, &impl, &native)) return JS_EXCEPTION;
@@ -154127,7 +159215,8 @@ static JSValue NativeOtpValue(JSContext* ctx, JSValueConst, int argc,
     OtpState* state = entry->otp.Get(entry->app);
     if (!state)
         return JS_ThrowTypeError(ctx, "this OTP state has been released");
-    return JS_NewStringLen(ctx, state->value, (size_t)state->len);
+    Str value = OtpValue(state);
+    return JS_NewStringLen(ctx, value.s, (size_t)len(value));
 }
 
 static JSValue NativeOtpSetValue(JSContext* ctx, JSValueConst, int argc,
@@ -154148,14 +159237,7 @@ static JSValue NativeOtpSetValue(JSContext* ctx, JSValueConst, int argc,
     Arena* arena = ArenaNew();
     Str value;
     bool ok = state && JsString(ctx, argv[1], arena, &value);
-    if (ok) {
-        int n = len(value);
-        if (n > (int)sizeof(state->value) - 1)
-            n = (int)sizeof(state->value) - 1;
-        if (n > 0) memcpy(state->value, value.s, (size_t)n);
-        state->len = n;
-        state->value[n] = 0;
-    }
+    if (ok) OtpSetValue(state, value);
     ArenaDelete(arena);
     if (!ok) return JS_EXCEPTION;
     AppInvalidate(host.GetWindow());
@@ -155355,7 +160437,7 @@ static JSValue NativeSleep(JSContext* ctx, JSValueConst, int argc,
     ShellTask* task = FindTask(impl, id);
     task->timer = WindowSetTimeout(
         host.GetWindow(), ms,
-        ListenTo(driver, &ShellTaskDriver::OnTimer, (intptr_t)id));
+        ListenTo(driver, &ShellTaskDriver::OnTimer, (int64_t)id));
     if (!task->timer) {
         ForgetTask(impl, id, false);
         JS_FreeValue(ctx, promise);
@@ -155393,7 +160475,7 @@ static JSValue NativeTimer(JSContext* ctx, JSValueConst, int argc,
             ctx, "the runtime reached its 1024 outstanding task limit");
     ShellTask* task = FindTask(impl, id);
     Listener listener =
-        ListenTo(driver, &ShellTaskDriver::OnTimer, (intptr_t)id);
+        ListenTo(driver, &ShellTaskDriver::OnTimer, (int64_t)id);
     task->timer = magic ? WindowSetInterval(host.GetWindow(), ms, listener)
                         : WindowSetTimeout(host.GetWindow(), ms, listener);
     if (!task->timer) {
@@ -158056,15 +163138,13 @@ static bool WindowHost(JSContext* ctx, const char* api, bool mutation,
     return true;
 }
 
-static const float kShellRemSize = 16.f;
-
 static JSValue NativeWindowRemSize(JSContext* ctx, JSValueConst, int,
                                    JSValueConst*) {
     Window* window = nullptr;
     App* app = nullptr;
     if (!WindowHost(ctx, "window.rem_size()", false, &window, &app))
         return JS_EXCEPTION;
-    return JS_NewFloat64(ctx, kShellRemSize);
+    return JS_NewFloat64(ctx, WindowRemSize(window));
 }
 
 static JSValue NativeWindowLineHeight(JSContext* ctx, JSValueConst, int,
@@ -158073,7 +163153,7 @@ static JSValue NativeWindowLineHeight(JSContext* ctx, JSValueConst, int,
     App* app = nullptr;
     if (!WindowHost(ctx, "window.line_height()", false, &window, &app))
         return JS_EXCEPTION;
-    return JS_NewFloat64(ctx, kShellRemSize * kLineHeight);
+    return JS_NewFloat64(ctx, WindowRemSize(window) * kLineHeight);
 }
 
 static JSValue JsSize(JSContext* ctx, float width, float height) {
@@ -158155,6 +163235,18 @@ static JSValue NativeWindowIsMaximized(JSContext* ctx, JSValueConst, int,
     if (!WindowHost(ctx, "window.is_maximized()", false, &window, &app))
         return JS_EXCEPTION;
     return JS_NewBool(ctx, AppIsMaximized(window));
+}
+
+static JSValue NativeWindowSetRemSize(JSContext* ctx, JSValueConst, int argc,
+                                      JSValueConst* argv) {
+    Window* window = nullptr;
+    App* app = nullptr;
+    if (!WindowHost(ctx, "window.set_rem_size()", true, &window, &app))
+        return JS_EXCEPTION;
+    double size = 0;
+    if (argc < 1 || JS_ToFloat64(ctx, &size, argv[0]) < 0) return JS_EXCEPTION;
+    WindowSetRemSize(window, (float)size);
+    return JS_UNDEFINED;
 }
 
 static JSValue NativeWindowRefresh(JSContext* ctx, JSValueConst, int,
@@ -158601,7 +163693,7 @@ static JSValue NativeCalendarOn(JSContext* ctx, JSValueConst, int argc,
     }
     entry->subscription = SubscribeTo(
         app, entry->calendar, Entity<ScriptView>{shell::ScopeCurrentView()},
-        &ScriptView::OnCalendarEvent, (intptr_t)handle);
+        &ScriptView::OnCalendarEvent, (int64_t)handle);
     return JS_NewBool(ctx, true);
 }
 
@@ -159273,7 +164365,7 @@ static JSValue NativeDockOn(JSContext* ctx, JSValueConst, int argc,
                                callback, true, &replaced);
     if (replaced) impl->callbacks.RetireId(ctx, replaced);
     state->onEvent = ListenTo(Entity<ScriptView>{shell::ScopeCurrentView()},
-                              &ScriptView::OnDockEvent, (intptr_t)callback);
+                              &ScriptView::OnDockEvent, (int64_t)callback);
     return JS_NewBool(ctx, true);
 }
 
@@ -159355,6 +164447,8 @@ static bool InstallRuntime(ShellRuntimeImpl* impl, ShellError* error) {
                       NativeWindowRemSize, 0);
     SetGlobalFunction(impl->context, global, "__window_line_height",
                       NativeWindowLineHeight, 0);
+    SetGlobalFunction(impl->context, global, "__window_set_rem_size",
+                      NativeWindowSetRemSize, 1);
     SetGlobalFunction(impl->context, global, "__window_viewport_size",
                       NativeWindowViewportSize, 0);
     SetGlobalFunction(impl->context, global, "__window_bounds",
@@ -160993,7 +166087,7 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
                     binding->value = itemKeys[i];
                     row->OnClick(ListenTo(Entity<ScriptView>{render->view},
                                           &ScriptView::OnBoundString,
-                                          (intptr_t)binding));
+                                          (int64_t)binding));
                 }
                 if (onItemSecondaryClick) {
                     ShellStringBinding* binding =
@@ -161002,7 +166096,7 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
                     binding->value = itemKeys[i];
                     row->OnMouseDown(ListenTo(Entity<ScriptView>{render->view},
                                               &ScriptView::OnItemSecondaryPress,
-                                              (intptr_t)binding));
+                                              (int64_t)binding));
                 }
                 out[i] = row;
             }
@@ -161514,14 +166608,14 @@ El* shell::ComponentCallback::BuildInteractiveWith(
 
 Listener shell::ComponentListener(Ctx* cx, shell::ComponentEventRun run,
                                   shell::ComponentCallback callback, void* user,
-                                  intptr_t value) {
+                                  int64_t value) {
     shell::ComponentEventBinding* binding =
         ArenaNew<shell::ComponentEventBinding>(cx->a);
     binding->run = run;
     binding->callback = callback;
     binding->user = user;
     binding->value = value;
-    return Listen(cx, &ScriptView::OnComponentEvent, (intptr_t)binding);
+    return Listen(cx, &ScriptView::OnComponentEvent, (int64_t)binding);
 }
 
 struct ShellComponentValueRelay {
@@ -161531,7 +166625,7 @@ struct ShellComponentValueRelay {
     void* user = nullptr;
 
     static void OnValue(ShellComponentValueRelay* self, Ctx* cx,
-                        const void* event, intptr_t value) {
+                        const void* event, int64_t value) {
         if (!self || !self->run) return;
         Entity<ScriptView> handle;
         handle.id = self->view;
@@ -161768,7 +166862,7 @@ bool ShellRuntime::ScheduleComponentAppEffect(
     Entity<ScriptView> owner;
     owner.id = view;
     WindowPost(window, ListenTo(owner, &ScriptView::OnComponentAppEffect,
-                                (intptr_t)deferred.token));
+                                (int64_t)deferred.token));
     return true;
 }
 
@@ -161856,6 +166950,64 @@ void ShellRuntime::CleanupComponentAppEffects(EntityId view) {
 ViewType* ViewTypeRetain(ViewType* type) {
     if (type) type->refs++;
     return type;
+}
+
+struct LoadedApplication {
+    ViewType* type = nullptr;
+    Policy* policy = nullptr;
+    bool mounted = false;
+};
+
+LoadedApplication* ShellRuntime::LoadApplication(Str directory, Str entry,
+                                                 ShellError* error) {
+    Policy* authority = PolicyDefault();
+    ViewType* type = LoadApp(directory, entry, authority, error);
+    if (!type) {
+        PolicyRelease(authority);
+        return nullptr;
+    }
+    LoadedApplication* application = new LoadedApplication();
+    application->type = type;
+    application->policy = authority;
+    return application;
+}
+
+Entity<ScriptView> ShellRuntime::MountApplication(
+    LoadedApplication* application, Window* window, App* app,
+    ShellError* error) {
+    ShellErrorClear(error);
+    if (!application || !application->type ||
+        application->type->runtime != this) {
+        shell_runtime_SetError(error, StrL("loaded application belongs to a different "
+                             "ShellRuntime"));
+        return {};
+    }
+    if (application->mounted) {
+        shell_runtime_SetError(error, StrL("loaded application has already been mounted"));
+        return {};
+    }
+    application->mounted = true;
+    Entity<ScriptView> view =
+        ScriptView::New(app, this, application->type, application->policy);
+    ScriptView* state = view.Get(app);
+    if (!state) {
+        shell_runtime_SetError(error, StrL("could not create the application view"));
+        return {};
+    }
+    state->object = Instantiate(state->type, window, app, application->policy,
+                                error, view.id);
+    if (!state->object) {
+        EntityDrop(app, view.id);
+        return {};
+    }
+    return view;
+}
+
+void LoadedApplicationFree(LoadedApplication* application) {
+    if (!application) return;
+    ViewTypeRelease(application->type);
+    PolicyRelease(application->policy);
+    delete application;
 }
 
 void ViewTypeRelease(ViewType* type) {
@@ -163749,6 +168901,8 @@ enum class LenKind : uint8_t {
 struct Len {
     LenKind kind = LenKind::Px;
     float v = 0;
+
+    bool rem = false;
 };
 
 static Len Px(float v) {
@@ -163756,6 +168910,14 @@ static Len Px(float v) {
 }
 
 static constexpr float kRem = 16.f;
+
+static float gRemSize = kRem;
+
+static Len Rem(float v) {
+    Len l{LenKind::Px, v};
+    l.rem = true;
+    return l;
+}
 
 enum class Suffix : uint8_t {
     Box,
@@ -164013,7 +169175,7 @@ static bool ParseBoxSuffix(Str text, bool autoAllowed, Len* out) {
         return false;
     }
     float steps = (float)n + (half ? 0.5f : 0.f);
-    *out = Px(sign * steps * 0.25f * kRem);
+    *out = Rem(sign * steps * 0.25f * kRem);
     return true;
 }
 
@@ -164028,7 +169190,8 @@ static bool ParseCornerSuffix(Str text, Len* out) {
     };
     for (const auto& c : corners) {
         if (StrEq(text, c.name)) {
-            *out = Px(c.px);
+
+            *out = c.px < 9999.f ? Rem(c.px) : Px(c.px);
             return true;
         }
     }
@@ -164277,6 +169440,9 @@ static void SetBorderEdges(Style& s, float v, bool t, bool r, bool b,
 
 static void ApplyFamily(El* e, Fam fam, Len l) {
     Style& s = e->style;
+    if (l.rem) {
+        l.v *= gRemSize / kRem;
+    }
     switch (fam) {
         case Fam::W:
             SetWidth(s, l);
@@ -164547,6 +169713,19 @@ struct Keyword {
     void (*apply)(El* e);
     uint32_t fields;
 };
+
+static void ShellDebug(El* e, bool below) {
+#ifndef NDEBUG
+    if (below) {
+        e->DebugBelow();
+    } else {
+        e->Debug();
+    }
+#else
+    (void)e;
+    (void)below;
+#endif
+}
 
 static const Keyword kKeywords[] = {
 
@@ -164888,8 +170067,8 @@ static const Keyword kKeywords[] = {
     {"font_extrabold", [](El* e) { e->Weight(FontWeight::ExtraBold); }, 0},
     {"font_black", [](El* e) { e->Weight(FontWeight::Black); }, 0},
 
-    {"debug", [](El*) {}, 0},
-    {"debug_below", [](El*) {}, 0},
+    {"debug", [](El* e) { ShellDebug(e, false); }, 0},
+    {"debug_below", [](El* e) { ShellDebug(e, true); }, 0},
     {"debug_red", [](El* e) { DebugBorder(e, 0.f, 72.2f, 50.6f); }, 0},
     {"debug_blue", [](El* e) { DebugBorder(e, 217.2f, 91.2f, 59.8f); }, 0},
     {"debug_yellow", [](El* e) { DebugBorder(e, 47.9f, 95.8f, 53.1f); }, 0},
@@ -164919,7 +170098,7 @@ static bool IsOtherParam(Str name) {
 }
 
 static bool shell_style_ParseNumber(Str text, float* out) {
-    text = StrTrimAscii(text);
+    text = StrTrim(text);
     if (len(text) <= 0 || len(text) >= 64) {
         return false;
     }
@@ -164938,13 +170117,14 @@ static bool shell_style_ParseNumber(Str text, float* out) {
 static bool ParseLength(const Bridged& value, Str method, Len* out,
                         ShellError* error) {
     if (value.kind == BridgedKind::String) {
-        Str text = StrTrimAscii(value.string);
+        Str text = StrTrim(value.string);
         if (StrEq(text, StrL("auto"))) {
             *out = Len{LenKind::Auto, 0};
             return true;
         }
         Str number = text;
         float scale = 0;
+        bool rem = false;
         LenKind kind = LenKind::Px;
         if (StrEndsWith(text, "%")) {
             number.len -= 1;
@@ -164953,6 +170133,7 @@ static bool ParseLength(const Bridged& value, Str method, Len* out,
         } else if (StrEndsWith(text, "rem")) {
             number.len -= 3;
             scale = kRem;
+            rem = true;
         } else if (StrEndsWith(text, "px")) {
             number.len -= 2;
             scale = 1;
@@ -164971,7 +170152,7 @@ static bool ParseLength(const Bridged& value, Str method, Len* out,
                                      method, text));
             return false;
         }
-        *out = Len{kind, v * scale};
+        *out = Len{kind, v * scale, rem};
         return true;
     }
     float v = 0;
@@ -165040,7 +170221,8 @@ static bool ApplyOtherParam(El* e, Str name, const Bridged& value,
         if (!ParseLength(value, name, &l, error) ||
             !NarrowLength(l, Arg::Absolute, name, error))
             return false;
-        s.fontSize = l.v;
+
+        s.fontSize = l.rem ? l.v : l.v * kRem / gRemSize;
     } else if (StrEq(name, StrL("font_family"))) {
         Str family;
         if (!BridgedAsString(value, &family, error)) return false;
@@ -165225,7 +170407,19 @@ bool IsNullaryStyleName(Str name) {
     return style::ParseFamily(name, &l) != nullptr;
 }
 
-bool ApplyNullaryStyle(El* element, Str name) {
+namespace {
+
+struct RemScope {
+    float was;
+    explicit RemScope(float rem) : was(style::gRemSize) {
+        style::gRemSize = rem > 0 ? rem : style::kRem;
+    }
+    ~RemScope() { style::gRemSize = was; }
+};
+}
+
+bool ApplyNullaryStyle(El* element, Str name, float remSize) {
+    RemScope scope(remSize);
     if (const style::Keyword* keyword = style::FindKeyword(name)) {
         if (element) {
             keyword->apply(element);
@@ -165243,7 +170437,9 @@ bool ApplyNullaryStyle(El* element, Str name) {
     return true;
 }
 
-bool ApplyParamStyle(El* element, const SpecOp& op, ShellError* error) {
+bool ApplyParamStyle(El* element, const SpecOp& op, ShellError* error,
+                     float remSize) {
+    RemScope scope(remSize);
     const style::Family* family = style::FindFamily(op.name);
     if (!family && !style::IsOtherParam(op.name)) {
         return false;
@@ -165343,9 +170539,9 @@ uint32_t ThemeTokensSync(const App* app) {
     if (!app) {
         return gThemeCache.revision;
     }
+
     const BaseTheme* base = BaseThemeGlobal(app);
-    SemanticThemeTokens tokens =
-        base ? base->tokens : ThemeSemanticTokens(ThemeNow(app));
+    SemanticThemeTokens tokens = base ? base->tokens : SemanticThemeTokens{};
     BaseThemeAppearance appearance =
         base ? base->appearance : BaseThemeAppearance::Light;
     if (ThemeKeyEqual(gThemeCache, tokens, appearance)) {
@@ -188430,14 +193626,14 @@ bool ScriptView::Reload(ScriptView* self, Ctx* cx, Str directory, Str entry,
 }
 
 void ScriptView::OnClick(ScriptView* self, Ctx* cx, const ClickEvent* event,
-                         intptr_t callback) {
+                         int64_t callback) {
     if (!self || !self->runtime || !event) return;
     self->runtime
         ->DispatchClick((shell::CallbackId)callback, *event, cx->win, cx->app);
 }
 
 void ScriptView::OnTextLink(ScriptView* self, Ctx* cx, const ClickEvent*,
-                            intptr_t value) {
+                            int64_t value) {
     TextViewLinkBinding* binding = (TextViewLinkBinding*)value;
     if (!self || !self->runtime || !binding || !binding->href) {
         return;
@@ -188452,21 +193648,21 @@ void ScriptView::OnTextLink(ScriptView* self, Ctx* cx, const ClickEvent*,
 }
 
 void ScriptView::OnChange(ScriptView* self, Ctx* cx, const ClickEvent* event,
-                          intptr_t value) {
+                          int64_t value) {
     if (!self || !self->runtime || !event || event->id <= 0) return;
     self->runtime->DispatchChange((shell::CallbackId)(uint32_t)event->id,
                                   value != 0, cx->win, cx->app);
 }
 
 void ScriptView::OnHover(ScriptView* self, Ctx* cx, const HoverEvent* event,
-                         intptr_t callback) {
+                         int64_t callback) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchChange((shell::CallbackId)callback, event->hovered,
                                   cx->win, cx->app);
 }
 
 void ScriptView::OnScrollPosition(ScriptView*, Ctx* cx,
-                                  const ScrollEvent* event, intptr_t position) {
+                                  const ScrollEvent* event, int64_t position) {
     auto* at = (ShellScrollPosition*)position;
     if (!at || !event) return;
     at->x = event->offsetX;
@@ -188476,7 +193672,7 @@ void ScriptView::OnScrollPosition(ScriptView*, Ctx* cx,
 }
 
 void ScriptView::OnMouseMove(ScriptView* self, Ctx* cx,
-                             const MouseMoveEvent* event, intptr_t callback) {
+                             const MouseMoveEvent* event, int64_t callback) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchMouseMove((shell::CallbackId)callback, *event,
                                      cx->win, cx->app);
@@ -188484,7 +193680,7 @@ void ScriptView::OnMouseMove(ScriptView* self, Ctx* cx,
 
 void ScriptView::OnOpenChange(ScriptView* self, Ctx* cx,
                               const PopoverOpenChangeEvent* event,
-                              intptr_t callback) {
+                              int64_t callback) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchChange((shell::CallbackId)callback, event->open,
                                   cx->win, cx->app);
@@ -188495,14 +193691,14 @@ void ScriptView::OnImageDeadline(ScriptView* self, Ctx* cx, const TickEvent*) {
 }
 
 void ScriptView::OnResize(ScriptView* self, Ctx* cx,
-                          const ResizablePanelEvent* event, intptr_t callback) {
+                          const ResizablePanelEvent* event, int64_t callback) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchNumbers((shell::CallbackId)callback, event->sizes,
                                    event->count, cx->win, cx->app);
 }
 
 void ScriptView::OnBoundBool(ScriptView* self, Ctx* cx, const void*,
-                             intptr_t binding) {
+                             int64_t binding) {
     ShellBoolBinding* value = (ShellBoolBinding*)binding;
     if (!self || !self->runtime || !value || !value->callback) return;
     self->runtime
@@ -188510,7 +193706,7 @@ void ScriptView::OnBoundBool(ScriptView* self, Ctx* cx, const void*,
 }
 
 void ScriptView::OnComponentEvent(ScriptView* self, Ctx* cx, const void* event,
-                                  intptr_t binding) {
+                                  int64_t binding) {
     const shell::ComponentEventBinding* bound =
         (const shell::ComponentEventBinding*)binding;
     if (!self || !self->runtime || !bound || !bound->run) return;
@@ -188518,19 +193714,19 @@ void ScriptView::OnComponentEvent(ScriptView* self, Ctx* cx, const void* event,
 }
 
 void ScriptView::OnComponentAppEffect(ScriptView* self, Ctx* cx, const void*,
-                                      intptr_t token) {
+                                      int64_t token) {
     if (!self || !self->runtime) return;
     self->runtime->ApplyComponentAppEffect((uint64_t)token, cx->app);
 }
 
 void ScriptView::OnDispatchAction(ScriptView* self, Ctx* cx, const ClickEvent*,
-                                  intptr_t action) {
+                                  int64_t action) {
     if (!self || !action) return;
     WindowDispatchAction(cx->win, (uint32_t)action);
 }
 
 void ScriptView::OnBoundString(ScriptView* self, Ctx* cx, const ClickEvent*,
-                               intptr_t binding) {
+                               int64_t binding) {
     ShellStringBinding* value = (ShellStringBinding*)binding;
     if (!self || !self->runtime || !value || !value->callback) return;
     self->runtime
@@ -188539,7 +193735,7 @@ void ScriptView::OnBoundString(ScriptView* self, Ctx* cx, const ClickEvent*,
 
 void ScriptView::OnItemSecondaryPress(ScriptView* self, Ctx* cx,
                                       const MouseDownEvent* event,
-                                      intptr_t binding) {
+                                      int64_t binding) {
     ShellStringBinding* value = (ShellStringBinding*)binding;
     if (!self || !self->runtime || !event || !value || !value->callback) return;
     if (event->button != MouseButton::Right) return;
@@ -188568,7 +193764,7 @@ static void ShellSelectOpen(ScriptView* self, Ctx* cx,
 }
 
 void ScriptView::OnSelectAction(ScriptView* self, Ctx* cx,
-                                const ActionEvent* event, intptr_t binding) {
+                                const ActionEvent* event, int64_t binding) {
     ShellSelectBinding* value = (ShellSelectBinding*)binding;
     if (!self || !self->runtime || !event || !value) return;
     switch (SelectActionOf(event->action, value->open, value->disabled)) {
@@ -188590,7 +193786,7 @@ void ScriptView::OnSelectAction(ScriptView* self, Ctx* cx,
 }
 
 void ScriptView::OnSelectActivate(ScriptView* self, Ctx* cx, const ClickEvent*,
-                                  intptr_t binding) {
+                                  int64_t binding) {
     ShellSelectBinding* value = (ShellSelectBinding*)binding;
     if (!self || !self->runtime || !value || value->disabled) return;
     if (value->open) {
@@ -188601,8 +193797,7 @@ void ScriptView::OnSelectActivate(ScriptView* self, Ctx* cx, const ClickEvent*,
 }
 
 void ScriptView::OnNumberStep(ScriptView* self, Ctx* cx,
-                              const NumberInputEvent* event,
-                              intptr_t callback) {
+                              const NumberInputEvent* event, int64_t callback) {
     if (!self || !self->runtime || !event || !callback) return;
     self->runtime->DispatchString((shell::CallbackId)callback,
                                   event->action == StepAction::Increment
@@ -188612,13 +193807,13 @@ void ScriptView::OnNumberStep(ScriptView* self, Ctx* cx,
 }
 
 void ScriptView::OnNumberKey(ScriptView* self, Ctx* cx, const KeyEvent* event,
-                             intptr_t binding) {
+                             int64_t binding) {
     ShellNumberBinding* value = (ShellNumberBinding*)binding;
     if (!self || !event || !value) return;
     StepAction action;
     if (!NumberStepForKey(event->vk, &action)) return;
     Listener onStep = value->onStep ? Listen(cx, &ScriptView::OnNumberStep,
-                                             (intptr_t)value->onStep)
+                                             (int64_t)value->onStep)
                                     : Listener{};
     const NumberStep* step =
         value->onStep || !value->hasStep ? nullptr : &value->step;
@@ -188631,35 +193826,35 @@ void ScriptView::OnNumberKey(ScriptView* self, Ctx* cx, const KeyEvent* event,
 }
 
 void ScriptView::OnInputEvent(ScriptView* self, Ctx* cx,
-                              const InputEvent* event, intptr_t handle) {
+                              const InputEvent* event, int64_t handle) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchInputEvent((shell::EntityHandle)handle, *event,
                                       cx->win, cx->app);
 }
 
 void ScriptView::OnSliderEvent(ScriptView* self, Ctx* cx,
-                               const SliderEvent* event, intptr_t handle) {
+                               const SliderEvent* event, int64_t handle) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchSliderEvent((shell::EntityHandle)handle, *event,
                                        cx->win, cx->app);
 }
 
 void ScriptView::OnOtpEvent(ScriptView* self, Ctx* cx, const OtpEvent* event,
-                            intptr_t handle) {
+                            int64_t handle) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchOtpEvent((shell::EntityHandle)handle, *event,
                                     cx->win, cx->app);
 }
 
 void ScriptView::OnCalendarEvent(ScriptView* self, Ctx* cx,
-                                 const CalendarEvent* event, intptr_t handle) {
+                                 const CalendarEvent* event, int64_t handle) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchCalendarEvent((shell::EntityHandle)handle, *event,
                                          cx->win, cx->app);
 }
 
 void ScriptView::OnDockEvent(ScriptView* self, Ctx* cx, const DockEvent* event,
-                             intptr_t callback) {
+                             int64_t callback) {
     if (!self || !self->runtime || !event ||
         event->kind != DockEventKind::LayoutChanged) {
         return;
@@ -188670,7 +193865,7 @@ void ScriptView::OnDockEvent(ScriptView* self, Ctx* cx, const DockEvent* event,
 }
 
 void ScriptView::OnScriptKey(ScriptView* self, Ctx* cx, const KeyEvent* event,
-                             intptr_t callback) {
+                             int64_t callback) {
     if (!self || !self->runtime || !event) return;
 
     bool propagate = true;
@@ -188689,7 +193884,7 @@ static shell::CallbackId MouseButtonCallback(
 
 void ScriptView::OnScriptMouseDown(ScriptView* self, Ctx* cx,
                                    const MouseDownEvent* event,
-                                   intptr_t binding) {
+                                   int64_t binding) {
     auto* buttons = (const ShellMouseButtonBinding*)binding;
     shell::CallbackId callback =
         event ? MouseButtonCallback(buttons, event->button) : 0;
@@ -188700,7 +193895,7 @@ void ScriptView::OnScriptMouseDown(ScriptView* self, Ctx* cx,
 }
 
 void ScriptView::OnScriptMouseUp(ScriptView* self, Ctx* cx,
-                                 const MouseUpEvent* event, intptr_t binding) {
+                                 const MouseUpEvent* event, int64_t binding) {
     auto* buttons = (const ShellMouseButtonBinding*)binding;
     shell::CallbackId callback =
         event ? MouseButtonCallback(buttons, event->button) : 0;
@@ -188712,7 +193907,7 @@ void ScriptView::OnScriptMouseUp(ScriptView* self, Ctx* cx,
 
 void ScriptView::OnScriptMouseDownOut(ScriptView* self, Ctx* cx,
                                       const MouseDownEvent* event,
-                                      intptr_t callback) {
+                                      int64_t callback) {
     if (!self || !self->runtime || !event) return;
     self->runtime->DispatchMouseButton(
         (shell::CallbackId)callback, event->button, event->x, event->y,
@@ -188721,7 +193916,7 @@ void ScriptView::OnScriptMouseDownOut(ScriptView* self, Ctx* cx,
 
 void ScriptView::OnScriptScrollWheel(ScriptView* self, Ctx* cx,
                                      const ScrollWheelEvent* event,
-                                     intptr_t callback) {
+                                     int64_t callback) {
     if (!self || !self->runtime || !event) return;
     bool propagate = true;
     self->runtime
@@ -188731,7 +193926,7 @@ void ScriptView::OnScriptScrollWheel(ScriptView* self, Ctx* cx,
 }
 
 void ScriptView::OnScriptAction(ScriptView* self, Ctx* cx,
-                                const ActionEvent* event, intptr_t binding) {
+                                const ActionEvent* event, int64_t binding) {
     auto* bound = (const ShellActionBinding*)binding;
     if (!self || !self->runtime || !event || !bound) return;
     Str id = shell::ShellActionScriptId(event->action);
@@ -198570,7 +203765,21 @@ void WebView::OnWindowMouseDown(WebView* self, Ctx* cx,
     }
 }
 
+static_assert(sizeof(PlatPollFd) == sizeof(wry::PollFd), "pollfd layout");
+
+static int WryLoopPrepare(PlatPollFd** fds, int* timeoutMs) {
+    wry::PollFd* raw = nullptr;
+    int n = wry::EventLoopPrepare(&raw, timeoutMs);
+    *fds = (PlatPollFd*)raw;
+    return n;
+}
+
+static void WryLoopDispatch() {
+    wry::EventLoopDispatch();
+}
+
 Entity<WebView> WebViewNew(Ctx* cx, const wry::WebViewAttributes* attrs) {
+    PlatAddLoopSource(WryLoopPrepare, WryLoopDispatch);
 
     Entity<WebView> handle = EntityNewState<WebView>(cx->app);
     WebView* self = handle.Get(cx->app);
@@ -198720,6 +203929,162 @@ Str RevertUriWorkAround(Str uri, Str httpOrHttps, Str protocol) {
                                base::FormatTemp("%s://", protocol));
 }
 
+Str ProxyUriTemp(const ProxyConfig* proxy) {
+    if (!proxy || proxy->kind == ProxyKind::None) {
+        return {};
+    }
+    const char* scheme = proxy->kind == ProxyKind::Socks5 ? "socks5" : "http";
+    return base::FormatTemp("%s://%s:%s", Str(scheme), proxy->host,
+                            proxy->port);
+}
+
+static int wry_wry_HexDigit(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+Str PathFromFileUriTemp(Str uri) {
+    Str path = uri;
+    if (base::StrStartsWith(path, "file://")) {
+        path = Str(path.s + 7, len(path) - 7);
+    }
+    Str res = base::AllocStrTemp(len(path) + 1);
+    if (!res.s) {
+        return {};
+    }
+    int n = 0;
+    for (int i = 0; i < len(path); i++) {
+        char c = path.s[i];
+        if (c == '%' && i + 2 < len(path)) {
+            int hi = wry_wry_HexDigit(path.s[i + 1]);
+            int lo = wry_wry_HexDigit(path.s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                res.s[n++] = (char)(hi * 16 + lo);
+                i += 2;
+                continue;
+            }
+        }
+        res.s[n++] = c;
+    }
+    res.s[n] = 0;
+    res.len = n;
+    return res;
+}
+
+void DownloadFileNameParts(Str uri, Str suggested, Str* stem, Str* ext) {
+
+    Str name = suggested;
+    Str dotExt;
+    for (int i = 0; i < len(suggested); i++) {
+        if (suggested.s[i] == '.') {
+            name = Str(suggested.s, i);
+            dotExt = Str(suggested.s + i, len(suggested) - i);
+            break;
+        }
+    }
+
+    if (base::StrStartsWith(uri, "data:")) {
+        int slash = -1;
+        for (int i = 0; i < len(uri); i++) {
+            if (uri.s[i] == '/') {
+                slash = i;
+                break;
+            }
+        }
+        if (slash >= 0) {
+            Str rest = Str(uri.s + slash + 1, len(uri) - slash - 1);
+            for (int i = 0; i < len(rest); i++) {
+                if (rest.s[i] == ',') {
+                    Str prefix = Str(rest.s, i + 1);
+                    if (base::StrStartsWith(name, prefix)) {
+                        name = StrL("Unknown");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    *stem = base::StrDupTemp(name);
+    *ext = base::StrDupTemp(dotExt);
+}
+
+double ScaleFactorFromScreen(int widthPx, int widthMm) {
+    if (widthPx <= 0 || widthMm <= 0) {
+        return 1.0;
+    }
+    return ((double)widthPx * 25.4 / (double)widthMm) / 96.0;
+}
+
+Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
+    base::StrBuilder b(base::GetTempArena());
+    Str name = ev->pressed ? StrL("mousedown") : StrL("mouseup");
+    Str x = base::FormatTemp("%d", ev->x);
+    Str y = base::FormatTemp("%d", ev->y);
+    auto boolStr = [](bool v) { return v ? StrL("true") : StrL("false"); };
+    auto add = [&b](Str s) { b.Append(s); };
+    add(StrL("(() => {\n        const el = document.elementFromPoint("));
+    add(x);
+    add(StrL(","));
+    add(y);
+    add(StrL(");\n        const ev = new MouseEvent('"));
+    add(name);
+    add(StrL("', {\n          view: window,\n          button: "));
+    add(base::FormatTemp("%d", ev->button == 8 ? 3 : 4));
+    add(StrL(",\n          buttons: "));
+    add(base::FormatTemp("%d", ev->buttons));
+    add(StrL(",\n          x: "));
+    add(x);
+    add(StrL(",\n          y: "));
+    add(y);
+    add(StrL(",\n          bubbles: true,\n          detail: "));
+    add(base::FormatTemp("%d", ev->detail));
+    add(
+        StrL(",\n          cancelBubble: false,\n          cancelable: true,\n"
+             "          clientX: "));
+    add(x);
+    add(StrL(",\n          clientY: "));
+    add(y);
+    add(StrL(",\n          composed: true,\n          layerX: "));
+    add(x);
+    add(StrL(",\n          layerY: "));
+    add(y);
+    add(StrL(",\n          pageX: "));
+    add(x);
+    add(StrL(",\n          pageY: "));
+    add(y);
+    add(StrL(",\n          screenX: window.screenX + "));
+    add(x);
+    add(StrL(",\n          screenY: window.screenY + "));
+    add(y);
+    add(StrL(",\n          ctrlKey: "));
+    add(boolStr(ev->ctrlKey));
+    add(StrL(",\n          metaKey: "));
+    add(boolStr(ev->metaKey));
+    add(StrL(",\n          shiftKey: "));
+    add(boolStr(ev->shiftKey));
+    add(StrL(",\n          altKey: "));
+    add(boolStr(ev->altKey));
+    add(
+        StrL(",\n        });\n        el.dispatchEvent(ev)\n"
+             "        if (!ev.defaultPrevented && \""));
+    add(name);
+    add(
+        StrL("\" === \"mouseup\") {\n          if (ev.button === 3) {\n"
+             "            window.history.back();\n          }\n"
+             "          if (ev.button === 4) {\n"
+             "            window.history.forward();\n          }\n"
+             "        }\n      })()"));
+    return b.TakeStr();
+}
+
 }
 
 #if GPUI_OS_LINUX
@@ -198732,10 +204097,8 @@ Str RevertUriWorkAround(Str uri, Str httpOrHttps, Str protocol) {
 #include <pango/pangocairo.h>
 #include <poll.h>
 #include <pthread.h>
-#include <sys/inotify.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -198822,6 +204185,21 @@ Str RevertUriWorkAround(Str uri, Str httpOrHttps, Str protocol) {
 #include <emscripten/emscripten.h>
 #include <emscripten/heap.h>
 #include <emscripten/html5.h>
+#endif
+
+#if GPUI_OS_LINUX || GPUI_OS_ANDROID
+#include <poll.h>
+#include <sys/inotify.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#if GPUI_OS_IOS
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/event.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
@@ -204109,6 +209487,50 @@ void PathStroke(PaintCtx* ctx, Path* p, float stroke, Rgba c, bool roundCaps,
     cairo_restore(cr);
 }
 
+void PathStrokeGradient(PaintCtx* ctx, Path* p, float stroke, float x0,
+                        float y0, float x1, float y1, Rgba from, Rgba to,
+                        bool roundCaps, float dx, float dy) {
+    if (scene::Recording()) {
+        scene::RecPathStrokeGradient(ctx, p, stroke, x0, y0, x1, y1, from, to,
+                                     roundCaps);
+        return;
+    }
+    cairo_t* cr = Cr(ctx);
+    if (!cr) {
+        return;
+    }
+    cairo_pattern_t* pat = cairo_pattern_create_linear(x0, y0, x1, y1);
+    if (!pat) {
+        PathStroke(ctx, p, stroke, from, roundCaps, dx, dy);
+        return;
+    }
+    cairo_save(cr);
+    cairo_translate(cr, dx, dy);
+    if (!Replay(cr, p)) {
+        cairo_pattern_destroy(pat);
+        cairo_restore(cr);
+        return;
+    }
+
+    from = PaintFade(ctx, from);
+    to = PaintFade(ctx, to);
+    cairo_pattern_add_color_stop_rgba(pat, 0, from.r / 255.0, from.g / 255.0,
+                                      from.b / 255.0, from.a / 255.0);
+    cairo_pattern_add_color_stop_rgba(pat, 1, to.r / 255.0, to.g / 255.0,
+                                      to.b / 255.0, to.a / 255.0);
+    cairo_set_source(cr, pat);
+    cairo_set_line_width(cr, stroke);
+    cairo_set_line_cap(cr,
+                       roundCaps ? CAIRO_LINE_CAP_ROUND : CAIRO_LINE_CAP_BUTT);
+    cairo_set_line_join(
+        cr, roundCaps ? CAIRO_LINE_JOIN_ROUND : CAIRO_LINE_JOIN_MITER);
+    cairo_stroke(cr);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_BUTT);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
+    cairo_pattern_destroy(pat);
+    cairo_restore(cr);
+}
+
 struct LinuxImageFrame {
     cairo_surface_t* surface = nullptr;
     cairo_surface_t* graySurface = nullptr;
@@ -204483,6 +209905,8 @@ void RenderImageDraw(PaintCtx* ctx, RenderImage* img, Bounds bounds,
 }
 
 struct TextLayout {
+
+    int textLen = 0;
     uint64_t generation = 0;
     PangoLayout* layout = nullptr;
 
@@ -204595,6 +210019,7 @@ TextLayout* TextLayoutNew(PaintCtx* ctx, Str s, float fontSize, float maxW,
     }
 
     auto* tl = new TextLayout();
+    tl->textLen = len(s);
     tl->width = pango_layout_get_width(l);
     tl->generation = PaintResourceGenerationNew();
     tl->layout = l;
@@ -204658,6 +210083,10 @@ void TextLayoutRelease(TextLayout* tl) {
 
 uint64_t TextLayoutGeneration(const TextLayout* tl) {
     return tl ? tl->generation : 0;
+}
+
+int TextLayoutTextLen(const TextLayout* tl) {
+    return tl ? tl->textLen : 0;
 }
 
 static float BoxPad(TextLayout* tl) {
@@ -204771,12 +210200,7 @@ int TextLayoutHitPoint(TextLayout* tl, Str s, float relX, float relY) {
         index = (int)(g_utf8_next_char(text + index) - text);
         trailing--;
     }
-    if (index < 0) {
-        index = 0;
-    }
-    if (index > len(s)) {
-        index = len(s);
-    }
+    index = ClampI(index, 0, len(s));
     return index;
 }
 
@@ -205412,6 +210836,48 @@ void PathStroke(PaintCtx* ctx, Path* p, float stroke, Rgba c, bool roundCaps,
     CGContextRestoreGState(cg);
 }
 
+void PathStrokeGradient(PaintCtx* ctx, Path* p, float stroke, float x0,
+                        float y0, float x1, float y1, Rgba from, Rgba to,
+                        bool roundCaps, float dx, float dy) {
+    if (scene::Recording()) {
+        scene::RecPathStrokeGradient(ctx, p, stroke, x0, y0, x1, y1, from, to,
+                                     roundCaps);
+        return;
+    }
+    CGContextRef cg = Cg(ctx);
+    if (!cg || !p || CGPathIsEmpty(p->path)) {
+        return;
+    }
+    from = PaintFade(ctx, from);
+    to = PaintFade(ctx, to);
+    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
+    CGFloat comps[8] = {from.r / 255.0, from.g / 255.0, from.b / 255.0,
+                        from.a / 255.0, to.r / 255.0,   to.g / 255.0,
+                        to.b / 255.0,   to.a / 255.0};
+    CGFloat stops[2] = {0.0, 1.0};
+    CGGradientRef grad =
+        CGGradientCreateWithColorComponents(space, comps, stops, 2);
+    CGColorSpaceRelease(space);
+    if (!grad) {
+        PathStroke(ctx, p, stroke, from, roundCaps, dx, dy);
+        return;
+    }
+
+    CGContextSaveGState(cg);
+    CGContextTranslateCTM(cg, dx, dy);
+    CGContextSetLineWidth(cg, stroke);
+    CGContextSetLineCap(cg, roundCaps ? kCGLineCapRound : kCGLineCapButt);
+    CGContextSetLineJoin(cg, roundCaps ? kCGLineJoinRound : kCGLineJoinMiter);
+    CGContextAddPath(cg, p->path);
+    CGContextReplacePathWithStrokedPath(cg);
+    CGContextClip(cg);
+    CGContextDrawLinearGradient(
+        cg, grad, CGPointMake(x0, y0), CGPointMake(x1, y1),
+        kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+    CGContextRestoreGState(cg);
+    CGGradientRelease(grad);
+}
+
 static int gpui_paint_mac_Utf8Decode(const char* s, int len, uint32_t* out) {
     if (len <= 0) {
         return 0;
@@ -205787,6 +211253,8 @@ struct MacLine {
 };
 
 struct TextLayout {
+
+    int textLen = 0;
     uint64_t generation = 0;
     int refs = 1;
 
@@ -205848,9 +211316,8 @@ static CTFontRef FontFor(PaintApp* pa, float fontSize, uint16_t weight) {
                                                 encoding:NSUTF8StringEncoding];
         if (name) {
 
-            NSInteger managerWeight = (NSInteger)lround(5.0 + (double)w * 8.0);
-            if (managerWeight < 0) managerWeight = 0;
-            if (managerWeight > 15) managerWeight = 15;
+            NSInteger managerWeight =
+                ClampI((int)lround(5.0 + (double)w * 8.0), 0, 15);
             font =
                 [[NSFontManager sharedFontManager] fontWithFamily:name
                                                            traits:0
@@ -206016,6 +211483,7 @@ TextLayout* TextLayoutNew(PaintCtx* ctx, Str s, float fontSize, float maxW,
     }
 
     auto* tl = new TextLayout();
+    tl->textLen = len(s);
     tl->generation = PaintResourceGenerationNew();
     tl->attr = attr;
     tl->lines = lines;
@@ -206088,6 +211556,10 @@ void TextLayoutRelease(TextLayout* tl) {
 
 uint64_t TextLayoutGeneration(const TextLayout* tl) {
     return tl ? tl->generation : 0;
+}
+
+int TextLayoutTextLen(const TextLayout* tl) {
+    return tl ? tl->textLen : 0;
 }
 
 bool PaintTextLayoutSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x,
@@ -206372,13 +211844,15 @@ EM_JS(void, GpJsInit, (), {
                         const parsed = marker > start
                             ? Number(font.slice(start, marker)) : 16;
                         const px = parsed > 0 ? parsed : 16;
+
+                        const mono = font.indexOf("monospace") >= 0;
                         let units = 0;
                         for (let i = 0; i < s.length; i++) {
                             const code = s.charCodeAt(i);
                             if (code === 9) {
                                 units += 4;
                             } else if (code === 32) {
-                                units += 0.33;
+                                units += mono ? 0.6 : 0.33;
                             } else if (code >= 0xd800 && code < 0xdc00) {
                                 units += 1;
                                 i++;
@@ -206670,6 +212144,29 @@ EM_JS(void, GpJsPathStroke,
     c.save();
     c.translate(dx, dy);
     c.strokeStyle = G.color(color);
+    c.lineWidth = stroke;
+    c.lineCap = roundCaps ? "round" : "butt";
+    c.lineJoin = roundCaps ? "round" : "miter";
+    c.stroke(e.p);
+    c.lineCap = "butt";
+    c.lineJoin = "miter";
+    c.restore();
+});
+
+EM_JS(void, GpJsPathStrokeGradient,
+      (int id, float stroke, float x0, float y0, float x1, float y1, int from,
+       int to, int roundCaps, float dx, float dy), {
+    const G = globalThis.__gpui;
+    const c = G.cur, e = G.paths[id];
+    if (!c || !e) {
+        return;
+    }
+    c.save();
+    c.translate(dx, dy);
+    const g = c.createLinearGradient(x0, y0, x1, y1);
+    g.addColorStop(0, G.color(from));
+    g.addColorStop(1, G.color(to));
+    c.strokeStyle = g;
     c.lineWidth = stroke;
     c.lineCap = roundCaps ? "round" : "butt";
     c.lineJoin = roundCaps ? "round" : "miter";
@@ -207449,8 +212946,12 @@ void PathFill(PaintCtx* ctx, Path* p, Rgba c, float dx, float dy) {
         scene::RecPathFill(ctx, p, c);
         return;
     }
+
+    if (!ctx || !ctx->rt) {
+        return;
+    }
     int id = JsPath(p);
-    if (!id || !ctx || !ctx->rt) {
+    if (!id) {
         return;
     }
     GpJsPathFill(id, (int)Packed(ctx, c), dx, dy);
@@ -207467,8 +212968,12 @@ void PathFillGradient(PaintCtx* ctx, Path* p, float x0, float y0, float x1,
         scene::RecPathFillGradient(ctx, p, x0, y0, x1, y1, from, to);
         return;
     }
+
+    if (!ctx || !ctx->rt) {
+        return;
+    }
     int id = JsPath(p);
-    if (!id || !ctx || !ctx->rt) {
+    if (!id) {
         return;
     }
     GpJsPathFillGradient(id, x0, y0, x1, y1, (int)Packed(ctx, from),
@@ -207481,11 +212986,35 @@ void PathStroke(PaintCtx* ctx, Path* p, float stroke, Rgba c, bool roundCaps,
         scene::RecPathStroke(ctx, p, stroke, c, roundCaps);
         return;
     }
+
+    if (!ctx || !ctx->rt) {
+        return;
+    }
     int id = JsPath(p);
-    if (!id || !ctx || !ctx->rt) {
+    if (!id) {
         return;
     }
     GpJsPathStroke(id, stroke, (int)Packed(ctx, c), roundCaps ? 1 : 0, dx, dy);
+}
+
+void PathStrokeGradient(PaintCtx* ctx, Path* p, float stroke, float x0,
+                        float y0, float x1, float y1, Rgba from, Rgba to,
+                        bool roundCaps, float dx, float dy) {
+    if (scene::Recording()) {
+        scene::RecPathStrokeGradient(ctx, p, stroke, x0, y0, x1, y1, from, to,
+                                     roundCaps);
+        return;
+    }
+
+    if (!ctx || !ctx->rt) {
+        return;
+    }
+    int id = JsPath(p);
+    if (!id) {
+        return;
+    }
+    GpJsPathStrokeGradient(id, stroke, x0, y0, x1, y1, (int)Packed(ctx, from),
+                           (int)Packed(ctx, to), roundCaps ? 1 : 0, dx, dy);
 }
 
 struct RenderImage {
@@ -207625,6 +213154,8 @@ void RenderImageDraw(PaintCtx* ctx, RenderImage* img, Bounds bounds,
 }
 
 struct TextLayout {
+
+    int textLen = 0;
     uint64_t generation = 0;
     int js = 0;
     int refs = 1;
@@ -207654,6 +213185,7 @@ TextLayout* TextLayoutNew(PaintCtx* ctx, Str s, float fontSize, float maxW,
         outSize->h = size[1];
     }
     auto* tl = new TextLayout();
+    tl->textLen = len(s);
     tl->generation = PaintResourceGenerationNew();
     tl->js = id;
     tl->size = Size{size[2], size[1]};
@@ -207685,6 +213217,10 @@ void TextLayoutRelease(TextLayout* tl) {
 
 uint64_t TextLayoutGeneration(const TextLayout* tl) {
     return tl ? tl->generation : 0;
+}
+
+int TextLayoutTextLen(const TextLayout* tl) {
+    return tl ? tl->textLen : 0;
 }
 
 bool PaintTextLayoutSpans(PaintCtx* ctx, TextLayout* tl, Str text, float x,
@@ -207721,12 +213257,7 @@ int TextLayoutHitPoint(TextLayout* tl, Str s, float relX, float relY) {
         return 0;
     }
     int at = GpJsTextHit(tl->js, relX, relY);
-    if (at < 0) {
-        at = 0;
-    }
-    if (at > len(s)) {
-        at = len(s);
-    }
+    at = ClampI(at, 0, len(s));
     return at;
 }
 
@@ -208965,6 +214496,54 @@ void PathStroke(PaintCtx* ctx, Path* p, float stroke, Rgba c, bool roundCaps,
     gpui_paint_win_Rel(&ss);
 }
 
+void PathStrokeGradient(PaintCtx* ctx, Path* p, float stroke, float x0,
+                        float y0, float x1, float y1, Rgba from, Rgba to,
+                        bool roundCaps, float dx, float dy) {
+    if (scene::Recording()) {
+        scene::RecPathStrokeGradient(ctx, p, stroke, x0, y0, x1, y1, from, to,
+                                     roundCaps);
+        return;
+    }
+    if (PaintGpuOn()) {
+        gpuw::PathStrokeGradient(ctx, p, stroke, x0, y0, x1, y1, from, to,
+                                 roundCaps, dx, dy);
+        return;
+    }
+    ID2D1PathGeometry* g = PathSeal(p);
+    if (!g || !ctx || !ctx->rt) {
+        return;
+    }
+
+    D2D1_GRADIENT_STOP gs[2];
+    gs[0].position = 0.f;
+    gs[0].color = ToD2D(PaintFade(ctx, from));
+    gs[1].position = 1.f;
+    gs[1].color = ToD2D(PaintFade(ctx, to));
+    ID2D1GradientStopCollection* stops = nullptr;
+    ctx->rt->rt->CreateGradientStopCollection(gs, 2, &stops);
+    bool stroked = false;
+    if (stops) {
+        ID2D1LinearGradientBrush* gb = nullptr;
+        ctx->rt->rt->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(D2D1::Point2F(x0, y0),
+                                                D2D1::Point2F(x1, y1)),
+            stops, &gb);
+        if (gb) {
+            ID2D1StrokeStyle* ss = DashStyle(ctx, nullptr, roundCaps);
+            bool offset = PathOffsetBegin(ctx, dx, dy);
+            ctx->rt->rt->DrawGeometry(g, gb, stroke, ss);
+            PathOffsetEnd(ctx, offset);
+            gpui_paint_win_Rel(&ss);
+            gb->Release();
+            stroked = true;
+        }
+        stops->Release();
+    }
+    if (!stroked) {
+        PathStroke(ctx, p, stroke, from, roundCaps, dx, dy);
+    }
+}
+
 static IDWriteTextFormat* FontFor(PaintApp* pa, float fontSize,
                                   uint16_t weight) {
     if ((weight & kFontMono) && pa->fontMono) {
@@ -209072,6 +214651,31 @@ static int Utf8ToWideN(Str s, WCHAR* wbuf, int cap) {
     return n;
 }
 
+static WCHAR* Utf8ToWideAny(Str s, WCHAR* stack, int stackCap, int* outN) {
+    *outN = 0;
+    if (!s.s || len(s) <= 0) {
+        if (stack && stackCap > 0) {
+            stack[0] = 0;
+        }
+        return stack;
+    }
+    int need = MultiByteToWideChar(CP_UTF8, 0, s.s, len(s), nullptr, 0);
+    if (need <= 0) {
+        stack[0] = 0;
+        return stack;
+    }
+    WCHAR* buf = stack;
+    if (need + 1 > stackCap) {
+        buf = (WCHAR*)Alloc(GetTempArena(), (int)sizeof(WCHAR) * (need + 1));
+        if (!buf) {
+            stack[0] = 0;
+            return stack;
+        }
+    }
+    *outN = Utf8ToWideN(s, buf, need + 1);
+    return buf;
+}
+
 static int Utf8OffToWide(Str s, int u8off) {
     if (u8off <= 0 || !s.s) {
         return 0;
@@ -209086,8 +214690,9 @@ static int WideOffToUtf8(Str s, int woff) {
     if (woff <= 0 || !s.s) {
         return 0;
     }
-    WCHAR wbuf[2048];
-    int wn = Utf8ToWideN(s, wbuf, 2048);
+    WCHAR stack[2048];
+    int wn = 0;
+    WCHAR* wbuf = Utf8ToWideAny(s, stack, 2048, &wn);
     if (woff > wn) {
         woff = wn;
     }
@@ -209476,13 +215081,19 @@ static void ApplyLineHeight(IDWriteTextLayout* layout, float fontSize,
     if (n == 0) {
         return;
     }
+
     enum : uint16_t {
         kMaxLines = 256
     };
+    DWRITE_LINE_METRICS stack[kMaxLines] = {};
+    DWRITE_LINE_METRICS* lm = stack;
     if (n > kMaxLines) {
-        n = kMaxLines;
+        lm = (DWRITE_LINE_METRICS*)Alloc(
+            GetTempArena(), (int)(sizeof(DWRITE_LINE_METRICS) * n));
+        if (!lm) {
+            return;
+        }
     }
-    DWRITE_LINE_METRICS lm[kMaxLines] = {};
     UINT32 got = 0;
     if (FAILED(layout->GetLineMetrics(lm, n, &got)) || got == 0 ||
         lm[0].height <= 0) {
@@ -209494,6 +215105,8 @@ static void ApplyLineHeight(IDWriteTextLayout* layout, float fontSize,
 }
 
 struct TextLayout {
+
+    int textLen = 0;
     IDWriteTextLayout* layout = nullptr;
     uint64_t generation = 0;
     int refs = 1;
@@ -209513,8 +215126,9 @@ TextLayout* TextLayoutNew(PaintCtx* ctx, Str s, float fontSize, float maxW,
     if (!fmt) {
         return nullptr;
     }
-    WCHAR wbuf[2048];
-    int n = Utf8ToWideN(s, wbuf, 2048);
+    WCHAR stack[2048];
+    int n = 0;
+    WCHAR* wbuf = Utf8ToWideAny(s, stack, 2048, &n);
     if (n <= 0) {
         return nullptr;
     }
@@ -209576,6 +215190,7 @@ TextLayout* TextLayoutNew(PaintCtx* ctx, Str s, float fontSize, float maxW,
         outSize->h = m.height;
     }
     auto* tl = new TextLayout();
+    tl->textLen = len(s);
     tl->layout = layout;
     tl->generation = PaintResourceGenerationNew();
     return tl;
@@ -209610,6 +215225,10 @@ void TextLayoutRelease(TextLayout* tl) {
 
 uint64_t TextLayoutGeneration(const TextLayout* tl) {
     return tl ? tl->generation : 0;
+}
+
+int TextLayoutTextLen(const TextLayout* tl) {
+    return tl ? tl->textLen : 0;
 }
 
 void* PaintTextLayoutNative(TextLayout* tl) {
@@ -209693,8 +215312,7 @@ int TextLayoutHitPoint(TextLayout* tl, Str s, float relX, float relY) {
     if (!tl) {
         return 0;
     }
-    WCHAR wbuf[2048];
-    int wn = Utf8ToWideN(s, wbuf, 2048);
+    int wn = Utf8OffToWide(s, len(s));
     BOOL trailing = FALSE;
     BOOL inside = FALSE;
     DWRITE_HIT_TEST_METRICS m = {};
@@ -209703,12 +215321,7 @@ int TextLayoutHitPoint(TextLayout* tl, Str s, float relX, float relY) {
     if (trailing) {
         wpos += (int)m.length;
     }
-    if (wpos < 0) {
-        wpos = 0;
-    }
-    if (wpos > wn) {
-        wpos = wn;
-    }
+    wpos = ClampI(wpos, 0, wn);
     return WideOffToUtf8(s, wpos);
 }
 
@@ -209743,19 +215356,32 @@ int TextLayoutRangeRects(TextLayout* tl, Str s, int u8a, int u8b, Bounds* out,
     if (lineCount == 0) {
         return 0;
     }
-    DWRITE_LINE_METRICS lines[32] = {};
+
+    DWRITE_LINE_METRICS stackLines[32] = {};
+    DWRITE_LINE_METRICS* lines = stackLines;
     if (lineCount > 32) {
-        lineCount = 32;
+        lines = (DWRITE_LINE_METRICS*)Alloc(
+            GetTempArena(), (int)(sizeof(DWRITE_LINE_METRICS) * lineCount));
+        if (!lines) {
+            return 0;
+        }
     }
     UINT32 actual = 0;
-    layout->GetLineMetrics(lines, lineCount, &actual);
+    if (FAILED(layout->GetLineMetrics(lines, lineCount, &actual)) ||
+        actual > lineCount) {
+        return 0;
+    }
     UINT32 pos = 0;
     int n = 0;
+
+    float lineTop = tm.top;
     for (UINT32 i = 0; i < actual && n < max; i++) {
         int lineStart = (int)pos;
         int lineEnd = lineStart + (int)lines[i].length;
         int visEnd = lineEnd - (int)lines[i].newlineLength;
         pos = (UINT32)lineEnd;
+        float top = lineTop;
+        lineTop += lines[i].height;
         int lo = wa > lineStart ? wa : lineStart;
         int hi = wb < visEnd ? wb : visEnd;
         if (lo >= hi) {
@@ -209784,7 +215410,7 @@ int TextLayoutRangeRects(TextLayout* tl, Str s, int u8a, int u8b, Bounds* out,
             right = tm.layoutWidth;
         }
         out[n].x = left;
-        out[n].y = y0;
+        out[n].y = top;
         out[n].w = right - left;
         out[n].h = lines[i].height;
         n++;
@@ -211599,11 +217225,35 @@ static void Quad(PaintCtx* ctx, int kind, float x, float y, float w, float h,
     gpui_paintgpu_win_Push(i);
 }
 
+struct StrokeGradient {
+    bool on = false;
+    float x0 = 0, y0 = 0, dx = 0, dy = 0, len2 = 0;
+    Rgba from = {};
+    Rgba to = {};
+};
+static StrokeGradient gStrokeGradient;
+
+static Rgba StrokeGradientAt(float x, float y) {
+    const StrokeGradient& g = gStrokeGradient;
+    float t =
+        g.len2 > 0 ? ((x - g.x0) * g.dx + (y - g.y0) * g.dy) / g.len2 : 0.f;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    Rgba out;
+    out.r = (uint8_t)lroundf(g.from.r + (g.to.r - g.from.r) * t);
+    out.g = (uint8_t)lroundf(g.from.g + (g.to.g - g.from.g) * t);
+    out.b = (uint8_t)lroundf(g.from.b + (g.to.b - g.from.b) * t);
+    out.a = (uint8_t)lroundf(g.from.a + (g.to.a - g.from.a) * t);
+    return out;
+}
+
 static void TriVertex(float x, float y, Rgba c) {
     EnsureTriPhase();
     TriVert v = {};
     v.x = x;
     v.y = y;
+    if (gStrokeGradient.on) {
+        c = StrokeGradientAt(x, y);
+    }
     SetColor(v.color, c);
     memcpy(v.clip, gB.clip, sizeof(v.clip));
     VecAppend(gB.tris, v);
@@ -212631,6 +218281,35 @@ void PathStroke(PaintCtx* ctx, Path* path, float stroke, Rgba c, bool roundCaps,
     }
 }
 
+void PathStrokeGradient(PaintCtx* ctx, Path* path, float stroke, float x0,
+                        float y0, float x1, float y1, Rgba from, Rgba to,
+                        bool roundCaps, float dx, float dy) {
+    from = PaintFade(ctx, from);
+    to = PaintFade(ctx, to);
+    if (from.a == 0 && to.a == 0) {
+        return;
+    }
+
+    StrokeGradient& g = gStrokeGradient;
+    g.x0 = x0 + dx;
+    g.y0 = y0 + dy;
+    g.dx = x1 - x0;
+    g.dy = y1 - y0;
+    g.len2 = g.dx * g.dx + g.dy * g.dy;
+    g.from = from;
+    g.to = to;
+    g.on = true;
+    float opacity = ctx ? ctx->opacity : 1.f;
+    if (ctx) {
+        ctx->opacity = 1.f;
+    }
+    gpuw::PathStroke(ctx, path, stroke, Rgba{0, 0, 0, 255}, roundCaps, dx, dy);
+    if (ctx) {
+        ctx->opacity = opacity;
+    }
+    g.on = false;
+}
+
 constexpr int kImageSlots = 32;
 
 struct ImageSlot {
@@ -213369,6 +219048,8 @@ void PathFill(PaintCtx*, Path*, Rgba, float, float) {}
 void PathFillGradient(PaintCtx*, Path*, float, float, float, float, Rgba, Rgba,
                       float, float) {}
 void PathStroke(PaintCtx*, Path*, float, Rgba, bool, float, float) {}
+void PathStrokeGradient(PaintCtx*, Path*, float, float, float, float, float,
+                        Rgba, Rgba, bool, float, float) {}
 void PathRealize(PaintCtx*, Path*) {}
 void RenderImageDraw(PaintCtx*, RenderImage*, Bounds, Bounds, int, float,
                      bool) {}
@@ -213432,6 +219113,10 @@ static Atom aGtkEdgeConstraints;
 static Atom aClipboard, aTargets, aClipTarget;
 
 double TimeNow() {
+    double simulated = 0;
+    if (TestPlatformNow(&simulated)) {
+        return simulated;
+    }
     static bool started = false;
     static struct timespec start = {};
     struct timespec now = {};
@@ -214458,6 +220143,9 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
 }
 
 void ClipboardSetText(Window* win, Str text) {
+    if (TestPlatformClipboardWrite(text)) {
+        return;
+    }
     if (!win || !win->plat || !text.s || len(text) <= 0) {
         return;
     }
@@ -214475,6 +220163,10 @@ void WindowSetTextContentType(Window* win, Str value) {
 }
 
 Str ClipboardGetText(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated.text;
+    }
     if (!win || !win->plat || !gDpy) {
         return {};
     }
@@ -214522,6 +220214,10 @@ Str ClipboardGetText(Arena* a, Window* win) {
 }
 
 ClipboardItem ClipboardGetItem(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated;
+    }
     ClipboardItem out;
     out.text = ClipboardGetText(a, win);
     return out;
@@ -214785,7 +220481,10 @@ static void HandleEvent(App* app, XEvent* ev) {
             WindowSetActive(win, true);
             break;
         case FocusOut:
-            WindowSetActive(win, false);
+
+            if (ev->xfocus.detail != NotifyInferior) {
+                WindowSetActive(win, false);
+            }
             break;
         case ClientMessage:
             if (ev->xclient.message_type == aWmProtocols &&
@@ -214945,6 +220644,42 @@ void PlatWake(App* app) {
     char b = 1;
     ssize_t n = write(fd, &b, 1);
     (void)n;
+}
+
+static PlatLoopPrepare gLoopPrepare = nullptr;
+static PlatLoopDispatch gLoopDispatch = nullptr;
+
+void PlatAddLoopSource(PlatLoopPrepare prepare, PlatLoopDispatch dispatch) {
+    if (gLoopPrepare && gLoopPrepare != prepare) {
+        logf("PlatAddLoopSource: a second loop source is not supported\n");
+        return;
+    }
+    gLoopPrepare = prepare;
+    gLoopDispatch = dispatch;
+}
+
+static void PollAll(int xfd, int timeoutMs, PlatPollFd* extra, int nExtra) {
+    static Vec<struct pollfd> pfd;
+    VecClear(pfd);
+    int accessibilityFd = AccessibilityLinuxFd();
+    VecAppend(pfd, pollfd{xfd, POLLIN, 0});
+    if (gWakeFd[0] >= 0) {
+        VecAppend(pfd, pollfd{gWakeFd[0], POLLIN, 0});
+    }
+    if (accessibilityFd >= 0) {
+        VecAppend(pfd, pollfd{accessibilityFd, POLLIN, 0});
+    }
+    int own = len(pfd);
+    for (int i = 0; i < nExtra; i++) {
+        VecAppend(pfd, pollfd{extra[i].fd, (short)extra[i].events, 0});
+    }
+    if (poll(pfd.els, (nfds_t)len(pfd), timeoutMs) < 0) {
+        VecClear(pfd);
+    }
+    for (int i = 0; i < nExtra; i++) {
+        extra[i].revents =
+            own + i < len(pfd) ? (uint16_t)pfd.els[own + i].revents : 0;
+    }
 }
 
 bool PlatInit(App* app) {
@@ -215191,7 +220926,19 @@ int AppRun(App* app) {
                 }
             }
         }
-        if (!anyDirty && XPending(gDpy) == 0 && ExecQueued() == 0) {
+        bool idle = !anyDirty && XPending(gDpy) == 0 && ExecQueued() == 0;
+        PlatPollFd* extra = nullptr;
+        int extraTimeoutMs = -1;
+        int nExtra = gLoopPrepare ? gLoopPrepare(&extra, &extraTimeoutMs) : 0;
+        if (gLoopPrepare) {
+
+            int timeoutMs =
+                !idle ? 0 : (waitS <= 0 ? 0 : (int)(waitS * 1000.0));
+            if (extraTimeoutMs >= 0 && extraTimeoutMs < timeoutMs) {
+                timeoutMs = extraTimeoutMs;
+            }
+            PollAll(fd, timeoutMs, extra, nExtra);
+        } else if (idle) {
             int timeoutMs = waitS <= 0 ? 0 : (int)(waitS * 1000.0);
             int accessibilityFd = AccessibilityLinuxFd();
             struct pollfd pfd[3] = {{fd, POLLIN, 0},
@@ -215199,6 +220946,9 @@ int AppRun(App* app) {
                                     {accessibilityFd, POLLIN, 0}};
             int nfd = accessibilityFd >= 0 ? 3 : (gWakeFd[0] >= 0 ? 2 : 1);
             poll(pfd, nfd, timeoutMs);
+        }
+        if (gLoopDispatch) {
+            gLoopDispatch();
         }
 
         WakeConsume();
@@ -215255,6 +221005,10 @@ struct PlatWindow {
 };
 
 double TimeNow() {
+    double simulated = 0;
+    if (TestPlatformNow(&simulated)) {
+        return simulated;
+    }
     static bool started = false;
     static struct timespec start = {};
     struct timespec now = {};
@@ -216959,6 +222713,9 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
 }
 
 void ClipboardSetText(Window* win, Str text) {
+    if (TestPlatformClipboardWrite(text)) {
+        return;
+    }
     (void)win;
     if (!text.s || len(text) <= 0) {
         return;
@@ -216993,6 +222750,10 @@ void WindowSetTextContentType(Window* win, Str value) {
 }
 
 Str ClipboardGetText(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated.text;
+    }
     (void)win;
     NSPasteboard* pb = [NSPasteboard generalPasteboard];
     NSString* s = [pb stringForType:NSPasteboardTypeString];
@@ -217013,6 +222774,10 @@ Str ClipboardGetText(Arena* a, Window* win) {
 }
 
 ClipboardItem ClipboardGetItem(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated;
+    }
     ClipboardItem out;
     out.text = ClipboardGetText(a, win);
     NSPasteboard* pb = [NSPasteboard generalPasteboard];
@@ -217250,6 +223015,10 @@ static Str gClipboard = {};
 static const char* kCanvasSel = "#gpui-canvas";
 
 double TimeNow() {
+    double simulated = 0;
+    if (TestPlatformNow(&simulated)) {
+        return simulated;
+    }
     static double start = -1;
     double now = emscripten_get_now() / 1000.0;
     if (start < 0) {
@@ -217955,6 +223724,9 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
 }
 
 void ClipboardSetText(Window* win, Str text) {
+    if (TestPlatformClipboardWrite(text)) {
+        return;
+    }
     (void)win;
     if (text.s && len(text) > 0) {
         GpJsClipboardWrite(text.s, len(text));
@@ -217967,6 +223739,10 @@ void WindowSetTextContentType(Window* win, Str value) {
 }
 
 Str ClipboardGetText(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated.text;
+    }
     (void)win;
     if (!gInPasteEvent) {
         return {};
@@ -217984,6 +223760,10 @@ Str ClipboardGetText(Arena* a, Window* win) {
 }
 
 ClipboardItem ClipboardGetItem(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated;
+    }
     ClipboardItem out;
     out.text = ClipboardGetText(a, win);
     return out;
@@ -217991,7 +223771,8 @@ ClipboardItem ClipboardGetItem(Arena* a, Window* win) {
 
 bool ClipboardReadAsync(Window* win, ClipboardReadFn done, void* data) {
     (void)win;
-    if (!done) {
+    ClipboardItem simulated;
+    if (!done || TestPlatformClipboardRead(GetTempArena(), &simulated)) {
         return false;
     }
     gClipboardReadDone = done;
@@ -218219,6 +224000,10 @@ static bool ImeComposition(Window* win, LPARAM lParam) {
 }
 
 double TimeNow() {
+    double simulated = 0;
+    if (TestPlatformNow(&simulated)) {
+        return simulated;
+    }
     static LARGE_INTEGER freq = {};
     static LARGE_INTEGER start = {};
     if (freq.QuadPart == 0) {
@@ -219222,6 +225007,9 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
 }
 
 void ClipboardSetText(Window* win, Str text) {
+    if (TestPlatformClipboardWrite(text)) {
+        return;
+    }
     if (!text.s || len(text) <= 0) {
         return;
     }
@@ -219268,6 +225056,10 @@ void WindowSetTextContentType(Window* win, Str value) {
 }
 
 Str ClipboardGetText(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated.text;
+    }
     if (!OpenClipboard(Hwnd(win))) {
         return {};
     }
@@ -219358,6 +225150,10 @@ static Str ClipboardReadPaths(Arena* a, HANDLE handle) {
 }
 
 ClipboardItem ClipboardGetItem(Arena* a, Window* win) {
+    ClipboardItem simulated;
+    if (TestPlatformClipboardRead(a, &simulated)) {
+        return simulated;
+    }
     ClipboardItem out;
     out.text = ClipboardGetText(a, win);
     if (!OpenClipboard(Hwnd(win))) {
@@ -219552,8 +225348,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
 #endif
 
-#if GPUI_OS_LINUX
-#line 1 "src/sys/dir_watch_linux.cpp"
+#if GPUI_OS_LINUX || GPUI_OS_ANDROID
+#line 1 "src/sys/dir_watch_inotify.cpp"
 
 namespace gpui {
 
@@ -219666,6 +225462,193 @@ void DirWatchPlatClose(DirWatchPlat* w) {
         char b = 1;
         ssize_t r = write(w->stopWrite, &b, 1);
         (void)r;
+    }
+}
+
+}
+
+#endif
+
+#if GPUI_OS_IOS
+#line 1 "src/sys/dir_watch_ios.cpp"
+
+namespace gpui {
+
+struct DirWatchPlat {
+    DirWatchId id = 0;
+    int kq = -1;
+    int dirFd = -1;
+    char dir[kMaxPath] = {};
+
+    int* files = nullptr;
+    int nFiles = 0;
+    int capFiles = 0;
+};
+
+static const uintptr_t kDirWatchStop = 1;
+
+static const unsigned kDirWatchDirMask = NOTE_WRITE | NOTE_EXTEND |
+                                         NOTE_ATTRIB | NOTE_LINK | NOTE_DELETE |
+                                         NOTE_RENAME | NOTE_REVOKE;
+static const unsigned kDirWatchFileMask = NOTE_WRITE | NOTE_EXTEND |
+                                          NOTE_ATTRIB | NOTE_DELETE |
+                                          NOTE_RENAME | NOTE_REVOKE;
+
+static bool DirWatchAddVnode(int kq, int fd, unsigned mask) {
+    struct kevent ev;
+    EV_SET(&ev, (uintptr_t)fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, mask, 0,
+           nullptr);
+    return kevent(kq, &ev, 1, nullptr, 0, nullptr) == 0;
+}
+
+static void DirWatchCloseFiles(DirWatchPlat* w) {
+    for (int i = 0; i < w->nFiles; i++) {
+        close(w->files[i]);
+    }
+    w->nFiles = 0;
+}
+
+static void DirWatchOpenFiles(DirWatchPlat* w) {
+    DirWatchCloseFiles(w);
+    DIR* d = opendir(w->dir);
+    if (!d) {
+        return;
+    }
+    while (struct dirent* e = readdir(d)) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+        int fd = openat(w->dirFd, e->d_name, O_EVTONLY | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        if (w->nFiles == w->capFiles) {
+            int cap = w->capFiles ? w->capFiles * 2 : 16;
+            auto* grown = (int*)realloc(w->files, sizeof(int) * (size_t)cap);
+            if (!grown) {
+                close(fd);
+                break;
+            }
+            w->files = grown;
+            w->capFiles = cap;
+        }
+        if (!DirWatchAddVnode(w->kq, fd, kDirWatchFileMask)) {
+            close(fd);
+            continue;
+        }
+        w->files[w->nFiles++] = fd;
+    }
+    closedir(d);
+}
+
+static void DirWatchFree(DirWatchPlat* w) {
+    DirWatchCloseFiles(w);
+    free(w->files);
+    if (w->dirFd >= 0) {
+        close(w->dirFd);
+    }
+    if (w->kq >= 0) {
+        close(w->kq);
+    }
+    free(w);
+}
+
+static void DirWatchThread(DirWatchPlat* w) {
+    struct kevent evs[16];
+    for (;;) {
+        int n = kevent(w->kq, nullptr, 0, evs, 16, nullptr);
+        if (n < 0) {
+
+            if (errno != EINTR) {
+                PlatSleepMs(100);
+            }
+            continue;
+        }
+        bool stop = false;
+        bool changed = false;
+        bool dirChanged = false;
+        for (int i = 0; i < n; i++) {
+            if (evs[i].filter == EVFILT_USER) {
+                stop = true;
+            } else if (evs[i].filter == EVFILT_VNODE) {
+                changed = true;
+                if ((int)evs[i].ident == w->dirFd) {
+                    dirChanged = true;
+                }
+            }
+        }
+        if (stop) {
+            break;
+        }
+        if (dirChanged) {
+
+            DirWatchOpenFiles(w);
+        }
+        if (changed) {
+            DirWatchSignal(w->id);
+        }
+    }
+    DirWatchFree(w);
+}
+
+DirWatchPlat* DirWatchPlatOpen(DirWatchId id, const char* dir, bool create,
+                               DirWatchError* err) {
+    if (create && mkdir(dir, 0777) != 0 && errno != EEXIST) {
+        *err = DirWatchError::Failed;
+        return nullptr;
+    }
+    auto* w = (DirWatchPlat*)calloc(1, sizeof(DirWatchPlat));
+    if (!w) {
+        *err = DirWatchError::Failed;
+        return nullptr;
+    }
+    w->id = id;
+    w->kq = -1;
+    w->dirFd = -1;
+    size_t n = strlen(dir);
+    if (n >= sizeof(w->dir)) {
+        *err = DirWatchError::Failed;
+        DirWatchFree(w);
+        return nullptr;
+    }
+    memcpy(w->dir, dir, n + 1);
+    w->kq = kqueue();
+    if (w->kq < 0) {
+        *err = errno == EMFILE || errno == ENFILE ? DirWatchError::Limit
+                                                  : DirWatchError::Failed;
+        DirWatchFree(w);
+        return nullptr;
+    }
+    w->dirFd = open(dir, O_EVTONLY | O_DIRECTORY | O_CLOEXEC);
+    if (w->dirFd < 0) {
+        *err = errno == EMFILE || errno == ENFILE ? DirWatchError::Limit
+                                                  : DirWatchError::Failed;
+        DirWatchFree(w);
+        return nullptr;
+    }
+    struct kevent stop;
+    EV_SET(&stop, kDirWatchStop, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+    if (kevent(w->kq, &stop, 1, nullptr, 0, nullptr) != 0 ||
+        !DirWatchAddVnode(w->kq, w->dirFd, kDirWatchDirMask)) {
+        *err = DirWatchError::Failed;
+        DirWatchFree(w);
+        return nullptr;
+    }
+    DirWatchOpenFiles(w);
+    if (!PlatThreadRun(MkFunc0(DirWatchThread, w))) {
+        *err = DirWatchError::Failed;
+        DirWatchFree(w);
+        return nullptr;
+    }
+    return w;
+}
+
+void DirWatchPlatClose(DirWatchPlat* w) {
+    if (w) {
+
+        struct kevent ev;
+        EV_SET(&ev, kDirWatchStop, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+        kevent(w->kq, &ev, 1, nullptr, 0, nullptr);
     }
 }
 
@@ -220154,12 +226137,7 @@ static float GpuUsagePercentLocked() {
 
     uint64_t busy = used >= previous ? used - previous : 0;
     double percent = (double)busy / (double)elapsed * 100.0;
-    if (percent < 0) {
-        percent = 0;
-    }
-    if (percent > 100) {
-        percent = 100;
-    }
+    percent = ClampD(percent, 0, 100);
     return (float)percent;
 }
 
@@ -225385,6 +231363,1710 @@ bool StorageReplaceFile(Str temporary, Str path, Str* error) {
 #if GPUI_OS_LINUX
 #line 1 "src/wry/wry_linux.cpp"
 
+#if defined(GPUI_HAVE_WEBKITGTK) && GPUI_HAVE_WEBKITGTK
+
+#include <gtk/gtk.h>
+#include <gtk/gtkx.h>
+#include <gdk/gdkx.h>
+#include <webkit2/webkit2.h>
+#include <X11/Xlib.h>
+#include <math.h>
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
+namespace wry {
+
+using base::logf;
+using base::Str;
+using base::StrDup;
+using base::StrFree;
+
+static constexpr CookieSameSite kSameSiteNone = CookieSameSite();
+
+static const char* const kWebViewIdKey = "webview_id";
+static const char* const kIpcScript =
+    "Object.defineProperty(window, 'ipc', { value: Object.freeze({ "
+    "postMessage: function(x) { "
+    "window.webkit.messageHandlers['ipc'].postMessage(x) } }) })";
+
+template <typename F>
+static GCallback Cb(F f) {
+    return (GCallback)(void*)f;
+}
+
+static const char* CStrTemp(Str s) {
+    if (!s.s || len(s) <= 0) {
+        return "";
+    }
+    Str z = base::StrDupTemp(s);
+    return z.s ? z.s : "";
+}
+
+static const char* CStrOrNull(Str s) {
+    return s.s ? CStrTemp(s) : nullptr;
+}
+
+static Str FromCTemp(const char* s) {
+    return s ? base::StrDupTemp(Str(s)) : Str();
+}
+
+static bool gGtkTried = false;
+static bool gGtkOk = false;
+
+static bool EnsureGtk() {
+    if (gGtkTried) {
+        return gGtkOk;
+    }
+    gGtkTried = true;
+    gdk_set_allowed_backends("x11");
+
+    gtk_disable_setlocale();
+    if (!gtk_init_check(nullptr, nullptr)) {
+        logf("wry: GTK could not open the X display\n");
+        return false;
+    }
+    GdkDisplay* display = gdk_display_get_default();
+    if (!display || !GDK_IS_X11_DISPLAY(display)) {
+        logf("wry: GTK did not open an X11 display\n");
+        return false;
+    }
+
+    if (!g_main_context_acquire(g_main_context_default())) {
+        logf("wry: GLib's main context belongs to another thread\n");
+        return false;
+    }
+    gGtkOk = true;
+    return true;
+}
+
+static ::Display* XDisplayOf(GdkDisplay* display) {
+    return gdk_x11_display_get_xdisplay(GDK_X11_DISPLAY(display));
+}
+
+struct XTrap {
+    GdkDisplay* display;
+    explicit XTrap(GdkDisplay* d) : display(d) {
+        gdk_x11_display_error_trap_push(display);
+    }
+    ~XTrap() { gdk_x11_display_error_trap_pop_ignored(display); }
+};
+
+static Vec<PollFd> gPollFds;
+static int gPollCount = 0;
+static int gMaxPriority = 0;
+static bool gPrepared = false;
+
+static_assert(sizeof(PollFd) == sizeof(GPollFD), "GPollFD layout");
+
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    *fds = nullptr;
+    if (!gGtkOk) {
+        return 0;
+    }
+    GMainContext* context = g_main_context_default();
+    g_main_context_prepare(context, &gMaxPriority);
+    int timeout = -1;
+
+    int room = gPollFds.cap > 0 ? gPollFds.cap : 0;
+    for (;;) {
+        int n = g_main_context_query(context, gMaxPriority, &timeout,
+                                     (GPollFD*)gPollFds.els, room);
+        if (n <= room) {
+            gPollCount = n;
+            break;
+        }
+        if (!VecReserve(gPollFds, n)) {
+            gPollCount = 0;
+            break;
+        }
+        room = n;
+    }
+    for (int i = 0; i < gPollCount; i++) {
+        gPollFds.els[i].revents = 0;
+    }
+    gPrepared = true;
+    if (timeout >= 0 && (*timeoutMs < 0 || timeout < *timeoutMs)) {
+        *timeoutMs = timeout;
+    }
+    *fds = gPollFds.els;
+    return gPollCount;
+}
+
+void EventLoopDispatch() {
+    if (!gPrepared) {
+        return;
+    }
+    gPrepared = false;
+    GMainContext* context = g_main_context_default();
+    if (g_main_context_check(context, gMaxPriority, (GPollFD*)gPollFds.els,
+                             gPollCount)) {
+        g_main_context_dispatch(context);
+    }
+}
+
+static void PumpUntil(const bool* done) {
+    while (!*done) {
+        g_main_context_iteration(nullptr, TRUE);
+    }
+}
+
+struct WebView;
+
+struct RelatedWebView {
+    GtkWidget* window;
+    WebView* webview;
+};
+
+struct DownloadState;
+
+enum class DragState : uint8_t {
+    Left,
+    Entered,
+    Leaving,
+};
+
+struct WebView {
+    Str id;
+    WebKitWebView* webview = nullptr;
+    WebKitWebContext* context = nullptr;
+    WebKitUserContentManager* manager = nullptr;
+    GCancellable* cancellable = nullptr;
+
+    bool hasX11 = false;
+    bool isChild = false;
+    GdkDisplay* display = nullptr;
+    ::Display* xdisplay = nullptr;
+    ::Window x11Window = 0;
+    ::Window parentWindow = 0;
+    GtkWidget* gtkWindow = nullptr;
+    bool followsParent = false;
+
+    bool inspectorOpen = false;
+
+    Vec<Str> pendingScripts;
+    bool pendingOpen = true;
+
+    void* ctx = nullptr;
+    void (*ipcHandler)(void* ctx, Str url, Str body) = nullptr;
+    bool (*navigationHandler)(void* ctx, Str url) = nullptr;
+    void (*documentTitleChangedHandler)(void* ctx, Str title) = nullptr;
+    void (*onPageLoadHandler)(void* ctx, PageLoadEvent event,
+                              Str url) = nullptr;
+    NewWindowResponse (*newWindowReqHandler)(
+        void* ctx, Str url, const NewWindowFeatures* features,
+        WebView** createdWebView) = nullptr;
+    DownloadStartedHandler downloadStartedHandler = nullptr;
+    DownloadCompletedHandler downloadCompletedHandler = nullptr;
+    DragDropHandler dragDropHandler = nullptr;
+
+    DragState dragState = DragState::Left;
+    Vec<Str> dragPaths;
+    bool hasDragPaths = false;
+    int dragX = 0;
+    int dragY = 0;
+    guint dragLeaveIdle = 0;
+
+    uint8_t bfState = 0;
+
+    Vec<RelatedWebView> related;
+    Vec<DownloadState*> downloads;
+};
+
+static void FreeStrs(Vec<Str>* v) {
+    for (int i = 0; i < v->len; i++) {
+        StrFree(v->els[i]);
+    }
+    VecReset(*v);
+}
+
+static Str UriTemp(WebKitWebView* webview) {
+    return FromCTemp(webkit_web_view_get_uri(webview));
+}
+
+struct EvalCall {
+    void* ctx;
+    void (*callback)(void* ctx, Str result);
+};
+
+static void OnEvalDone(GObject* source, GAsyncResult* result, gpointer data) {
+    EvalCall* call = (EvalCall*)data;
+    GError* error = nullptr;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    JSCValue* value = webkit_web_view_evaluate_javascript_finish(
+        WEBKIT_WEB_VIEW(source), result, &error);
+#else
+    WebKitJavascriptResult* js = webkit_web_view_run_javascript_finish(
+        WEBKIT_WEB_VIEW(source), result, &error);
+    JSCValue* value = nullptr;
+    if (js) {
+        value =
+            (JSCValue*)g_object_ref(webkit_javascript_result_get_js_value(js));
+        webkit_javascript_result_unref(js);
+    }
+#endif
+    bool cancelled =
+        error && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+
+    char* json = value ? jsc_value_to_json(value, 0) : nullptr;
+    if (call && call->callback && !cancelled) {
+        call->callback(call->ctx, json ? Str(json) : Str());
+    }
+    g_free(json);
+    if (value) {
+        g_object_unref(value);
+    }
+    if (error) {
+        g_error_free(error);
+    }
+    delete call;
+}
+
+static void RunJavascript(WebView* wv, Str js, void* ctx,
+                          void (*callback)(void* ctx, Str result)) {
+    EvalCall* call = nullptr;
+    if (callback) {
+        call = new EvalCall{ctx, callback};
+    }
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    webkit_web_view_evaluate_javascript(wv->webview, CStrTemp(js), -1, nullptr,
+                                        nullptr, wv->cancellable,
+                                        call ? OnEvalDone : nullptr, call);
+#else
+    webkit_web_view_run_javascript(wv->webview, CStrTemp(js), wv->cancellable,
+                                   call ? OnEvalDone : nullptr, call);
+#endif
+}
+
+static void FlushPendingScripts(WebView* wv) {
+    if (!wv->pendingOpen) {
+        return;
+    }
+    wv->pendingOpen = false;
+    for (int i = 0; i < wv->pendingScripts.len; i++) {
+        RunJavascript(wv, wv->pendingScripts[i], nullptr, nullptr);
+    }
+    FreeStrs(&wv->pendingScripts);
+}
+
+static bool AddUserScript(WebView* wv, Str js, bool forMainFrameOnly) {
+    if (!wv->manager) {
+        logf("wry: the webview has no user content manager\n");
+        return false;
+    }
+    WebKitUserScript* script = webkit_user_script_new(
+        CStrTemp(js),
+        forMainFrameOnly ? WEBKIT_USER_CONTENT_INJECT_TOP_FRAME
+                         : WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(wv->manager, script);
+    webkit_user_script_unref(script);
+    return true;
+}
+
+static ::Window PlugXid(WebView* wv) {
+    if (!wv->gtkWindow) {
+        return 0;
+    }
+    GdkWindow* window = gtk_widget_get_window(wv->gtkWindow);
+    return window ? gdk_x11_window_get_xid(window) : 0;
+}
+
+static bool OwnsXFocus(WebView* wv) {
+    ::Window focus = 0;
+    int revert = 0;
+    XGetInputFocus(wv->xdisplay, &focus, &revert);
+    return focus != 0 && (focus == PlugXid(wv) || focus == wv->x11Window);
+}
+
+static void GiveXFocus(WebView* wv, Time time) {
+    if (!wv->hasX11) {
+        return;
+    }
+    ::Window plug = PlugXid(wv);
+    if (!plug) {
+        return;
+    }
+    XTrap trap(wv->display);
+    XSetInputFocus(wv->xdisplay, plug, RevertToParent, time);
+    XFlush(wv->xdisplay);
+}
+
+static void OnClose(WebKitWebView* webview, gpointer) {
+
+    gtk_widget_destroy(GTK_WIDGET(webview));
+}
+
+static void OnTitle(GObject*, GParamSpec*, gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (wv->documentTitleChangedHandler) {
+        wv->documentTitleChangedHandler(
+            wv->ctx, FromCTemp(webkit_web_view_get_title(wv->webview)));
+    }
+}
+
+static void OnLoadChanged(WebKitWebView* webview, WebKitLoadEvent event,
+                          gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (event == WEBKIT_LOAD_COMMITTED) {
+        if (wv->onPageLoadHandler) {
+            wv->onPageLoadHandler(wv->ctx, PageLoadEvent::Started,
+                                  UriTemp(webview));
+        }
+        FlushPendingScripts(wv);
+    } else if (event == WEBKIT_LOAD_FINISHED && wv->onPageLoadHandler) {
+        wv->onPageLoadHandler(wv->ctx, PageLoadEvent::Finished,
+                              UriTemp(webview));
+    }
+}
+
+static gboolean OnDecidePolicy(WebKitWebView*, WebKitPolicyDecision* decision,
+                               WebKitPolicyDecisionType type, gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION ||
+        !wv->navigationHandler) {
+        return FALSE;
+    }
+    WebKitNavigationAction* action =
+        webkit_navigation_policy_decision_get_navigation_action(
+            WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    WebKitURIRequest* request =
+        action ? webkit_navigation_action_get_request(action) : nullptr;
+    const char* uri = request ? webkit_uri_request_get_uri(request) : nullptr;
+    if (!uri) {
+        return FALSE;
+    }
+    if (wv->navigationHandler(wv->ctx, FromCTemp(uri))) {
+        webkit_policy_decision_use(decision);
+    } else {
+        webkit_policy_decision_ignore(decision);
+    }
+    return TRUE;
+}
+
+static void OnScriptMessage(WebKitUserContentManager*,
+                            WebKitJavascriptResult* result, gpointer data) {
+    WebView* wv = (WebView*)data;
+    JSCValue* value =
+        result ? webkit_javascript_result_get_js_value(result) : nullptr;
+    if (!value || !wv->ipcHandler) {
+        return;
+    }
+    char* body = jsc_value_to_string(value);
+    wv->ipcHandler(wv->ctx, UriTemp(wv->webview), body ? Str(body) : Str());
+    g_free(body);
+}
+
+static gboolean OnInspectorBringToFront(WebKitWebInspector*, gpointer data) {
+    ((WebView*)data)->inspectorOpen = true;
+    return FALSE;
+}
+
+static void OnInspectorClosed(WebKitWebInspector*, gpointer data) {
+    ((WebView*)data)->inspectorOpen = false;
+}
+
+static const uint8_t kBack = 1;
+static const uint8_t kForward = 2;
+
+static void DispatchSyntheticMouse(WebView* wv, GdkEventButton* event,
+                                   bool pressed) {
+    SyntheticMouseEvent ev;
+    ev.pressed = pressed;
+    ev.button = (int)event->button;
+    ev.x = (int)event->x;
+    ev.y = (int)event->y;
+    guint state = event->state;
+    ev.buttons = ((state & GDK_BUTTON1_MASK) ? 1 : 0) +
+                 ((state & GDK_BUTTON3_MASK) ? 2 : 0) +
+                 ((state & GDK_BUTTON2_MASK) ? 4 : 0) +
+                 ((wv->bfState & kBack) ? 8 : 0) +
+                 ((wv->bfState & kForward) ? 16 : 0);
+
+    guint clicks = 1;
+    if (!gdk_event_get_click_count((GdkEvent*)event, &clicks)) {
+        clicks = 1;
+    }
+    ev.detail = (int)clicks;
+    ev.ctrlKey = (state & GDK_CONTROL_MASK) != 0;
+    ev.altKey = (state & GDK_MOD1_MASK) != 0;
+    ev.shiftKey = (state & GDK_SHIFT_MASK) != 0;
+    ev.metaKey = (state & GDK_SUPER_MASK) != 0;
+    RunJavascript(wv, SyntheticMouseEventJsTemp(&ev), nullptr, nullptr);
+}
+
+static gboolean OnButtonPress(GtkWidget*, GdkEventButton* event,
+                              gpointer data) {
+    WebView* wv = (WebView*)data;
+
+    if (wv->hasX11) {
+        GiveXFocus(wv, event->time);
+        gtk_widget_grab_focus(GTK_WIDGET(wv->webview));
+    }
+    if (event->button == 8 || event->button == 9) {
+        wv->bfState |= event->button == 8 ? kBack : kForward;
+        DispatchSyntheticMouse(wv, event, true);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean OnButtonRelease(GtkWidget*, GdkEventButton* event,
+                                gpointer data) {
+    WebView* wv = (WebView*)data;
+    if (event->button == 8 || event->button == 9) {
+        wv->bfState &= (uint8_t)~(event->button == 8 ? kBack : kForward);
+        DispatchSyntheticMouse(wv, event, false);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void OnDragDataReceived(GtkWidget*, GdkDragContext*, gint, gint,
+                               GtkSelectionData* data, guint info, guint,
+                               gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (info != 2) {
+        return;
+    }
+    gchar** uris = gtk_selection_data_get_uris(data);
+    Vec<Str> paths;
+    for (int i = 0; uris && uris[i]; i++) {
+        VecAppend(paths, StrDup(PathFromFileUriTemp(Str(uris[i]))));
+    }
+    g_strfreev(uris);
+    wv->dragState = DragState::Entered;
+    DragDropEvent ev;
+    ev.kind = DragDropKind::Enter;
+    ev.paths = paths.els;
+    ev.pathCount = paths.len;
+    ev.x = wv->dragX;
+    ev.y = wv->dragY;
+    wv->dragDropHandler(wv->ctx, &ev);
+    FreeStrs(&wv->dragPaths);
+    wv->dragPaths = paths;
+    wv->hasDragPaths = true;
+}
+
+static gboolean OnDragMotion(GtkWidget*, GdkDragContext*, gint x, gint y, guint,
+                             gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (wv->dragState == DragState::Entered) {
+        DragDropEvent ev;
+        ev.kind = DragDropKind::Over;
+        ev.x = x;
+        ev.y = y;
+        wv->dragDropHandler(wv->ctx, &ev);
+    } else {
+        wv->dragX = x;
+        wv->dragY = y;
+    }
+    return FALSE;
+}
+
+static gboolean OnDragDrop(GtkWidget*, GdkDragContext* context, gint x, gint y,
+                           guint time, gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (wv->dragState != DragState::Leaving || !wv->hasDragPaths) {
+        return FALSE;
+    }
+    Vec<Str> paths = wv->dragPaths;
+    wv->dragPaths = Vec<Str>();
+    wv->hasDragPaths = false;
+    gdk_drop_finish(context, TRUE, time);
+    wv->dragState = DragState::Left;
+    DragDropEvent ev;
+    ev.kind = DragDropKind::Drop;
+    ev.paths = paths.els;
+    ev.pathCount = paths.len;
+    ev.x = x;
+    ev.y = y;
+    bool handled = wv->dragDropHandler(wv->ctx, &ev);
+    FreeStrs(&paths);
+    return handled ? TRUE : FALSE;
+}
+
+static gboolean OnDragLeaveIdle(gpointer user) {
+    WebView* wv = (WebView*)user;
+    wv->dragLeaveIdle = 0;
+    if (wv->dragState == DragState::Leaving) {
+        wv->dragState = DragState::Left;
+        DragDropEvent ev;
+        ev.kind = DragDropKind::Leave;
+        wv->dragDropHandler(wv->ctx, &ev);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void OnDragLeave(GtkWidget*, GdkDragContext*, guint, gpointer user) {
+    WebView* wv = (WebView*)user;
+    if (wv->dragState == DragState::Left) {
+        return;
+    }
+
+    wv->dragState = DragState::Leaving;
+    if (!wv->dragLeaveIdle) {
+        wv->dragLeaveIdle = g_idle_add(OnDragLeaveIdle, wv);
+    }
+}
+
+struct DownloadState {
+    WebView* wv;
+    WebKitDownload* download;
+    bool failed;
+};
+
+static void ForgetDownload(DownloadState* state) {
+    WebView* wv = state->wv;
+    for (int i = 0; i < wv->downloads.len; i++) {
+        if (wv->downloads[i] == state) {
+            wv->downloads.els[i] = wv->downloads.els[wv->downloads.len - 1];
+            wv->downloads.len--;
+            break;
+        }
+    }
+    g_signal_handlers_disconnect_by_data(state->download, state);
+    g_object_unref(state->download);
+    delete state;
+}
+
+static Str DownloadUriTemp(WebKitDownload* download) {
+    WebKitURIRequest* request = webkit_download_get_request(download);
+    return request ? FromCTemp(webkit_uri_request_get_uri(request)) : Str();
+}
+
+static gboolean OnDecideDestination(WebKitDownload* download, gchar* suggested,
+                                    gpointer data) {
+    DownloadState* state = (DownloadState*)data;
+    WebView* wv = state->wv;
+    Str uri = DownloadUriTemp(download);
+    if (!uri.s || !wv->downloadStartedHandler) {
+        return TRUE;
+    }
+
+    const char* dir = g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD);
+    char* cwd = nullptr;
+    if (!dir) {
+        cwd = g_get_current_dir();
+        dir = cwd;
+    }
+    Str stem;
+    Str ext;
+    DownloadFileNameParts(uri, suggested ? Str(suggested) : Str(), &stem, &ext);
+    char* path = g_build_filename(
+        dir, CStrTemp(base::FormatTemp("%s%s", stem, ext)), nullptr);
+
+    for (int counter = 1; g_file_test(path, G_FILE_TEST_EXISTS); counter++) {
+        g_free(path);
+        path = g_build_filename(
+            dir, CStrTemp(base::FormatTemp("%s (%d)%s", stem, counter, ext)),
+            nullptr);
+    }
+    g_free(cwd);
+    Str dest = FromCTemp(path);
+    g_free(path);
+    if (wv->downloadStartedHandler(wv->ctx, uri, &dest)) {
+        webkit_download_set_destination(download, CStrTemp(dest));
+    } else {
+        webkit_download_cancel(download);
+    }
+    return TRUE;
+}
+
+static void OnDownloadFailed(WebKitDownload*, GError*, gpointer data) {
+    ((DownloadState*)data)->failed = true;
+}
+
+static void OnDownloadFinished(WebKitDownload* download, gpointer data) {
+    DownloadState* state = (DownloadState*)data;
+    WebView* wv = state->wv;
+    Str uri = DownloadUriTemp(download);
+    if (wv->downloadCompletedHandler && uri.s) {
+        Str path = state->failed
+                       ? Str()
+                       : FromCTemp(webkit_download_get_destination(download));
+        wv->downloadCompletedHandler(wv->ctx, uri, path.s ? &path : nullptr,
+                                     !state->failed);
+    }
+    ForgetDownload(state);
+}
+
+static void OnDownloadStarted(WebKitWebContext*, WebKitDownload* download,
+                              gpointer data) {
+    WebView* wv = (WebView*)data;
+    DownloadState* state = new DownloadState{wv, download, false};
+    g_object_ref(download);
+    VecAppend(wv->downloads, state);
+    g_signal_connect(download, "decide-destination", Cb(OnDecideDestination),
+                     state);
+    g_signal_connect(download, "failed", Cb(OnDownloadFailed), state);
+    g_signal_connect(download, "finished", Cb(OnDownloadFinished), state);
+}
+
+struct ProtocolHandler {
+    Str name;
+    Str webviewId;
+    void* ctx;
+    void (*handler)(void* ctx, Str id, const Request* request,
+                    RequestResponder* responder);
+};
+
+static void FreeProtocolHandler(gpointer data) {
+    ProtocolHandler* p = (ProtocolHandler*)data;
+    StrFree(p->name);
+    StrFree(p->webviewId);
+    delete p;
+}
+
+struct RequestResponder {
+    WebKitURISchemeRequest* request;
+};
+
+static void CollectHeader(const char* name, const char* value, gpointer data) {
+    Header h;
+    h.name = FromCTemp(name);
+    h.value = FromCTemp(value);
+    VecAppend(*(Vec<Header>*)data, h);
+}
+
+static void OnUriScheme(WebKitURISchemeRequest* request, gpointer data) {
+    ProtocolHandler* p = (ProtocolHandler*)data;
+    const char* uri = webkit_uri_scheme_request_get_uri(request);
+    if (!uri) {
+        GError* error = g_error_new_literal(G_FILE_ERROR, G_FILE_ERROR_EXIST,
+                                            "Could not get uri.");
+        webkit_uri_scheme_request_finish_error(request, error);
+        g_error_free(error);
+        return;
+    }
+    Vec<Header> headers;
+    SoupMessageHeaders* h = webkit_uri_scheme_request_get_http_headers(request);
+    if (h) {
+        soup_message_headers_foreach(h, CollectHeader, &headers);
+    }
+    const char* method = webkit_uri_scheme_request_get_http_method(request);
+    Request req;
+    req.uri = FromCTemp(uri);
+    req.method = method ? FromCTemp(method) : StrL("GET");
+    req.headers = headers.els;
+    req.headerCount = headers.len;
+
+    Str id;
+    WebKitWebView* webview = webkit_uri_scheme_request_get_web_view(request);
+    if (webview) {
+        id = FromCTemp(
+            (const char*)g_object_get_data(G_OBJECT(webview), kWebViewIdKey));
+    }
+    RequestResponder* responder = new RequestResponder{request};
+    g_object_ref(request);
+    p->handler(p->ctx, id, &req, responder);
+    VecReset(headers);
+}
+
+struct PendingResponse {
+    WebKitURISchemeRequest* request;
+    int status;
+    Vec<Header> headers;
+    GBytes* body;
+};
+
+static gboolean FinishResponse(gpointer data) {
+    PendingResponse* r = (PendingResponse*)data;
+    GInputStream* input = g_memory_input_stream_new_from_bytes(r->body);
+    WebKitURISchemeResponse* response = webkit_uri_scheme_response_new(
+        input, (gint64)g_bytes_get_size(r->body));
+    webkit_uri_scheme_response_set_status(response, (guint)r->status, nullptr);
+    SoupMessageHeaders* headers =
+        soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
+    for (int i = 0; i < r->headers.len; i++) {
+        const char* name = CStrTemp(r->headers[i].name);
+        const char* value = CStrTemp(r->headers[i].value);
+        if (g_ascii_strcasecmp(name, "content-type") == 0) {
+            webkit_uri_scheme_response_set_content_type(response, value);
+        }
+        soup_message_headers_append(headers, name, value);
+    }
+    webkit_uri_scheme_response_set_http_headers(response, headers);
+    webkit_uri_scheme_request_finish_with_response(r->request, response);
+    g_object_unref(response);
+    g_object_unref(input);
+    g_object_unref(r->request);
+    g_bytes_unref(r->body);
+    for (int i = 0; i < r->headers.len; i++) {
+        StrFree(r->headers[i].name);
+        StrFree(r->headers[i].value);
+    }
+    VecReset(r->headers);
+    delete r;
+    return G_SOURCE_REMOVE;
+}
+
+void Respond(RequestResponder* responder, const Response* response) {
+    if (!responder) {
+        return;
+    }
+
+    PendingResponse* r = new PendingResponse();
+    r->request = responder->request;
+    r->status = response ? response->status : 500;
+    if (response) {
+        for (int i = 0; i < response->headerCount; i++) {
+            Header h;
+            h.name = StrDup(response->headers[i].name);
+            h.value = StrDup(response->headers[i].value);
+            VecAppend(r->headers, h);
+        }
+    }
+    r->body = g_bytes_new(response ? response->body : nullptr,
+                          response && response->body ? response->bodyLen : 0);
+    delete responder;
+    g_main_context_invoke(nullptr, FinishResponse, r);
+}
+
+static WebKitWebContext* NewWebContext(const WebViewAttributes* attrs) {
+    WebKitWebContext* context = nullptr;
+    if (attrs->incognito) {
+        context = webkit_web_context_new_ephemeral();
+    } else if (len(attrs->dataDirectory) > 0) {
+        const char* dir = CStrTemp(attrs->dataDirectory);
+        WebKitWebsiteDataManager* manager = webkit_website_data_manager_new(
+            "base-data-directory", dir, nullptr);
+        WebKitCookieManager* cookies =
+            webkit_website_data_manager_get_cookie_manager(manager);
+        if (cookies) {
+            char* path = g_build_filename(dir, "cookies", nullptr);
+            webkit_cookie_manager_set_persistent_storage(
+                cookies, path, WEBKIT_COOKIE_PERSISTENT_STORAGE_TEXT);
+            g_free(path);
+        }
+        context = webkit_web_context_new_with_website_data_manager(manager);
+        g_object_unref(manager);
+    } else {
+        context = webkit_web_context_new();
+    }
+
+    webkit_web_context_set_automation_allowed(context, FALSE);
+    return context;
+}
+
+static void RegisterProtocols(WebView* wv, const WebViewAttributes* attrs) {
+    WebKitSecurityManager* security =
+        webkit_web_context_get_security_manager(wv->context);
+    for (int i = 0; i < attrs->customProtocolCount; i++) {
+        const CustomProtocol& cp = attrs->customProtocols[i];
+        bool duplicate = false;
+        for (int j = 0; j < i; j++) {
+            if (base::StrEq(attrs->customProtocols[j].name, cp.name)) {
+                duplicate = true;
+            }
+        }
+        if (duplicate || !cp.handler) {
+
+            logf("wry: custom protocol '%s' skipped\n", cp.name);
+            continue;
+        }
+        const char* scheme = CStrTemp(cp.name);
+        if (security) {
+            webkit_security_manager_register_uri_scheme_as_secure(security,
+                                                                  scheme);
+        }
+        ProtocolHandler* p = new ProtocolHandler();
+        p->name = StrDup(cp.name);
+        p->webviewId = StrDup(wv->id);
+        p->ctx = cp.ctx;
+        p->handler = cp.handler;
+        webkit_web_context_register_uri_scheme(wv->context, scheme, OnUriScheme,
+                                               p, FreeProtocolHandler);
+    }
+}
+
+static void SetWebviewSettings(WebView* wv, const WebViewAttributes* attrs) {
+
+    WebKitInputMethodContext* im =
+        webkit_web_view_get_input_method_context(wv->webview);
+    if (im) {
+        webkit_input_method_context_set_enable_preedit(im, FALSE);
+    }
+    webkit_web_context_set_use_system_appearance_for_scrollbars(wv->context,
+                                                                FALSE);
+    WebKitSettings* settings = webkit_web_view_get_settings(wv->webview);
+    if (!settings) {
+        return;
+    }
+    webkit_settings_set_enable_webgl(settings, TRUE);
+    webkit_settings_set_enable_webaudio(settings, TRUE);
+    webkit_settings_set_enable_back_forward_navigation_gestures(
+        settings, attrs->backForwardNavigationGestures);
+    if (attrs->clipboard) {
+        webkit_settings_set_javascript_can_access_clipboard(settings, TRUE);
+    }
+    webkit_settings_set_enable_page_cache(settings, TRUE);
+    webkit_settings_set_user_agent(settings, CStrOrNull(attrs->userAgent));
+    if (attrs->devtools) {
+        webkit_settings_set_enable_developer_extras(settings, TRUE);
+    }
+    if (attrs->javascriptDisabled) {
+        webkit_settings_set_enable_javascript(settings, FALSE);
+    }
+}
+
+static WebView* NewGtk(GtkWidget* container, const WebViewAttributes* attrs,
+                       WebKitWebView* relatedView);
+
+static void FreeRelated(WebView* wv, int index, bool destroyWindow);
+
+static void OnRelatedWindowDestroy(GtkWidget* window, gpointer data) {
+    WebView* wv = (WebView*)data;
+    for (int i = 0; i < wv->related.len; i++) {
+        if (wv->related[i].window == window) {
+            FreeRelated(wv, i, false);
+            return;
+        }
+    }
+}
+
+static GtkWidget* OnCreate(WebKitWebView* webview,
+                           WebKitNavigationAction* action, gpointer data) {
+    WebView* wv = (WebView*)data;
+    WebKitURIRequest* request = webkit_navigation_action_get_request(action);
+    const char* uri = request ? webkit_uri_request_get_uri(request) : nullptr;
+    if (!uri || !wv->newWindowReqHandler) {
+        return nullptr;
+    }
+    NewWindowFeatures features;
+    features.opener = wv;
+    WebView* created = nullptr;
+    NewWindowResponse response =
+        wv->newWindowReqHandler(wv->ctx, FromCTemp(uri), &features, &created);
+    if (response == NewWindowResponse::Create) {
+        return created && created->webview ? GTK_WIDGET(created->webview)
+                                           : nullptr;
+    }
+    if (response != NewWindowResponse::Allow) {
+        return nullptr;
+    }
+
+    GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), uri);
+    GtkWidget* box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(window), box);
+    gtk_widget_show_all(window);
+    WebViewAttributes defaults;
+    WebView* related = NewGtk(box, &defaults, webview);
+    if (!related) {
+        gtk_widget_destroy(window);
+        return nullptr;
+    }
+    VecAppend(wv->related, RelatedWebView{window, related});
+    g_signal_connect(window, "destroy", Cb(OnRelatedWindowDestroy), wv);
+    return GTK_WIDGET(related->webview);
+}
+
+static WebView* NewGtk(GtkWidget* container, const WebViewAttributes* attrs,
+                       WebKitWebView* relatedView) {
+    WebView* wv = new WebView();
+    wv->ctx = attrs->ctx;
+    wv->ipcHandler = attrs->ipcHandler;
+    wv->navigationHandler = attrs->navigationHandler;
+    wv->documentTitleChangedHandler = attrs->documentTitleChangedHandler;
+    wv->onPageLoadHandler = attrs->onPageLoadHandler;
+    wv->newWindowReqHandler = attrs->newWindowReqHandler;
+    wv->downloadStartedHandler = attrs->downloadStartedHandler;
+    wv->downloadCompletedHandler = attrs->downloadCompletedHandler;
+    wv->dragDropHandler = attrs->dragDropHandler;
+    wv->cancellable = g_cancellable_new();
+
+    wv->context = relatedView ? webkit_web_view_get_context(relatedView)
+                              : NewWebContext(attrs);
+    if (relatedView) {
+        g_object_ref(wv->context);
+    }
+    Str proxy = ProxyUriTemp(&attrs->proxyConfig);
+    if (proxy.s) {
+        WebKitWebsiteDataManager* manager =
+            webkit_web_context_get_website_data_manager(wv->context);
+        if (manager) {
+            WebKitNetworkProxySettings* settings =
+                webkit_network_proxy_settings_new(CStrTemp(proxy), nullptr);
+            webkit_website_data_manager_set_network_proxy_settings(
+                manager, WEBKIT_NETWORK_PROXY_MODE_CUSTOM, settings);
+            webkit_network_proxy_settings_free(settings);
+        }
+    }
+
+    if (len(attrs->extensionPath) > 0) {
+        webkit_web_context_set_web_extensions_directory(
+            wv->context, CStrTemp(attrs->extensionPath));
+    }
+
+    wv->manager = webkit_user_content_manager_new();
+    WebKitWebsitePolicies* policies = nullptr;
+    if (attrs->autoplay) {
+        policies = webkit_website_policies_new_with_policies(
+            "autoplay", WEBKIT_AUTOPLAY_ALLOW, nullptr);
+    }
+    GObject* object =
+        relatedView
+            ? (GObject*)g_object_new(
+                  WEBKIT_TYPE_WEB_VIEW, "user-content-manager", wv->manager,
+                  "is-controlled-by-automation", FALSE, "website-policies",
+                  policies, "related-view", relatedView, nullptr)
+            : (GObject*)g_object_new(
+                  WEBKIT_TYPE_WEB_VIEW, "user-content-manager", wv->manager,
+                  "is-controlled-by-automation", FALSE, "website-policies",
+                  policies, "web-context", wv->context, nullptr);
+    if (policies) {
+        g_object_unref(policies);
+    }
+    wv->webview = WEBKIT_WEB_VIEW(object);
+    g_object_ref_sink(wv->webview);
+
+    if (attrs->transparent) {
+        GdkRGBA clear = {0, 0, 0, 0};
+        webkit_web_view_set_background_color(wv->webview, &clear);
+    } else if (attrs->hasBackgroundColor) {
+
+        GdkRGBA c = {
+            attrs->backgroundColor.r / 255.0, attrs->backgroundColor.g / 255.0,
+            attrs->backgroundColor.b / 255.0, attrs->backgroundColor.a / 255.0};
+        webkit_web_view_set_background_color(wv->webview, &c);
+    }
+
+    SetWebviewSettings(wv, attrs);
+
+    GObject* view = G_OBJECT(wv->webview);
+    g_signal_connect(view, "close", Cb(OnClose), wv);
+    gtk_widget_add_events(GTK_WIDGET(wv->webview),
+                          GDK_BUTTON1_MOTION_MASK | GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(view, "button-press-event", Cb(OnButtonPress), wv);
+    g_signal_connect(view, "button-release-event", Cb(OnButtonRelease), wv);
+    if (wv->documentTitleChangedHandler) {
+        g_signal_connect(view, "notify::title", Cb(OnTitle), wv);
+    }
+    g_signal_connect(view, "load-changed", Cb(OnLoadChanged), wv);
+    if (wv->newWindowReqHandler) {
+        g_signal_connect(view, "create", Cb(OnCreate), wv);
+    }
+    if (wv->navigationHandler) {
+        g_signal_connect(view, "decide-policy", Cb(OnDecidePolicy), wv);
+    }
+    if (wv->downloadStartedHandler || wv->downloadCompletedHandler) {
+        g_signal_connect(wv->context, "download-started", Cb(OnDownloadStarted),
+                         wv);
+    }
+
+    g_signal_connect(wv->manager, "script-message-received::ipc",
+                     Cb(OnScriptMessage), wv);
+    webkit_user_content_manager_register_script_message_handler(wv->manager,
+                                                                "ipc");
+
+    if (wv->dragDropHandler) {
+        g_signal_connect(view, "drag-data-received", Cb(OnDragDataReceived),
+                         wv);
+        g_signal_connect(view, "drag-motion", Cb(OnDragMotion), wv);
+        g_signal_connect(view, "drag-drop", Cb(OnDragDrop), wv);
+        g_signal_connect(view, "drag-leave", Cb(OnDragLeave), wv);
+    }
+
+    gtk_box_pack_start(GTK_BOX(container), GTK_WIDGET(wv->webview), TRUE, TRUE,
+                       0);
+
+    WebKitWebInspector* inspector = webkit_web_view_get_inspector(wv->webview);
+    if (inspector) {
+        g_signal_connect(inspector, "bring-to-front",
+                         Cb(OnInspectorBringToFront), wv);
+        g_signal_connect(inspector, "closed", Cb(OnInspectorClosed), wv);
+    }
+
+    wv->id =
+        len(attrs->id) > 0
+            ? StrDup(attrs->id)
+            : StrDup(base::FormatTemp("%d", (long long)(intptr_t)wv->webview));
+    g_object_set_data_full(G_OBJECT(wv->webview), kWebViewIdKey,
+                           g_strdup(CStrTemp(wv->id)), g_free);
+
+    AddUserScript(wv, Str(kIpcScript), true);
+    for (int i = 0; i < attrs->initializationScriptCount; i++) {
+        AddUserScript(wv, attrs->initializationScripts[i].script,
+                      attrs->initializationScripts[i].forMainFrameOnly);
+    }
+
+    if (!relatedView) {
+        RegisterProtocols(wv, attrs);
+    }
+
+    if (attrs->url.s) {
+        if (attrs->headerCount > 0) {
+            WebViewLoadUrlWithHeaders(wv, attrs->url, attrs->headers,
+                                      attrs->headerCount);
+        } else {
+            webkit_web_view_load_uri(wv->webview, CStrTemp(attrs->url));
+        }
+    } else if (attrs->html.s) {
+        webkit_web_view_load_html(wv->webview, CStrTemp(attrs->html), nullptr);
+    }
+
+    if (attrs->visible) {
+        gtk_widget_show_all(GTK_WIDGET(wv->webview));
+    }
+    if (attrs->focused) {
+        gtk_widget_grab_focus(GTK_WIDGET(wv->webview));
+    }
+    return wv;
+}
+
+static int ToPhysical(double v, bool logical, double scale) {
+    return (int)lround(logical ? v * scale : v);
+}
+
+static int ToLogical(double v, bool logical, double scale) {
+    return (int)lround(logical ? v : v / scale);
+}
+
+static ::Window CreateContainer(::Display* xdpy, ::Window parent,
+                                const WebViewAttributes* attrs, bool asChild) {
+    int x = 0;
+    int y = 0;
+    int w = 1;
+    int h = 1;
+    if (asChild) {
+        XWindowAttributes pa = {};
+        XGetWindowAttributes(xdpy, parent, &pa);
+        double scale = pa.screen ? ScaleFactorFromScreen(pa.screen->width,
+                                                         pa.screen->mwidth)
+                                 : 1.0;
+        if (attrs->hasBounds) {
+            const Rect& b = attrs->bounds;
+            x = ToPhysical(b.position.x, b.position.logical, scale);
+            y = ToPhysical(b.position.y, b.position.logical, scale);
+            w = ToPhysical(b.size.width, b.size.logical, scale);
+            h = ToPhysical(b.size.height, b.size.logical, scale);
+        }
+    } else {
+
+        XWindowAttributes pa = {};
+        XGetWindowAttributes(xdpy, parent, &pa);
+        w = pa.width;
+        h = pa.height;
+    }
+
+    w = std::max(w, 1);
+    h = std::max(h, 1);
+    ::Window window = XCreateSimpleWindow(xdpy, parent, x, y, (unsigned)w,
+                                          (unsigned)h, 0, 0, 0);
+    if (attrs->visible) {
+        XMapWindow(xdpy, window);
+    }
+    return window;
+}
+
+static void PlaceMappedPlug(WebView* wv) {
+    ::Window plug = PlugXid(wv);
+    if (!plug) {
+        return;
+    }
+    XWindowAttributes ca = {};
+    XTrap trap(wv->display);
+    if (!XGetWindowAttributes(wv->xdisplay, wv->x11Window, &ca)) {
+        return;
+    }
+    XMoveResizeWindow(wv->xdisplay, plug, 0, 0, (unsigned)std::max(ca.width, 1),
+                      (unsigned)std::max(ca.height, 1));
+    XMapWindow(wv->xdisplay, plug);
+    XFlush(wv->xdisplay);
+}
+
+static void ResizeContainer(WebView* wv, int x, int y, int w, int h) {
+    w = std::max(w, 1);
+    h = std::max(h, 1);
+    {
+        XTrap trap(wv->display);
+        XMoveResizeWindow(wv->xdisplay, wv->x11Window, x, y, (unsigned)w,
+                          (unsigned)h);
+        ::Window plug = PlugXid(wv);
+        if (plug) {
+            XMoveResizeWindow(wv->xdisplay, plug, 0, 0, (unsigned)w,
+                              (unsigned)h);
+        }
+        XFlush(wv->xdisplay);
+    }
+
+    gtk_window_resize(GTK_WINDOW(wv->gtkWindow), w, h);
+    GtkAllocation a = {0, 0, w, h};
+    gtk_widget_size_allocate(wv->gtkWindow, &a);
+}
+
+static GdkFilterReturn ParentFilter(GdkXEvent* xevent, GdkEvent*,
+                                    gpointer data) {
+    WebView* wv = (WebView*)data;
+    XEvent* ev = (XEvent*)xevent;
+    if (ev->type == ConfigureNotify && ev->xconfigure
+                                               .window == wv->parentWindow) {
+        ResizeContainer(wv, 0, 0, ev->xconfigure.width, ev->xconfigure.height);
+    }
+    return GDK_FILTER_CONTINUE;
+}
+
+WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
+                    bool asChild) {
+    if (!attrs) {
+        return nullptr;
+    }
+    ::Window parent = (::Window)(uintptr_t)parentWindow;
+    if (!parent) {
+
+        logf("wry: a webview needs an X11 window to go in\n");
+        return nullptr;
+    }
+    if (!EnsureGtk()) {
+        return nullptr;
+    }
+    GdkDisplay* display = gdk_display_get_default();
+    ::Display* xdpy = XDisplayOf(display);
+
+    ::Window container = CreateContainer(xdpy, parent, attrs, asChild);
+    if (!container) {
+        logf("wry: could not make the webview's X11 window\n");
+        return nullptr;
+    }
+
+    GtkWidget* plug = gtk_plug_new_for_display(display, container);
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_add(GTK_CONTAINER(plug), vbox);
+
+    WebView* wv = NewGtk(vbox, attrs, nullptr);
+
+    gtk_widget_show_all(plug);
+    wv->display = display;
+    wv->xdisplay = xdpy;
+    wv->x11Window = container;
+    wv->parentWindow = parent;
+    wv->gtkWindow = plug;
+    wv->isChild = asChild;
+    PlaceMappedPlug(wv);
+    if (!attrs->visible) {
+        WebViewSetVisible(wv, false);
+    }
+    wv->hasX11 = true;
+    if (!asChild) {
+        XTrap trap(display);
+        XSelectInput(xdpy, parent, StructureNotifyMask);
+        gdk_window_add_filter(nullptr, ParentFilter, wv);
+        wv->followsParent = true;
+    }
+    return wv;
+}
+
+static void FreeInner(WebView* wv) {
+    if (!wv) {
+        return;
+    }
+    g_cancellable_cancel(wv->cancellable);
+    if (wv->followsParent) {
+        gdk_window_remove_filter(nullptr, ParentFilter, wv);
+    }
+    while (wv->related.len > 0) {
+        FreeRelated(wv, wv->related.len - 1, true);
+    }
+    while (wv->downloads.len > 0) {
+        ForgetDownload(wv->downloads[wv->downloads.len - 1]);
+    }
+    if (wv->dragLeaveIdle) {
+        g_source_remove(wv->dragLeaveIdle);
+        wv->dragLeaveIdle = 0;
+    }
+
+    g_signal_handlers_disconnect_by_data(wv->webview, wv);
+    g_signal_handlers_disconnect_by_data(wv->manager, wv);
+    g_signal_handlers_disconnect_by_data(wv->context, wv);
+    WebKitWebInspector* inspector = webkit_web_view_get_inspector(wv->webview);
+    if (inspector) {
+        g_signal_handlers_disconnect_by_data(inspector, wv);
+    }
+
+    gtk_widget_destroy(GTK_WIDGET(wv->webview));
+    if (wv->hasX11) {
+        gtk_widget_destroy(wv->gtkWindow);
+        XTrap trap(wv->display);
+        XDestroyWindow(wv->xdisplay, wv->x11Window);
+        XFlush(wv->xdisplay);
+    }
+    g_object_unref(wv->webview);
+    g_object_unref(wv->manager);
+    g_object_unref(wv->context);
+    g_object_unref(wv->cancellable);
+    FreeStrs(&wv->pendingScripts);
+    FreeStrs(&wv->dragPaths);
+    VecReset(wv->related);
+    VecReset(wv->downloads);
+    StrFree(wv->id);
+    delete wv;
+}
+
+static void FreeRelated(WebView* wv, int index, bool destroyWindow) {
+    RelatedWebView r = wv->related[index];
+    wv->related.els[index] = wv->related.els[wv->related.len - 1];
+    wv->related.len--;
+    g_signal_handlers_disconnect_by_data(r.window, wv);
+    FreeInner(r.webview);
+    if (destroyWindow) {
+        gtk_widget_destroy(r.window);
+    }
+}
+
+void WebViewFree(WebView* wv) {
+    FreeInner(wv);
+}
+
+Str WebViewId(WebView* wv) {
+    return wv ? wv->id : Str();
+}
+
+bool WebViewEval(WebView* wv, Str js) {
+    return WebViewEvalWithCallback(wv, js, nullptr, nullptr);
+}
+
+bool WebViewEvalWithCallback(WebView* wv, Str js, void* ctx,
+                             void (*callback)(void* ctx, Str result)) {
+    if (!wv) {
+        return false;
+    }
+    if (wv->pendingOpen) {
+
+        VecAppend(wv->pendingScripts, StrDup(js));
+        return true;
+    }
+    RunJavascript(wv, js, ctx, callback);
+    return true;
+}
+
+Str WebViewUrlTemp(WebView* wv) {
+    return wv ? UriTemp(wv->webview) : Str();
+}
+
+bool WebViewLoadUrl(WebView* wv, Str url) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_load_uri(wv->webview, CStrTemp(url));
+    return true;
+}
+
+bool WebViewLoadUrlWithHeaders(WebView* wv, Str url, const Header* headers,
+                               int headerCount) {
+    if (!wv) {
+        return false;
+    }
+    WebKitURIRequest* request = webkit_uri_request_new(CStrTemp(url));
+    SoupMessageHeaders* h = webkit_uri_request_get_http_headers(request);
+    if (h) {
+        for (int i = 0; i < headerCount; i++) {
+            soup_message_headers_append(h, CStrTemp(headers[i].name),
+                                        CStrTemp(headers[i].value));
+        }
+    }
+    webkit_web_view_load_request(wv->webview, request);
+    g_object_unref(request);
+    return true;
+}
+
+bool WebViewLoadHtml(WebView* wv, Str html) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_load_html(wv->webview, CStrTemp(html), nullptr);
+    return true;
+}
+
+bool WebViewReload(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_reload(wv->webview);
+    return true;
+}
+
+bool WebViewBounds(WebView* wv, Rect* out) {
+    if (!wv || !out) {
+        return false;
+    }
+    *out = Rect{};
+    if (wv->hasX11) {
+        XWindowAttributes a = {};
+        XTrap trap(wv->display);
+        if (XGetWindowAttributes(wv->xdisplay, wv->x11Window, &a)) {
+            out->position = LogicalPosition(a.x, a.y);
+            out->size = LogicalSize(a.width, a.height);
+        }
+        return true;
+    }
+    GtkAllocation a = {};
+    gtk_widget_get_allocation(GTK_WIDGET(wv->webview), &a);
+    out->size = LogicalSize(a.width, a.height);
+    return true;
+}
+
+bool WebViewSetBounds(WebView* wv, Rect bounds) {
+    if (!wv) {
+        return false;
+    }
+    double scale = gtk_widget_get_scale_factor(GTK_WIDGET(wv->webview));
+    int w = ToLogical(bounds.size.width, bounds.size.logical, scale);
+    int h = ToLogical(bounds.size.height, bounds.size.logical, scale);
+    int x = ToLogical(bounds.position.x, bounds.position.logical, scale);
+    int y = ToLogical(bounds.position.y, bounds.position.logical, scale);
+    if (wv->hasX11 && !wv->followsParent) {
+
+        int s = (int)scale;
+        ResizeContainer(wv, x * s, y * s, w * s, h * s);
+    }
+    return true;
+}
+
+bool WebViewSetVisible(WebView* wv, bool visible) {
+    if (!wv) {
+        return false;
+    }
+
+    if (wv->hasX11 && wv->isChild) {
+        XTrap trap(wv->display);
+        if (visible) {
+            XMapWindow(wv->xdisplay, wv->x11Window);
+        } else {
+            XUnmapWindow(wv->xdisplay, wv->x11Window);
+        }
+    }
+    if (visible) {
+        gtk_widget_show_all(GTK_WIDGET(wv->webview));
+    } else {
+        gtk_widget_hide(GTK_WIDGET(wv->webview));
+    }
+    if (wv->hasX11 && wv->isChild) {
+        if (visible) {
+            gtk_widget_show_all(wv->gtkWindow);
+            PlaceMappedPlug(wv);
+        } else {
+            gtk_widget_hide(wv->gtkWindow);
+        }
+    }
+    return true;
+}
+
+bool WebViewFocus(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+
+    if (wv->hasX11) {
+        ::Window focus = 0;
+        int revert = 0;
+        XGetInputFocus(wv->xdisplay, &focus, &revert);
+        if (focus == wv->parentWindow || OwnsXFocus(wv)) {
+            GiveXFocus(wv, CurrentTime);
+        }
+    }
+    gtk_widget_grab_focus(GTK_WIDGET(wv->webview));
+    return true;
+}
+
+bool WebViewFocusParent(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+
+    if (wv->hasX11 && OwnsXFocus(wv)) {
+        XTrap trap(wv->display);
+        XSetInputFocus(wv->xdisplay, wv->parentWindow, RevertToParent,
+                       CurrentTime);
+        XFlush(wv->xdisplay);
+    }
+    return true;
+}
+
+bool WebViewZoom(WebView* wv, double scaleFactor) {
+    if (!wv) {
+        return false;
+    }
+    webkit_web_view_set_zoom_level(wv->webview, scaleFactor);
+    return true;
+}
+
+bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
+    if (!wv) {
+        return false;
+    }
+    GdkRGBA c = {color.r / 255.0, color.g / 255.0, color.b / 255.0,
+                 color.a / 255.0};
+    webkit_web_view_set_background_color(wv->webview, &c);
+    return true;
+}
+
+bool WebViewSetTheme(WebView*, Theme) {
+    return false;
+}
+bool WebViewSetMemoryUsageLevel(WebView*, MemoryUsageLevel) {
+    return false;
+}
+bool WebViewSetTrafficLightInset(WebView*, Position) {
+    return false;
+}
+
+bool WebViewReparent(WebView* wv, void* parentWindow) {
+    ::Window parent = (::Window)(uintptr_t)parentWindow;
+    if (!wv || !wv->hasX11 || !parent || wv->followsParent) {
+        return false;
+    }
+    XTrap trap(wv->display);
+    XReparentWindow(wv->xdisplay, wv->x11Window, parent, 0, 0);
+    XFlush(wv->xdisplay);
+    wv->parentWindow = parent;
+    return true;
+}
+
+bool WebViewPrint(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+    WebKitPrintOperation* op = webkit_print_operation_new(wv->webview);
+    webkit_print_operation_run_dialog(op, nullptr);
+    g_object_unref(op);
+    return true;
+}
+
+bool WebViewClearAllBrowsingData(WebView* wv) {
+    if (!wv) {
+        return false;
+    }
+    WebKitWebsiteDataManager* manager =
+        webkit_web_context_get_website_data_manager(wv->context);
+    if (manager) {
+        webkit_website_data_manager_clear(manager, WEBKIT_WEBSITE_DATA_ALL, 0,
+                                          nullptr, nullptr, nullptr);
+    }
+    return true;
+}
+
+static WebKitCookieManager* CookieManagerOf(WebView* wv) {
+    WebKitWebsiteDataManager* data =
+        wv ? webkit_web_view_get_website_data_manager(wv->webview) : nullptr;
+    return data ? webkit_website_data_manager_get_cookie_manager(data)
+                : nullptr;
+}
+
+static Cookie CookieFromSoup(SoupCookie* c) {
+    Cookie out;
+    out.name = StrDup(Str(soup_cookie_get_name(c)));
+    out.value = StrDup(Str(soup_cookie_get_value(c)));
+    const char* domain = soup_cookie_get_domain(c);
+    const char* path = soup_cookie_get_path(c);
+    out.domain = domain ? StrDup(Str(domain)) : Str();
+    out.path = path ? StrDup(Str(path)) : Str();
+    out.hasHttpOnly = true;
+    out.httpOnly = soup_cookie_get_http_only(c);
+    out.hasSecure = true;
+    out.secure = soup_cookie_get_secure(c);
+    out.hasSameSite = true;
+    SoupSameSitePolicy policy = soup_cookie_get_same_site_policy(c);
+    out.sameSite =
+        policy == SOUP_SAME_SITE_POLICY_LAX
+            ? CookieSameSite::Lax
+            : (policy == SOUP_SAME_SITE_POLICY_STRICT ? CookieSameSite::Strict
+                                                      : kSameSiteNone);
+    GDateTime* expires = soup_cookie_get_expires(c);
+    if (expires) {
+        out.session = false;
+
+        int64_t t = g_date_time_to_unix(expires);
+        if (t >= -377705116800LL && t <= 253402300799LL) {
+            out.hasExpires = true;
+            out.expiresUnixSeconds = t;
+        }
+    }
+    return out;
+}
+
+static SoupCookie* CookieToSoup(const Cookie* c) {
+    SoupCookie* out = soup_cookie_new(
+        CStrTemp(c->name), CStrTemp(c->value), CStrTemp(c->domain),
+        CStrTemp(c->path), c->hasMaxAge ? (int)c->maxAgeSeconds : -1);
+    if (c->hasExpires) {
+        GDateTime* dt = g_date_time_new_from_unix_utc(c->expiresUnixSeconds);
+        if (dt) {
+            soup_cookie_set_expires(out, dt);
+            g_date_time_unref(dt);
+        }
+    }
+    if (c->hasHttpOnly) {
+        soup_cookie_set_http_only(out, c->httpOnly);
+    }
+    if (c->hasSameSite) {
+        soup_cookie_set_same_site_policy(
+            out, c->sameSite == CookieSameSite::Lax
+                     ? SOUP_SAME_SITE_POLICY_LAX
+                     : (c->sameSite == CookieSameSite::Strict
+                            ? SOUP_SAME_SITE_POLICY_STRICT
+                            : SOUP_SAME_SITE_POLICY_NONE));
+    }
+    if (c->hasSecure) {
+        soup_cookie_set_secure(out, c->secure);
+    }
+    return out;
+}
+
+struct CookieWait {
+    bool done = false;
+    bool ok = false;
+    GList* cookies = nullptr;
+    bool all = false;
+};
+
+static void OnCookies(GObject* source, GAsyncResult* result, gpointer data) {
+    CookieWait* wait = (CookieWait*)data;
+    GError* error = nullptr;
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    if (wait->all) {
+        wait->cookies = webkit_cookie_manager_get_all_cookies_finish(
+            WEBKIT_COOKIE_MANAGER(source), result, &error);
+    } else
+#endif
+    {
+        wait->cookies = webkit_cookie_manager_get_cookies_finish(
+            WEBKIT_COOKIE_MANAGER(source), result, &error);
+    }
+    wait->ok = error == nullptr;
+    if (error) {
+        g_error_free(error);
+    }
+    wait->done = true;
+}
+
+static bool CookiesInner(WebView* wv, const char* uri, Vec<Cookie>* out) {
+    if (!out) {
+        return false;
+    }
+    CookieListFree(out);
+    WebKitCookieManager* manager = CookieManagerOf(wv);
+    if (!manager) {
+        return false;
+    }
+    CookieWait wait;
+    if (uri) {
+        webkit_cookie_manager_get_cookies(manager, uri, nullptr, OnCookies,
+                                          &wait);
+    } else {
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+        wait.all = true;
+        webkit_cookie_manager_get_all_cookies(manager, nullptr, OnCookies,
+                                              &wait);
+#else
+        logf("wry: listing every cookie needs WebKitGTK 2.42\n");
+        return false;
+#endif
+    }
+    PumpUntil(&wait.done);
+    for (GList* l = wait.cookies; l; l = l->next) {
+        VecAppend(*out, CookieFromSoup((SoupCookie*)l->data));
+    }
+    g_list_free_full(wait.cookies, (GDestroyNotify)soup_cookie_free);
+    return wait.ok;
+}
+
+bool WebViewCookies(WebView* wv, Vec<Cookie>* out) {
+    return CookiesInner(wv, nullptr, out);
+}
+
+bool WebViewCookiesForUrl(WebView* wv, Str url, Vec<Cookie>* out) {
+    return CookiesInner(wv, CStrTemp(url), out);
+}
+
+struct CookieChange {
+    bool done = false;
+    bool ok = false;
+    bool add = true;
+};
+
+static void OnCookieChanged(GObject* source, GAsyncResult* result,
+                            gpointer data) {
+    CookieChange* change = (CookieChange*)data;
+    GError* error = nullptr;
+    gboolean ok = change->add
+                      ? webkit_cookie_manager_add_cookie_finish(
+                            WEBKIT_COOKIE_MANAGER(source), result, &error)
+                      : webkit_cookie_manager_delete_cookie_finish(
+                            WEBKIT_COOKIE_MANAGER(source), result, &error);
+    change->ok = ok && !error;
+    if (error) {
+        g_error_free(error);
+    }
+    change->done = true;
+}
+
+static bool ChangeCookie(WebView* wv, const Cookie* cookie, bool add) {
+    WebKitCookieManager* manager = CookieManagerOf(wv);
+    if (!manager || !cookie) {
+        return false;
+    }
+    SoupCookie* soup = CookieToSoup(cookie);
+    CookieChange change;
+    change.add = add;
+    if (add) {
+        webkit_cookie_manager_add_cookie(manager, soup, nullptr,
+                                         OnCookieChanged, &change);
+    } else {
+        webkit_cookie_manager_delete_cookie(manager, soup, nullptr,
+                                            OnCookieChanged, &change);
+    }
+    PumpUntil(&change.done);
+    soup_cookie_free(soup);
+    return change.ok;
+}
+
+bool WebViewSetCookie(WebView* wv, const Cookie* cookie) {
+    return ChangeCookie(wv, cookie, true);
+}
+
+bool WebViewDeleteCookie(WebView* wv, const Cookie* cookie) {
+    return ChangeCookie(wv, cookie, false);
+}
+
+void WebViewOpenDevtools(WebView* wv) {
+    WebKitWebInspector* inspector =
+        wv ? webkit_web_view_get_inspector(wv->webview) : nullptr;
+    if (inspector) {
+        webkit_web_inspector_show(inspector);
+
+        wv->inspectorOpen = true;
+    }
+}
+
+void WebViewCloseDevtools(WebView* wv) {
+    WebKitWebInspector* inspector =
+        wv ? webkit_web_view_get_inspector(wv->webview) : nullptr;
+    if (inspector) {
+        webkit_web_inspector_close(inspector);
+    }
+}
+
+bool WebViewIsDevtoolsOpen(WebView* wv) {
+    return wv && wv->inspectorOpen;
+}
+
+Str WebViewVersionTemp() {
+    return base::FormatTemp("%d.%d.%d", (int)webkit_get_major_version(),
+                            (int)webkit_get_minor_version(),
+                            (int)webkit_get_micro_version());
+}
+
+bool WebViewAvailable() {
+    return EnsureGtk();
+}
+
+}
+
+#pragma GCC diagnostic pop
+
+#else
+
 namespace wry {
 
 using base::logf;
@@ -225394,7 +233076,7 @@ static void wry_wry_linux_Unsupported() {
     static bool said = false;
     if (!said) {
         said = true;
-        logf("wry: no webview backend on this platform\n");
+        logf("wry: built without WebKitGTK, so there is no webview here\n");
     }
 }
 
@@ -225487,6 +233169,13 @@ bool WebViewIsDevtoolsOpen(WebView*) {
 }
 void Respond(RequestResponder*, const Response*) {}
 
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
+
 Str WebViewVersionTemp() {
     return {};
 }
@@ -225495,6 +233184,8 @@ bool WebViewAvailable() {
 }
 
 }
+
+#endif
 
 #endif
 
@@ -226796,6 +234487,13 @@ bool WebViewAvailable() {
     return true;
 }
 
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
+
 }
 
 #endif
@@ -226911,6 +234609,13 @@ Str WebViewVersionTemp() {
 bool WebViewAvailable() {
     return false;
 }
+
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
 
 }
 
@@ -232175,6 +239880,13 @@ void* WebViewEnvironmentRaw(WebView* wv) {
 void* WebViewNativeRaw(WebView* wv) {
     return wv ? wv->webview : nullptr;
 }
+
+int EventLoopPrepare(PollFd** fds, int* timeoutMs) {
+    (void)timeoutMs;
+    *fds = nullptr;
+    return 0;
+}
+void EventLoopDispatch() {}
 
 }
 

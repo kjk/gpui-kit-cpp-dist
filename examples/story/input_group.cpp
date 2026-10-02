@@ -320,7 +320,7 @@ static void OnSend(InputGroupStory* self, Ctx* cx, const ClickEvent*) {
 }
 
 static void OnFileMenu(InputGroupStory* self, Ctx* cx, const ClickEvent*,
-                       intptr_t action) {
+                       int64_t action) {
     InputState* s = &self->fields[IgDropdownFile];
     if (action == 0) {
         ClipboardSetText(cx->win, InputValue(s));
@@ -331,13 +331,13 @@ static void OnFileMenu(InputGroupStory* self, Ctx* cx, const ClickEvent*,
 }
 
 static void OnScope(InputGroupStory* self, Ctx* cx, const ClickEvent*,
-                    intptr_t ix) {
+                    int64_t ix) {
     self->searchScope = (int)ix;
     Notify(cx);
 }
 
 static void OnCountry(InputGroupStory* self, Ctx* cx, const ClickEvent*,
-                      intptr_t ix) {
+                      int64_t ix) {
     self->countryCode = (int)ix;
     Notify(cx);
 }
@@ -666,7 +666,7 @@ static El* RenderDropdowns(InputGroupStory* self, Ctx* cx) {
         component::PopupMenu::New(cx, StrL("file-menu"));
     for (int i = 0; i < 3; i++) {
         fileMenu->Menu(Str(kIgFileActions[i]))
-            ->OnClick(Listen(cx, &OnFileMenu, (intptr_t)i));
+            ->OnClick(Listen(cx, &OnFileMenu, (int64_t)i));
     }
     col->Child(
         IgExtraInput(cx, self, IgDropdownFile, "dropdown-file", "File name")
@@ -680,7 +680,7 @@ static El* RenderDropdowns(InputGroupStory* self, Ctx* cx) {
     for (int i = 0; i < 3; i++) {
         scopeMenu->Menu(Str(kIgSearchScopes[i]))
             ->Checked(i == self->searchScope)
-            ->OnClick(Listen(cx, &OnScope, (intptr_t)i));
+            ->OnClick(Listen(cx, &OnScope, (int64_t)i));
     }
     col->Child(IgExtraInput(cx, self, IgDropdownSearch, "dropdown-search",
                             "Scoped search")
@@ -696,7 +696,7 @@ static El* RenderDropdowns(InputGroupStory* self, Ctx* cx) {
     for (int i = 0; i < 3; i++) {
         countryMenu->Menu(Str(kIgCountryCodes[i]))
             ->Checked(i == self->countryCode)
-            ->OnClick(Listen(cx, &OnCountry, (intptr_t)i));
+            ->OnClick(Listen(cx, &OnCountry, (int64_t)i));
     }
     col->Child(IgExtraInput(cx, self, IgPhone, "phone", "Phone number")
                    ->Addon(IgAddon(cx, "country-menu-addon")
@@ -715,25 +715,27 @@ static El* RenderPopover(InputGroupStory* self, Ctx* cx) {
     El* sec = StorySection(
         cx, "Popover",
         "A native popover keeps contextual details attached to its trigger.");
-    // Popover's surface: popover_style().p_3(), then .w(rems(18.)).gap_2()
-    // .text_sm() from the story.
-    El* content = component::PopoverSurface(
-        cx, Div(a)->FlexCol()->Pad(12)->W(288)->Gap(8)->Font(14));
-    content->Child(TextEl(a, StrL("Address details"))->Semibold());
-    content->Child(TextEl(a, StoryFmt(cx, "https://%s", address))->Wrap());
-    content->Child(
-        TextEl(a, StrL("The protocol prefix stays separate from the editable "
-                       "hostname."))
-            ->Wrap());
-    El* popover = component::Popover::New(cx, StrL("address-details"))
-                      ->Trigger(component::InputGroupButton::New(
-                                    cx, StrL("address-details-trigger"))
-                                    ->Icon(IconName::Info)
-                                    ->AriaLabel(StrL("Address details"))
-                                    ->Tooltip(StrL("Address details"))
-                                    ->IntoEl())
-                      ->Content(content)
-                      ->IntoEl();
+    // .w(rems(18.)).gap_2().text_sm() on the popover's surface.
+    Style surface;
+    surface.width = 288;
+    surface.gapX = surface.gapY = 8;
+    surface.fontSize = 14;
+    El* popover =
+        component::Popover::New(cx, StrL("address-details"))
+            ->Trigger(component::InputGroupButton::New(
+                          cx, StrL("address-details-trigger"))
+                          ->Icon(IconName::Info)
+                          ->AriaLabel(StrL("Address details"))
+                          ->Tooltip(StrL("Address details"))
+                          ->IntoEl())
+            ->Refine(surface,
+                     StyleFieldWidth | StyleFieldGap | StyleFieldFontSize)
+            ->Child(TextEl(a, StrL("Address details"))->Semibold())
+            ->Child(TextEl(a, StoryFmt(cx, "https://%s", address))->Wrap())
+            ->Child(TextEl(a, StrL("The protocol prefix stays separate from "
+                                   "the editable hostname."))
+                        ->Wrap())
+            ->IntoEl();
     El* col = IgColumn(cx);
     col->Child(IgExtraInput(cx, self, IgPopoverUrl, "popover-url",
                             "Website with details")

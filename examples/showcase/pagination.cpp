@@ -3,8 +3,7 @@
 
 using namespace gpui;
 
-static void GoPage(ShowcaseApp* app, Ctx* cx, const ClickEvent*,
-                   intptr_t page) {
+static void GoPage(ShowcaseApp* app, Ctx* cx, const ClickEvent*, int64_t page) {
     app->page = (int)page;
     Notify(cx);
 }
@@ -37,12 +36,7 @@ El* ShowcasePagination(ShowcaseApp* app, Ctx* cx) {
     constexpr int n = 8;
     constexpr int maxVis = 5;
     int cur = app->page;
-    if (cur < 1) {
-        cur = 1;
-    }
-    if (cur > n) {
-        cur = n;
-    }
+    cur = ClampI(cur, 1, n);
     El* row = Pagination::New(cx, StrL("example-pagination"))
                   ->FlexRow()
                   ->ItemsCenter()

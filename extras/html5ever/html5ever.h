@@ -121,6 +121,11 @@ float StrToFloatUnchecked(Str s);
 
 void log(Str s);
 
+using PanicHook = void (*)(const char* msg);
+
+PanicHook SetPanicHook(PanicHook hook);
+void Panic(const char* msg);
+
 using TempStr = Str;
 
 #define StrL(lit) ::base::Str{(char*)(lit), (int)dimof(lit) - 1}
@@ -175,6 +180,22 @@ inline T* AllocArray(int n) {
 template <typename T>
 inline void ZeroStruct(T* s) {
     memset((void*)s, 0, sizeof(T));
+}
+
+constexpr int ClampI(int x, int lo, int hi) {
+    if (x < lo) x = lo;
+    if (x > hi) x = hi;
+    return x;
+}
+constexpr float ClampF(float x, float lo, float hi) {
+    if (x < lo) x = lo;
+    if (x > hi) x = hi;
+    return x;
+}
+constexpr double ClampD(double x, double lo, double hi) {
+    if (x < lo) x = lo;
+    if (x > hi) x = hi;
+    return x;
 }
 
 struct Func0 {
@@ -1128,6 +1149,8 @@ inline bool StrContainsI(Str s, Str sub) {
     return StrFindI(s, sub) >= 0;
 }
 Str StrTrimAscii(Str s);
+
+Str StrTrim(Str s);
 Str StrReplaceAll(Str value, Str from, Str to);
 
 using SeqStrings = const char*;

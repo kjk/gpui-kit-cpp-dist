@@ -15,6 +15,23 @@ namespace base {
 static int VsnprintfUtf8(Str buf, const char* fmt, va_list args);
 static int VscprintfUtf8(const char* fmt, va_list args);
 
+static PanicHook gPanicHook = nullptr;
+
+PanicHook SetPanicHook(PanicHook hook) {
+    PanicHook was = gPanicHook;
+    gPanicHook = hook;
+    return was;
+}
+
+void Panic(const char* msg) {
+    if (gPanicHook) {
+        gPanicHook(msg);
+        return;
+    }
+    log(Str(msg ? msg : "panic"));
+    abort();
+}
+
 float StrToFloatUnchecked(Str s) {
     if (!s.s || len(s) <= 0) {
         return 0;
@@ -1137,6 +1154,67 @@ Str StrTrimAscii(Str s) {
     return Str(s.s + start, end - start);
 }
 
+static bool IsUnicodeWhiteSpace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+
+static uint32_t StrTrimDecode(Str s, int i, int* n) {
+    uint8_t c = (uint8_t)s.s[i];
+    int want = c < 0x80         ? 1
+               : (c >> 5) == 6  ? 2
+               : (c >> 4) == 14 ? 3
+               : (c >> 3) == 30 ? 4
+                                : 0;
+    if (want <= 1 || i + want > len(s)) {
+        *n = 1;
+        return c;
+    }
+    uint32_t cp = c & (0x7F >> want);
+    for (int k = 1; k < want; k++) {
+        uint8_t b = (uint8_t)s.s[i + k];
+        if ((b & 0xC0) != 0x80) {
+            *n = 1;
+            return c;
+        }
+        cp = (cp << 6) | (b & 0x3F);
+    }
+    *n = want;
+    return cp;
+}
+
+Str StrTrim(Str s) {
+    if (!s.s || len(s) <= 0) {
+        return s;
+    }
+    int start = 0;
+    int end = len(s);
+    while (start < end) {
+        int n = 1;
+        if (!IsUnicodeWhiteSpace(StrTrimDecode(s, start, &n))) {
+            break;
+        }
+        start += n;
+    }
+    while (end > start) {
+
+        int at = end - 1;
+        while (at > start && ((uint8_t)s.s[at] & 0xC0) == 0x80 &&
+               end - at < 4) {
+            at--;
+        }
+        int n = 1;
+        uint32_t cp = StrTrimDecode(s, at, &n);
+        if (at + n != end || !IsUnicodeWhiteSpace(cp)) {
+            break;
+        }
+        end = at;
+    }
+    return Str(s.s + start, end - start);
+}
+
 Str StrReplaceAll(Str value, Str from, Str to) {
     if (len(from) == 0 || len(from) > len(value)) {
         return value;
@@ -1710,7 +1788,7 @@ static int64_t argToI64(const FmtArg& arg) {
         case FmtArg::Kind::Char:
             return (int64_t)arg.c;
         case FmtArg::Kind::Ptr:
-            return (int64_t)(intptr_t)arg.ptr;
+            return (int64_t)(int64_t)arg.ptr;
         default:
             return arg.i;
     }
@@ -1752,7 +1830,7 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     if (inst.conv == 'p') {
         const void* pv = arg.t == FmtArg::Kind::Ptr
                              ? arg.ptr
-                             : (const void*)(intptr_t)argToI64(arg);
+                             : (const void*)(int64_t)argToI64(arg);
         return appendConv(fmt, "%p", pv);
     }
 

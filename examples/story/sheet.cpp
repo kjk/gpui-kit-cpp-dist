@@ -111,11 +111,12 @@ static component::ListItem* SheetFoodRow(Ctx* cx, void* data, int, int row,
                     ->Icon(IconName::Heart)
                     ->IntoEl());
     return component::ListItem::New(cx, line)
+        ->CheckIcon(IconName::Check)
         ->Confirmed(self->confirmedFood == entry);
 }
 
 static void SheetToolbarAct(SheetStory* self, Ctx* cx, const ClickEvent*,
-                            intptr_t act) {
+                            int64_t act) {
     if (act == SheetOptOverlay) {
         self->overlay = !self->overlay;
     } else if (act == SheetOptOverlayClosable) {
@@ -127,7 +128,7 @@ static void SheetToolbarAct(SheetStory* self, Ctx* cx, const ClickEvent*,
 }
 
 static void OpenSheet(SheetStory* self, Ctx* cx, const ClickEvent*,
-                      intptr_t which) {
+                      int64_t which) {
     self->open = (int)which;
     Notify(cx);
 }
@@ -165,7 +166,7 @@ static void ToggleSheetBirthday(SheetStory* self, Ctx* cx, const ClickEvent*) {
     Notify(cx);
 }
 static void PickSheetBirthday(SheetStory* self, Ctx* cx, const ClickEvent*,
-                              intptr_t day) {
+                              int64_t day) {
     self->birthday.day = (int)day;
     self->birthdayOpen = false;
     Notify(cx);
@@ -381,15 +382,13 @@ El* SheetStory::Render(SheetStory* self, Ctx* cx) {
                 component::List::New(cx, StrL("sheet-foods"), self->foods)
                     ->Items(self, &SheetFoodRow)
                     ->Searchable(&self->foodSearch,
-                                 Listen(cx, &FocusSheetSearch))
-                    // The list virtualizes against a height it is told, so
-                    // it is what the sheet has left over its four controls
-                    // and the footer under them.
-                    ->H(size.dipH - 272);
+                                 Listen(cx, &FocusSheetSearch));
             list->Sections(counts, 1);
             if (self->nMatches == 0) {
                 list->Empty(SheetFoodsEmpty(cx));
             }
+            // It takes what the sheet has left over its four controls and
+            // virtualizes against the box it was laid out in.
             body->Child(list->IntoEl()
                             ->Flex1()
                             ->MinH(0)

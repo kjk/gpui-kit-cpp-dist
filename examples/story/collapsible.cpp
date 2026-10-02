@@ -30,7 +30,7 @@ struct CollapsibleStory {
 };
 
 static void OnColl(CollapsibleStory* self, Ctx* cx, const ClickEvent*,
-                   intptr_t ix) {
+                   int64_t ix) {
     if (ix >= 0 && ix < CollCount) {
         self->open[ix] = !self->open[ix];
     }
@@ -39,20 +39,20 @@ static void OnColl(CollapsibleStory* self, Ctx* cx, const ClickEvent*,
 
 // One handler per settings row: the checkbox fills the listener's value with
 // the state it lands on, so the row has to come from the handler.
-static void SetNote(CollapsibleStory* self, Ctx* cx, int ix, intptr_t v) {
+static void SetNote(CollapsibleStory* self, Ctx* cx, int ix, int64_t v) {
     self->checked[ix] = v != 0;
     Notify(cx);
 }
 static void SetPush(CollapsibleStory* self, Ctx* cx, const ClickEvent*,
-                    intptr_t v) {
+                    int64_t v) {
     SetNote(self, cx, CollPush, v);
 }
 static void SetEmail(CollapsibleStory* self, Ctx* cx, const ClickEvent*,
-                     intptr_t v) {
+                     int64_t v) {
     SetNote(self, cx, CollEmail, v);
 }
 static void SetSms(CollapsibleStory* self, Ctx* cx, const ClickEvent*,
-                   intptr_t v) {
+                   int64_t v) {
     SetNote(self, cx, CollSms, v);
 }
 
@@ -60,7 +60,7 @@ static void SetSms(CollapsibleStory* self, Ctx* cx, const ClickEvent*,
 static El* Chevron(Ctx* cx, bool open) {
     Arena* a = cx->a;
     return IconEl(a, open ? IconName::ChevronDown : IconName::ChevronRight,
-                  UiIconPx(UiSize::XSmall))
+                  UiIconPx(cx, UiSize::XSmall))
         ->Fg(ThemeNow(cx->app).mutedFg);
 }
 
@@ -95,7 +95,7 @@ static El* FileRow(Ctx* cx, Str name) {
         ->HoverBg(th.tokens.accent)
         ->Font(14)
         ->Child(Div(a)->W(12)->Shrink0())
-        ->Child(IconEl(a, IconName::File, UiIconPx(UiSize::XSmall))
+        ->Child(IconEl(a, IconName::File, UiIconPx(cx, UiSize::XSmall))
                     ->Fg(th.mutedFg))
         ->Child(TextEl(a, name));
 }
@@ -118,7 +118,7 @@ static El* FolderRow(CollapsibleStory* self, Ctx* cx, int key, Str name) {
         ->OnClick(Listen(cx, &OnColl, key))
         ->Child(Chevron(cx, open))
         ->Child(IconEl(a, open ? IconName::FolderOpen : IconName::Folder,
-                       UiIconPx(UiSize::XSmall))
+                       UiIconPx(cx, UiSize::XSmall))
                     ->Fg(th.mutedFg))
         ->Child(TextEl(a, name));
 }
@@ -365,17 +365,17 @@ El* CollapsibleStory::Render(CollapsibleStory* self, Ctx* cx) {
     El* keysBody = Div(a)->FlexCol()->Gap(8)->W(kFill);
     for (int i = 0; i < 3; i++) {
         El* keyRow = Div(a)->FlexRow()->Gap(8)->ItemsCenter()->W(kFill);
-        keyRow->Child(
-            Div(a)
-                ->W(20)
-                ->H(20)
-                ->Shrink0()
-                ->ItemsCenter()
-                ->JustifyCenter()
-                ->Radius(th.radius)
-                ->Bg(th.tokens.muted)
-                ->Child(IconEl(a, IconName::Asterisk, UiIconPx(UiSize::XSmall))
-                            ->Fg(th.green)));
+        keyRow->Child(Div(a)
+                          ->W(20)
+                          ->H(20)
+                          ->Shrink0()
+                          ->ItemsCenter()
+                          ->JustifyCenter()
+                          ->Radius(th.radius)
+                          ->Bg(th.tokens.muted)
+                          ->Child(IconEl(a, IconName::Asterisk,
+                                         UiIconPx(cx, UiSize::XSmall))
+                                      ->Fg(th.green)));
         keyRow->Child(TextEl(a, Str(kKeys[i][0]))->Font(12)->W(80)->Shrink0());
         keyRow->Child(Div(a)
                           ->Flex1()
@@ -470,7 +470,8 @@ El* CollapsibleStory::Render(CollapsibleStory* self, Ctx* cx) {
         {IconName::Globe, "Location", "Hong Kong"}};
     for (const Field& fld : kFields) {
         El* f = Div(a)->FlexRow()->Gap(8)->ItemsCenter()->Font(12);
-        f->Child(IconEl(a, fld.icon, UiIconPx(UiSize::XSmall))->Fg(th.mutedFg));
+        f->Child(IconEl(a, fld.icon, UiIconPx(cx, UiSize::XSmall))
+                     ->Fg(th.mutedFg));
         f->Child(TextEl(a, Str(fld.label))->Fg(th.mutedFg));
         f->Child(TextEl(a, Str(fld.value))->Medium());
         profBody->Child(f);

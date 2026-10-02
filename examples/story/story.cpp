@@ -692,7 +692,7 @@ static bool StoryMatches(const StoryInfo* m, const char* q) {
 
 // Gallery::set_active_story
 static void OpenStory(StoryApp* app, Ctx* cx, const ClickEvent*,
-                      intptr_t story) {
+                      int64_t story) {
     app->search.focused = false;
     cx->win->input = nullptr;
     app->story = (int)story;
@@ -1191,7 +1191,7 @@ static El* AppearanceMenu(StoryApp* app, Ctx* cx) {
             default: {
                 component::PopupMenu* into = sub ? sub : menu;
                 into->MenuWithAction(Str(r.label), ApAction(r.kind),
-                                     (intptr_t)r.value);
+                                     (int64_t)r.value);
                 into->Checked(ApChecked(app, cx, r));
                 break;
             }
@@ -1869,11 +1869,14 @@ static El* Footer(StoryApp* app, Ctx* cx) {
 // StoryContainer::render: `div().size_full().p(paddings).child(story)` inside
 // the scrolling pane. Story::paddings is 16 unless a story asks for none. A
 // page that is itself size_full and hands the rest to a flex_1 child -- the
-// Dock's area, the Scrollbar page's list, the Editor -- fills the pane; the
-// others keep their own height and scroll.
+// Dock's area, the Scrollbar page's list, the Editor, the List, DataTable and
+// VirtualList pages' lists -- fills the pane; the others keep their own
+// height and scroll.
 static El* StoryContainerBody(StoryApp* app, Ctx* cx, Arena* frame) {
     if (app->story == StoryDock || app->story == StoryScrollbar ||
-        app->story == StoryEditor || app->story == StorySettings) {
+        app->story == StoryEditor || app->story == StorySettings ||
+        app->story == StoryList || app->story == StoryDataTable ||
+        app->story == StoryVirtualList) {
         // DockStory and SettingsStory have paddings() of 0.
         bool unpadded = app->story == StoryDock || app->story == StorySettings;
         return Div(frame)

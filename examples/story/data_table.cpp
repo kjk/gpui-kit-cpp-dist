@@ -246,7 +246,7 @@ static void OnTableEvent(DataTableStory* self, Ctx* cx, const TableEvent* ev) {
 }
 
 static void DtMenuOpen(DataTableStory* self, Ctx* cx, const ClickEvent*,
-                       intptr_t which) {
+                       int64_t which) {
     self->openMenu = self->openMenu == (int)which ? 0 : (int)which;
     Notify(cx);
 }
@@ -260,7 +260,7 @@ static void DtExport(DataTableStory* self, Ctx* cx, const ClickEvent*) {
 }
 
 static void DtMenuAct(DataTableStory* self, Ctx* cx, const ClickEvent*,
-                      intptr_t act) {
+                      int64_t act) {
     if (act >= DtActGoTo) {
         // Top and Bottom scroll_to_row; the other two set_selected_cell.
         TableState* st = self->table.Get(cx);
@@ -298,7 +298,7 @@ static void DtMenuAct(DataTableStory* self, Ctx* cx, const ClickEvent*,
 // also offers. The row line carries `OpenDetail(row_ix)` in Rust, which
 // nothing handles, so it does nothing here either.
 static void OnDtContextItem(DataTableStory* self, Ctx* cx, const ClickEvent*,
-                            intptr_t ix) {
+                            int64_t ix) {
     // 0 is the row line, 1 the separator, and the sizes follow.
     int size = (int)ix - 2;
     if (size >= 0 && size < kNSizes) {
@@ -718,7 +718,8 @@ El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
         self->seeded = true;
         self->table = EntityNewState<TableState>(cx->app);
     }
-    El* page = Div(a)->FlexCol()->Gap(16)->W(kFill);
+    // v_flex().size_full().gap_4(): the table takes what the toolbar leaves.
+    El* page = Div(a)->FlexCol()->Gap(16)->W(kFill)->H(kFill);
 
     // One group holding the size, rows, extra columns, options, go-to and
     // export controls.
@@ -908,11 +909,6 @@ El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
         component::DataTable::New(cx, StrL("data-table"), self->table)
             ->Columns(cols, nColumns)
             ->Rows(kRowCounts[self->rowCount], self, DtCellFor)
-            // The story's table is `v_flex().min_h_0().flex_1()`, so the body
-            // takes what the pane has left over the toolbar, the gap and the
-            // status line under it. Virtualization needs that as a number
-            // before the tree is laid out, so it comes off the window.
-            ->H(WindowSize(cx->win).dipH - 368)
             ->RowHeight(kSizeRowH[self->size])
             ->Stripe(self->options[DtOptStriped])
             ->ContextMenu(DtContextMenu)
@@ -984,7 +980,14 @@ El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
     status->Child(right);
     // The table and the line under it share one `v_flex().min_h_0().flex_1()`
     // with no gap of its own; the page's gap_4 is between the toolbar and it.
-    page->Child(Div(a)->FlexCol()->W(kFill)->Child(box)->Child(status));
+    // The table fills what the line leaves and virtualizes against it.
+    page->Child(Div(a)
+                    ->FlexCol()
+                    ->W(kFill)
+                    ->Flex1()
+                    ->MinH(0)
+                    ->Child(box->Flex1()->MinH(0))
+                    ->Child(status->Shrink0()));
     if (self->message.s) {
         page->Child(StoryTxt(cx, self->message, 14, th.mutedFg));
     }
