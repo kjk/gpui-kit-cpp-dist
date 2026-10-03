@@ -21354,7 +21354,7 @@ static void WindowPointerInput(Window* win, float x, float y) {
     AppInvalidate(win);
 }
 
-static bool IsModifierKey(int key) {
+static bool IsModifierKeyCode(int key) {
 
     return key == KeyShift || key == KeyControl || key == KeyAlt ||
            key == 0x14 || key == 0x5B || key == 0x5C ||
@@ -21394,7 +21394,7 @@ bool WindowKeyDown(Window* win, int key, bool shift, bool ctrl, bool alt,
     WindowTrackModifiers(win, key, true, shift, ctrl, alt, platform, function);
 
     bool wasKeyboard = win->lastInputKeyboard;
-    if (!IsModifierKey(key)) {
+    if (!IsModifierKeyCode(key)) {
         win->lastInputKeyboard = true;
 
         if (win->input && win->input->focused) {
@@ -219623,7 +219623,7 @@ static void OnKeyPress(Window* win, XKeyEvent* ke) {
     KeySym ks = 0;
     int n = 0;
     if (pw && pw->xic) {
-        Status st = 0;
+        int st = 0;
         n = Xutf8LookupString(pw->xic, ke, buf, (int)sizeof(buf) - 1, &ks, &st);
         if (st == XLookupNone) {
             return;
