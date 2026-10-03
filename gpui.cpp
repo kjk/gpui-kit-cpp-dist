@@ -204217,6 +204217,11 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #if GPUI_OS_LINUX
 #line 1 "src/gpui/accessibility_linux.cpp"
 
+#pragma push_macro("Status")
+#pragma push_macro("True")
+#undef Status
+#undef True
+
 namespace gpui {
 
 static constexpr const char* kRootPath = "/org/a11y/atspi/accessible/root";
@@ -206340,6 +206345,9 @@ void AccessibilityLinuxFocusChanged(Window* win, int focusId) {
 }
 
 }
+
+#pragma pop_macro("True")
+#pragma pop_macro("Status")
 
 #endif
 
