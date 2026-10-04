@@ -2179,11 +2179,112 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 
 }
 
+#if GPUI_OS_ANDROID
+#line 1 "src/base_android.cpp"
+
+#include <sys/stat.h>
+
+namespace base {
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
+                                                              .tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return true;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "linux";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
+}
+
+}
+
+#endif
+
+#if GPUI_OS_IOS
+#line 1 "src/base_ios.cpp"
+
+#include <sys/stat.h>
+
+namespace base {
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
+           (uint64_t)st->st_mtimespec.tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return true;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "linux";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
+}
+
+}
+
+#endif
+
 #if GPUI_OS_LINUX
 #line 1 "src/base_linux.cpp"
 
 #include <stdio.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace base {
@@ -2232,6 +2333,45 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
     return true;
 }
 
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
+                                                              .tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "linux";
+}
+bool PlatBlockSelectUsesControl() {
+    return true;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 20.f;
+}
+
 }
 
 #endif
@@ -2241,6 +2381,7 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
 
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <sys/stat.h>
 
 namespace base {
 
@@ -2288,6 +2429,45 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
         *cpu100ns = us * 10ull;
     }
     return true;
+}
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
+           (uint64_t)st->st_mtimespec.tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return true;
+}
+bool PlatShowsWindowControls() {
+    return false;
+}
+float PlatCaretWidth() {
+    return 1.5f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "Menlo";
+}
+const char* PlatShellDataDir() {
+    return "/Library/Application Support";
+}
+const char* PlatShellPlatformName() {
+    return "macos";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
 }
 
 }
@@ -2377,6 +2557,8 @@ uint64_t PlatArenaReserveSize() {
 #include <unistd.h>
 
 namespace base {
+
+uint64_t PlatStatModifiedNs(const struct stat* st);
 
 int StrCmpI(const char* a, const char* b) {
     return strcasecmp(a ? a : "", b ? b : "");
@@ -2489,13 +2671,7 @@ int PlatListDir(const char* dir, DirEntry* out, int max) {
         e.isDir = S_ISDIR(st.st_mode);
         e.isFile = S_ISREG(st.st_mode);
         e.size = e.isFile && st.st_size > 0 ? (uint64_t)st.st_size : 0;
-#if GPUI_OS_MAC || GPUI_OS_IOS
-        e.modified = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull +
-                     (uint64_t)st.st_mtimespec.tv_nsec;
-#else
-        e.modified = (uint64_t)st.st_mtim.tv_sec * 1000000000ull +
-                     (uint64_t)st.st_mtim.tv_nsec;
-#endif
+        e.modified = PlatStatModifiedNs(&st);
         n++;
     }
     closedir(d);
@@ -2569,6 +2745,16 @@ void PlatSleepMs(int ms) {
     nanosleep(&ts, nullptr);
 }
 
+char PlatPathSep() {
+    return '/';
+}
+bool PlatPathsCaseFold() {
+    return false;
+}
+bool PlatIsWindows() {
+    return false;
+}
+
 }
 
 #endif
@@ -2578,6 +2764,7 @@ void PlatSleepMs(int ms) {
 
 #include <emscripten/emscripten.h>
 #include <emscripten/heap.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 
 namespace base {
@@ -2652,6 +2839,45 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
         *memBytes = (uint64_t)emscripten_get_heap_size();
     }
     return true;
+}
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
+                                                              .tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "emscripten";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return false;
+}
+bool PlatAsyncIo() {
+    return true;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
 }
 
 }
@@ -2941,6 +3167,49 @@ uint64_t PlatThreadId() {
 
 void PlatSleepMs(int ms) {
     Sleep((DWORD)(ms < 0 ? 0 : ms));
+}
+
+char PlatPathSep() {
+    return '\\';
+}
+bool PlatPathsCaseFold() {
+    return true;
+}
+bool PlatIsWindows() {
+    return true;
+}
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "Consolas";
+}
+const char* PlatShellDataDir() {
+    return "\\AppData\\Roaming";
+}
+const char* PlatShellPlatformName() {
+    return "windows";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
 }
 
 }

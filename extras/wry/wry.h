@@ -170,6 +170,21 @@ int PlatListDir(const char* dir, DirEntry* out, int max);
 int PlatCoreCount();
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes);
 
+char PlatPathSep();
+bool PlatPathsCaseFold();
+bool PlatIsWindows();
+bool PlatSecondaryIsCommand();
+bool PlatShowsWindowControls();
+float PlatCaretWidth();
+bool PlatScrollBounce();
+const char* PlatMonoFontName();
+const char* PlatShellDataDir();
+const char* PlatShellPlatformName();
+bool PlatBlockSelectUsesControl();
+bool PlatScrollGestureLocks();
+bool PlatAsyncIo();
+float PlatWindowShadowSize();
+
 void* AllocZero(int count, int size);
 
 template <typename T>

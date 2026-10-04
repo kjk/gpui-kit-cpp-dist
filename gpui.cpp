@@ -4379,12 +4379,6 @@ const int kAssetIconsCount = 109;
 
 namespace gpui {
 
-#if GPUI_OS_WINDOWS
-static const char gpui_assets_kSep = '\\';
-#else
-static const char gpui_assets_kSep = '/';
-#endif
-
 static const int kMaxRoots = 12;
 static char gRoots[kMaxRoots][kMaxPath];
 static int gRootN = 0;
@@ -4457,7 +4451,7 @@ void AssetsAddRoot(Str dir) {
 static TempStr gpui_assets_JoinPathTemp(Str a, Str b) {
     if (!a) return StrDupTemp(b);
     if (!b) return StrDupTemp(a);
-    return fmt("%s%c%s", a, gpui_assets_kSep, b);
+    return fmt("%s%c%s", a, base::PlatPathSep(), b);
 }
 
 static void ParentDir(Str* path) {
@@ -4478,7 +4472,7 @@ static void ParentDir(Str* path) {
 static void ToNativeSep(Str s) {
     for (int i = 0; i < len(s); i++) {
         if (s.s[i] == '/' || s.s[i] == '\\') {
-            s.s[i] = gpui_assets_kSep;
+            s.s[i] = base::PlatPathSep();
         }
     }
 }
@@ -4494,8 +4488,9 @@ void AssetsAddDefaultRoots(Str exampleName) {
     PlatGetExeDir(exe.s, len(exe) + 1);
     exe.len = (int)strlen(exe.s);
 
-    TempStr sub = exampleName ? fmt("assets%c%s", gpui_assets_kSep, exampleName)
-                              : StrDupTemp(StrL("assets"));
+    TempStr sub = exampleName
+                      ? fmt("assets%c%s", base::PlatPathSep(), exampleName)
+                      : StrDupTemp(StrL("assets"));
 
     TempStr path = gpui_assets_JoinPathTemp(cwd, sub);
     AddRootRaw(path.s);
@@ -4509,17 +4504,19 @@ void AssetsAddDefaultRoots(Str exampleName) {
             AddRootRaw(path.s);
             if (exampleName.s) {
 
-                TempStr rust =
-                    fmt("examples%c%s%cassets", gpui_assets_kSep, exampleName, gpui_assets_kSep);
+                TempStr rust = fmt("examples%c%s%cassets", base::PlatPathSep(),
+                                   exampleName, base::PlatPathSep());
                 path = gpui_assets_JoinPathTemp(walk, rust);
                 AddRootRaw(path.s);
-                rust = fmt(".work%cgpui-component%cexamples%c%s%cassets", gpui_assets_kSep,
-                           gpui_assets_kSep, gpui_assets_kSep, exampleName, gpui_assets_kSep);
+                rust =
+                    fmt(".work%cgpui-component%cexamples%c%s%cassets",
+                        base::PlatPathSep(), base::PlatPathSep(),
+                        base::PlatPathSep(), exampleName, base::PlatPathSep());
                 path = gpui_assets_JoinPathTemp(walk, rust);
                 AddRootRaw(path.s);
             }
 
-            TempStr work = fmt(".work%cgpui-component", gpui_assets_kSep);
+            TempStr work = fmt(".work%cgpui-component", base::PlatPathSep());
             path = gpui_assets_JoinPathTemp(walk, work);
             AddRootRaw(path.s);
             TempStr prev = StrDupTemp(walk);
@@ -16034,19 +16031,15 @@ bool KeyChordParse(Str spec, KeyChord* out) {
         }
         Str part = Str(spec.s + i, dash - i);
         bool secondary = base::StrEqI(part, "secondary");
-        if (base::StrEqI(part, "ctrl") || (secondary && !GPUI_OS_MAC)) {
+
+        if (base::StrEqI(part, "ctrl") ||
+            (secondary && !base::PlatSecondaryIsCommand())) {
             c.ctrl = true;
         } else if (base::StrEqI(part, "cmd") || base::StrEqI(part, "super") ||
-                   base::StrEqI(part, "win")) {
+                   base::StrEqI(part, "win") ||
+                   (secondary && base::PlatSecondaryIsCommand())) {
             c.platform = true;
-        }
-#if GPUI_OS_MAC
-        else if (secondary) {
-
-            c.platform = true;
-        }
-#endif
-        else if (base::StrEqI(part, "alt") || base::StrEqI(part, "option")) {
+        } else if (base::StrEqI(part, "alt") || base::StrEqI(part, "option")) {
             c.alt = true;
         } else if (base::StrEqI(part, "shift")) {
             c.shift = true;
@@ -16687,17 +16680,8 @@ namespace gpui {
 
 static int gSceneLevel = kSceneSkip;
 
-int SceneLevelOn() {
-#if GPUI_OS_WINDOWS
-    static_assert((int)WinSceneMode::Off == kSceneOff);
-    static_assert((int)WinSceneMode::Replay == kSceneReplay);
-    static_assert((int)WinSceneMode::Cache == kSceneCache);
-    static_assert((int)WinSceneMode::Skip == kSceneSkip);
-    static_assert((int)WinSceneMode::Damage == kSceneDamage);
-    return (int)WinPaintOptionsGet().scene;
-#else
+int SceneLevelFallback() {
     return gSceneLevel;
-#endif
 }
 
 bool SceneTakeArg(Str arg) {
@@ -20488,6 +20472,10 @@ void TestFocus(Window* win, FocusHandle handle) {
 
 namespace gpui {
 
+void FrameBenchLogGpu();
+
+bool WindowTakePaintArg(Str arg);
+
 void OngoingScroll::Filter(Point* delta, TouchPhase phase) {
     if (!delta) {
         return;
@@ -20582,16 +20570,11 @@ static void FrameBenchTick(Window* win, float secs) {
     static Vec<float> paint;
     if (want < 0) {
         char buf[16] = {};
-#if GPUI_OS_WINDOWS
-        DWORD n = GetEnvironmentVariableA("GPUI_FRAME_BENCH", buf, sizeof(buf));
-        want = (n > 0 && n < sizeof(buf)) ? StrToIntUnchecked(Str(buf)) : 0;
-#else
         const char* e = getenv("GPUI_FRAME_BENCH");
         if (e) {
             StrCopyZ(buf, (int)sizeof(buf), e);
         }
         want = buf[0] ? StrToIntUnchecked(Str(buf)) : 0;
-#endif
         if (want > 0) {
 
             win->anim = true;
@@ -20656,16 +20639,7 @@ static void FrameBenchTick(Window* win, float secs) {
         ls.nodes, LayoutCacheNodeCount(win->layout),
         LayoutCacheSlotCount(win->layout), ls.made, ls.dropped, ls.restyled,
         ls.remeasured, ls.allocs);
-#if GPUI_OS_WINDOWS
-    if (PaintGpuOn()) {
-        const gpuw::FrameStats& st = gpuw::LastFrameStats();
-        logf(
-            "frame-bench %s instances=%d draws=%d pathTris=%d "
-            "glyphsRasterized=%d",
-            PaintD3d12On() ? StrL("d3d12") : StrL("d3d11"), st.instances,
-            st.draws, st.pathTriangles, st.glyphsRasterized);
-    }
-#endif
+    FrameBenchLogGpu();
     if (SceneOn()) {
         const scene::SceneStats& sc = scene::Stats(&win->paint);
         logf(
@@ -21728,9 +21702,9 @@ static void InputPress(Window* win, const MouseDownEvent& in) {
                in.modifiers.alt) {
 
         bool block = in.modifiers.shift;
-#if GPUI_OS_LINUX
-        block = block || in.modifiers.control;
-#endif
+        if (base::PlatBlockSelectUsesControl()) {
+            block = block || in.modifiers.control;
+        }
         if (block) {
             InputMoveToWithAffinity(s, win->app, win, offset, lineEndAffinity);
         } else {
@@ -22724,7 +22698,6 @@ static bool ScrollMaskIsTopmost(Window* win, const ScrollRect& s, float x,
     return leaf >= 0 && HitDescendsFrom(win->paint, leaf, s.maskHit);
 }
 
-#if !GPUI_OS_WASM
 static OngoingScroll* ScrollLockFor(Window* win, int id, Axis maskAxis) {
     int* slotId = maskAxis == Axis::Horizontal ? &win->scrollLockHorizontalId
                                                : &win->scrollLockVerticalId;
@@ -22737,20 +22710,13 @@ static OngoingScroll* ScrollLockFor(Window* win, int id, Axis maskAxis) {
     }
     return slot;
 }
-#endif
 
 static Point ScrollMaskDelta(Window* win, const ScrollRect& s,
                              const ScrollWheelEvent& in, Axis maskAxis) {
     Point delta = {in.deltaX, in.deltaY};
-#if GPUI_OS_WASM
-    (void)win;
-    (void)s;
-    (void)maskAxis;
-#else
-    if (in.precise) {
+    if (base::PlatScrollGestureLocks() && in.precise) {
         ScrollLockFor(win, s.id, maskAxis)->Filter(&delta, in.phase);
     }
-#endif
     if (delta.x != 0 && delta.y != 0) {
         float ax = delta.x < 0 ? -delta.x : delta.x;
         float ay = delta.y < 0 ? -delta.y : delta.y;
@@ -23626,16 +23592,6 @@ void WindowClosed(Window* win) {
     win->running = false;
 }
 
-#if !GPUI_OS_WASM
-
-bool ClipboardReadAsync(Window* win, ClipboardReadFn done, void* data) {
-    (void)win;
-    (void)done;
-    (void)data;
-    return false;
-}
-#endif
-
 static void AppFetchLanded(App* app) {
     if (!app) {
         return;
@@ -23883,11 +23839,9 @@ int GpuiTakeRuntimeArgs(int argc, char** argv) {
     int keep = 0;
     for (int i = 0; i < argc; i++) {
         Str argument = Str(argv[i]);
-#if GPUI_OS_WINDOWS
-        if (i > 0 && argument && WinPaintOptionsTakeArg(argument)) {
+        if (i > 0 && argument && WindowTakePaintArg(argument)) {
             continue;
         }
-#endif
         if (i > 0 && argument && SceneTakeArg(argument)) {
             continue;
         }
@@ -33082,6 +33036,41 @@ Str InputContext() {
     return StrL("Input");
 }
 
+void InputBindKeysOther(const char* ctx) {
+    KeyBinding bindings[] = {
+        {"ctrl-backspace", input::DeleteToPreviousWordStart(), ctx},
+        {"ctrl-delete", input::DeleteToNextWordEnd(), ctx},
+        {"ctrl-]", input::Indent(), ctx},
+        {"ctrl-[", input::Outdent(), ctx},
+        {"shift-alt-left", input::SelectLeft(), ctx},
+        {"shift-alt-right", input::SelectRight(), ctx},
+        {"shift-alt-up", input::AddCursorAbove(), ctx},
+        {"shift-alt-down", input::AddCursorBelow(), ctx},
+        {"ctrl-shift-left", input::SelectToPreviousWordStart(), ctx},
+        {"ctrl-shift-right", input::SelectToNextWordEnd(), ctx},
+        {"ctrl-a", input::SelectAll(), ctx},
+        {"ctrl-c", input::Copy(), ctx},
+        {"ctrl-x", input::Cut(), ctx},
+        {"ctrl-v", input::Paste(), ctx},
+        {"ctrl-left", input::MoveToPreviousWord(), ctx},
+        {"ctrl-right", input::MoveToNextWord(), ctx},
+        {"ctrl-z", input::Undo(), ctx},
+        {"ctrl-y", input::Redo(), ctx},
+        {"ctrl-.", input::ToggleCodeActions(), ctx},
+        {"ctrl-f", input::Search(), ctx},
+        {"ctrl-h", input::Replace(), ctx},
+
+        {"ctrl-home", input::MoveToStart(), ctx},
+        {"ctrl-end", input::MoveToEnd(), ctx},
+        {"ctrl-shift-home", input::SelectToStart(), ctx},
+        {"ctrl-shift-end", input::SelectToEnd(), ctx},
+        {"ctrl-shift-z", input::Redo(), ctx},
+    };
+    KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+}
+
+void InputBindPlatformKeys(const char* ctx);
+
 void InputInitKeys() {
     static uint32_t bound = 0;
     if (bound == KeymapGeneration()) {
@@ -33090,30 +33079,10 @@ void InputInitKeys() {
     bound = KeymapGeneration();
     const char* ctx = "Input";
     KeyBinding bindings[] = {
-
         {"backspace", input::Backspace(), ctx},
         {"shift-backspace", input::Backspace(), ctx},
-
-#if GPUI_OS_MAC
-        {"ctrl-backspace", input::Backspace(), ctx},
-#endif
         {"delete", input::Delete(), ctx},
         {"shift-delete", input::Delete(), ctx},
-
-#if GPUI_OS_MAC
-        {"cmd-backspace", input::DeleteToBeginningOfLine(), ctx},
-        {"cmd-delete", input::DeleteToEndOfLine(), ctx},
-        {"alt-backspace", input::DeleteToPreviousWordStart(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-backspace", input::DeleteToPreviousWordStart(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"alt-delete", input::DeleteToNextWordEnd(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-delete", input::DeleteToNextWordEnd(), ctx},
-#endif
         {"enter", input::Enter(), ctx},
         {"shift-enter", input::Enter(), ctx, 2},
         {"secondary-enter", input::Enter(), ctx, 1},
@@ -33126,137 +33095,17 @@ void InputInitKeys() {
         {"pagedown", input::MovePageDown(), ctx},
         {"tab", input::IndentInline(), ctx},
         {"shift-tab", input::OutdentInline(), ctx},
-
-#if GPUI_OS_MAC
-        {"cmd-]", input::Indent(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-]", input::Indent(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-[", input::Outdent(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-[", input::Outdent(), ctx},
-#endif
         {"shift-left", input::SelectLeft(), ctx},
         {"shift-right", input::SelectRight(), ctx},
         {"shift-up", input::SelectUp(), ctx},
         {"shift-down", input::SelectDown(), ctx},
-#if !GPUI_OS_MAC && !GPUI_OS_LINUX
-        {"shift-alt-left", input::SelectLeft(), ctx},
-        {"shift-alt-right", input::SelectRight(), ctx},
-#endif
-
-#if GPUI_OS_MAC
-        {"cmd-alt-up", input::AddCursorAbove(), ctx},
-        {"cmd-alt-down", input::AddCursorBelow(), ctx},
-#elif GPUI_OS_WINDOWS
-        {"ctrl-alt-up", input::AddCursorAbove(), ctx},
-        {"ctrl-alt-down", input::AddCursorBelow(), ctx},
-#else
-        {"shift-alt-up", input::AddCursorAbove(), ctx},
-        {"shift-alt-down", input::AddCursorBelow(), ctx},
-#endif
         {"home", input::MoveHome(), ctx},
         {"end", input::MoveEnd(), ctx},
         {"shift-home", input::SelectToStartOfLine(), ctx},
         {"shift-end", input::SelectToEndOfLine(), ctx},
-
-#if GPUI_OS_MAC
-        {"ctrl-shift-a", input::SelectToStartOfLine(), ctx},
-        {"ctrl-shift-e", input::SelectToEndOfLine(), ctx},
-        {"shift-cmd-left", input::SelectToStartOfLine(), ctx},
-        {"shift-cmd-right", input::SelectToEndOfLine(), ctx},
-#endif
-#if GPUI_OS_MAC || GPUI_OS_LINUX
-        {"alt-shift-left", input::SelectToPreviousWordStart(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-shift-left", input::SelectToPreviousWordStart(), ctx},
-#endif
-#if GPUI_OS_MAC || GPUI_OS_LINUX
-        {"alt-shift-right", input::SelectToNextWordEnd(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-shift-right", input::SelectToNextWordEnd(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-a", input::SelectAll(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-a", input::SelectAll(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-c", input::Copy(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-c", input::Copy(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-x", input::Cut(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-x", input::Cut(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-v", input::Paste(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-v", input::Paste(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"ctrl-a", input::MoveHome(), ctx},
-        {"cmd-left", input::MoveHome(), ctx},
-        {"ctrl-e", input::MoveEnd(), ctx},
-        {"cmd-right", input::MoveEnd(), ctx},
-        {"cmd-z", input::Undo(), ctx},
-        {"cmd-shift-z", input::Redo(), ctx},
-        {"cmd-up", input::MoveToStart(), ctx},
-        {"cmd-down", input::MoveToEnd(), ctx},
-        {"alt-left", input::MoveToPreviousWord(), ctx},
-        {"alt-right", input::MoveToNextWord(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-left", input::MoveToPreviousWord(), ctx},
-        {"ctrl-right", input::MoveToNextWord(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-shift-up", input::SelectToStart(), ctx},
-        {"cmd-shift-down", input::SelectToEnd(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-z", input::Undo(), ctx},
-        {"ctrl-y", input::Redo(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-.", input::ToggleCodeActions(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-.", input::ToggleCodeActions(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-f", input::Search(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-f", input::Search(), ctx},
-#endif
-#if GPUI_OS_MAC
-        {"cmd-shift-f", input::Replace(), ctx},
-#endif
-#if !GPUI_OS_MAC
-        {"ctrl-h", input::Replace(), ctx},
-#endif
-#if !GPUI_OS_MAC
-
-        {"ctrl-home", input::MoveToStart(), ctx},
-        {"ctrl-end", input::MoveToEnd(), ctx},
-        {"ctrl-shift-home", input::SelectToStart(), ctx},
-        {"ctrl-shift-end", input::SelectToEnd(), ctx},
-        {"ctrl-shift-z", input::Redo(), ctx},
-#endif
     };
     KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+    InputBindPlatformKeys(ctx);
 }
 
 InputAction InputActionOf(uint32_t id, int64_t arg) {
@@ -37444,12 +37293,6 @@ void InputScrollToCursor(InputState* s, InputMoveDir dir) {
     InputScrollToCaret(s, s->caretX, caretY, dir);
 }
 
-#if GPUI_OS_MAC
-static const float kInputCursorWidth = 1.5f;
-#else
-static const float kInputCursorWidth = 2.f;
-#endif
-
 bool InputUpdateScrollOffset(InputState* s, App* app, Window* win,
                              const Point* offset) {
     (void)app;
@@ -37459,7 +37302,7 @@ bool InputUpdateScrollOffset(InputState* s, App* app, Window* win,
 
     Point want = offset ? *offset : Point{s->scrollX, s->scrollY};
 
-    float safeX = s->align == 0 ? 0.f : kInputCursorWidth;
+    float safeX = s->align == 0 ? 0.f : base::PlatCaretWidth();
     float mostY = s->contentH - s->viewH;
     float mostX = s->contentW - s->viewW + safeX;
     if (mostY < 0) {
@@ -52434,7 +52277,7 @@ ScrollBounce* ScrollBounce::New(Ctx* cx, Str id, El* child) {
     out->cx = cx;
     out->id = id;
     out->child = child;
-    out->enabled = GPUI_OS_IOS || GPUI_OS_ANDROID;
+    out->enabled = base::PlatScrollBounce();
     return out;
 }
 
@@ -56041,16 +55884,19 @@ void TextViewInitKeys() {
     if (bound == KeymapGeneration()) return;
     bound = KeymapGeneration();
     const char* context = "TextView";
-    KeyBinding bindings[] = {
-#if GPUI_OS_MAC
-        {"cmd-c", input::Copy(), context},
-        {"cmd-a", input::SelectAll(), context},
-#else
-        {"ctrl-c", input::Copy(), context},
-        {"ctrl-a", input::SelectAll(), context},
-#endif
-    };
-    KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+    if (base::PlatSecondaryIsCommand()) {
+        KeyBinding bindings[] = {
+            {"cmd-c", input::Copy(), context},
+            {"cmd-a", input::SelectAll(), context},
+        };
+        KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+    } else {
+        KeyBinding bindings[] = {
+            {"ctrl-c", input::Copy(), context},
+            {"ctrl-a", input::SelectAll(), context},
+        };
+        KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+    }
 }
 
 TextMark& TextMark::Bold() {
@@ -80429,11 +80275,9 @@ namespace gpui {
 
 namespace component {
 
-#if GPUI_OS_MAC
-static const char* kKbdSeparator = "";
-#else
-static const char* kKbdSeparator = "+";
-#endif
+static const char* KbdSeparator() {
+    return base::PlatSecondaryIsCommand() ? "" : "+";
+}
 
 static void KbdAppend(char* out, int cap, int* len, const char* part) {
     for (const char* p = part; *p && *len + 1 < cap; p++) {
@@ -80443,7 +80287,7 @@ static void KbdAppend(char* out, int cap, int* len, const char* part) {
 
 static void KbdAppendSep(char* out, int cap, int* len) {
     if (*len > 0) {
-        KbdAppend(out, cap, len, kKbdSeparator);
+        KbdAppend(out, cap, len, KbdSeparator());
     }
 }
 
@@ -80475,12 +80319,8 @@ static const char* KbdKeyName(Str key) {
         if (!base::StrEq(key, kNamed[i].key)) {
             continue;
         }
-#if GPUI_OS_MAC
-        return kNamed[i].mac;
-#else
 
-        return kNamed[i].other;
-#endif
+        return base::PlatSecondaryIsCommand() ? kNamed[i].mac : kNamed[i].other;
     }
     return nullptr;
 }
@@ -80491,37 +80331,22 @@ int KbdFormat(Keystroke stroke, char* out, int cap) {
         return 0;
     }
 
+    const bool mac = base::PlatSecondaryIsCommand();
     if (stroke.ctrl) {
         KbdAppendSep(out, cap, &len);
-#if GPUI_OS_MAC
-        KbdAppend(out, cap, &len, "\u2303");
-#else
-        KbdAppend(out, cap, &len, "Ctrl");
-#endif
+        KbdAppend(out, cap, &len, mac ? "\u2303" : "Ctrl");
     }
     if (stroke.alt) {
         KbdAppendSep(out, cap, &len);
-#if GPUI_OS_MAC
-        KbdAppend(out, cap, &len, "\u2325");
-#else
-        KbdAppend(out, cap, &len, "Alt");
-#endif
+        KbdAppend(out, cap, &len, mac ? "\u2325" : "Alt");
     }
     if (stroke.shift) {
         KbdAppendSep(out, cap, &len);
-#if GPUI_OS_MAC
-        KbdAppend(out, cap, &len, "\u21e7");
-#else
-        KbdAppend(out, cap, &len, "Shift");
-#endif
+        KbdAppend(out, cap, &len, mac ? "\u21e7" : "Shift");
     }
     if (stroke.platform) {
         KbdAppendSep(out, cap, &len);
-#if GPUI_OS_MAC
-        KbdAppend(out, cap, &len, "\u2318");
-#else
-        KbdAppend(out, cap, &len, "Win");
-#endif
+        KbdAppend(out, cap, &len, mac ? "\u2318" : "Win");
     }
 
     KbdAppendSep(out, cap, &len);
@@ -80597,11 +80422,11 @@ bool KeystrokeParse(Arena* a, Str source, Keystroke* out) {
             continue;
         }
         if (KeystrokePartIs(part, "secondary")) {
-#if GPUI_OS_MAC
-            k.platform = true;
-#else
-            k.ctrl = true;
-#endif
+            if (base::PlatSecondaryIsCommand()) {
+                k.platform = true;
+            } else {
+                k.ctrl = true;
+            }
             continue;
         }
         if (KeystrokePartIs(part, "cmd") || KeystrokePartIs(part, "super") ||
@@ -98530,12 +98355,6 @@ void ThemeSyncBase(App* app) {
     component::TextViewInstallDefaults(app);
 }
 
-#if GPUI_OS_WINDOWS
-static const char ui_theme_kSep = '\\';
-#else
-static const char ui_theme_kSep = '/';
-#endif
-
 static Str ReadTextFile(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) {
@@ -99993,7 +99812,7 @@ static int ThemesDirLoadFiles(App* app, const char* path) {
         if (nameLen < 6 || !base::StrEqI(Str(name + nameLen - 5), ".json")) {
             continue;
         }
-        TempStr file = fmt("%s%c%s", Str(path), ui_theme_kSep, Str(name));
+        TempStr file = fmt("%s%c%s", Str(path), base::PlatPathSep(), Str(name));
         Str text = len(file) < kMaxPath ? ReadTextFile(file.s) : Str{};
         if (text.s) {
             added += ThemeRegistryLoadStr(app, text);
@@ -101768,8 +101587,6 @@ namespace gpui {
 
 namespace component {
 
-#if !GPUI_OS_MAC
-
 static El* ControlIcon(Ctx* cx, IconName icon, int clickId) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
@@ -101806,7 +101623,6 @@ static El* WindowControls(Ctx* cx) {
             ClickWinMax))
         ->Child(ControlIcon(cx, IconName::WindowClose, ClickWinClose));
 }
-#endif
 
 TitleBar* TitleBar::New(Ctx* cx) {
     Arena* a = cx->a;
@@ -101828,7 +101644,7 @@ TitleBar* TitleBar::New(Ctx* cx) {
                  ->W(kFill)
                  ->H(kTitleBarHeight)
                  ->Shrink0()
-                 ->PadL(kTitleBarLeftPad)
+                 ->PadL(TitleBarLeftPad())
                  ->ItemsCenter()
                  ->Bg(mixed)
                  ->BorderB(1, th.titleBarBorder)
@@ -101843,9 +101659,9 @@ TitleBar* TitleBar::Child(El* e) {
 }
 
 El* TitleBar::IntoEl() {
-#if !GPUI_OS_MAC
-    bar->Child(WindowControls(cx));
-#endif
+    if (base::PlatShowsWindowControls()) {
+        bar->Child(WindowControls(cx));
+    }
     return bar;
 }
 
@@ -102431,7 +102247,7 @@ Edges WindowPaddings(Window* window) {
         return {};
     }
     float shadow =
-        window->clientInset >= 0 ? window->clientInset : kWindowShadowSize;
+        window->clientInset >= 0 ? window->clientInset : WindowShadowSize();
     return WindowBorderInsets(shadow, window->tiling);
 }
 
@@ -102440,7 +102256,7 @@ Edges WindowContentInsets(Window* window) {
         return {};
     }
     float shadow =
-        window->clientInset >= 0 ? window->clientInset : kWindowShadowSize;
+        window->clientInset >= 0 ? window->clientInset : WindowShadowSize();
     Edges insets = WindowBorderInsets(shadow, window->tiling);
     const WindowTiling& tiling = window->tiling;
     if (!tiling.top) {
@@ -103318,18 +103134,7 @@ bool HttpUrlIsRemote(Str url) {
            base::StrStartsWithI(url, "https://");
 }
 
-struct HttpAsyncJob {
-    HttpReq req;
-    Str url;
-    Str method;
-    Str body;
-    Vec<HttpHeader> headers;
-    HttpRsp response;
-    Func1<HttpAsyncResult> done;
-    bool ok = false;
-};
-
-static void HttpAsyncJobFree(HttpAsyncJob* job) {
+void HttpAsyncJobFree(HttpAsyncJob* job) {
     if (!job) {
         return;
     }
@@ -103380,15 +103185,6 @@ static HttpAsyncJob* HttpAsyncJobNew(const HttpReq& req,
     return job;
 }
 
-#if GPUI_OS_WASM
-
-bool HttpWasmSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done);
-
-static void HttpAsyncWasmDone(HttpAsyncJob* job, HttpAsyncResult result) {
-    job->done.Call(result);
-    HttpAsyncJobFree(job);
-}
-#else
 static void HttpAsyncWork(HttpAsyncJob* job) {
     job->ok = HttpSend(job->req, &job->response);
 }
@@ -103398,7 +103194,10 @@ static void HttpAsyncDone(HttpAsyncJob* job) {
     job->done.Call(result);
     HttpAsyncJobFree(job);
 }
-#endif
+
+bool HttpAsyncLaunchHosted(HttpAsyncJob* job) {
+    return ExecSpawn(MkFunc0(HttpAsyncWork, job), MkFunc0(HttpAsyncDone, job));
+}
 
 bool HttpSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done) {
     if (!done.IsValid()) {
@@ -103408,27 +103207,17 @@ bool HttpSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done) {
     if (!job) {
         return false;
     }
-#if GPUI_OS_WASM
-    if (!HttpWasmSendAsync(job->req, MkFunc1(HttpAsyncWasmDone, job))) {
+    if (!HttpAsyncLaunch(job)) {
         HttpAsyncJobFree(job);
         return false;
     }
     return true;
-#else
-    if (!ExecSpawn(MkFunc0(HttpAsyncWork, job), MkFunc0(HttpAsyncDone, job))) {
-        HttpAsyncJobFree(job);
-        return false;
-    }
-    return true;
-#endif
 }
 
 struct FetchJob {
     int slot = 0;
     Func0 done = {};
-#if !GPUI_OS_WASM
     Str url = {};
-#endif
 };
 
 struct FetchSlot {
@@ -103493,8 +103282,6 @@ static void SlotDrop(FetchSlot* s) {
     s->state = FetchState::None;
 }
 
-#if GPUI_OS_WASM
-
 static void FetchDone(FetchJob* job, HttpAsyncResult result) {
     HttpRsp* response = result.response;
     bool got = result.ok && response && response->status >= 200 &&
@@ -103522,12 +103309,12 @@ static void FetchDone(FetchJob* job, HttpAsyncResult result) {
     gFetchLock.Unlock();
 
     Func0 done = job->done;
+    StrFree(job->url);
     Free(nullptr, job);
     if (!discard) {
         done.Call();
     }
 }
-#else
 
 static void FetchWorker(FetchJob* job) {
     HttpRsp response;
@@ -103563,7 +103350,6 @@ static void FetchWorker(FetchJob* job) {
         ExecPost(done);
     }
 }
-#endif
 
 static FetchSlot* SlotFree() {
     for (int i = 0; i < kFetchSlots; i++) {
@@ -103628,39 +103414,37 @@ FetchState HttpFetch(Str url, const uint8_t** bytes, int* len) {
     s->job = job;
     job->slot = (int)(s - gFetch);
     job->done = gOnFetchDone;
-#if !GPUI_OS_WASM
     job->url = StrDup(url);
-#endif
     gFetchPending++;
     gFetchLock.Unlock();
 
-#if GPUI_OS_WASM
-    HttpReq req;
-    req.url = url;
-    bool started = HttpSendAsync(req, MkFunc1(FetchDone, job));
-#else
-    TaskId task = job->url.s ? ExecSpawn(MkFunc0(FetchWorker, job)) : 0;
-    bool started = task != 0;
-#endif
+    bool started = false;
+    TaskId task = 0;
+    if (base::PlatAsyncIo()) {
+        HttpReq req;
+        req.url = url;
+        started = HttpSendAsync(req, MkFunc1(FetchDone, job));
+    } else {
+        task = job->url.s ? ExecSpawn(MkFunc0(FetchWorker, job)) : 0;
+        started = task != 0;
+    }
     if (!started) {
         gFetchLock.Lock();
         gFetchPending--;
         SlotDrop(s);
         gFetchLock.Unlock();
-#if !GPUI_OS_WASM
         StrFree(job->url);
-#endif
         Free(nullptr, job);
         return FetchState::None;
     }
-#if !GPUI_OS_WASM
-    gFetchLock.Lock();
+    if (!base::PlatAsyncIo()) {
+        gFetchLock.Lock();
 
-    if (s->state == FetchState::Pending && s->job == job) {
-        s->task = task;
+        if (s->state == FetchState::Pending && s->job == job) {
+            s->task = task;
+        }
+        gFetchLock.Unlock();
     }
-    gFetchLock.Unlock();
-#endif
     return FetchState::Pending;
 }
 
@@ -103675,21 +103459,17 @@ void HttpFetchClear() {
             continue;
         }
         s->discard = true;
-#if !GPUI_OS_WASM
-        if (s->task && ExecCancel(s->task)) {
+        if (!base::PlatAsyncIo() && s->task && ExecCancel(s->task)) {
             cancelled[cancelledN++] = s->job;
             gFetchPending--;
             SlotDrop(s);
         }
-#endif
     }
     gFetchNext = 0;
     gFetchLock.Unlock();
     for (int i = 0; i < cancelledN; i++) {
         FetchJob* job = cancelled[i];
-#if !GPUI_OS_WASM
         StrFree(job->url);
-#endif
         Free(nullptr, job);
     }
 }
@@ -116353,7 +116133,7 @@ static constexpr MethodDescriptor component_shell_separator_kMethods[] = {
     {"color", component_shell_separator_kColorArgs, "Sets the separator line color.", &component_shell_separator_RecordColor},
     {"dashed", {}, "Uses a dashed separator line.", &RecordDashed},
 };
-static constexpr ComponentDescriptor component_shell_separator_kSeparator = {
+static constexpr ComponentDescriptor kSeparator = {
     "Separator", component_shell_separator_kConstructors, component_shell_separator_kMethods,
     "A horizontal or vertical, solid or dashed separator.", &component_shell_separator_Materialize};
 
@@ -116363,7 +116143,7 @@ namespace gpui::component_shell {
 
 bool RegisterSeparator(shell::ComponentRegistry* registry,
                        shell::RegistryError* error) {
-    return registry->Register(&separator::component_shell_separator_kSeparator, error);
+    return registry->Register(&separator::kSeparator, error);
 }
 
 }
@@ -144351,29 +144131,24 @@ static bool shell_capability_IsSeparator(char c) {
 static bool IsAbsolute(Str path) {
     if (len(path) == 0) return false;
     if (shell_capability_IsSeparator(path.s[0])) return true;
-#if GPUI_OS_WINDOWS
+    if (!base::PlatIsWindows()) return false;
     return len(path) >= 3 &&
            ((path.s[0] >= 'A' && path.s[0] <= 'Z') ||
             (path.s[0] >= 'a' && path.s[0] <= 'z')) &&
            path.s[1] == ':' && shell_capability_IsSeparator(path.s[2]);
-#else
-    return false;
-#endif
 }
 
 static Str NormalizePath(Arena* arena, Str path, bool* escaped) {
     if (escaped) *escaped = false;
     StrBuilder out(arena);
     int prefix = 0;
-#if GPUI_OS_WINDOWS
-    if (len(path) >= 2 && path.s[1] == ':') {
+    if (base::PlatIsWindows() && len(path) >= 2 && path.s[1] == ':') {
         char drive = path.s[0];
         if (drive >= 'a' && drive <= 'z') drive = (char)(drive - 'a' + 'A');
         out.AppendChar(drive);
         out.AppendChar(':');
         prefix = 2;
     }
-#endif
     if (prefix < len(path) && shell_capability_IsSeparator(path.s[prefix])) {
         out.AppendChar('/');
         while (prefix < len(path) && shell_capability_IsSeparator(path.s[prefix])) prefix++;
@@ -144407,24 +144182,18 @@ static Str NormalizePath(Arena* arena, Str path, bool* escaped) {
     return len(result) == 0 ? StrDup(arena, StrL(".")) : result;
 }
 
+static bool PathSame(Str a, Str b) {
+    return base::PlatPathsCaseFold() ? StrEqI(a, b) : StrEq(a, b);
+}
+
 static bool PathPrefix(Str root, Str path, Str* relative) {
-    bool same = false;
-#if GPUI_OS_WINDOWS
-    same = StrEqI(root, path);
-#else
-    same = StrEq(root, path);
-#endif
-    if (same) {
+    if (PathSame(root, path)) {
         *relative = StrL(".");
         return true;
     }
     if (len(path) <= len(root) || path.s[len(root)] != '/') return false;
     Str head(path.s, len(root));
-#if GPUI_OS_WINDOWS
-    if (!StrEqI(head, root)) return false;
-#else
-    if (!StrEq(head, root)) return false;
-#endif
+    if (!PathSame(head, root)) return false;
     *relative = Str(path.s + len(root) + 1, len(path) - len(root) - 1);
     return true;
 }
@@ -145765,7 +145534,9 @@ bool QueueComponentAppEffect(ComponentAppEffectQueue* queue, Str key,
 
 namespace gpui::shell {
 
-static const char shell_dependencies_kSeparator = GPUI_OS_WINDOWS ? '\\' : '/';
+static char PathSep() {
+    return base::PlatPathSep();
+}
 
 static void DepError(Str* error, Str message) {
     if (!error) return;
@@ -145782,12 +145553,12 @@ static Str JoinPath(Str left, Str right) {
     if (!right) return StrDup(left);
     bool separated = shell_dependencies_IsSeparator(left.s[len(left) - 1]);
     return StrDup(separated ? fmt("%s%s", left, right)
-                            : fmt("%s%c%s", left, shell_dependencies_kSeparator, right));
+                            : fmt("%s%c%s", left, PathSep(), right));
 }
 
 static bool PathEq(Str a, Str b) {
     if (len(a) != len(b)) return false;
-#if GPUI_OS_WINDOWS
+    if (!base::PlatPathsCaseFold()) return StrEq(a, b);
     for (int i = 0; i < len(a); i++) {
         char ca = a.s[i];
         char cb = b.s[i];
@@ -145796,24 +145567,21 @@ static bool PathEq(Str a, Str b) {
             return false;
     }
     return true;
-#else
-    return StrEq(a, b);
-#endif
 }
 
 static bool WithinPath(Str root, Str path) {
     if (!root || !path || len(path) < len(root)) return false;
-#if GPUI_OS_WINDOWS
-    for (int i = 0; i < len(root); i++) {
-        char a = root.s[i];
-        char b = path.s[i];
-        if (shell_dependencies_IsSeparator(a) && shell_dependencies_IsSeparator(b)) continue;
-        if (tolower((unsigned char)a) != tolower((unsigned char)b))
-            return false;
+    if (!base::PlatPathsCaseFold()) {
+        if (!StrEq(root, Str(path.s, len(root)))) return false;
+    } else {
+        for (int i = 0; i < len(root); i++) {
+            char a = root.s[i];
+            char b = path.s[i];
+            if (shell_dependencies_IsSeparator(a) && shell_dependencies_IsSeparator(b)) continue;
+            if (tolower((unsigned char)a) != tolower((unsigned char)b))
+                return false;
+        }
     }
-#else
-    if (!StrEq(root, Str(path.s, len(root)))) return false;
-#endif
     return len(path) == len(root) || shell_dependencies_IsSeparator(path.s[len(root)]);
 }
 
@@ -151675,7 +151443,7 @@ static Str Join(Arena* arena, Str left, Str right) {
     StrBuilder path(arena);
     path.Append(left);
     if (left && left.s[len(left) - 1] != '/' && left.s[len(left) - 1] != '\\')
-        path.AppendChar(GPUI_OS_WINDOWS ? '\\' : '/');
+        path.AppendChar(base::PlatPathSep());
     path.Append(right);
     return path.TakeStr();
 }
@@ -152466,7 +152234,7 @@ static Str ExpandPath(Str raw, Str plugin, Str data) {
     joined.Append(plugin);
     if (plugin && plugin.s[len(plugin) - 1] != '/' &&
         plugin.s[len(plugin) - 1] != '\\')
-        joined.AppendChar(GPUI_OS_WINDOWS ? '\\' : '/');
+        joined.AppendChar(base::PlatPathSep());
     joined.Append(expanded);
     StrFree(expanded);
     return joined.TakeStr();
@@ -152521,11 +152289,11 @@ static int ComparePaths(const void* left, const void* right) {
 Str ShellDataHome() {
     const char* explicitHome = getenv("XDG_DATA_HOME");
     if (explicitHome && *explicitHome) return StrDup(Str(explicitHome));
-#if GPUI_OS_WINDOWS
-    const char* appData = getenv("APPDATA");
-    if (appData && *appData) return StrDup(Str(appData));
-#endif
-    const char* user = getenv(GPUI_OS_WINDOWS ? "USERPROFILE" : "HOME");
+    if (base::PlatIsWindows()) {
+        const char* appData = getenv("APPDATA");
+        if (appData && *appData) return StrDup(Str(appData));
+    }
+    const char* user = getenv(base::PlatIsWindows() ? "USERPROFILE" : "HOME");
     TempStr cwd;
     if (!user || !*user) {
         cwd = AllocStrTemp(kMaxPath - 1);
@@ -152535,13 +152303,7 @@ Str ShellDataHome() {
     }
     StrBuilder path;
     path.Append(Str(user));
-#if GPUI_OS_MAC
-    path.Append(StrL("/Library/Application Support"));
-#elif GPUI_OS_WINDOWS
-    path.Append(StrL("\\AppData\\Roaming"));
-#else
-    path.Append(StrL("/.local/share"));
-#endif
+    path.Append(Str(base::PlatShellDataDir()));
     return path.TakeStr();
 }
 
@@ -155096,19 +154858,15 @@ static JSValue FetchJobResolved(ShellRuntimeImpl* impl, void* user) {
     return FetchJobValue(impl->context, (ShellFetchJob*)user);
 }
 
-#if !GPUI_OS_WASM
 static void FetchJobWork(ShellFetchJob* job) {
     shell::FetchSend(job->request, job->capabilities, &job->result);
 }
-#endif
 
 static void ShellFetchJobDestroy(void* job) {
     ShellFetchJob* self = (ShellFetchJob*)job;
     self->Free();
     delete self;
 }
-
-#if GPUI_OS_WASM
 
 static void ShellFetchDone(ShellFetchJob* job, shell::FetchAsyncResult landed) {
     if (landed.result) {
@@ -155119,7 +154877,6 @@ static void ShellFetchDone(ShellFetchJob* job, shell::FetchAsyncResult landed) {
     bool failed = !landed.ok || job->result.error.s != nullptr;
     SettleShellTask(&lease, failed, job->result.error, FetchJobResolved, job);
 }
-#else
 
 static Task ShellFetchTask(TaskGuard guard, ShellFetchJob* job) {
     (void)guard;
@@ -155128,7 +154885,6 @@ static Task ShellFetchTask(TaskGuard guard, ShellFetchJob* job) {
     bool failed = job->result.error.s != nullptr;
     SettleShellTask(&lease, failed, job->result.error, FetchJobResolved, job);
 }
-#endif
 
 static void StorageFlushDone(StorageFlushState* state,
                              shell::StorageOutcome outcome) {
@@ -155537,11 +155293,11 @@ static void DirectoryName(Str* path) {
 
 static bool WithinRoot(Str root, Str path) {
     if (len(path) < len(root)) return false;
-#if GPUI_OS_WINDOWS
-    if (StrCmpNI(root.s, path.s, len(root)) != 0) return false;
-#else
-    if (!StrEq(root, Str(path.s, len(root)))) return false;
-#endif
+    if (base::PlatPathsCaseFold()) {
+        if (StrCmpNI(root.s, path.s, len(root)) != 0) return false;
+    } else if (!StrEq(root, Str(path.s, len(root)))) {
+        return false;
+    }
     return len(path) == len(root) || path.s[len(root)] == '/';
 }
 
@@ -161407,28 +161163,28 @@ static JSValue NativeFetch(JSContext* ctx, JSValueConst, int argc,
     ControlRetain(job->head.control);
     job->head.task = task;
     job->head.kind = ShellTaskKind::Fetch;
-#if GPUI_OS_WASM
-    if (!shell::FetchSendAsync(job->request, job->capabilities,
-                               MkFunc1(ShellFetchDone, job))) {
-        ForgetTask(impl, task, false);
-        ControlRelease(job->head.control);
-        job->Free();
-        delete job;
-        JS_FreeValue(ctx, promise);
-        return JS_ThrowInternalError(ctx,
-                                     "fetch could not start asynchronous work");
+    if (base::PlatAsyncIo()) {
+        if (!shell::FetchSendAsync(job->request, job->capabilities,
+                                   MkFunc1(ShellFetchDone, job))) {
+            ForgetTask(impl, task, false);
+            ControlRelease(job->head.control);
+            job->Free();
+            delete job;
+            JS_FreeValue(ctx, promise);
+            return JS_ThrowInternalError(
+                ctx, "fetch could not start asynchronous work");
+        }
+    } else {
+        TaskGuard guard;
+        guard.alive = ShellTaskOwnerAlive;
+        guard.user = &job->head;
+        Task work = ShellFetchTask(guard, job);
+        if (!work.IsRunning()) {
+            JS_FreeValue(ctx, promise);
+            return JS_ThrowInternalError(
+                ctx, "fetch could not start background work");
+        }
     }
-#else
-    TaskGuard guard;
-    guard.alive = ShellTaskOwnerAlive;
-    guard.user = &job->head;
-    Task work = ShellFetchTask(guard, job);
-    if (!work.IsRunning()) {
-        JS_FreeValue(ctx, promise);
-        return JS_ThrowInternalError(ctx,
-                                     "fetch could not start background work");
-    }
-#endif
     return promise;
 }
 
@@ -164436,15 +164192,7 @@ static JSValue NativeDockRegisterPanel(JSContext* ctx, JSValueConst, int argc,
 
 static bool InstallRuntime(ShellRuntimeImpl* impl, ShellError* error) {
     JSValue global = JS_GetGlobalObject(impl->context);
-#if GPUI_OS_WINDOWS
-    const char* platform = "windows";
-#elif GPUI_OS_MAC
-    const char* platform = "macos";
-#elif GPUI_OS_WASM
-    const char* platform = "emscripten";
-#else
-    const char* platform = "linux";
-#endif
+    const char* platform = base::PlatShellPlatformName();
 #if defined(_M_ARM64) || defined(__aarch64__)
     const char* architecture = "aarch64";
 #elif defined(__wasm32__)
@@ -164455,7 +164203,7 @@ static bool InstallRuntime(ShellRuntimeImpl* impl, ShellError* error) {
     const char* architecture = "x86_64";
 #endif
     JS_SetPropertyStr(impl->context, global, "__shell_is_windows",
-                      JS_NewBool(impl->context, GPUI_OS_WINDOWS));
+                      JS_NewBool(impl->context, base::PlatIsWindows()));
     JS_SetPropertyStr(impl->context, global, "__shell_platform",
                       JS_NewString(impl->context, platform));
     JS_SetPropertyStr(impl->context, global, "__shell_arch",
@@ -192992,7 +192740,7 @@ static TempStr shell_typings_JoinPathTemp(Str directory, Str name) {
     int n = len(directory) + (separator ? 1 : 0) + len(name);
     if (n >= kMaxPath) return {};
     if (!separator) return fmt("%s%s", directory, name);
-    return fmt("%s%c%s", directory, GPUI_OS_WINDOWS ? '\\' : '/', name);
+    return fmt("%s%c%s", directory, base::PlatPathSep(), name);
 }
 
 static bool SourceImportsBuiltins(Str source) {
@@ -204115,8 +203863,10 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #include <pango/pangocairo.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -204154,6 +203904,7 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #include <wincodec.h>
 #include <windows.h>
 #include <winhttp.h>
+#include <winternl.h>
 #endif
 
 #if GPUI_OS_MAC
@@ -204200,14 +203951,36 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #endif
 
 #if GPUI_OS_WASM
+#include <emscripten.h>
 #include <emscripten/emscripten.h>
 #include <emscripten/heap.h>
 #include <emscripten/html5.h>
+#include <sys/stat.h>
 #endif
 
-#if GPUI_OS_LINUX || GPUI_OS_ANDROID
-#include <poll.h>
-#include <sys/inotify.h>
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
+#include <dirent.h>
+#include <fcntl.h>
+#include <strings.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
+#include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#if GPUI_OS_ANDROID
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -204220,15 +203993,10 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #include <unistd.h>
 #endif
 
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
-#include <dirent.h>
-#include <strings.h>
+#if GPUI_OS_LINUX || GPUI_OS_ANDROID
+#include <poll.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#endif
-
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
-#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -215451,7 +215219,7 @@ int TextLayoutRangeRects(TextLayout* tl, Str s, int u8a, int u8b, Bounds* out,
 #if GPUI_OS_WINDOWS
 #line 1 "src/gpui/paintgpu_shaders_win.cpp"
 
-#if GPUI_OS_WINDOWS && WIN_BACKEND_GPU
+#if WIN_BACKEND_GPU
 namespace gpui {
 namespace gpuw {
 
@@ -215598,7 +215366,7 @@ uint8_t kShaderPSTriBytes[844] = {};
 #if GPUI_OS_WINDOWS
 #line 1 "src/gpui/paintgpu_win.cpp"
 
-#if GPUI_OS_WINDOWS && WIN_BACKEND_GPU
+#if WIN_BACKEND_GPU
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -219021,7 +218789,7 @@ void TextLayoutDraw(PaintCtx* ctx, TextLayout* tl, float x, float y, Rgba c,
 }
 }
 
-#elif GPUI_OS_WINDOWS
+#else
 
 namespace gpui {
 
@@ -219093,6 +218861,39 @@ const FrameStats& LastFrameStats() {
 }
 
 #endif
+
+#endif
+
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
+#line 1 "src/gpui/scene_posix.cpp"
+
+namespace gpui {
+
+int SceneLevelFallback();
+
+int SceneLevelOn() {
+    return SceneLevelFallback();
+}
+
+}
+
+#endif
+
+#if GPUI_OS_WINDOWS
+#line 1 "src/gpui/scene_win.cpp"
+
+namespace gpui {
+
+int SceneLevelOn() {
+    static_assert((int)WinSceneMode::Off == kSceneOff);
+    static_assert((int)WinSceneMode::Replay == kSceneReplay);
+    static_assert((int)WinSceneMode::Cache == kSceneCache);
+    static_assert((int)WinSceneMode::Skip == kSceneSkip);
+    static_assert((int)WinSceneMode::Damage == kSceneDamage);
+    return (int)WinPaintOptionsGet().scene;
+}
+
+}
 
 #endif
 
@@ -223229,6 +223030,37 @@ int main(int argc, char** argv) {
 
 #endif
 
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
+#line 1 "src/gpui/window_mem_posix.cpp"
+
+namespace gpui {
+
+bool ClipboardReadAsync(Window* win, ClipboardReadFn done, void* data) {
+    (void)win;
+    (void)done;
+    (void)data;
+    return false;
+}
+
+}
+
+#endif
+
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
+#line 1 "src/gpui/window_posix.cpp"
+
+namespace gpui {
+
+void FrameBenchLogGpu() {}
+
+bool WindowTakePaintArg(Str) {
+    return false;
+}
+
+}
+
+#endif
+
 #if GPUI_OS_WASM
 #line 1 "src/gpui/window_wasm.cpp"
 
@@ -225066,6 +224898,9 @@ void PlatSetCursor(Window* win, CursorKind kind) {
         case CursorKind::Crosshair:
             name = IDC_CROSS;
             break;
+        case CursorKind::ClosedHand:
+            name = IDC_SIZEALL;
+            break;
         default:
             break;
     }
@@ -225690,6 +225525,28 @@ int AppRun(App* app) {
     return (int)msg.wParam;
 }
 
+void FrameBenchLogGpu() {
+    if (PaintGpuOn()) {
+        const gpuw::FrameStats& st = gpuw::LastFrameStats();
+        logf(
+            "frame-bench %s instances=%d draws=%d pathTris=%d "
+            "glyphsRasterized=%d",
+            PaintD3d12On() ? StrL("d3d12") : StrL("d3d11"), st.instances,
+            st.draws, st.pathTriangles, st.glyphsRasterized);
+    }
+}
+
+bool WindowTakePaintArg(Str arg) {
+    return WinPaintOptionsTakeArg(arg);
+}
+
+bool ClipboardReadAsync(Window* win, ClipboardReadFn done, void* data) {
+    (void)win;
+    (void)done;
+    (void)data;
+    return false;
+}
+
 }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
@@ -225721,6 +225578,183 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     LocalFree(static_cast<void*>(wargv));
     argc = gpui::GpuiTakeRuntimeArgs(argc, argv);
     return GpuiMain(argc, argv);
+}
+
+#endif
+
+#if GPUI_OS_ANDROID
+#line 1 "src/base/input_keys_android.cpp"
+
+namespace gpui {
+
+void InputBindKeysOther(const char* ctx);
+
+void InputBindPlatformKeys(const char* ctx) {
+    InputBindKeysOther(ctx);
+}
+
+}
+
+#endif
+
+#if GPUI_OS_IOS
+#line 1 "src/base/input_keys_ios.cpp"
+
+namespace gpui {
+
+void InputBindKeysOther(const char* ctx);
+
+void InputBindPlatformKeys(const char* ctx) {
+    InputBindKeysOther(ctx);
+}
+
+}
+
+#endif
+
+#if GPUI_OS_LINUX
+#line 1 "src/base/input_keys_linux.cpp"
+
+namespace gpui {
+
+void InputBindPlatformKeys(const char* ctx) {
+
+    KeyBinding bindings[] = {
+        {"ctrl-backspace", input::DeleteToPreviousWordStart(), ctx},
+        {"ctrl-delete", input::DeleteToNextWordEnd(), ctx},
+        {"ctrl-]", input::Indent(), ctx},
+        {"ctrl-[", input::Outdent(), ctx},
+        {"shift-alt-up", input::AddCursorAbove(), ctx},
+        {"shift-alt-down", input::AddCursorBelow(), ctx},
+        {"alt-shift-left", input::SelectToPreviousWordStart(), ctx},
+        {"alt-shift-right", input::SelectToNextWordEnd(), ctx},
+        {"ctrl-shift-left", input::SelectToPreviousWordStart(), ctx},
+        {"ctrl-shift-right", input::SelectToNextWordEnd(), ctx},
+        {"ctrl-a", input::SelectAll(), ctx},
+        {"ctrl-c", input::Copy(), ctx},
+        {"ctrl-x", input::Cut(), ctx},
+        {"ctrl-v", input::Paste(), ctx},
+        {"ctrl-left", input::MoveToPreviousWord(), ctx},
+        {"ctrl-right", input::MoveToNextWord(), ctx},
+        {"ctrl-z", input::Undo(), ctx},
+        {"ctrl-y", input::Redo(), ctx},
+        {"ctrl-.", input::ToggleCodeActions(), ctx},
+        {"ctrl-f", input::Search(), ctx},
+        {"ctrl-h", input::Replace(), ctx},
+        {"ctrl-home", input::MoveToStart(), ctx},
+        {"ctrl-end", input::MoveToEnd(), ctx},
+        {"ctrl-shift-home", input::SelectToStart(), ctx},
+        {"ctrl-shift-end", input::SelectToEnd(), ctx},
+        {"ctrl-shift-z", input::Redo(), ctx},
+    };
+    KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+}
+
+}
+
+#endif
+
+#if GPUI_OS_MAC
+#line 1 "src/base/input_keys_mac.cpp"
+
+namespace gpui {
+
+void InputBindPlatformKeys(const char* ctx) {
+    KeyBinding bindings[] = {
+        {"ctrl-backspace", input::Backspace(), ctx},
+        {"cmd-backspace", input::DeleteToBeginningOfLine(), ctx},
+        {"cmd-delete", input::DeleteToEndOfLine(), ctx},
+        {"alt-backspace", input::DeleteToPreviousWordStart(), ctx},
+        {"alt-delete", input::DeleteToNextWordEnd(), ctx},
+        {"cmd-]", input::Indent(), ctx},
+        {"cmd-[", input::Outdent(), ctx},
+        {"cmd-alt-up", input::AddCursorAbove(), ctx},
+        {"cmd-alt-down", input::AddCursorBelow(), ctx},
+        {"ctrl-shift-a", input::SelectToStartOfLine(), ctx},
+        {"ctrl-shift-e", input::SelectToEndOfLine(), ctx},
+        {"shift-cmd-left", input::SelectToStartOfLine(), ctx},
+        {"shift-cmd-right", input::SelectToEndOfLine(), ctx},
+        {"alt-shift-left", input::SelectToPreviousWordStart(), ctx},
+        {"alt-shift-right", input::SelectToNextWordEnd(), ctx},
+        {"cmd-a", input::SelectAll(), ctx},
+        {"cmd-c", input::Copy(), ctx},
+        {"cmd-x", input::Cut(), ctx},
+        {"cmd-v", input::Paste(), ctx},
+        {"ctrl-a", input::MoveHome(), ctx},
+        {"cmd-left", input::MoveHome(), ctx},
+        {"ctrl-e", input::MoveEnd(), ctx},
+        {"cmd-right", input::MoveEnd(), ctx},
+        {"cmd-z", input::Undo(), ctx},
+        {"cmd-shift-z", input::Redo(), ctx},
+        {"cmd-up", input::MoveToStart(), ctx},
+        {"cmd-down", input::MoveToEnd(), ctx},
+        {"alt-left", input::MoveToPreviousWord(), ctx},
+        {"alt-right", input::MoveToNextWord(), ctx},
+        {"cmd-shift-up", input::SelectToStart(), ctx},
+        {"cmd-shift-down", input::SelectToEnd(), ctx},
+        {"cmd-.", input::ToggleCodeActions(), ctx},
+        {"cmd-f", input::Search(), ctx},
+        {"cmd-shift-f", input::Replace(), ctx},
+    };
+    KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+}
+
+}
+
+#endif
+
+#if GPUI_OS_WASM
+#line 1 "src/base/input_keys_wasm.cpp"
+
+namespace gpui {
+
+void InputBindKeysOther(const char* ctx);
+
+void InputBindPlatformKeys(const char* ctx) {
+    InputBindKeysOther(ctx);
+}
+
+}
+
+#endif
+
+#if GPUI_OS_WINDOWS
+#line 1 "src/base/input_keys_win.cpp"
+
+namespace gpui {
+
+void InputBindPlatformKeys(const char* ctx) {
+    KeyBinding bindings[] = {
+        {"ctrl-backspace", input::DeleteToPreviousWordStart(), ctx},
+        {"ctrl-delete", input::DeleteToNextWordEnd(), ctx},
+        {"ctrl-]", input::Indent(), ctx},
+        {"ctrl-[", input::Outdent(), ctx},
+        {"shift-alt-left", input::SelectLeft(), ctx},
+        {"shift-alt-right", input::SelectRight(), ctx},
+        {"ctrl-alt-up", input::AddCursorAbove(), ctx},
+        {"ctrl-alt-down", input::AddCursorBelow(), ctx},
+        {"ctrl-shift-left", input::SelectToPreviousWordStart(), ctx},
+        {"ctrl-shift-right", input::SelectToNextWordEnd(), ctx},
+        {"ctrl-a", input::SelectAll(), ctx},
+        {"ctrl-c", input::Copy(), ctx},
+        {"ctrl-x", input::Cut(), ctx},
+        {"ctrl-v", input::Paste(), ctx},
+        {"ctrl-left", input::MoveToPreviousWord(), ctx},
+        {"ctrl-right", input::MoveToNextWord(), ctx},
+        {"ctrl-z", input::Undo(), ctx},
+        {"ctrl-y", input::Redo(), ctx},
+        {"ctrl-.", input::ToggleCodeActions(), ctx},
+        {"ctrl-f", input::Search(), ctx},
+        {"ctrl-h", input::Replace(), ctx},
+        {"ctrl-home", input::MoveToStart(), ctx},
+        {"ctrl-end", input::MoveToEnd(), ctx},
+        {"ctrl-shift-home", input::SelectToStart(), ctx},
+        {"ctrl-shift-end", input::SelectToEnd(), ctx},
+        {"ctrl-shift-z", input::Redo(), ctx},
+    };
+    KeymapBind(bindings, (int)(sizeof(bindings) / sizeof(bindings[0])));
+}
+
 }
 
 #endif
@@ -226321,6 +226355,63 @@ void DirWatchPlatClose(DirWatchPlat* w) {
 
 #endif
 
+#if GPUI_OS_ANDROID
+#line 1 "src/sys/gpu_android.cpp"
+
+namespace gpui {
+
+bool GpuAvailable() {
+    return false;
+}
+
+float GpuUsagePercent() {
+    return -1.f;
+}
+
+void GpuProbeFree() {}
+
+}
+
+#endif
+
+#if GPUI_OS_IOS
+#line 1 "src/sys/gpu_ios.cpp"
+
+namespace gpui {
+
+bool GpuAvailable() {
+    return false;
+}
+
+float GpuUsagePercent() {
+    return -1.f;
+}
+
+void GpuProbeFree() {}
+
+}
+
+#endif
+
+#if GPUI_OS_LINUX
+#line 1 "src/sys/gpu_linux.cpp"
+
+namespace gpui {
+
+bool GpuAvailable() {
+    return false;
+}
+
+float GpuUsagePercent() {
+    return -1.f;
+}
+
+void GpuProbeFree() {}
+
+}
+
+#endif
+
 #if GPUI_OS_MAC
 #line 1 "src/sys/gpu_mac.cpp"
 
@@ -226543,10 +226634,9 @@ void GpuProbeFree() {
 
 #endif
 
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
-#line 1 "src/sys/gpu_posix.cpp"
+#if GPUI_OS_WASM
+#line 1 "src/sys/gpu_wasm.cpp"
 
-#if !GPUI_OS_MAC
 namespace gpui {
 
 bool GpuAvailable() {
@@ -226560,7 +226650,6 @@ float GpuUsagePercent() {
 void GpuProbeFree() {}
 
 }
-#endif
 
 #endif
 
@@ -227103,6 +227192,19 @@ bool HttpGetNoRedirect(Str url, HttpRsp* out) {
 
 #endif
 
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
+#line 1 "src/sys/http_mem_posix.cpp"
+
+namespace gpui {
+
+bool HttpAsyncLaunch(HttpAsyncJob* job) {
+    return HttpAsyncLaunchHosted(job);
+}
+
+}
+
+#endif
+
 #if GPUI_OS_WASM
 #line 1 "src/sys/http_wasm.cpp"
 
@@ -227313,6 +227415,17 @@ extern "C" EMSCRIPTEN_KEEPALIVE void gpui_wasm_http_done(
     transfer->done.Call(result);
     HttpRspFree(&transfer->response);
     delete transfer;
+}
+
+bool HttpWasmSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done);
+
+static void HttpAsyncWasmDone(HttpAsyncJob* job, HttpAsyncResult result) {
+    job->done.Call(result);
+    HttpAsyncJobFree(job);
+}
+
+bool HttpAsyncLaunch(HttpAsyncJob* job) {
+    return HttpWasmSendAsync(job->req, MkFunc1(HttpAsyncWasmDone, job));
 }
 
 bool HttpWasmSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done) {
@@ -227606,6 +227719,10 @@ bool HttpGetNoRedirect(Str url, HttpRsp* out) {
     req.url = url;
     req.noRedirect = true;
     return HttpSend(req, out);
+}
+
+bool HttpAsyncLaunch(HttpAsyncJob* job) {
+    return HttpAsyncLaunchHosted(job);
 }
 
 }
@@ -228747,6 +228864,102 @@ bool SysSelfPrivateMemory(uint64_t* bytes) {
 
 #endif
 
+#if GPUI_OS_ANDROID
+#line 1 "src/base_android.cpp"
+
+namespace base {
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
+                                                              .tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return true;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "linux";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
+}
+
+}
+
+#endif
+
+#if GPUI_OS_IOS
+#line 1 "src/base_ios.cpp"
+
+namespace base {
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
+           (uint64_t)st->st_mtimespec.tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return true;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "linux";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
+}
+
+}
+
+#endif
+
 #if GPUI_OS_LINUX
 #line 1 "src/base_linux.cpp"
 
@@ -228794,6 +229007,45 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
         }
     }
     return true;
+}
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
+                                                              .tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "linux";
+}
+bool PlatBlockSelectUsesControl() {
+    return true;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 20.f;
 }
 
 }
@@ -228849,6 +229101,45 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
         *cpu100ns = us * 10ull;
     }
     return true;
+}
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
+           (uint64_t)st->st_mtimespec.tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return true;
+}
+bool PlatShowsWindowControls() {
+    return false;
+}
+float PlatCaretWidth() {
+    return 1.5f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "Menlo";
+}
+const char* PlatShellDataDir() {
+    return "/Library/Application Support";
+}
+const char* PlatShellPlatformName() {
+    return "macos";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
 }
 
 }
@@ -228927,6 +229218,8 @@ uint64_t PlatArenaReserveSize() {
 #line 1 "src/base_posix.cpp"
 
 namespace base {
+
+uint64_t PlatStatModifiedNs(const struct stat* st);
 
 int StrCmpI(const char* a, const char* b) {
     return strcasecmp(a ? a : "", b ? b : "");
@@ -229039,13 +229332,7 @@ int PlatListDir(const char* dir, DirEntry* out, int max) {
         e.isDir = S_ISDIR(st.st_mode);
         e.isFile = S_ISREG(st.st_mode);
         e.size = e.isFile && st.st_size > 0 ? (uint64_t)st.st_size : 0;
-#if GPUI_OS_MAC || GPUI_OS_IOS
-        e.modified = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull +
-                     (uint64_t)st.st_mtimespec.tv_nsec;
-#else
-        e.modified = (uint64_t)st.st_mtim.tv_sec * 1000000000ull +
-                     (uint64_t)st.st_mtim.tv_nsec;
-#endif
+        e.modified = PlatStatModifiedNs(&st);
         n++;
     }
     closedir(d);
@@ -229117,6 +229404,16 @@ void PlatSleepMs(int ms) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, nullptr);
+}
+
+char PlatPathSep() {
+    return '/';
+}
+bool PlatPathsCaseFold() {
+    return false;
+}
+bool PlatIsWindows() {
+    return false;
 }
 
 }
@@ -229198,6 +229495,45 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
         *memBytes = (uint64_t)emscripten_get_heap_size();
     }
     return true;
+}
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
+                                                              .tv_nsec;
+}
+
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "DejaVu Sans Mono";
+}
+const char* PlatShellDataDir() {
+    return "/.local/share";
+}
+const char* PlatShellPlatformName() {
+    return "emscripten";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return false;
+}
+bool PlatAsyncIo() {
+    return true;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
 }
 
 }
@@ -229487,22 +229823,55 @@ void PlatSleepMs(int ms) {
     Sleep((DWORD)(ms < 0 ? 0 : ms));
 }
 
+char PlatPathSep() {
+    return '\\';
+}
+bool PlatPathsCaseFold() {
+    return true;
+}
+bool PlatIsWindows() {
+    return true;
+}
+bool PlatSecondaryIsCommand() {
+    return false;
+}
+bool PlatShowsWindowControls() {
+    return true;
+}
+float PlatCaretWidth() {
+    return 2.f;
+}
+bool PlatScrollBounce() {
+    return false;
+}
+const char* PlatMonoFontName() {
+    return "Consolas";
+}
+const char* PlatShellDataDir() {
+    return "\\AppData\\Roaming";
+}
+const char* PlatShellPlatformName() {
+    return "windows";
+}
+bool PlatBlockSelectUsesControl() {
+    return false;
+}
+bool PlatScrollGestureLocks() {
+    return true;
+}
+bool PlatAsyncIo() {
+    return false;
+}
+float PlatWindowShadowSize() {
+    return 0.f;
+}
+
 }
 
 #endif
 
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
 #line 1 "src/shell/dependencies_posix.cpp"
-
-#if !GPUI_OS_WINDOWS
-
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <string.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace gpui::shell {
 
@@ -229632,14 +230001,8 @@ uint32_t DependencyProcessId() {
 
 #endif
 
-#endif
-
 #if GPUI_OS_WINDOWS
 #line 1 "src/shell/dependencies_win.cpp"
-
-#if GPUI_OS_WINDOWS
-
-#include <windows.h>
 
 namespace gpui::shell {
 
@@ -229886,21 +230249,8 @@ uint32_t DependencyProcessId() {
 
 #endif
 
-#endif
-
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/shell/filesystem_posix.cpp"
-
-#if !GPUI_OS_WINDOWS && !GPUI_OS_WASM
-
-#include <dirent.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace gpui::shell {
 
@@ -230277,9 +230627,13 @@ bool FsRun(FsOperation operation, Str rootName, Str relative, Str input,
 
 }
 
-#elif GPUI_OS_WASM
+#endif
+
+#if GPUI_OS_WASM
+#line 1 "src/shell/filesystem_wasm.cpp"
 
 namespace gpui::shell {
+
 bool FsRun(FsOperation, Str root, Str relative, Str, bool, FsResult*,
            Str* error) {
     if (error)
@@ -230288,20 +230642,13 @@ bool FsRun(FsOperation, Str root, Str relative, Str, bool, FsResult*,
                 relative));
     return false;
 }
-}
 
-#endif
+}
 
 #endif
 
 #if GPUI_OS_WINDOWS
 #line 1 "src/shell/filesystem_win.cpp"
-
-#if GPUI_OS_WINDOWS
-
-#include <windows.h>
-#include <winternl.h>
-#include <stdlib.h>
 
 namespace gpui::shell {
 
@@ -230857,22 +231204,8 @@ bool FsRun(FsOperation operation, Str rootName, Str relative, Str input,
 
 #endif
 
-#endif
-
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
+#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/shell/process_posix.cpp"
-
-#if !GPUI_OS_WINDOWS && !GPUI_OS_WASM
-
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/select.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 extern char** environ;
 
@@ -231070,9 +231403,13 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
 
 }
 
-#elif GPUI_OS_WASM
+#endif
+
+#if GPUI_OS_WASM
+#line 1 "src/shell/process_wasm.cpp"
 
 namespace gpui::shell {
+
 bool ProcessRunBounded(Str command, const Str*, int, ProcessCancellation*,
                        ProcessOutput*, Str* error, const ProcessOptions*) {
     if (error)
@@ -231080,18 +231417,13 @@ bool ProcessRunBounded(Str command, const Str*, int, ProcessCancellation*,
             StrDup(fmt("running `%s` is unavailable in a browser", command));
     return false;
 }
-}
 
-#endif
+}
 
 #endif
 
 #if GPUI_OS_WINDOWS
 #line 1 "src/shell/process_win.cpp"
-
-#if GPUI_OS_WINDOWS
-
-#include <windows.h>
 
 namespace gpui::shell {
 
@@ -231574,31 +231906,56 @@ cleanup:
 
 #endif
 
-#endif
-
-#if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
-#line 1 "src/shell/standard_random_posix.cpp"
-
-#if !GPUI_OS_WINDOWS && !GPUI_OS_WASM
-
-#include <errno.h>
-#include <fcntl.h>
-#include <stdlib.h>
-#include <unistd.h>
-#if GPUI_OS_LINUX
-#include <sys/random.h>
-#endif
+#if GPUI_OS_ANDROID
+#line 1 "src/shell/standard_random_android.cpp"
 
 namespace gpui::shell {
 
 bool SecureRandom(uint8_t* bytes, int count) {
     if (count < 0) return false;
-#if GPUI_OS_MAC || GPUI_OS_IOS
+    int file = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (file < 0) return false;
+    int offset = 0;
+    while (offset < count) {
+        ssize_t got = read(file, bytes + offset, (size_t)(count - offset));
+        if (got > 0)
+            offset += (int)got;
+        else if (got < 0 && errno == EINTR)
+            continue;
+        else
+            break;
+    }
+    close(file);
+    return offset == count;
+}
+
+}
+
+#endif
+
+#if GPUI_OS_IOS
+#line 1 "src/shell/standard_random_ios.cpp"
+
+namespace gpui::shell {
+
+bool SecureRandom(uint8_t* bytes, int count) {
+    if (count < 0) return false;
     if (count > 0) arc4random_buf(bytes, (size_t)count);
     return true;
-#else
-    int offset = 0;
+}
+
+}
+
+#endif
+
 #if GPUI_OS_LINUX
+#line 1 "src/shell/standard_random_linux.cpp"
+
+namespace gpui::shell {
+
+bool SecureRandom(uint8_t* bytes, int count) {
+    if (count < 0) return false;
+    int offset = 0;
     while (offset < count) {
         ssize_t got = getrandom(bytes + offset, (size_t)(count - offset), 0);
         if (got > 0)
@@ -231609,7 +231966,6 @@ bool SecureRandom(uint8_t* bytes, int count) {
             break;
     }
     if (offset == count) return true;
-#endif
     int file = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (file < 0) return false;
     while (offset < count) {
@@ -231623,20 +231979,29 @@ bool SecureRandom(uint8_t* bytes, int count) {
     }
     close(file);
     return offset == count;
-#endif
 }
 
 }
+
 #endif
+
+#if GPUI_OS_MAC
+#line 1 "src/shell/standard_random_mac.cpp"
+
+namespace gpui::shell {
+
+bool SecureRandom(uint8_t* bytes, int count) {
+    if (count < 0) return false;
+    if (count > 0) arc4random_buf(bytes, (size_t)count);
+    return true;
+}
+
+}
 
 #endif
 
 #if GPUI_OS_WASM
 #line 1 "src/shell/standard_random_wasm.cpp"
-
-#if GPUI_OS_WASM
-
-#include <emscripten.h>
 
 EM_JS(int, ShellCryptoRandom, (uint8_t* bytes, int count), {
     if (count < 0 || !globalThis.crypto || !globalThis.crypto.getRandomValues)
@@ -231654,16 +232019,11 @@ bool SecureRandom(uint8_t* bytes, int count) {
     return ShellCryptoRandom(bytes, count) != 0;
 }
 }
-#endif
 
 #endif
 
 #if GPUI_OS_WINDOWS
 #line 1 "src/shell/standard_random_win.cpp"
-
-#if GPUI_OS_WINDOWS
-
-#include <windows.h>
 
 extern "C" BOOLEAN NTAPI SystemFunction036(PVOID, ULONG);
 
@@ -231674,16 +232034,11 @@ bool SecureRandom(uint8_t* bytes, int count) {
 }
 
 }
-#endif
 
 #endif
 
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID || GPUI_OS_WASM
 #line 1 "src/shell/storage_posix.cpp"
-
-#if !GPUI_OS_WINDOWS
-
-#include <stdio.h>
 
 namespace gpui::shell {
 
@@ -231698,16 +232053,11 @@ bool StorageReplaceFile(Str temporary, Str path, Str* error) {
 }
 
 }
-#endif
 
 #endif
 
 #if GPUI_OS_WINDOWS
 #line 1 "src/shell/storage_win.cpp"
-
-#if GPUI_OS_WINDOWS
-
-#include <windows.h>
 
 namespace gpui::shell {
 
@@ -231733,7 +232083,6 @@ bool StorageReplaceFile(Str temporary, Str path, Str* error) {
 }
 
 }
-#endif
 
 #endif
 

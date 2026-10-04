@@ -178,6 +178,21 @@ int PlatListDir(const char* dir, DirEntry* out, int max);
 int PlatCoreCount();
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes);
 
+char PlatPathSep();
+bool PlatPathsCaseFold();
+bool PlatIsWindows();
+bool PlatSecondaryIsCommand();
+bool PlatShowsWindowControls();
+float PlatCaretWidth();
+bool PlatScrollBounce();
+const char* PlatMonoFontName();
+const char* PlatShellDataDir();
+const char* PlatShellPlatformName();
+bool PlatBlockSelectUsesControl();
+bool PlatScrollGestureLocks();
+bool PlatAsyncIo();
+float PlatWindowShadowSize();
+
 void* AllocZero(int count, int size);
 
 template <typename T>
@@ -3517,11 +3532,7 @@ struct Modifiers {
     }
 
     bool Secondary() const {
-#if GPUI_OS_MAC
-        return platform;
-#else
-        return control;
-#endif
+        return PlatSecondaryIsCommand() ? platform : control;
     }
     int Count() const {
         return (int)control + (int)alt + (int)shift + (int)platform +
@@ -8385,14 +8396,8 @@ uint32_t WindowResolveKeyAction(Window* win, int vk, bool shift, bool ctrl,
                                 bool alt, bool platform, bool function,
                                 int64_t* arg, bool* pending);
 
-constexpr bool KeySecondary(bool ctrl, bool platform) {
-#if GPUI_OS_MAC
-    (void)ctrl;
-    return platform;
-#else
-    (void)platform;
-    return ctrl;
-#endif
+inline bool KeySecondary(bool ctrl, bool platform) {
+    return PlatSecondaryIsCommand() ? platform : ctrl;
 }
 
 bool WindowDispatchAction(Window* win, uint32_t action, int64_t arg = 0);
@@ -13269,6 +13274,7 @@ uint32_t SelectToStartOfLine();
 uint32_t SelectUp();
 uint32_t Undo();
 uint32_t Enter();
+uint32_t ToggleCodeActions();
 
 }
 
@@ -15241,13 +15247,7 @@ struct TextStyleToken {
 
 struct TypographyTokens {
     Str sans = Str(".SystemUIFont");
-#if GPUI_OS_MAC
-    Str mono = Str("Menlo");
-#elif GPUI_OS_WINDOWS
-    Str mono = Str("Consolas");
-#else
-    Str mono = Str("DejaVu Sans Mono");
-#endif
+    Str mono = Str(PlatMonoFontName());
     TextStyleToken xs = {12, 16, FontWeight::Normal};
     TextStyleToken sm = {14, 20, FontWeight::Normal};
     TextStyleToken md = {16, 24, FontWeight::Normal};
@@ -19023,13 +19023,7 @@ struct Theme {
 
     Str fontFamily = Str(".SystemUIFont");
     float fontSize = 16.f;
-#if GPUI_OS_MAC
-    Str monoFontFamily = Str("Menlo");
-#elif GPUI_OS_WINDOWS
-    Str monoFontFamily = Str("Consolas");
-#else
-    Str monoFontFamily = Str("DejaVu Sans Mono");
-#endif
+    Str monoFontFamily = Str(PlatMonoFontName());
     float monoFontSize = kMonoFontSize;
     bool shadow = true;
     bool focusRing = true;
@@ -27198,11 +27192,9 @@ namespace gpui {
 
 namespace component {
 
-#if GPUI_OS_LINUX
-const float kWindowShadowSize = 20;
-#else
-const float kWindowShadowSize = 0;
-#endif
+inline float WindowShadowSize() {
+    return PlatWindowShadowSize();
+}
 const float kWindowBorderSize = 1;
 
 const float kWindowResizeHitSize = 4;
@@ -27236,7 +27228,7 @@ struct WindowBorder {
     Arena* a = nullptr;
     Ctx* cx = nullptr;
     El* child = nullptr;
-    float shadowSize = kWindowShadowSize;
+    float shadowSize = WindowShadowSize();
     float resizeHitSize = kWindowResizeHitSize;
     WindowTiling tiling = {};
     bool hasTiling = false;
@@ -29164,7 +29156,9 @@ namespace component {
 
 constexpr float kTitleBarHeight = 34.f;
 
-constexpr float kTitleBarLeftPad = GPUI_OS_MAC ? 80.f : 12.f;
+inline float TitleBarLeftPad() {
+    return PlatSecondaryIsCommand() ? 80.f : 12.f;
+}
 
 struct TitleBar {
     Arena* a = nullptr;
@@ -35531,6 +35525,23 @@ struct HttpAsyncResult {
 };
 
 bool HttpSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done);
+
+struct HttpAsyncJob {
+    HttpReq req;
+    Str url;
+    Str method;
+    Str body;
+    Vec<HttpHeader> headers;
+    HttpRsp response;
+    Func1<HttpAsyncResult> done;
+    bool ok = false;
+};
+
+void HttpAsyncJobFree(HttpAsyncJob* job);
+
+bool HttpAsyncLaunchHosted(HttpAsyncJob* job);
+
+bool HttpAsyncLaunch(HttpAsyncJob* job);
 
 enum class FetchState : uint8_t {
 
