@@ -23592,6 +23592,19 @@ void WindowClosed(Window* win) {
     win->running = false;
 }
 
+bool WindowShouldClose(Window* win) {
+    return !win || !win->shouldClose ||
+           win->shouldClose(win->shouldCloseData, win);
+}
+
+void WindowOnShouldClose(Window* win, WindowShouldCloseFn fn, void* data) {
+    if (!win) {
+        return;
+    }
+    win->shouldClose = fn;
+    win->shouldCloseData = data;
+}
+
 static void AppFetchLanded(App* app) {
     if (!app) {
         return;
@@ -23905,7 +23918,9 @@ int AppRunView(Str title, int dipW, int dipH, EntityId root, App* app,
 }
 
 void AppClose(Window* win) {
-    AppQuit(win);
+    if (WindowShouldClose(win)) {
+        AppQuit(win);
+    }
 }
 
 void AppQuitAll(App* app) {
@@ -220468,7 +220483,8 @@ static void HandleEvent(App* app, XEvent* ev) {
             break;
         case ClientMessage:
             if (ev->xclient.message_type == aWmProtocols &&
-                (Atom)ev->xclient.data.l[0] == aWmDeleteWindow) {
+                (Atom)ev->xclient.data.l[0] == aWmDeleteWindow &&
+                WindowShouldClose(win)) {
                 DestroyPlatWindow(win);
             }
             break;
@@ -221872,6 +221888,11 @@ static bool PressedButton(MouseButton* out) {
 @end
 
 @implementation GpuiWindowDelegate
+
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+    (void)sender;
+    return gpui::WindowShouldClose(win) ? YES : NO;
+}
 
 - (void)windowWillClose:(NSNotification*)note {
     (void)note;
@@ -224696,6 +224717,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
             break;
         case WM_ERASEBKGND:
             return 1;
+        case WM_CLOSE:
+            if (!WindowShouldClose(win)) {
+                return 0;
+            }
+            break;
         case WM_DESTROY: {
             KillTimer(hwnd, 1);
             App* app = win->app;

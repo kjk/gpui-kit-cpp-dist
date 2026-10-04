@@ -3298,6 +3298,8 @@ namespace gpui {
 
 struct App;
 struct Window;
+
+using WindowShouldCloseFn = bool (*)(void* data, Window* win);
 struct KeyChord;
 
 struct ClipboardItem {
@@ -7734,6 +7736,8 @@ struct Window {
 
     bool active = true;
     bool running = true;
+    WindowShouldCloseFn shouldClose = nullptr;
+    void* shouldCloseData = nullptr;
     bool anim = false;
 
     bool animFrame = false;
@@ -8463,6 +8467,8 @@ void AppToggleMaximize(Window* win);
 void WindowSetFullScreen(Window* win, bool fullScreen);
 
 void WindowSetCursorVisible(Window* win, bool visible);
+
+void WindowOnShouldClose(Window* win, WindowShouldCloseFn fn, void* data);
 void AppClose(Window* win);
 void AppDrag(Window* win);
 bool AppIsMaximized(Window* win);
@@ -32176,6 +32182,7 @@ int WindowChromeHit(Window* win, float x, float y);
 int WindowTimerMs(Window* win);
 
 void WindowClosed(Window* win);
+bool WindowShouldClose(Window* win);
 bool AppAnyWindowOpen(App* app);
 
 Window* WindowAlloc(App* app, WinOpts opts);
