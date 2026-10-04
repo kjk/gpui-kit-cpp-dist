@@ -15904,6 +15904,16 @@ static const NamedKey kNamedKeys[] = {
     {"back", KeyBrowserBack},
     {"forward", KeyBrowserForward},
     {"menu", KeyApps},
+    {"numpad0", KeyNumpad0},
+    {"numpad1", KeyNumpad0 + 1},
+    {"numpad2", KeyNumpad0 + 2},
+    {"numpad3", KeyNumpad0 + 3},
+    {"numpad4", KeyNumpad0 + 4},
+    {"numpad5", KeyNumpad0 + 5},
+    {"numpad6", KeyNumpad0 + 6},
+    {"numpad7", KeyNumpad0 + 7},
+    {"numpad8", KeyNumpad0 + 8},
+    {"numpad9", KeyNumpad9},
 
     {"cut", KeyCut},
     {"copy", KeyCopy},
@@ -219458,7 +219468,7 @@ static int KeyFor(KeySym ks) {
         return KeyF1 + (int)(ks - XK_KP_F1);
     }
     if (ks >= XK_KP_0 && ks <= XK_KP_9) {
-        return '0' + (int)(ks - XK_KP_0);
+        return KeyNumpad0 + (int)(ks - XK_KP_0);
     }
 
     if (ks >= XK_a && ks <= XK_z) {
@@ -222214,6 +222224,26 @@ static int KeyFor(unichar c) {
     return 0;
 }
 
+static int KeyForEvent(NSEvent* event, unichar c) {
+    switch ([event keyCode]) {
+        case 82:
+            return KeyNumpad0;
+        case 83:
+        case 84:
+        case 85:
+        case 86:
+        case 87:
+        case 88:
+        case 89:
+            return KeyNumpad0 + (int)[event keyCode] - 82;
+        case 91:
+        case 92:
+            return KeyNumpad0 + (int)[event keyCode] - 83;
+        default:
+            return KeyFor(c);
+    }
+}
+
 void WindowMacKeyUp(Window* win, NSEvent* event) {
     if (!win) {
         return;
@@ -222221,7 +222251,7 @@ void WindowMacKeyUp(Window* win, NSEvent* event) {
     NSEventModifierFlags mods = [event modifierFlags];
     NSString* bare = [event charactersIgnoringModifiers];
     unichar first = [bare length] > 0 ? [bare characterAtIndex:0] : 0;
-    int key = KeyFor(first);
+    int key = KeyForEvent(event, first);
     if (!key) {
         return;
     }
@@ -222250,7 +222280,7 @@ bool WindowMacKeyDown(Window* win, NSEvent* event) {
     bool function =
         (mods & NSEventModifierFlagFunction) != 0 &&
         !(first >= NSUpArrowFunctionKey && first <= NSModeSwitchFunctionKey);
-    int key = KeyFor(first);
+    int key = KeyForEvent(event, first);
     if (key) {
 
         KeyDownFlags flags;
