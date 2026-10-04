@@ -16720,6 +16720,20 @@ bool KeymapAnyBindingForAction(uint32_t action, KeyChord* out) {
     return false;
 }
 
+bool KeymapAnyBindingForActionArg(uint32_t action, int64_t arg, KeyChord* out) {
+    if (!action || !out) {
+        return false;
+    }
+    for (int i = gNBindings - 1; i >= 0; i--) {
+        if (gBindings[i].action == action && gBindings[i].arg == arg &&
+            gBindings[i].nStrokes > 0) {
+            *out = gBindings[i].strokes[0];
+            return true;
+        }
+    }
+    return false;
+}
+
 KeyMatch KeymapMatch(const KeyChord& chord, const uint32_t* contexts,
                      int nContexts) {
     if (gNPending >= kMaxStrokes) {
@@ -24106,7 +24120,14 @@ static PlatMenuItem* AppMenuToPlat(AppMenuState* state, Arena* a,
         p.id = state->rows.len;
 
         KeyChord chord = {};
-        if (r.action && KeymapAnyBindingForAction(r.action, &chord)) {
+        bool haveKey = false;
+        if (r.stroke && r.stroke[0]) {
+            haveKey = KeyChordParse(Str(r.stroke), &chord);
+        }
+        if (!haveKey && r.action) {
+            haveKey = KeymapAnyBindingForActionArg(r.action, r.arg, &chord);
+        }
+        if (haveKey) {
             Str key = KeyName(chord.vk);
             if (len(key) > 0) {
                 p.key = StrDup(a, key).s;
@@ -24175,6 +24196,10 @@ bool AppMenuRowForId(const App* app, int id, uint32_t* action, int64_t* arg) {
         *arg = state->rows[id - 1].arg;
     }
     return true;
+}
+
+void AppSetMenuBarVisible(bool visible) {
+    PlatSetMenuBarVisible(visible);
 }
 
 void AppMenuClear(App* app) {
@@ -221958,6 +221983,8 @@ void PlatSetAppMenu(App* app, const PlatMenuItem* items, int n) {
     (void)n;
 }
 
+void PlatSetMenuBarVisible(bool) {}
+
 bool PlatReduceMotion() {
     return false;
 }
@@ -224880,6 +224907,10 @@ bool PlatHasAppMenu() {
     return true;
 }
 
+void PlatSetMenuBarVisible(bool visible) {
+    [NSMenu setMenuBarVisible:visible ? YES : NO];
+}
+
 void PlatSetAppMenu(App* app, const PlatMenuItem* items, int n) {
     (void)app;
     if (!items || n <= 0) {
@@ -226072,6 +226103,8 @@ void PlatSetAppMenu(App* app, const PlatMenuItem* items, int n) {
     (void)items;
     (void)n;
 }
+
+void PlatSetMenuBarVisible(bool) {}
 
 bool PlatReduceMotion() {
     return GpJsReduceMotion() != 0;
@@ -227365,6 +227398,8 @@ void PlatSetAppMenu(App* app, const PlatMenuItem* items, int n) {
     (void)items;
     (void)n;
 }
+
+void PlatSetMenuBarVisible(bool) {}
 
 bool PlatReduceMotion() {
     BOOL wanted = TRUE;

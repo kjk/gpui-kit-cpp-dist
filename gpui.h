@@ -8445,6 +8445,8 @@ struct MenuRow {
     bool checked = false;
     const MenuRow* submenu = nullptr;
     int submenuN = 0;
+
+    const char* stroke = nullptr;
 };
 
 struct MenuDef {
@@ -8458,6 +8460,8 @@ struct MenuDef {
 bool AppHasMenuBar();
 
 void AppSetMenus(App* app, const MenuDef* menus, int n);
+
+void AppSetMenuBarVisible(bool visible);
 
 bool AppMenuRowForId(int id, uint32_t* action, int64_t* arg);
 bool AppMenuRowForId(const App* app, int id, uint32_t* action, int64_t* arg);
@@ -13288,6 +13292,8 @@ bool KeymapBindingForAction(uint32_t action, const uint32_t* contexts,
                             int nContexts, KeyChord* out);
 
 bool KeymapAnyBindingForAction(uint32_t action, KeyChord* out);
+
+bool KeymapAnyBindingForActionArg(uint32_t action, int64_t arg, KeyChord* out);
 
 Str KeyName(int vk);
 
@@ -32743,6 +32749,8 @@ int PlatShowMenu(Window* win, const PlatMenuItem* items, int n, float x,
 bool PlatHasAppMenu();
 
 void PlatSetAppMenu(App* app, const PlatMenuItem* items, int n);
+
+void PlatSetMenuBarVisible(bool visible);
 
 void AppMenuChosen(int id);
 
