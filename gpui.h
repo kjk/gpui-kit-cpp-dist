@@ -4164,6 +4164,7 @@ enum class IconName : uint8_t {
     Maximize,
     MemoryStick,
     Menu,
+    Mic,
     Minimize,
     Minus,
     Moon,
@@ -4191,6 +4192,7 @@ enum class IconName : uint8_t {
     Settings2,
     SortAscending,
     SortDescending,
+    Square,
     SquareTerminal,
     Star,
     StarFill,
@@ -4767,6 +4769,8 @@ struct SourceSegment {
     int renderedEnd = 0;
     int sourceStart = 0;
     int sourceEnd = 0;
+
+    bool linear = false;
 };
 
 struct SelSourceMap {
@@ -12677,6 +12681,16 @@ void LineWrapperWrapLine(const LineFragment* fragments, int n, float wrapWidth,
                          WrapCharWidth widthFor, void* user,
                          Vec<WrapBoundary>* out);
 
+void LineBreakOpportunities(Str text, Vec<int>* out);
+
+using WrapMeasureFn = float (*)(void* user, Str text);
+
+void MeasuredWrapBoundaries(Str text, float width, WrappingIndent indent,
+                            WrapMeasureFn measure, void* user,
+                            Vec<WrapBoundary>* out,
+                            WrapCharWidth hint = nullptr,
+                            void* hintUser = nullptr);
+
 using WrapLineFn = void (*)(void* user, Str line, int base,
                             Vec<WrapBoundary>* out);
 void TextWrapperWrapItem(Str line, bool wrap, WrappingIndent indent,
@@ -12920,9 +12934,37 @@ struct InlineTokenClickEvent {
     const InlineToken& Token() const { return span.token; }
 };
 
+struct InlineTokenHoverEvent {
+    InlineTokenSpan span = {};
+    Bounds bounds = {};
+    bool hovered = false;
+
+    int rangeUtf16Start = 0;
+    int rangeUtf16End = 0;
+
+    const InlineToken& Token() const { return span.token; }
+
+    bool IsHovered() const { return hovered; }
+};
+
+struct InlineTokenHoverSnapshot {
+    InlineTokenSpan span = {};
+    Bounds bounds = {};
+    int rangeUtf16Start = 0;
+    int rangeUtf16End = 0;
+};
+
+struct InlineTokenPlaced {
+    int start = 0;
+    Bounds bounds = {};
+};
+
 typedef El* (*InlineTokenRenderer)(Ctx* cx, const InlineTokenContext* ctx,
                                    void* user);
 typedef void (*InlineTokenClickListener)(const InlineTokenClickEvent* ev,
+                                         Ctx* cx, void* user);
+
+typedef void (*InlineTokenHoverListener)(const InlineTokenHoverEvent* ev,
                                          Ctx* cx, void* user);
 
 struct InlineTokenStore {
@@ -12933,9 +12975,21 @@ struct InlineTokenStore {
     void* rendererUser = nullptr;
     InlineTokenClickListener click = nullptr;
     void* clickUser = nullptr;
+    InlineTokenHoverListener hover = nullptr;
+    void* hoverUser = nullptr;
     bool secret = false;
     bool replaying = false;
     bool validatedEdit = false;
+
+    InlineTokenPlaced* placed = nullptr;
+    int nPlaced = 0;
+    int capPlaced = 0;
+
+    InlineTokenHoverSnapshot hovered = {};
+    bool hasHovered = false;
+    Vec<InlineTokenHoverSnapshot> pendingHoverExits;
+
+    uint32_t hoverEpoch = 0;
 };
 
 void InlineTokenStoreFree(InlineTokenStore* store);
@@ -12949,12 +13003,28 @@ void InputSetTokenPresentation(InputState* s, InlineTokenRenderer renderer,
                                void* rendererUser,
                                InlineTokenClickListener click, void* clickUser,
                                bool secret);
+
+void InputSetTokenHoverPresentation(InputState* s,
+                                    InlineTokenHoverListener hover,
+                                    void* hoverUser);
+
+bool InputTokenHover(InputState* s, int start, Bounds bounds, bool hovered,
+                     const InlineToken* expected, InlineTokenHoverEvent* out);
+
+bool InputReconcileTokenHover(InputState* s, InlineTokenHoverEvent* out);
+
+void InputTokenBoundsClear(InputState* s);
+
+Bounds* InputTokenBoundsSlot(InputState* s, int start);
+bool InputTokenBoundsGet(const InputState* s, int start, Bounds* out);
 void InputSetValue(InputState* s, const InputContent& content);
 InlineTokenError InputReplaceRangeWithToken(InputState* s, App* app,
                                             Window* win, int start, int end,
                                             InlineToken token);
 InlineTokenError InputReplaceWithToken(InputState* s, App* app, Window* win,
                                        InlineToken token);
+
+bool TextIsGraphemeBoundary(Str text, int off);
 int InputPreviousStartOfWordAt(const InputState* s, int offset);
 int InputNextEndOfWordAt(const InputState* s, int offset);
 
@@ -14182,6 +14252,10 @@ struct QuestionnaireState {
     QuestionnaireShortcutMode shortcutMode = QuestionnaireShortcutMode::Letters;
     bool hasShortcutMode = false;
     bool complete = false;
+
+    bool pendingConfirm = false;
+    uint32_t pendingConfirmGen = 0;
+    int pendingConfirmTimer = 0;
     FocusHandle focus = {};
 
     Entity<QuestionnaireState> self = {};
@@ -14238,7 +14312,10 @@ struct QuestionnaireState {
     QuestionnaireSchemaError SetExternalError(Str item, Str error, Ctx* cx);
     QuestionnaireSchemaError ClearExternalError(Str item, Ctx* cx);
     void Reset(Ctx* cx);
+
     QuestionnaireSchemaError ActivateChoice(Str item, Str value, Ctx* cx);
+
+    QuestionnaireSchemaError Choose(Str item, Str value, Ctx* cx);
     bool ConfirmCurrent(Ctx* cx);
     bool GoPrevious(Ctx* cx);
     bool GoNext(Ctx* cx);
@@ -14254,6 +14331,9 @@ struct QuestionnaireState {
 
     static void OnInputChange(QuestionnaireState* self, Ctx* cx,
                               const InputEvent* ev, int64_t itemIx);
+
+    static void OnPendingConfirm(QuestionnaireState* self, Ctx* cx,
+                                 const TickEvent* ev, int64_t packed);
 };
 
 QuestionnaireSchemaError QuestionnaireStateNew(
@@ -17017,6 +17097,9 @@ struct TextViewStyle {
     uint32_t tableCellFields = 0;
     gpui::Style inlineCode = {};
     uint32_t inlineCodeFields = 0;
+
+    Rgba tableBackground = {};
+    bool hasTableBackground = false;
     bool isDark = false;
 
     static TextViewStyle Default();
@@ -17042,6 +17125,10 @@ struct TextViewStyle {
     TextViewStyle& WithTableCell(const gpui::Style& style, uint32_t fields);
     TextViewStyle& WithInlineCode(const gpui::Style& style, uint32_t fields);
     TextViewStyle& WithDark(bool value);
+
+    TextViewStyle OnTextColor(Rgba color) const;
+
+    bool IsInvertedBy(Rgba color) const;
     bool Equals(const TextViewStyle& other) const;
 };
 
@@ -17068,9 +17155,14 @@ struct TextViewDefaults {
     bool hasStyle = false;
     CodeBlockHighlighterFn codeBlockHighlighter = nullptr;
     void* codeBlockHighlighterData = nullptr;
+    bool inheritTextColor = false;
 
     static TextViewDefaults New() { return {}; }
     TextViewDefaults& WithStyle(const TextViewStyle& value);
+
+    TextViewDefaults& WithInheritTextColor(bool inherit);
+
+    bool InheritTextColor() const { return inheritTextColor; }
     TextViewDefaults& WithCodeBlockHighlighter(CodeBlockHighlighterFn fn,
                                                void* data = nullptr);
     void Install(App* app) const;
@@ -17197,14 +17289,21 @@ inline bool operator==(RangeHighlightError a, RangeHighlightError b) {
     return a.kind == b.kind && a.index == b.index;
 }
 
+struct RenderedIndex;
 struct RenderedText {
     EntityId owner = {};
     uint64_t revision = 0;
     Str text = {};
+    Str source = {};
+    const RenderedIndex* index = nullptr;
 
     Str AsStr() const { return text; }
     int Len() const { return len(text); }
     bool IsEmpty() const { return len(text) == 0; }
+
+    Str Source() const { return source; }
+
+    bool RangeForSource(Span range, Span* out) const;
 };
 inline bool operator==(const RenderedText& a, const RenderedText& b) {
     return a.owner == b.owner && a.revision == b.revision;
@@ -17231,11 +17330,17 @@ struct RangeHighlightFrame {
     const RangeBackground* Backgrounds(TextLeafKey key, int* count) const;
 };
 
-struct RenderedIndex;
-
 RenderedIndex* RenderedIndexNew(const MdNode* doc, Str source);
 void RenderedIndexFree(RenderedIndex* index);
 Str RenderedIndexText(const RenderedIndex* index);
+Str RenderedIndexSource(const RenderedIndex* index);
+bool RenderedIndexRangeForSource(const RenderedIndex* index, Span source,
+                                 Span* out);
+
+int RenderedIndexLeafCount(const RenderedIndex* index);
+Span RenderedIndexLeafRange(const RenderedIndex* index, int ix);
+const SourceSegment* RenderedIndexSourceMap(const RenderedIndex* index,
+                                            int* count);
 
 RangeHighlightError RangeHighlightFrameNew(const RenderedIndex* index,
                                            const RangeHighlight* highlights,
@@ -17376,6 +17481,8 @@ struct TextViewState {
 
     static void ParseLanded(TextViewParseJob* job);
 
+    static void CommitParsedUpdate(TextViewParseJob* job);
+
     void RecordStreamFade(const RenderedIndex* prev, const RenderedIndex* next,
                           double now);
 
@@ -17447,16 +17554,21 @@ struct TextView {
 
     bool tableScroll = false;
 
+    bool codeBlockScroll = false;
+
     bool scrollable = false;
 
     int maxLines = -1;
 
     int tableIx = 0;
+    int codeIx = 0;
 
     gpui::SelectionFormat selFormat = gpui::SelectionFormat::Plain;
     TextViewStyle textViewStyle = {};
 
     bool textViewStyleSet = false;
+
+    bool onInvertedSurface = false;
     MarkdownExtensions markdownExtensions = {};
     gpui::Style outerStyle = {};
     uint32_t outerStyleFields = 0;
@@ -17488,6 +17600,8 @@ struct TextView {
     TextView* SelFormat(gpui::SelectionFormat fmt);
     TextView* TableColumnWidth(float px);
     TextView* TableScroll(bool on = true);
+
+    TextView* CodeBlockScroll(bool on = true);
     TextView* Scrollable(bool on = true);
 
     TextView* MaxLines(int count);
@@ -17626,13 +17740,15 @@ int SourceCharOffset(Str raw, int rawCursor, const char* ch, int cl,
                      SourceCharIndex* positions);
 
 void AlignedSourceSegments(Arena* a, Str raw, Str rendered, int sourceOffset,
-                           bool decodeEntities, Vec<SourceSegment>& out);
+                           bool decodeEntities, bool decodeEscapes,
+                           Vec<SourceSegment>& out);
 
 SourceRangeSelection MdSelectedSourceRange(const MdNode* n, int start, int end);
 
 SourceRangeSelection TextHitsSourceRange(const PaintCtx* ctx, int selA,
                                          int selB, int scope, EntityId owner);
 
+TextViewParseJob* TextViewParseNowForTest(TextViewState* s, App* app);
 MdNode* MdParseCachedForTest(Ctx* cx, Arena* frame, Str source,
                              const MarkdownExtensions* extensions);
 
@@ -19936,6 +20052,8 @@ namespace component {
 
 const int kShimmerLayerCount = 12;
 const float kDefaultShimmerSpread = 0.3f;
+
+const float kMinHighlightLightnessGap = 0.1f;
 
 struct ShimmerSpread {
     enum class Kind : uint8_t {
@@ -22273,12 +22391,15 @@ struct Clipboard {
     Str id = {};
     Str value = {};
     Str tooltipText = {};
+    Str accessibilityLabel = {};
     Listener onCopied;
     UiSize size = UiSize::XSmall;
 
     static Clipboard* New(Ctx* cx, Str id);
     Clipboard* Value(Str v);
     Clipboard* Tooltip(Str t);
+
+    Clipboard* AccessibilityLabel(Str label);
     Clipboard* OnCopied(Listener fn);
     Clipboard* WithSize(UiSize sizeValue);
     El* IntoEl();
@@ -25041,6 +25162,8 @@ struct Input {
     void* tokenRendererUser = nullptr;
     InlineTokenClickListener tokenClick = nullptr;
     void* tokenClickUser = nullptr;
+    InlineTokenHoverListener tokenHover = nullptr;
+    void* tokenHoverUser = nullptr;
     EditorContextMenuFn contextMenu = nullptr;
     void* contextMenuData = nullptr;
 
@@ -25079,6 +25202,8 @@ struct Input {
 
     Input* Token(InlineTokenRenderer fn, void* user = nullptr);
     Input* OnTokenClick(InlineTokenClickListener fn, void* user = nullptr);
+
+    Input* OnTokenHover(InlineTokenHoverListener fn, void* user = nullptr);
     El* IntoEl();
 };
 
@@ -25239,6 +25364,8 @@ struct Textarea {
     void* tokenRendererUser = nullptr;
     InlineTokenClickListener tokenClick = nullptr;
     void* tokenClickUser = nullptr;
+    InlineTokenHoverListener tokenHover = nullptr;
+    void* tokenHoverUser = nullptr;
     EditorContextMenuFn contextMenu = nullptr;
     void* contextMenuData = nullptr;
 
@@ -25264,6 +25391,8 @@ struct Textarea {
     Textarea* OnPaste(InputPasteFn fn, void* data = nullptr);
     Textarea* Token(InlineTokenRenderer fn, void* user = nullptr);
     Textarea* OnTokenClick(InlineTokenClickListener fn, void* user = nullptr);
+
+    Textarea* OnTokenHover(InlineTokenHoverListener fn, void* user = nullptr);
     El* IntoEl();
 };
 
@@ -28083,6 +28212,329 @@ struct Slider {
 };
 
 }
+}
+
+#line 1 "src/ui/speech.h"
+
+namespace gpui {
+
+namespace component {
+
+struct AudioFormat {
+    uint32_t sampleRate = 16000;
+    uint16_t channels = 1;
+
+    static AudioFormat New(uint32_t sampleRate, uint16_t channels) {
+        return AudioFormat{sampleRate, channels};
+    }
+
+    uint32_t SampleRate() const { return sampleRate; }
+
+    uint16_t Channels() const { return channels; }
+};
+inline bool operator==(AudioFormat a, AudioFormat b) {
+    return a.sampleRate == b.sampleRate && a.channels == b.channels;
+}
+inline bool operator!=(AudioFormat a, AudioFormat b) {
+    return !(a == b);
+}
+
+enum class SpeechErrorKind : uint8_t {
+
+    PermissionDenied,
+
+    NoInputDevice,
+
+    Unsupported,
+
+    Input,
+
+    Recognizer
+};
+
+struct SpeechError {
+    SpeechErrorKind kind = SpeechErrorKind::Unsupported;
+    char message[160] = {};
+
+    static SpeechError PermissionDenied();
+    static SpeechError NoInputDevice();
+    static SpeechError Unsupported();
+
+    static SpeechError Input(Str message);
+
+    static SpeechError Recognizer(Str message);
+
+    Str Display(Arena* a) const;
+};
+
+struct SpeechState;
+
+struct SpeechSink {
+    Entity<SpeechState> state = {};
+    uint32_t session = 0;
+
+    void Ready(App* app) const;
+
+    void Hypothesis(Str text, App* app) const;
+
+    void Phrase(Str text, App* app) const;
+
+    void Finish(App* app) const;
+
+    void Error(const SpeechError& error, App* app) const;
+};
+
+struct AudioSink {
+    Entity<SpeechState> state = {};
+    uint32_t session = 0;
+
+    void Push(const int16_t* samples, int count, App* app) const;
+
+    void Error(const SpeechError& error, App* app) const;
+};
+
+struct RecognitionSession {
+    void* data = nullptr;
+
+    void (*pushAudio)(void* data, const int16_t* samples, int count,
+                      App* app) = nullptr;
+
+    void (*finish)(void* data, App* app) = nullptr;
+    void (*drop)(void* data) = nullptr;
+};
+
+struct SpeechRecognizer {
+    void* data = nullptr;
+
+    AudioFormat (*audioFormat)(void* data) = nullptr;
+
+    bool (*isAvailable)(void* data, const App* app) = nullptr;
+
+    bool (*start)(void* data, SpeechSink sink, App* app,
+                  RecognitionSession* out, SpeechError* error) = nullptr;
+
+    bool IsSet() const { return start != nullptr; }
+};
+
+struct AudioCapture {
+    void* data = nullptr;
+    void (*stop)(void* data) = nullptr;
+};
+
+struct AudioInput {
+    void* data = nullptr;
+
+    bool (*start)(void* data, AudioFormat format, AudioSink sink, App* app,
+                  AudioCapture* out, SpeechError* error) = nullptr;
+
+    bool IsSet() const { return start != nullptr; }
+};
+
+struct SpeechAudioConverter {
+
+    double step = 1;
+
+    double position = 1;
+    float previous = 0;
+
+    bool lowPass = false;
+    float alpha = 0;
+    float stages[2] = {};
+    int channels = 1;
+
+    static SpeechAudioConverter New(uint32_t sourceRate, AudioFormat format);
+
+    void Convert(const float* input, int n, Vec<int16_t>& out);
+};
+
+const int kSpeechLevelIntervalMs = 25;
+
+const int kSpeechLevelHistory = 256;
+
+struct LevelMeter {
+
+    int window = 400;
+    double sum = 0;
+    int count = 0;
+    float smoothed = 0;
+
+    float levels[kSpeechLevelHistory] = {};
+    int first = 0;
+    int nLevels = 0;
+
+    double lastLevelAt = -1;
+
+    void Reset(uint32_t sampleRate, uint16_t channels);
+
+    bool Push(const int16_t* samples, int n);
+    int LevelsLen() const { return nLevels; }
+
+    float LevelAt(int ix) const {
+        return levels[(first + ix) % kSpeechLevelHistory];
+    }
+};
+
+int SpeechLevelWindowFor(uint32_t sampleRate, uint16_t channels);
+
+float SpeechLevelOfRms(double rms);
+
+float SpeechLevelSmooth(float previous, float raw);
+
+enum class SpeechStatus : uint8_t {
+
+    Idle,
+
+    Connecting,
+
+    Recording,
+
+    Stopping
+};
+
+inline bool SpeechStatusIsActive(SpeechStatus s) {
+    return s != SpeechStatus::Idle;
+}
+
+inline bool SpeechStatusIsCapturing(SpeechStatus s) {
+    return s == SpeechStatus::Connecting || s == SpeechStatus::Recording;
+}
+
+enum class SpeechEventKind : uint8_t {
+
+    Started,
+
+    Partial,
+
+    Final,
+
+    Cancelled,
+
+    Error
+};
+
+struct SpeechEvent {
+    SpeechEventKind kind = SpeechEventKind::Started;
+    Str text = {};
+    SpeechError error = {};
+};
+
+struct SpeechDeferredOp;
+
+struct SpeechState {
+    SpeechRecognizer recognizer = {};
+    AudioInput input = {};
+    bool systemFallback = true;
+
+    int stopTimeoutMs = 3000;
+    SpeechStatus status = SpeechStatus::Idle;
+
+    bool hasSession = false;
+    uint32_t sessionId = 0;
+
+    AudioCapture capture = {};
+    bool hasCapture = false;
+    RecognitionSession recognition = {};
+
+    int stopTimer = 0;
+    Window* stopTimerWin = nullptr;
+
+    uint32_t nextSession = 0;
+
+    Str committed = {};
+    Str hypothesis = {};
+    LevelMeter meter = {};
+
+    Vec<SpeechDeferredOp*> deferred;
+    bool drainPosted = false;
+    int updateDepth = 0;
+
+    Entity<SpeechState> self = {};
+
+    ~SpeechState();
+
+    SpeechState* Recognizer(const SpeechRecognizer& value);
+
+    SpeechState* Input(const AudioInput& value);
+
+    SpeechState* SystemFallback(bool value);
+
+    SpeechState* StopTimeout(int ms);
+
+    bool HasRecognizer() const;
+
+    bool IsAvailable(const App* app) const;
+
+    SpeechStatus Status() const { return status; }
+
+    TempStr TranscriptTemp() const;
+
+    int LevelsLen() const { return meter.LevelsLen(); }
+    float LevelAt(int ix) const { return meter.LevelAt(ix); }
+    double LastLevelAt() const { return meter.lastLevelAt; }
+
+    void Start(Ctx* cx);
+
+    void Stop(Ctx* cx);
+
+    void Cancel(Ctx* cx);
+
+    void Toggle(Ctx* cx);
+
+    bool IsSession(uint32_t id) const { return hasSession && sessionId == id; }
+
+    static void OnToggle(SpeechState* self, Ctx* cx, const ClickEvent* ev);
+    static void OnDrain(SpeechState* self, Ctx* cx, const void*);
+    static void OnStopTimeout(SpeechState* self, Ctx* cx, const TickEvent* ev,
+                              int64_t session);
+};
+
+Entity<SpeechState> SpeechStateNew(App* app);
+
+struct SpeechButton {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Str id = {};
+    Entity<SpeechState> state = {};
+    UiSize size = UiSize::Medium;
+    bool disabled = false;
+    bool showWhenUnsupported = false;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static SpeechButton* New(Ctx* cx, Entity<SpeechState> state);
+
+    SpeechButton* ShowWhenUnsupported(bool show);
+    SpeechButton* WithSize(UiSize s);
+    SpeechButton* Disabled(bool v);
+
+    SpeechButton* Refine(const Style& refinement, uint32_t fields);
+    El* IntoEl();
+};
+
+struct SpeechWaveform {
+    Arena* a = nullptr;
+    Ctx* cx = nullptr;
+    Entity<SpeechState> state = {};
+    UiSize size = UiSize::Medium;
+    Style style = {};
+    uint32_t styleSet = 0;
+
+    static SpeechWaveform* New(Ctx* cx, Entity<SpeechState> state);
+    SpeechWaveform* WithSize(UiSize s);
+    SpeechWaveform* Refine(const Style& refinement, uint32_t fields);
+    float Height() const;
+    El* IntoEl();
+};
+
+int SpeechWaveformBarRects(Bounds bounds, const float* levels, int nLevels,
+                           float scroll, float bar, float gap, Bounds* out,
+                           int cap);
+
+}
+
+template <>
+struct EventEmitter<component::SpeechState, component::SpeechEvent> {};
+
 }
 
 #line 1 "src/ui/spinner.h"
@@ -31062,6 +31514,10 @@ ComponentDataValue InlineTokenClickData(Arena* a,
                                         const InlineTokenClickEvent& event,
                                         Str text);
 
+ComponentDataValue InlineTokenHoverData(Arena* a,
+                                        const InlineTokenHoverEvent& event,
+                                        Str text);
+
 extern const StateMethodDescriptor kInputTokenStateMethods[8];
 extern const StateMethodDescriptor kTextareaTokenStateMethods[8];
 
@@ -31070,6 +31526,7 @@ struct InlineTokenCallbacks {
     InputState* state = nullptr;
     ComponentCallback renderer = {};
     ComponentCallback listener = {};
+    ComponentCallback hoverListener = {};
 
     static InlineTokenCallbacks* New(Ctx* cx, ShellRuntime* runtime,
                                      InputState* state,
@@ -31078,6 +31535,10 @@ struct InlineTokenCallbacks {
 
     InlineTokenRenderer Renderer() const;
     InlineTokenClickListener Listener() const;
+
+    InlineTokenCallbacks* WithHover(ComponentCallback hover);
+
+    InlineTokenHoverListener HoverListener() const;
 };
 
 }
@@ -31090,6 +31551,7 @@ struct Op {
     enum Kind : uint8_t {
         Render,
         Click,
+        Hover,
         Change,
     } kind = Render;
     ComponentArgument argument = {};
@@ -31097,6 +31559,7 @@ struct Op {
 
 bool RecordRender(PayloadBuild* build, const ComponentArgument* args, int);
 bool RecordClick(PayloadBuild* build, const ComponentArgument* args, int);
+bool RecordHover(PayloadBuild* build, const ComponentArgument* args, int);
 bool RecordChange(PayloadBuild* build, const ComponentArgument* args, int);
 
 inline constexpr ArgumentDescriptor kRenderArguments[] = {
@@ -31105,6 +31568,9 @@ inline constexpr ArgumentDescriptor kRenderArguments[] = {
 inline constexpr ArgumentDescriptor kClickArguments[] = {
     {"listener",
      SchemaCallback("(event: InlineTokenClickEvent, cx: Context) => void")}};
+inline constexpr ArgumentDescriptor kHoverArguments[] = {
+    {"listener",
+     SchemaCallback("(event: InlineTokenHoverEvent, cx: Context) => void")}};
 inline constexpr ArgumentDescriptor kChangeArguments[] = {
     {"listener", SchemaCallback("(text: string, cx: Context) => void")}};
 
@@ -31118,6 +31584,10 @@ inline constexpr MethodDescriptor kTokenClickMethod = {
     "Activates a reference after a completed unconsumed click, outside the "
     "editing borrow.",
     &RecordClick};
+inline constexpr MethodDescriptor kTokenHoverMethod = {
+    "on_token_hover", kHoverArguments,
+    "Reports pointer presence over a token; hover never selects or edits.",
+    &RecordHover};
 inline constexpr MethodDescriptor kChangeMethod = {
     "on_change", kChangeArguments,
     "Reports user text or token identity changes; explicit draft restoration "
@@ -32450,6 +32920,9 @@ void TestSimulateMouseUp(Window* win, Point position,
                          Modifiers modifiers = {});
 
 void TestSimulateClick(Window* win, Point position, Modifiers modifiers = {});
+
+void TestSimulateScrollWheel(Window* win, Point position, Point delta,
+                             Modifiers modifiers = {});
 
 bool TestDispatchAction(Window* win, uint32_t action, int64_t arg = 0);
 
@@ -34678,6 +35151,7 @@ namespace gpui {
 struct ShellTaskDriver;
 struct InlineTokenContext;
 struct InlineTokenClickEvent;
+struct InlineTokenHoverEvent;
 
 class ShellRuntime {
   public:
@@ -34812,6 +35286,8 @@ class ShellRuntime {
                           const InlineTokenContext* ctx, Str text, Ctx* cx);
     void DispatchTokenClick(shell::CallbackId click,
                             const InlineTokenClickEvent* ev, Str text, Ctx* cx);
+    void DispatchTokenHover(shell::CallbackId hover,
+                            const InlineTokenHoverEvent* ev, Str text, Ctx* cx);
 
   private:
     friend struct ShellRuntimeAccess;
