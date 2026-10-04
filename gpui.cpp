@@ -219115,6 +219115,7 @@ static Str gClipboard = {};
 
 static Atom aWmDeleteWindow, aWmProtocols, aNetWmName, aUtf8String;
 static Atom aNetWmState, aNetWmStateMaxVert, aNetWmStateMaxHorz;
+static Atom aNetWmStateFullscreen;
 static Atom aNetFrameExtents;
 static Atom aNetWmMoveResize, aMotifWmHints, aGtkShowWindowMenu;
 static Atom aGtkEdgeConstraints;
@@ -220709,6 +220710,12 @@ void AppToggleMaximize(Window* win) {
     }
 }
 
+void WindowSetFullScreen(Window* win, bool fullScreen) {
+    if (win && win->plat) {
+        SendWmState(win, aNetWmStateFullscreen, None, fullScreen ? 1 : 0);
+    }
+}
+
 void AppDrag(Window* win) {
     if (!win || !win->plat) {
         return;
@@ -220853,6 +220860,8 @@ bool PlatInit(App* app) {
         XInternAtom(gDpy, "_NET_WM_STATE_MAXIMIZED_VERT", False);
     aNetWmStateMaxHorz =
         XInternAtom(gDpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
+    aNetWmStateFullscreen =
+        XInternAtom(gDpy, "_NET_WM_STATE_FULLSCREEN", False);
     aNetWmMoveResize = XInternAtom(gDpy, "_NET_WM_MOVERESIZE", False);
     aMotifWmHints = XInternAtom(gDpy, "_MOTIF_WM_HINTS", False);
     aGtkShowWindowMenu = XInternAtom(gDpy, "_GTK_SHOW_WINDOW_MENU", False);
@@ -222317,6 +222326,17 @@ void AppToggleMaximize(Window* win) {
     }
 }
 
+void WindowSetFullScreen(Window* win, bool fullScreen) {
+    if (!win || !win->plat) {
+        return;
+    }
+    NSWindow* window = win->plat->window;
+    bool current = ([window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+    if (current != fullScreen) {
+        [window toggleFullScreen:nil];
+    }
+}
+
 void AppDrag(Window* win) {
     if (!win || !win->plat) {
         return;
@@ -223365,10 +223385,10 @@ EM_JS(int, GpJsFullscreen, (), {
     return document.fullscreenElement ? 1 : 0;
 });
 
-EM_JS(void, GpJsToggleFullscreen, (), {
-    if (document.fullscreenElement) {
+EM_JS(void, GpJsSetFullscreen, (int on), {
+    if (!on && document.fullscreenElement) {
         document.exitFullscreen();
-    } else if (document.documentElement.requestFullscreen) {
+    } else if (on && !document.fullscreenElement && document.documentElement.requestFullscreen) {
         document.documentElement.requestFullscreen().catch(function() {});
     }
 });
@@ -223837,8 +223857,18 @@ void AppToggleMaximize(Window* win) {
     if (!win || !win->plat) {
         return;
     }
-    GpJsToggleFullscreen();
-    win->maximized = !GpJsFullscreen();
+    bool fullScreen = !GpJsFullscreen();
+    GpJsSetFullscreen(fullScreen);
+    win->maximized = fullScreen;
+    win->plat->dirty = true;
+}
+
+void WindowSetFullScreen(Window* win, bool fullScreen) {
+    if (!win || !win->plat || (GpJsFullscreen() != 0) == fullScreen) {
+        return;
+    }
+    GpJsSetFullscreen(fullScreen);
+    win->maximized = fullScreen;
     win->plat->dirty = true;
 }
 
@@ -224156,6 +224186,9 @@ struct PlatWindow {
     HCURSOR cursor = nullptr;
 
     bool firstMouse = false;
+    LONG_PTR windowedStyle = 0;
+    WINDOWPLACEMENT windowedPlacement = {sizeof(WINDOWPLACEMENT)};
+    bool fullScreen = false;
 };
 
 static HWND Hwnd(Window* win) {
@@ -224831,6 +224864,34 @@ void AppToggleMaximize(Window* win) {
     WINDOWPLACEMENT wp = {sizeof(wp)};
     GetWindowPlacement(hwnd, &wp);
     ShowWindow(hwnd, wp.showCmd == SW_SHOWMAXIMIZED ? SW_RESTORE : SW_MAXIMIZE);
+}
+
+void WindowSetFullScreen(Window* win, bool fullScreen) {
+    HWND hwnd = Hwnd(win);
+    PlatWindow* pw = win ? win->plat : nullptr;
+    if (!hwnd || !pw || pw->fullScreen == fullScreen) {
+        return;
+    }
+    if (fullScreen) {
+        pw->windowedStyle = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        pw->windowedPlacement = {sizeof(WINDOWPLACEMENT)};
+        GetWindowPlacement(hwnd, &pw->windowedPlacement);
+        MONITORINFO monitor = {sizeof(monitor)};
+        GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                        &monitor);
+        SetWindowLongPtrW(hwnd, GWL_STYLE,
+                          pw->windowedStyle & ~(WS_CAPTION | WS_THICKFRAME));
+        RECT r = monitor.rcMonitor;
+        SetWindowPos(hwnd, HWND_TOP, r.left, r.top, r.right - r.left,
+                     r.bottom - r.top, SWP_FRAMECHANGED | SWP_NOACTIVATE);
+    } else {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, pw->windowedStyle);
+        SetWindowPlacement(hwnd, &pw->windowedPlacement);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOACTIVATE);
+    }
+    pw->fullScreen = fullScreen;
 }
 
 void AppDrag(Window* win) {
