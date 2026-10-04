@@ -7711,6 +7711,7 @@ struct Window {
     Modifiers mouseModifiers = {};
 
     CursorKind cursor = CursorKind::Arrow;
+    bool cursorHidden = false;
     bool maximized = false;
 
     float clientInset = -1;
@@ -8453,6 +8454,8 @@ void AppMinimize(Window* win);
 void AppToggleMaximize(Window* win);
 
 void WindowSetFullScreen(Window* win, bool fullScreen);
+
+void WindowSetCursorVisible(Window* win, bool visible);
 void AppClose(Window* win);
 void AppDrag(Window* win);
 bool AppIsMaximized(Window* win);

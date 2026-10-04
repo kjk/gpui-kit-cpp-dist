@@ -23970,6 +23970,14 @@ bool AppIsMaximized(Window* win) {
     return win && win->maximized;
 }
 
+void WindowSetCursorVisible(Window* win, bool visible) {
+    if (!win || win->cursorHidden == !visible) {
+        return;
+    }
+    win->cursorHidden = !visible;
+    PlatSetCursor(win, win->cursor);
+}
+
 struct AppMenuBinding {
     uint32_t action = 0;
     int64_t arg = 0;
@@ -219815,6 +219823,21 @@ void PlatSetCursor(Window* win, CursorKind kind) {
     if (!win || !win->plat || !gDpy) {
         return;
     }
+    if (win->cursorHidden) {
+        static ::Cursor hidden = 0;
+        if (!hidden) {
+            char bits[1] = {0};
+            Pixmap bitmap =
+                XCreateBitmapFromData(gDpy, win->plat->xwin, bits, 1, 1);
+            XColor black = {};
+            hidden =
+                XCreatePixmapCursor(gDpy, bitmap, bitmap, &black, &black, 0, 0);
+            XFreePixmap(gDpy, bitmap);
+        }
+        XDefineCursor(gDpy, win->plat->xwin, hidden);
+        XFlush(gDpy);
+        return;
+    }
 
     static const unsigned int shapes[(int)CursorKind::Count] = {
         XC_left_ptr,
@@ -222373,7 +222396,19 @@ void PlatSetMouseCapture(Window* win, bool capture) {
 }
 
 void PlatSetCursor(Window* win, CursorKind kind) {
-    (void)win;
+    static bool hidden = false;
+    bool wantHidden = win && win->cursorHidden;
+    if (wantHidden != hidden) {
+        hidden = wantHidden;
+        if (hidden) {
+            [NSCursor hide];
+        } else {
+            [NSCursor unhide];
+        }
+    }
+    if (wantHidden) {
+        return;
+    }
     if (kind == CursorKind::IBeam) {
         [[NSCursor IBeamCursor] set];
     } else if (kind == CursorKind::Pointer) {
@@ -223270,7 +223305,7 @@ EM_JS(void, GpJsSetCursor, (int kind), {
     ];
     const c = globalThis.__gpui.canvas;
     if (c) {
-        c.style.cursor = names[kind] || "default";
+        c.style.cursor = kind === names.length ? "none" : (names[kind] || "default");
     }
 });
 
@@ -223891,8 +223926,8 @@ void PlatSetTimer(Window* win, int ms) {
 }
 
 void PlatSetCursor(Window* win, CursorKind kind) {
-    (void)win;
-    GpJsSetCursor((int)kind);
+    GpJsSetCursor(win && win->cursorHidden ? (int)CursorKind::Count
+                                           : (int)kind);
 }
 
 void PlatSetMouseCapture(Window* win, bool capture) {
@@ -224789,8 +224824,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_SETCURSOR:
 
             if (LOWORD(lParam) == HTCLIENT) {
-                SetCursor(win->plat->cursor ? win->plat->cursor
-                                            : LoadCursorW(nullptr, IDC_ARROW));
+                SetCursor(win->cursorHidden
+                              ? nullptr
+                              : (win->plat->cursor
+                                     ? win->plat->cursor
+                                     : LoadCursorW(nullptr, IDC_ARROW)));
                 return TRUE;
             }
             break;
@@ -224957,6 +224995,10 @@ void PlatSetMouseCapture(Window* win, bool capture) {
 
 void PlatSetCursor(Window* win, CursorKind kind) {
     if (!win || !win->plat) {
+        return;
+    }
+    if (win->cursorHidden) {
+        SetCursor(nullptr);
         return;
     }
 
