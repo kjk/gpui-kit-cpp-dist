@@ -207,6 +207,7 @@ export const simpleExamples = [
   "brush",
   "editor",
   "webview",
+  "speech",
 ];
 
 /** A directory of .cpp built as one binary. */
@@ -1019,10 +1020,23 @@ function winLibs(f: BuildFlags): string[] {
 // glyphs and IOKit answers the battery question. WebKit is
 // src/wry/wry_mac.cpp — the webview.
 // CoreServices is FSEvents, the directory watcher in sys/dir_watch_mac.cpp.
-const macFrameworks = ["Cocoa", "CoreServices", "CoreText", "CoreGraphics", "ImageIO", "IOKit", "WebKit"];
+// AudioToolbox and AVFoundation are the microphone (sys/audio_input_mac.cpp)
+// and Speech the system recognizer (sys/speech_recognizer_mac.cpp).
+const macFrameworks = [
+  "Cocoa",
+  "CoreServices",
+  "CoreText",
+  "CoreGraphics",
+  "ImageIO",
+  "IOKit",
+  "WebKit",
+  "AudioToolbox",
+  "AVFoundation",
+  "Speech",
+];
 
 // x11 for the window, cairo + pangocairo for everything drawn in it. The two
-// soft dependencies, libcurl and WebKitGTK, are probed in linuxDeps below.
+// soft dependencies, libcurl, WebKitGTK and ALSA, are probed in linuxDeps below.
 const linuxPkgs = ["x11", "cairo", "pangocairo", "gdk-pixbuf-2.0", "gio-2.0"];
 
 function pkgConfig(names: string[], kind: "--cflags" | "--libs", fail: (msg: string) => never): string[] {
@@ -1070,6 +1084,19 @@ function linuxDeps(fail: (msg: string) => never): LinuxDeps {
     libs.push(...pkgConfig(["webkit2gtk-4.1"], "--libs", fail));
   } else {
     console.log("webkit2gtk-4.1 not found: webviews will be empty. Install it with: bash cmd/ubuntu-install-deps.sh");
+  }
+  // ALSA is sys/audio_input_linux.cpp's microphone, and the third soft
+  // dependency: without libasound2-dev the tree still builds and speech input
+  // has no microphone, which is what a machine with no input device answers
+  // too. GPUI_HAVE_ALSA is what the source switches on.
+  const alsa = Bun.spawnSync(["pkg-config", "--exists", "alsa"], { stdout: "pipe", stderr: "pipe" });
+  if ((alsa.exitCode ?? 1) === 0) {
+    cflags.push(...pkgConfig(["alsa"], "--cflags", fail), "-DGPUI_HAVE_ALSA=1");
+    libs.push(...pkgConfig(["alsa"], "--libs", fail));
+  } else {
+    console.log(
+      "alsa not found: speech input will have no microphone. Install it with: bash cmd/ubuntu-install-deps.sh",
+    );
   }
   linuxDepsMemo = { cflags, libs };
   return linuxDepsMemo;
@@ -1397,6 +1424,7 @@ function amalgamSize(bytes: number, lines: number): string {
 const extrasPairs = [
   ["extras/autocorrect", "autocorrect"],
   ["extras/taffy", "taffy"],
+  ["extras/unicode-linebreak", "unicode_linebreak"],
   ["extras/markdown", "markdown"],
   ["extras/markdown-mini", "markdown"],
   ["extras/html5ever", "html5ever"],
@@ -1664,6 +1692,12 @@ function link(
   if (tc.plat === "mac") {
     for (const fw of macFrameworks) {
       ldflags.push("-framework", fw);
+    }
+    // examples/speech's build.rs: macOS reads the microphone and speech
+    // recognition usage descriptions from the binary's __info_plist section,
+    // and refuses access without asking when they are missing.
+    if (name === "speech") {
+      ldflags.push("-Wl,-sectcreate,__TEXT,__info_plist,examples/speech_Info.plist");
     }
   } else {
     ldflags.push(...linuxDeps(fail).libs, "-lm", "-lpthread");

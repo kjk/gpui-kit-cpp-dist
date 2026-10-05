@@ -1989,6 +1989,24 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args) {
 
 namespace wry {
 
+bool MacCookieMatchesUrl(const Cookie* cookie, Str scheme, Str domain) {
+    if (!cookie || !domain.s || !base::StrEq(cookie->domain, domain))
+        return false;
+    if (!cookie->hasSecure || !cookie->secure) return true;
+    return base::StrEq(scheme, StrL("https")) ||
+           (base::StrEq(scheme, StrL("http")) &&
+            base::StrEq(domain, StrL("localhost")));
+}
+
+Str MacDownloadFileNameTemp(Str suggested, int collision) {
+    if (collision <= 0) return suggested;
+    int dot = base::StrFind(suggested, ".");
+    Str stem = dot < 0 ? suggested : Str(suggested.s, dot);
+    Str extension =
+        dot < 0 ? Str() : Str(suggested.s + dot, len(suggested) - dot);
+    return base::FormatTemp("%s (%d)%s", stem, collision, extension);
+}
+
 void CookieListFree(Vec<Cookie>* cookies) {
     if (!cookies) {
         return;
@@ -5050,6 +5068,10 @@ bool WebViewAvailable() {
 
 #import <Cocoa/Cocoa.h>
 
+#import <WebKit/WKDownload.h>
+#import <WebKit/WKDownloadDelegate.h>
+#import <WebKit/WKHTTPCookieStore.h>
+#import <WebKit/WKNavigationResponse.h>
 #import <WebKit/WKFrameInfo.h>
 #import <WebKit/WKNavigation.h>
 #import <WebKit/WKNavigationAction.h>
@@ -5071,10 +5093,17 @@ bool WebViewAvailable() {
 
 @class GpuiWryScriptHandler;
 @class GpuiWryNavigationDelegate;
+@class GpuiWryDownloadDelegate;
 @class GpuiWryUIDelegate;
 @class GpuiWryTitleObserver;
 @class GpuiWrySchemeHandler;
 @class GpuiWryWebView;
+@interface GpuiWryCookieResult : NSObject
+@property(nonatomic, assign) BOOL done;
+@property(nonatomic, strong) NSArray<NSHTTPCookie*>* cookies;
+@end
+@implementation GpuiWryCookieResult
+@end
 
 namespace wry {
 
@@ -5118,6 +5147,10 @@ struct WebView {
         void* ctx, Str url, const NewWindowFeatures* features,
         WebView** createdWebView) = nullptr;
 
+    DownloadStartedHandler downloadStartedHandler = nullptr;
+    DownloadCompletedHandler downloadCompletedHandler = nullptr;
+    DragDropHandler dragDropHandler = nullptr;
+
     Vec<ProtocolCopy> protocols;
 
     Vec<Str> pendingScripts;
@@ -5127,6 +5160,7 @@ struct WebView {
 
     GpuiWryScriptHandler* ipcDelegate = nil;
     GpuiWryNavigationDelegate* navDelegate = nil;
+    GpuiWryDownloadDelegate* downloadDelegate = nil;
     GpuiWryUIDelegate* uiDelegate = nil;
     GpuiWryTitleObserver* titleObserver = nil;
     NSMutableArray* schemeHandlers = nil;
@@ -5180,11 +5214,64 @@ static void HandleSchemeTask(WebView* wv, int index, id<WKURLSchemeTask> task);
 }
 
 @interface GpuiWryWebView : WKWebView
+@property(nonatomic, assign) wry::WebView* wv;
 @property(nonatomic, assign) BOOL childWebView;
 @property(nonatomic, assign) BOOL acceptFirstMouseEnabled;
 @end
 
 @implementation GpuiWryWebView
+
+- (BOOL)emitDrag:(id<NSDraggingInfo>)sender kind:(wry::DragDropKind)kind {
+    wry::WebView* wv = self.wv;
+    if (!wv || !wv->dragDropHandler) return NO;
+    wry::Vec<wry::Str> paths;
+    if (kind == wry::DragDropKind::Enter || kind == wry::DragDropKind::Drop) {
+        NSArray* files = [sender.draggingPasteboard
+            propertyListForType:NSFilenamesPboardType];
+        if ([files isKindOfClass:[NSArray class]]) {
+            for (id file in files) {
+                if ([file isKindOfClass:[NSString class]])
+                    VecAppend(paths, wry::StrDup(wry::FromNSTemp(file)));
+            }
+        }
+    }
+    wry::DragDropEvent event;
+    event.kind = kind;
+    event.paths = paths.els;
+    event.pathCount = len(paths);
+    if (kind != wry::DragDropKind::Leave) {
+
+        NSPoint point =
+            [self convertPoint:sender.draggingLocation fromView:nil];
+        event.x = (int32_t)point.x;
+        event.y = (int32_t)(self.isFlipped ? point.y
+                                           : self.bounds.size.height - point.y);
+    }
+    bool handled = wv->dragDropHandler(wv->ctx, &event);
+    for (int i = 0; i < len(paths); i++) wry::StrFree(paths[i]);
+    return handled ? YES : NO;
+}
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    if ([self emitDrag:sender kind:wry::DragDropKind::Enter])
+        return NSDragOperationCopy;
+    return [super draggingEntered:sender];
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    if ([self emitDrag:sender kind:wry::DragDropKind::Over])
+        return NSDragOperationCopy;
+    NSDragOperation operation = [super draggingUpdated:sender];
+
+    return operation == NSDragOperationNone ? NSDragOperationCopy : operation;
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    if ([self emitDrag:sender kind:wry::DragDropKind::Drop]) return YES;
+    return [super performDragOperation:sender];
+}
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    if (![self emitDrag:sender kind:wry::DragDropKind::Leave])
+        [super draggingExited:sender];
+}
+
 - (BOOL)performKeyEquivalent:(NSEvent*)event {
     if (self.childWebView) {
         return NO;
@@ -5301,6 +5388,70 @@ static void HandleSchemeTask(WebView* wv, int index, id<WKURLSchemeTask> task);
 }
 @end
 
+API_AVAILABLE(macos(11.3))
+@interface GpuiWryDownloadDelegate : NSObject <WKDownloadDelegate>
+@property(nonatomic, assign) wry::WebView* wv;
+@property(nonatomic, strong) NSMutableSet* downloads;
+@end
+
+@implementation GpuiWryDownloadDelegate
+- (void)download:(WKDownload*)download
+    decideDestinationUsingResponse:(NSURLResponse*)response
+                 suggestedFilename:(NSString*)filename
+                 completionHandler:(void (^)(NSURL*))handler
+    API_AVAILABLE(macos(11.3)) {
+    (void)response;
+    wry::WebView* wv = self.wv;
+    if (!wv || !wv->downloadStartedHandler) {
+        handler(nil);
+        return;
+    }
+    NSFileManager* files = [NSFileManager defaultManager];
+    NSURL* directory = [[files URLsForDirectory:NSDownloadsDirectory
+                                      inDomains:NSUserDomainMask] firstObject];
+    if (!directory)
+        directory =
+            [NSURL fileURLWithPath:files.currentDirectoryPath isDirectory:YES];
+    NSString* destination =
+        [directory.path stringByAppendingPathComponent:filename];
+    int counter = 1;
+    while ([files fileExistsAtPath:destination]) {
+        destination = [directory.path
+            stringByAppendingPathComponent:wry::ToNS(
+                                               wry::MacDownloadFileNameTemp(
+                                                   wry::FromNSTemp(filename),
+                                                   counter++))];
+    }
+    wry::Str path = wry::FromNSTemp(destination);
+    wry::Str url = wry::FromNSTemp(download.originalRequest.URL.absoluteString);
+    bool allowed = wv->downloadStartedHandler(wv->ctx, url, &path);
+    handler(allowed && self.wv ? [NSURL fileURLWithPath:wry::ToNS(path)] : nil);
+}
+- (void)complete:(WKDownload*)download
+         success:(BOOL)success API_AVAILABLE(macos(11.3)) {
+    [self.downloads removeObject:download];
+    download.delegate = nil;
+    wry::WebView* wv = self.wv;
+    if (wv && wv->downloadCompletedHandler) {
+
+        wv->downloadCompletedHandler(
+            wv->ctx,
+            wry::FromNSTemp(download.originalRequest.URL.absoluteString),
+            nullptr, success);
+    }
+}
+- (void)downloadDidFinish:(WKDownload*)download API_AVAILABLE(macos(11.3)) {
+    [self complete:download success:YES];
+}
+- (void)download:(WKDownload*)download
+    didFailWithError:(NSError*)error
+          resumeData:(NSData*)resumeData API_AVAILABLE(macos(11.3)) {
+    (void)error;
+    (void)resumeData;
+    [self complete:download success:NO];
+}
+@end
+
 @interface GpuiWryNavigationDelegate : NSObject <WKNavigationDelegate>
 @property(nonatomic, assign) wry::WebView* wv;
 @end
@@ -5312,11 +5463,13 @@ static void HandleSchemeTask(WebView* wv, int index, id<WKURLSchemeTask> task);
                         (void (^)(WKNavigationActionPolicy))handler {
     (void)webView;
     wry::WebView* wv = self.wv;
-
-    if ([action respondsToSelector:@selector(shouldPerformDownload)] &&
-        action.shouldPerformDownload) {
-        handler(WKNavigationActionPolicyCancel);
-        return;
+    if (@available(macOS 11.3, *)) {
+        if (action.shouldPerformDownload) {
+            handler(wv && wv->downloadStartedHandler
+                        ? WKNavigationActionPolicyDownload
+                        : WKNavigationActionPolicyCancel);
+            return;
+        }
     }
     if (!wv || !wv->navigationHandler) {
         handler(WKNavigationActionPolicyAllow);
@@ -5327,6 +5480,41 @@ static void HandleSchemeTask(WebView* wv, int index, id<WKURLSchemeTask> task);
         wv->ctx, url ? wry::FromNSTemp(url.absoluteString) : wry::Str());
     handler(allow ? WKNavigationActionPolicyAllow
                   : WKNavigationActionPolicyCancel);
+}
+
+- (void)webView:(WKWebView*)webView
+    decidePolicyForNavigationResponse:(WKNavigationResponse*)response
+                      decisionHandler:
+                          (void (^)(WKNavigationResponsePolicy))handler {
+    (void)webView;
+    if (@available(macOS 11.3, *)) {
+        if (!response.canShowMIMEType && self.wv &&
+            self.wv->downloadStartedHandler) {
+            handler(WKNavigationResponsePolicyDownload);
+            return;
+        }
+    }
+    handler(WKNavigationResponsePolicyAllow);
+}
+- (void)webView:(WKWebView*)webView
+     navigationAction:(WKNavigationAction*)action
+    didBecomeDownload:(WKDownload*)download API_AVAILABLE(macos(11.3)) {
+    (void)webView;
+    (void)action;
+    if (self.wv && self.wv->downloadDelegate) {
+        [self.wv->downloadDelegate.downloads addObject:download];
+        download.delegate = self.wv->downloadDelegate;
+    } else {
+        [download cancel:^(NSData* data) {
+          (void)data;
+        }];
+    }
+}
+- (void)webView:(WKWebView*)webView
+    navigationResponse:(WKNavigationResponse*)response
+     didBecomeDownload:(WKDownload*)download API_AVAILABLE(macos(11.3)) {
+    (void)response;
+    [self webView:webView navigationAction:nil didBecomeDownload:download];
 }
 
 - (void)webView:(WKWebView*)webView
@@ -5788,6 +5976,9 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
     wv->isChild = asChild;
     wv->visible = attrs->visible;
     wv->ctx = attrs->ctx;
+    wv->downloadStartedHandler = attrs->downloadStartedHandler;
+    wv->downloadCompletedHandler = attrs->downloadCompletedHandler;
+    wv->dragDropHandler = attrs->dragDropHandler;
     wv->ipcHandler = attrs->ipcHandler;
     wv->navigationHandler = attrs->navigationHandler;
     wv->documentTitleChangedHandler = attrs->documentTitleChangedHandler;
@@ -5875,6 +6066,9 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
 
     GpuiWryWebView* webview =
         [[GpuiWryWebView alloc] initWithFrame:frame configuration:config];
+    webview.wv = wv;
+    if (wv->dragDropHandler)
+        [webview registerForDraggedTypes:@[ NSFilenamesPboardType ]];
     webview.childWebView = asChild ? YES : NO;
     webview.acceptFirstMouseEnabled = attrs->acceptFirstMouse ? YES : NO;
     wv->webview = webview;
@@ -5926,6 +6120,13 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
                          context:nullptr];
     }
 
+    if (@available(macOS 11.3, *)) {
+        if (wv->downloadStartedHandler || wv->downloadCompletedHandler) {
+            wv->downloadDelegate = [[GpuiWryDownloadDelegate alloc] init];
+            wv->downloadDelegate.wv = wv;
+            wv->downloadDelegate.downloads = [NSMutableSet set];
+        }
+    }
     wv->navDelegate = [[GpuiWryNavigationDelegate alloc] init];
     wv->navDelegate.wv = wv;
     wv->webview.navigationDelegate = wv->navDelegate;
@@ -5997,6 +6198,17 @@ void WebViewFree(WebView* wv) {
         [wv->webview removeFromSuperview];
     }
 
+    ((GpuiWryWebView*)wv->webview).wv = nullptr;
+    if (@available(macOS 11.3, *)) {
+        wv->downloadDelegate.wv = nullptr;
+        for (WKDownload* download in wv->downloadDelegate.downloads) {
+            download.delegate = nil;
+            [download cancel:^(NSData* data) {
+              (void)data;
+            }];
+        }
+        [wv->downloadDelegate.downloads removeAllObjects];
+    }
     wv->ipcDelegate.wv = nullptr;
     wv->navDelegate.wv = nullptr;
     wv->uiDelegate.wv = nullptr;
@@ -6272,22 +6484,160 @@ bool WebViewClearAllBrowsingData(WebView* wv) {
     return true;
 }
 
-bool WebViewCookies(WebView*, Vec<Cookie>* out) {
+static bool WaitForCookies(GpuiWryCookieResult* result) {
+    NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+    while (!result.done && deadline.timeIntervalSinceNow > 0) {
+        [[NSRunLoop mainRunLoop]
+               runMode:NSDefaultRunLoopMode
+            beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.002]];
+    }
+    if (!result.done) logf("wry: timed out waiting for cookies response\n");
+    return result.done;
+}
+
+static Cookie CookieFromWK(NSHTTPCookie* source) {
+    Cookie cookie;
+    cookie.name = StrDup(FromNSTemp(source.name));
+    cookie.value = StrDup(FromNSTemp(source.value));
+    cookie.domain = StrDup(FromNSTemp(source.domain));
+    cookie.path = StrDup(FromNSTemp(source.path));
+    cookie.hasHttpOnly = true;
+    cookie.httpOnly = source.HTTPOnly;
+    cookie.hasSecure = true;
+    cookie.secure = source.secure;
+    cookie.hasSameSite = true;
+    cookie.sameSite = CookieSameSite::None;
+    if (@available(macOS 10.15, *)) {
+        if ([source.sameSitePolicy isEqualToString:NSHTTPCookieSameSiteLax])
+            cookie.sameSite = CookieSameSite::Lax;
+        else if ([source.sameSitePolicy
+                     isEqualToString:NSHTTPCookieSameSiteStrict])
+            cookie.sameSite = CookieSameSite::Strict;
+    }
+    cookie.session = source.expiresDate == nil;
+    cookie.hasExpires = !cookie.session;
+    if (cookie.hasExpires)
+        cookie.expiresUnixSeconds = (int64_t)source.expiresDate
+                                        .timeIntervalSince1970;
+    return cookie;
+}
+
+static NSHTTPCookie* CookieToWK(const Cookie* source) {
+    if (!source) return nil;
+    NSMutableDictionary* properties = [@{
+        NSHTTPCookieName : ToNS(source->name),
+        NSHTTPCookieValue : ToNS(source->value),
+        NSHTTPCookieDomain : ToNS(source->domain),
+        NSHTTPCookiePath : ToNS(source->path)
+    } mutableCopy];
+    if (source->hasMaxAge) {
+        properties[NSHTTPCookieMaximumAge] =
+            ToNS(base::FormatTemp("%lld", (long long)source->maxAgeSeconds));
+        properties[NSHTTPCookieVersion] = @"1";
+    } else if (source->hasExpires) {
+        properties[NSHTTPCookieExpires] = [NSDate
+            dateWithTimeIntervalSince1970:(double)source->expiresUnixSeconds];
+        properties[NSHTTPCookieVersion] = @"0";
+    }
+    if (source->hasSecure)
+        properties[NSHTTPCookieSecure] = source->secure ? @"TRUE" : @"FALSE";
+    if (source->hasHttpOnly)
+        properties[@"HttpOnly"] = source->httpOnly ? @"TRUE" : @"FALSE";
+    if (@available(macOS 10.15, *)) {
+        if (source->hasSameSite && source->sameSite != CookieSameSite::None)
+            properties[NSHTTPCookieSameSitePolicy] =
+                source->sameSite == CookieSameSite::Strict
+                    ? NSHTTPCookieSameSiteStrict
+                    : NSHTTPCookieSameSiteLax;
+    }
+    return [NSHTTPCookie cookieWithProperties:properties];
+}
+
+bool WebViewCookies(WebView* wv, Vec<Cookie>* out) {
+    if (!out) return false;
     CookieListFree(out);
-    return false;
+    if (!wv || !wv->webview) return false;
+    GpuiWryCookieResult* result = [[GpuiWryCookieResult alloc] init];
+    [wv->webview.configuration.websiteDataStore.httpCookieStore
+        getAllCookies:^(NSArray<NSHTTPCookie*>* cookies) {
+          result.cookies = cookies;
+          result.done = YES;
+        }];
+    if (!WaitForCookies(result)) return false;
+    for (NSHTTPCookie* source in result.cookies) {
+        Cookie cookie = CookieFromWK(source);
+        if (!cookie.name.s || !cookie.value.s || !cookie.domain.s ||
+            !cookie.path.s || !VecAppend(*out, cookie)) {
+            StrFree(cookie.name);
+            StrFree(cookie.value);
+            StrFree(cookie.domain);
+            StrFree(cookie.path);
+            CookieListFree(out);
+            return false;
+        }
+    }
+    return true;
 }
 
-bool WebViewCookiesForUrl(WebView*, Str, Vec<Cookie>* out) {
+bool WebViewCookiesForUrl(WebView* wv, Str url, Vec<Cookie>* out) {
+    if (!out) return false;
     CookieListFree(out);
-    return false;
+    NSURL* parsed = [NSURL URLWithString:ToNS(url)];
+    if (!parsed.scheme) return false;
+
+    NSString* host = parsed.host.lowercaseString;
+    if ([host rangeOfString:@":"].location != NSNotFound ||
+        [host rangeOfCharacterFromSet:[[NSCharacterSet
+                                          characterSetWithCharactersInString:
+                                              @"0123456789."] invertedSet]]
+                .location == NSNotFound)
+        host = nil;
+    if (!WebViewCookies(wv, out)) return false;
+
+    Str domain = FromNSTemp(host);
+    Str scheme = FromNSTemp(parsed.scheme.lowercaseString);
+    int kept = 0;
+    for (int i = 0; i < len(*out); i++) {
+        Cookie cookie = (*out)[i];
+        if (MacCookieMatchesUrl(&cookie, scheme, domain))
+            (*out)[kept++] = cookie;
+        else {
+            StrFree(cookie.name);
+            StrFree(cookie.value);
+            StrFree(cookie.domain);
+            StrFree(cookie.path);
+        }
+    }
+    out->len = kept;
+    return true;
 }
 
-bool WebViewSetCookie(WebView*, const Cookie*) {
-    return false;
+static bool ChangeWKCookie(WebView* wv, const Cookie* source, bool remove) {
+    if (!wv || !wv->webview) return false;
+    NSHTTPCookie* cookie = CookieToWK(source);
+    if (!cookie) return false;
+    GpuiWryCookieResult* result = [[GpuiWryCookieResult alloc] init];
+    WKHTTPCookieStore* store = wv->webview.configuration.websiteDataStore
+                                   .httpCookieStore;
+    if (remove)
+        [store deleteCookie:cookie
+            completionHandler:^{
+              result.done = YES;
+            }];
+    else
+        [store setCookie:cookie
+            completionHandler:^{
+              result.done = YES;
+            }];
+    return WaitForCookies(result);
 }
 
-bool WebViewDeleteCookie(WebView*, const Cookie*) {
-    return false;
+bool WebViewSetCookie(WebView* wv, const Cookie* source) {
+    return ChangeWKCookie(wv, source, false);
+}
+
+bool WebViewDeleteCookie(WebView* wv, const Cookie* source) {
+    return ChangeWKCookie(wv, source, true);
 }
 
 static id Inspector(WebView* wv) {

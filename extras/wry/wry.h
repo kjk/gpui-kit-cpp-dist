@@ -1456,6 +1456,9 @@ struct Cookie {
 
 void CookieListFree(Vec<Cookie>* cookies);
 
+bool MacCookieMatchesUrl(const Cookie* cookie, Str scheme, Str domain);
+Str MacDownloadFileNameTemp(Str suggested, int collision);
+
 struct WebViewAttributes {
     static bool AllowDownload(void*, Str, Str*) { return true; }
 
