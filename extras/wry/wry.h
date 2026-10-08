@@ -1583,6 +1583,12 @@ bool WebViewFocusParent(WebView* webview);
 
 bool WebViewZoom(WebView* webview, double scaleFactor);
 
+bool WebViewMatchPageScale(WebView* webview, float gpuiScale);
+
+typedef void (*WebViewPageClick)(void* user, int button, float x, float y,
+                                 float gdkScale);
+void WebViewSetPageClick(WebView* webview, WebViewPageClick fn, void* user);
+
 bool WebViewSetBackgroundColor(WebView* webview, Rgba color);
 
 bool WebViewSetTheme(WebView* webview, Theme theme);

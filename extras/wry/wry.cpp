@@ -3433,6 +3433,8 @@ struct WebView {
     DownloadStartedHandler downloadStartedHandler = nullptr;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;
     DragDropHandler dragDropHandler = nullptr;
+    WebViewPageClick pageClick = nullptr;
+    void* pageClickUser = nullptr;
 
     DragState dragState = DragState::Left;
     Vec<Str> dragPaths;
@@ -3681,6 +3683,14 @@ static gboolean OnButtonPress(GtkWidget*, GdkEventButton* event,
         wv->bfState |= event->button == 8 ? kBack : kForward;
         DispatchSyntheticMouse(wv, event, true);
         return TRUE;
+    }
+
+    if (wv->pageClick && event->type == GDK_BUTTON_PRESS &&
+        (event->button == 1 || event->button == 2 || event->button == 3)) {
+        float scale =
+            (float)gtk_widget_get_scale_factor(GTK_WIDGET(wv->webview));
+        wv->pageClick(wv->pageClickUser, (int)event->button, (float)event->x,
+                      (float)event->y, scale);
     }
     return FALSE;
 }
@@ -4665,6 +4675,28 @@ bool WebViewZoom(WebView* wv, double scaleFactor) {
     return true;
 }
 
+bool WebViewMatchPageScale(WebView* wv, float gpuiScale) {
+    if (!wv || !wv->webview) {
+        return false;
+    }
+    int gdk = gtk_widget_get_scale_factor(GTK_WIDGET(wv->webview));
+    if (gdk < 1) {
+        gdk = 1;
+    }
+    if (gpuiScale <= 0) {
+        gpuiScale = 1;
+    }
+    return WebViewZoom(wv, (double)gpuiScale / (double)gdk);
+}
+
+void WebViewSetPageClick(WebView* wv, WebViewPageClick fn, void* user) {
+    if (!wv) {
+        return;
+    }
+    wv->pageClick = fn;
+    wv->pageClickUser = user;
+}
+
 bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
     if (!wv) {
         return false;
@@ -5001,6 +5033,10 @@ bool WebViewFocusParent(WebView*) {
 bool WebViewZoom(WebView*, double) {
     return false;
 }
+bool WebViewMatchPageScale(WebView*, float) {
+    return false;
+}
+void WebViewSetPageClick(WebView*, WebViewPageClick, void*) {}
 bool WebViewSetBackgroundColor(WebView*, Rgba) {
     return false;
 }
@@ -6413,6 +6449,12 @@ bool WebViewZoom(WebView* wv, double scaleFactor) {
     return true;
 }
 
+bool WebViewMatchPageScale(WebView*, float) {
+    return true;
+}
+
+void WebViewSetPageClick(WebView*, WebViewPageClick, void*) {}
+
 bool WebViewSetBackgroundColor(WebView*, Rgba) {
 
     return true;
@@ -6793,6 +6835,10 @@ bool WebViewFocusParent(WebView*) {
 bool WebViewZoom(WebView*, double) {
     return false;
 }
+bool WebViewMatchPageScale(WebView*, float) {
+    return false;
+}
+void WebViewSetPageClick(WebView*, WebViewPageClick, void*) {}
 bool WebViewSetBackgroundColor(WebView*, Rgba) {
     return false;
 }
@@ -11720,6 +11766,12 @@ bool WebViewZoom(WebView* wv, double scaleFactor) {
     }
     return SUCCEEDED(wv->controller->put_ZoomFactor(scaleFactor));
 }
+
+bool WebViewMatchPageScale(WebView*, float) {
+    return true;
+}
+
+void WebViewSetPageClick(WebView*, WebViewPageClick, void*) {}
 
 bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
     if (!wv) {

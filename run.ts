@@ -538,17 +538,17 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "4c7f1350331562436df868c55ac33bebc4c6406c",
-  date: "2026-10-04",
-  subject: "editor: Measure the completion prefix from the typed text and drop stale trigger offsets (#3363)",
+  sha: "02daace3522954eb8b3a8db77d59c3bbaa5a839d",
+  date: "2026-10-08",
+  subject: "tab: Scroll a clicked tab into view with the next one peeking (#3419)",
   crates: {
-    "gpui-kit": "0.7.0",
-    "gpui-base": "0.7.0",
-    "gpui-component": "0.7.0",
-    "gpui-component-story": "0.7.0",
-    "gpui-wry": "0.7.0",
-    "gpui-shell": "0.7.0",
-    "gpui-component-shell": "0.7.0",
+    "gpui-kit": "0.7.1",
+    "gpui-base": "0.7.1",
+    "gpui-component": "0.7.1",
+    "gpui-component-story": "0.7.1",
+    "gpui-webview": "0.7.1",
+    "gpui-shell": "0.7.1",
+    "gpui-component-shell": "0.7.1",
   },
   dir: ".work/gpui-component",
 } as const;
@@ -559,15 +559,15 @@ export const gpuiComponent = {
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "1a28cff4b409169bac058bca40dfbfeb7621d19b",
-  date: "2026-09-27",
-  subject: "git: Stop remote operations blocking commit views (#64720)",
+  sha: "279fe070bb389b79652e52065b2f001edcc0b11b",
+  date: "2026-10-04",
+  subject: "languages: Fix JSON completion order for settings keys (#65139)",
   crates: {
-    "gpui-pre": "0.3.7",
-    "gpui-pre-platform": "0.3.7",
-    "gpui-pre-macros": "0.3.7",
+    "gpui-pre": "0.3.8",
+    "gpui-pre-platform": "0.3.8",
+    "gpui-pre-macros": "0.3.8",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.7",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.8",
 } as const;
 
 /**
@@ -609,7 +609,7 @@ export const html5ever = {
 } as const;
 
 /**
- * The webview crate `crates/webview` (the `gpui-wry` crate) is built on:
+ * The webview crate `crates/webview` (the `gpui-webview` crate) is built on:
  * `wry = { version = "0.53.3", package = "lb-wry" }`, longbridge's fork. We
  * port it: `src/wry/` is a C++ port of exactly this version, and
  * `src/webview/` is the gpui-side view `crates/webview` is. See
