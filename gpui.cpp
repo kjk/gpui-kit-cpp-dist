@@ -22131,8 +22131,14 @@ static bool PageScrollBy(Window* win, int dir) {
     return true;
 }
 
+enum class ScrollbarPressKind : uint8_t {
+    Mouse,
+    ShiftMouse,
+    Touch,
+};
+
 static bool ScrollbarPress(Window* win, ScrollRect* s, float x, float y,
-                           bool horizontal, bool thumbOnly = false) {
+                           bool horizontal, ScrollbarPressKind kind) {
     float track = horizontal ? s->bounds.w : s->bounds.h;
     float content = horizontal ? s->contentW : s->contentH;
     float origin = horizontal ? s->bounds.x : s->bounds.y;
@@ -22192,9 +22198,16 @@ static bool ScrollbarPress(Window* win, ScrollRect* s, float x, float y,
                            horizontal ? s->scrollY : off, true);
         return true;
     }
-    if (thumbOnly) return false;
+    if (kind == ScrollbarPressKind::Touch) return false;
 
-    float off = geometry.DragOffset(at, geometry.length * .5f, current);
+    float off;
+    if (kind == ScrollbarPressKind::ShiftMouse) {
+        off = geometry.DragOffset(at, geometry.length * .5f, current);
+    } else {
+        float direction = at < thumbStart ? -1.f : 1.f;
+        float viewport = horizontal ? s->bounds.w : s->bounds.h;
+        off = current + direction * viewport;
+    }
     ScrollbarEmit(win, s, horizontal ? off : s->scrollX,
                   horizontal ? s->scrollY : off);
     return false;
@@ -22733,7 +22746,10 @@ static void DispatchMouseDown(Window* win, const MouseDownEvent& in) {
     ScrollRect* bar = ScrollbarAt(&win->paint, x, y, &barHorizontal);
     if (bar) {
         SetMouseDown(win, true);
-        (void)ScrollbarPress(win, bar, x, y, barHorizontal);
+        ScrollbarPressKind kind = in.modifiers.shift
+                                      ? ScrollbarPressKind::ShiftMouse
+                                      : ScrollbarPressKind::Mouse;
+        (void)ScrollbarPress(win, bar, x, y, barHorizontal, kind);
         DispatchMouseDownOut(win, in);
 
         ClearPendingClick(win);
@@ -23179,9 +23195,9 @@ void WindowDispatchInput(Window* win, const PlatformInput* input) {
                     ScrollbarAt(&win->paint, touch.startPosition.x,
                                 touch.startPosition.y, &horizontal);
                 win->touchScrollbarDrag =
-                    bar &&
-                    ScrollbarPress(win, bar, touch.startPosition.x,
-                                   touch.startPosition.y, horizontal, true);
+                    bar && ScrollbarPress(win, bar, touch.startPosition.x,
+                                          touch.startPosition.y, horizontal,
+                                          ScrollbarPressKind::Touch);
                 if (win->touchScrollbarDrag &&
                     (touch.position.x != touch.startPosition.x ||
                      touch.position.y != touch.startPosition.y)) {
