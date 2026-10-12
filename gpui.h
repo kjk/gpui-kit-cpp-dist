@@ -36952,9 +36952,15 @@ struct HttpRsp {
     Str contentType;
 
     Str redirectUrl;
+
+    Str headers;
 };
 
 void HttpRspFree(HttpRsp* r);
+
+Str HttpRspHeader(const HttpRsp& r, Str name);
+
+Str HttpHeadersFromRaw(Str raw);
 
 struct HttpHeader {
     Str name;

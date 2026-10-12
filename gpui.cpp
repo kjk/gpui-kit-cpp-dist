@@ -111443,7 +111443,58 @@ void HttpRspFree(HttpRsp* r) {
     }
     StrFree(r->redirectUrl);
     r->redirectUrl = {};
+    StrFree(r->headers);
+    r->headers = {};
     r->status = 0;
+}
+
+Str HttpRspHeader(const HttpRsp& r, Str name) {
+    Str all = r.headers;
+    for (int at = 0; at < len(all);) {
+        int end = at;
+        while (end < len(all) && all.s[end] != '\n') {
+            end++;
+        }
+        int colon = at;
+        while (colon < end && all.s[colon] != ':') {
+            colon++;
+        }
+        if (colon < end && base::StrEqI(Str(all.s + at, colon - at), name)) {
+            return StrTrimAscii(Str(all.s + colon + 1, end - colon - 1));
+        }
+        at = end + 1;
+    }
+    return {};
+}
+
+Str HttpHeadersFromRaw(Str raw) {
+    StrBuilder out;
+    for (int at = 0; at < len(raw);) {
+        int end = at;
+        while (end < len(raw) && raw.s[end] != '\n') {
+            end++;
+        }
+        Str line = StrTrimAscii(Str(raw.s + at, end - at));
+        at = end + 1;
+
+        if (base::StrStartsWithI(line, "HTTP/")) {
+            out.Reset();
+            continue;
+        }
+        int colon = 0;
+        while (colon < len(line) && line.s[colon] != ':') {
+            colon++;
+        }
+        if (colon <= 0 || colon >= len(line)) {
+            continue;
+        }
+        out.Append(StrTrimAscii(Str(line.s, colon)));
+        out.Append(StrL(": "));
+        out.Append(
+            StrTrimAscii(Str(line.s + colon + 1, len(line) - colon - 1)));
+        out.AppendChar('\n');
+    }
+    return out.TakeStr();
 }
 
 bool HttpUrlIsRemote(Str url) {
@@ -237285,7 +237336,15 @@ struct CurlTransfer {
     HttpRsp* out = nullptr;
     CURL* curl = nullptr;
     int64_t sent = 0;
+
+    StrBuilder rawHeaders;
 };
+
+static size_t OnHeader(char* data, size_t size, size_t n, void* userp) {
+    CurlTransfer* t = (CurlTransfer*)userp;
+    size_t got = size * n;
+    return t->rawHeaders.Append(Str(data, (int)got)) ? got : 0;
+}
 
 static size_t OnBody(char* data, size_t size, size_t n, void* userp) {
     CurlTransfer* t = (CurlTransfer*)userp;
@@ -237371,6 +237430,8 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, OnBody);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, &transfer);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, OnHeader);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA, &transfer);
 
 #if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(c, CURLOPT_PROTOCOLS_STR, "http,https");
@@ -237390,6 +237451,10 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
         memcpy(verb, req.method.s, (size_t)len(req.method));
         verb[len(req.method)] = 0;
         curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, verb);
+
+        if (base::StrEqI(req.method, "HEAD")) {
+            curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
+        }
     }
     struct curl_slist* headers = nullptr;
     bool headersReady = true;
@@ -237450,6 +237515,8 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
             TrimMediaType(&s);
             out->contentType = s;
         }
+        out->headers = HttpHeadersFromRaw(
+            Str(transfer.rawHeaders.els, len(transfer.rawHeaders)));
     }
     curl_easy_cleanup(c);
     if (headers) {
@@ -237643,6 +237710,28 @@ static Str StrFromNS(NSString* s) {
     return StrDup(Str(u));
 }
 
+static Str HeadersFromResponse(NSHTTPURLResponse* rsp) {
+    StrBuilder out;
+    NSDictionary* fields = [rsp allHeaderFields];
+    for (id key in fields) {
+        id value = [fields objectForKey:key];
+        if (![key isKindOfClass:[NSString class]] ||
+            ![value isKindOfClass:[NSString class]]) {
+            continue;
+        }
+        const char* name = [(NSString*)key UTF8String];
+        const char* text = [(NSString*)value UTF8String];
+        if (!name || !text) {
+            continue;
+        }
+        out.Append(Str(name));
+        out.Append(StrL(": "));
+        out.Append(Str(text));
+        out.AppendChar('\n');
+    }
+    return out.TakeStr();
+}
+
 static NSString* NSFromStr(Str s) {
     if (len(s) <= 0) {
         return @"";
@@ -237758,6 +237847,7 @@ static bool HttpSendStreamed(const HttpReq& request, HttpRsp* out) {
         Str ct = StrFromNS([rsp valueForHTTPHeaderField:@"Content-Type"]);
         TrimMediaType(&ct);
         out->contentType = ct;
+        out->headers = HeadersFromResponse(rsp);
         return true;
     }
 }
@@ -237847,6 +237937,7 @@ bool HttpSend(const HttpReq& request, HttpRsp* out) {
         Str ct = StrFromNS([rsp valueForHTTPHeaderField:@"Content-Type"]);
         TrimMediaType(&ct);
         out->contentType = ct;
+        out->headers = HeadersFromResponse(rsp);
 
         NSUInteger n = body ? [body length] : 0;
         if (n > (NSUInteger)kHttpMaxBody) {
@@ -237931,11 +238022,12 @@ EM_JS(int, GpJsHttpBegin,
             return { ptr: ptr, len: bytes.length };
         };
         G.finish = function(tokenValue, ok, status, bytes, contentType,
-                            redirectUrl) {
+                            redirectUrl, headerLines) {
             let body = 0;
             let bodyLen = 0;
             const type = G.encoded(contentType);
             const redirect = G.encoded(redirectUrl);
+            const headers = G.encoded(headerLines);
             if (bytes && bytes.length > 0) {
                 bodyLen = bytes.length;
                 body = _malloc(bodyLen);
@@ -237948,7 +238040,10 @@ EM_JS(int, GpJsHttpBegin,
             }
             _gpui_wasm_http_done(tokenValue, ok ? 1 : 0, status, body,
                                  bodyLen, type.ptr, type.len, redirect.ptr,
-                                 redirect.len);
+                                 redirect.len, headers.ptr, headers.len);
+            if (headers.ptr) {
+                _free(headers.ptr);
+            }
             if (type.ptr) {
                 _free(type.ptr);
             }
@@ -238062,10 +238157,15 @@ EM_JS(void, GpJsHttpStart,
                     redirectUrl = new URL(location, response.url).href;
                 }
             }
+            let headerLines = "";
+            response.headers.forEach(function(value, name) {
+                headerLines += name + ": " + value + String.fromCharCode(10);
+            });
             G.finish(token, true, response.status, bytes,
-                     response.headers.get("content-type") || "", redirectUrl);
+                     response.headers.get("content-type") || "", redirectUrl,
+                     headerLines);
         } catch (error) {
-            G.finish(token, false, 0, null, "", "");
+            G.finish(token, false, 0, null, "", "", "");
         } finally {
             clearTimeout(timeout);
         }
@@ -238075,7 +238175,7 @@ EM_JS(void, GpJsHttpStart,
 extern "C" EMSCRIPTEN_KEEPALIVE void gpui_wasm_http_done(
     int token, int ok, int status, uint8_t* body, int bodyLen,
     const char* contentType, int contentTypeLen, const char* redirectUrl,
-    int redirectUrlLen) {
+    int redirectUrlLen, const char* headers, int headersLen) {
     WasmHttpTransfer* transfer = (WasmHttpTransfer*)(intptr_t)token;
     if (!transfer) {
         Free(nullptr, body);
@@ -238098,6 +238198,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void gpui_wasm_http_done(
     if (redirectUrl && redirectUrlLen > 0) {
         transfer->response
             .redirectUrl = StrDup(Str(redirectUrl, redirectUrlLen));
+    }
+    if (headers && headersLen > 0) {
+        transfer->response.headers = StrDup(Str(headers, headersLen));
     }
     HttpAsyncResult result = {ok != 0, &transfer->response};
     transfer->done.Call(result);
@@ -238240,6 +238343,26 @@ static void ReadRedirect(HINTERNET req, const wchar_t* base, HttpRsp* out) {
     Free(nullptr, location);
 }
 
+static void ReadHeaders(HINTERNET req, HttpRsp* out) {
+    DWORD size = 0;
+    WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                        WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &size,
+                        WINHTTP_NO_HEADER_INDEX);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size < sizeof(wchar_t))
+        return;
+    wchar_t* block = (wchar_t*)Alloc(nullptr, (int)size + (int)sizeof(wchar_t));
+    if (!block) return;
+    if (WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                            WINHTTP_HEADER_NAME_BY_INDEX, block, &size,
+                            WINHTTP_NO_HEADER_INDEX)) {
+        block[size / sizeof(wchar_t)] = 0;
+        Str raw = FromWide(block);
+        out->headers = HttpHeadersFromRaw(raw);
+        StrFree(raw);
+    }
+    Free(nullptr, block);
+}
+
 constexpr int kStreamBuf = 64 * 1024;
 
 static bool WriteBody(HINTERNET req, const HttpReq& request) {
@@ -238297,6 +238420,7 @@ static bool ReadResponse(HINTERNET req, const wchar_t* base,
         return false;
     }
     out->status = (int)status;
+    ReadHeaders(req, out);
     if (noRedirect && status >= 300 && status < 400) {
         ReadRedirect(req, base, out);
     }
