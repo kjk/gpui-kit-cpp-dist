@@ -229985,6 +229985,28 @@ void WindowSetFullScreen(Window* win, bool fullScreen) {
     }
 }
 
+void AppWindowSetOpacity(Window* win, int percent) {
+    if (!win || !win->plat) {
+        return;
+    }
+    Atom atom = XInternAtom(gDpy, "_NET_WM_WINDOW_OPACITY", False);
+    if (percent >= 100) {
+        XDeleteProperty(gDpy, win->plat->xwin, atom);
+    } else {
+
+        unsigned long value = (unsigned long)(0xFFFFFFFFu / 100.0 *
+                                              (percent < 20 ? 20 : percent));
+        XChangeProperty(gDpy, win->plat->xwin, atom, XA_CARDINAL, 32,
+                        PropModeReplace, (unsigned char*)&value, 1);
+    }
+    XFlush(gDpy);
+}
+
+void AppWindowSetClickThrough(Window* win, bool on) {
+    (void)win;
+    (void)on;
+}
+
 void AppDrag(Window* win) {
     if (!win || !win->plat) {
         return;
@@ -231725,6 +231747,21 @@ void WindowSetFullScreen(Window* win, bool fullScreen) {
     }
 }
 
+void AppWindowSetOpacity(Window* win, int percent) {
+    if (!win || !win->plat) {
+        return;
+    }
+    int clamped = percent < 20 ? 20 : percent > 100 ? 100 : percent;
+    [win->plat->window setAlphaValue:clamped / 100.0];
+}
+
+void AppWindowSetClickThrough(Window* win, bool on) {
+    if (!win || !win->plat) {
+        return;
+    }
+    [win->plat->window setIgnoresMouseEvents:on ? YES : NO];
+}
+
 void AppDrag(Window* win) {
     if (!win || !win->plat) {
         return;
@@ -233405,6 +233442,16 @@ void WindowSetFullScreen(Window* win, bool fullScreen) {
     win->plat->dirty = true;
 }
 
+void AppWindowSetOpacity(Window* win, int percent) {
+    (void)win;
+    (void)percent;
+}
+
+void AppWindowSetClickThrough(Window* win, bool on) {
+    (void)win;
+    (void)on;
+}
+
 void AppDrag(Window* win) {
     (void)win;
 }
@@ -233727,6 +233774,9 @@ struct PlatWindow {
     LONG_PTR windowedStyle = 0;
     WINDOWPLACEMENT windowedPlacement = {sizeof(WINDOWPLACEMENT)};
     bool fullScreen = false;
+
+    int opacity = 100;
+    bool clickThrough = false;
 };
 
 static HWND Hwnd(Window* win) {
@@ -234567,6 +234617,51 @@ void WindowSetFullScreen(Window* win, bool fullScreen) {
                          SWP_NOACTIVATE);
     }
     pw->fullScreen = fullScreen;
+}
+
+static void ApplyLayered(HWND hwnd, const PlatWindow* pw) {
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    bool layered = (ex & WS_EX_LAYERED) != 0;
+    if (!layered && pw->opacity >= 100 && !pw->clickThrough) {
+        return;
+    }
+    LONG_PTR want = (ex | WS_EX_LAYERED) & ~(LONG_PTR)WS_EX_TRANSPARENT;
+    if (pw->clickThrough) {
+        want |= WS_EX_TRANSPARENT;
+    }
+    if (want != ex) {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want);
+    }
+    SetLayeredWindowAttributes(hwnd, 0, (BYTE)(pw->opacity * 255 / 100),
+                               LWA_ALPHA);
+    if (!layered) {
+
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                         SWP_NOACTIVATE);
+        RedrawWindow(hwnd, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+}
+
+void AppWindowSetOpacity(Window* win, int percent) {
+    HWND hwnd = Hwnd(win);
+    PlatWindow* pw = win ? win->plat : nullptr;
+    if (!hwnd || !pw) {
+        return;
+    }
+    pw->opacity = percent < 20 ? 20 : percent > 100 ? 100 : percent;
+    ApplyLayered(hwnd, pw);
+}
+
+void AppWindowSetClickThrough(Window* win, bool on) {
+    HWND hwnd = Hwnd(win);
+    PlatWindow* pw = win ? win->plat : nullptr;
+    if (!hwnd || !pw) {
+        return;
+    }
+    pw->clickThrough = on;
+    ApplyLayered(hwnd, pw);
 }
 
 void AppDrag(Window* win) {

@@ -8574,6 +8574,10 @@ void AppToggleMaximize(Window* win);
 
 void WindowSetFullScreen(Window* win, bool fullScreen);
 
+void AppWindowSetOpacity(Window* win, int percent);
+
+void AppWindowSetClickThrough(Window* win, bool on);
+
 void WindowSetCursorVisible(Window* win, bool visible);
 
 void WindowOnShouldClose(Window* win, WindowShouldCloseFn fn, void* data);
