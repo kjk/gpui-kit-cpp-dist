@@ -111625,12 +111625,22 @@ constexpr int kMaxConcurrent = 4;
 static FetchSlot gFetch[kFetchSlots];
 static Mutex gProxyLock;
 static Str gProxy;
+static Str gProxyDirect;
 
-void HttpSetProxy(Str proxy) {
+void HttpSetProxy(Str proxy, Str direct) {
     gProxyLock.Lock();
     StrFree(gProxy);
     gProxy = StrDup(StrTrim(proxy));
+    StrFree(gProxyDirect);
+    gProxyDirect = StrDup(StrTrim(direct));
     gProxyLock.Unlock();
+}
+
+Str HttpProxyDirectDup() {
+    gProxyLock.Lock();
+    Str copy = StrDup(gProxyDirect);
+    gProxyLock.Unlock();
+    return copy;
 }
 
 Str HttpProxyDup() {
@@ -237615,6 +237625,25 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
             curl_easy_setopt(c, CURLOPT_PROXY, p);
             Free(nullptr, p);
         }
+
+        Str direct = HttpProxyDirectDup();
+        StrBuilder list;
+        list.Append(StrL("localhost,127.0.0.1,::1"));
+        int start = 0;
+        for (int i = 0; i <= len(direct); i++) {
+            char ch = i < len(direct) ? direct.s[i] : ',';
+            if (ch != ',' && ch != ';' && ch != ' ') {
+                continue;
+            }
+            if (i > start) {
+                list.AppendChar(',');
+                list.Append(Str(direct.s + start, i - start));
+            }
+            start = i + 1;
+        }
+        list.AppendChar(0);
+        curl_easy_setopt(c, CURLOPT_NOPROXY, list.els);
+        StrFree(direct);
     }
     StrFree(proxy);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, noRedirect ? 0L : 1L);
@@ -238741,12 +238770,40 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
             }
         }
 
-        session.h = WinHttpOpen(
-            L"gpui/1.0", access, named ? named : WINHTTP_NO_PROXY_NAME,
-            named ? L"<local>;localhost;127.0.0.1" : WINHTTP_NO_PROXY_BYPASS,
-            0);
+        wchar_t* bypass = nullptr;
+        if (named) {
+            Str direct = HttpProxyDirectDup();
+            StrBuilder list;
+            list.Append(StrL("<local>;localhost;127.0.0.1"));
+            int start = 0;
+            for (int i = 0; i <= len(direct); i++) {
+                char c = i < len(direct) ? direct.s[i] : ';';
+                if (c != ',' && c != ';' && c != ' ') {
+                    continue;
+                }
+                if (i > start) {
+                    list.AppendChar(';');
+                    list.Append(Str(direct.s + start, i - start));
+                }
+                start = i + 1;
+            }
+            int n = MultiByteToWideChar(CP_UTF8, 0, list.els, len(list),
+                                        nullptr, 0);
+            bypass = (wchar_t*)Alloc(nullptr, (n + 1) * (int)sizeof(wchar_t));
+            if (bypass) {
+                MultiByteToWideChar(CP_UTF8, 0, list.els, len(list), bypass, n);
+                bypass[n] = 0;
+            }
+            StrFree(direct);
+        }
+        session.h = WinHttpOpen(L"gpui/1.0", access,
+                                named ? named : WINHTTP_NO_PROXY_NAME,
+                                bypass ? bypass : WINHTTP_NO_PROXY_BYPASS, 0);
         if (named) {
             Free(nullptr, named);
+        }
+        if (bypass) {
+            Free(nullptr, bypass);
         }
         StrFree(proxy);
         if (session.h) {
