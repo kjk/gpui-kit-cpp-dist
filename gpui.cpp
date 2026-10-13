@@ -238630,8 +238630,16 @@ static bool StreamBody(HINTERNET req, const HttpReq& request) {
     }
     bool ok = true;
     for (;;) {
+
+        DWORD avail = 0;
+        ok = WinHttpQueryDataAvailable(req, &avail);
+        if (!ok || avail == 0) {
+            break;
+        }
         DWORD got = 0;
-        ok = WinHttpReadData(req, buf, kStreamBuf, &got);
+        ok = WinHttpReadData(
+            req, buf, avail < (DWORD)kStreamBuf ? avail : (DWORD)kStreamBuf,
+            &got);
         if (!ok || got == 0) {
             break;
         }
