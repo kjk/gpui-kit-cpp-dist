@@ -37004,6 +37004,10 @@ struct HttpReq {
 
 bool HttpSend(const HttpReq& req, HttpRsp* out);
 
+void HttpSetProxy(Str proxy);
+
+Str HttpProxyDup();
+
 bool HttpGet(Str url, HttpRsp* out);
 bool HttpGetNoRedirect(Str url, HttpRsp* out);
 

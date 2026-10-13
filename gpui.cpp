@@ -111623,6 +111623,23 @@ constexpr int kFetchSlots = 24;
 constexpr int kMaxConcurrent = 4;
 
 static FetchSlot gFetch[kFetchSlots];
+static Mutex gProxyLock;
+static Str gProxy;
+
+void HttpSetProxy(Str proxy) {
+    gProxyLock.Lock();
+    StrFree(gProxy);
+    gProxy = StrDup(StrTrim(proxy));
+    gProxyLock.Unlock();
+}
+
+Str HttpProxyDup() {
+    gProxyLock.Lock();
+    Str copy = StrDup(gProxy);
+    gProxyLock.Unlock();
+    return copy;
+}
+
 static Mutex gFetchLock;
 static int gFetchPending = 0;
 static int gFetchNext = 0;
@@ -237585,6 +237602,21 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
     u[len(url)] = 0;
 
     curl_easy_setopt(c, CURLOPT_URL, u);
+
+    Str proxy = HttpProxyDup();
+    if (StrEqI(proxy, StrL("direct"))) {
+        curl_easy_setopt(c, CURLOPT_PROXY, "");
+    } else if (len(proxy) > 0 && !StrEqI(proxy, StrL("system"))) {
+        char* p = (char*)Alloc(nullptr, len(proxy) + 1);
+        if (p) {
+            memcpy(p, proxy.s, (size_t)len(proxy));
+            p[len(proxy)] = 0;
+
+            curl_easy_setopt(c, CURLOPT_PROXY, p);
+            Free(nullptr, p);
+        }
+    }
+    StrFree(proxy);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, noRedirect ? 0L : 1L);
     curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
     CurlTransfer transfer;
@@ -238679,9 +238711,44 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
     {
         WinHttpHandle session;
 
-        session
-            .h = WinHttpOpen(L"gpui/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        Str proxy = HttpProxyDup();
+        DWORD access = WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
+        wchar_t* named = nullptr;
+        if (StrEqI(proxy, StrL("system"))) {
+            access = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+        } else if (StrEqI(proxy, StrL("direct"))) {
+            access = WINHTTP_ACCESS_TYPE_NO_PROXY;
+        } else if (len(proxy) > 0) {
+
+            Str proxyHost = proxy;
+            int scheme = StrFind(proxyHost, StrL("://"));
+            if (scheme >= 0) {
+                proxyHost =
+                    Str(proxyHost.s + scheme + 3, len(proxyHost) - scheme - 3);
+            }
+            while (len(proxyHost) > 0 &&
+                   proxyHost.s[len(proxyHost) - 1] == '/') {
+                proxyHost = Str(proxyHost.s, len(proxyHost) - 1);
+            }
+            int n = MultiByteToWideChar(CP_UTF8, 0, proxyHost.s, len(proxyHost),
+                                        nullptr, 0);
+            named = (wchar_t*)Alloc(nullptr, (n + 1) * (int)sizeof(wchar_t));
+            if (named) {
+                MultiByteToWideChar(CP_UTF8, 0, proxyHost.s, len(proxyHost),
+                                    named, n);
+                named[n] = 0;
+                access = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+            }
+        }
+
+        session.h = WinHttpOpen(
+            L"gpui/1.0", access, named ? named : WINHTTP_NO_PROXY_NAME,
+            named ? L"<local>;localhost;127.0.0.1" : WINHTTP_NO_PROXY_BYPASS,
+            0);
+        if (named) {
+            Free(nullptr, named);
+        }
+        StrFree(proxy);
         if (session.h) {
             WinHttpSetTimeouts(session.h, kHttpTimeoutMs, kHttpTimeoutMs,
                                kHttpTimeoutMs, kHttpTimeoutMs);
