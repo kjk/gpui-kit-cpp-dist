@@ -5947,6 +5947,8 @@ struct PaintCtx {
 
     bool headless = false;
 
+    bool transparent = false;
+
     scene::State* sceneState = nullptr;
 
     float opacity = 1;
@@ -7660,6 +7662,8 @@ struct WinOpts {
     bool borderless = false;
 
     bool clientTitleBar = false;
+
+    bool transparent = false;
     bool anim = false;
     int timerMs = 500;
 };
@@ -8577,6 +8581,8 @@ void WindowSetFullScreen(Window* win, bool fullScreen);
 void AppWindowSetOpacity(Window* win, int percent);
 
 void AppWindowSetClickThrough(Window* win, bool on);
+
+bool WindowIsTransparent(const Window* win);
 
 void WindowSetCursorVisible(Window* win, bool visible);
 
@@ -33307,6 +33313,10 @@ const Str* PaintInstalledFontNames(PaintApp* pa, int* n);
 Str PaintSystemUIFontMappedFamily();
 
 bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH);
+
+bool PaintWindowCanBeTransparent();
+
+bool PlatWindowCanBeTransparent();
 
 bool PaintTargetBeginOffscreen(PaintCtx* ctx, int pxW, int pxH);
 

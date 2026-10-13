@@ -18463,8 +18463,16 @@ void Replay(PaintCtx* ctx, const Bounds* damage) {
             case kPClear:
                 if (partial) {
 
-                    CanvasFillRect(ctx, damage->x, damage->y, damage->w,
-                                   damage->h, p.color);
+                    if (ctx->transparent) {
+
+                        CanvasPushClip(ctx, damage->x, damage->y, damage->w,
+                                       damage->h);
+                        CanvasClear(ctx, p.color);
+                        CanvasPopClip(ctx);
+                    } else {
+                        CanvasFillRect(ctx, damage->x, damage->y, damage->w,
+                                       damage->h, p.color);
+                    }
                 } else {
                     CanvasClear(ctx, p.color);
                 }
@@ -21214,7 +21222,8 @@ static void DrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     win->paint.app = win->app;
     win->paint.window = win;
     const RuntimeStyle& th = RuntimeStyleNow(win->app);
-    CanvasClear(&win->paint, th.background);
+    CanvasClear(&win->paint,
+                win->paint.transparent ? RgbaTransparent() : th.background);
     gFrameLayoutSecs = 0;
     gFramePaintSecs = 0;
     if (root) {
@@ -21307,6 +21316,10 @@ static void DrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     InteractionBenchRecord(win, timing);
     win->frameSeq++;
     FrameBenchTick(win, timing.drawSecs);
+}
+
+bool WindowIsTransparent(const Window* win) {
+    return win && win->paint.transparent;
 }
 
 void WindowDrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
@@ -24010,6 +24023,7 @@ Window* WindowAlloc(App* app, WinOpts opts) {
     Window* win = new Window();
     win->app = app;
     win->opts = opts;
+    win->paint.transparent = opts.transparent && PlatWindowCanBeTransparent();
     win->anim = opts.anim;
 
     win->paint.pa = app->paint;
@@ -213072,6 +213086,7 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #include <d2d1_2.h>
 #include <d2d1.h>
 #include <d3d11.h>
+#include <dcomp.h>
 #include <dwmapi.h>
 #include <dwrite.h>
 #include <dxgi1_2.h>
@@ -222434,6 +222449,11 @@ struct PaintTarget {
     int pxH = 0;
     ID2D1RenderTarget* rt = nullptr;
     ID2D1SolidColorBrush* brush = nullptr;
+
+    bool transparent = false;
+    IDCompositionDevice* dcomp = nullptr;
+    IDCompositionTarget* dcompTarget = nullptr;
+    IDCompositionVisual* dcompVisual = nullptr;
 };
 
 static void MakeFontFamily(PaintApp* pa, const wchar_t* family, float px,
@@ -222590,6 +222610,10 @@ Str PaintSystemUIFontMappedFamily() {
     return cached;
 }
 
+bool PaintWindowCanBeTransparent() {
+    return WIN_BACKEND_DIRECT2D && !PaintGpuOn();
+}
+
 void PaintTargetFree(PaintCtx* ctx) {
 
     if (SceneOn()) {
@@ -222602,6 +222626,9 @@ void PaintTargetFree(PaintCtx* ctx) {
     if (!ctx || !ctx->rt) {
         return;
     }
+    gpui_paint_win_Rel(&ctx->rt->dcompVisual);
+    gpui_paint_win_Rel(&ctx->rt->dcompTarget);
+    gpui_paint_win_Rel(&ctx->rt->dcomp);
     gpui_paint_win_Rel(&ctx->rt->brush);
     gpui_paint_win_Rel(&ctx->rt->dcRt);
     if (ctx->rt->dc) {
@@ -222682,7 +222709,9 @@ static bool BindBackBuffer(PaintTarget* t) {
     }
     D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                          t->transparent ? D2D1_ALPHA_MODE_PREMULTIPLIED
+                                         : D2D1_ALPHA_MODE_IGNORE),
         96.f, 96.f);
     hr = t->dc->CreateBitmapFromDxgiSurface(surface, &props, &t->backBuffer);
     surface->Release();
@@ -222712,13 +222741,15 @@ bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH) {
         return false;
     }
 
-    if (ctx->rt && ctx->rt->hwnd != hwnd) {
+    if (ctx->rt &&
+        (ctx->rt->hwnd != hwnd || ctx->rt->transparent != ctx->transparent)) {
         PaintTargetFree(ctx);
     }
     if (!ctx->rt) {
         auto* t = new PaintTarget();
         t->generation = PaintResourceGenerationNew();
         t->hwnd = hwnd;
+        t->transparent = ctx->transparent;
         DXGI_SWAP_CHAIN_DESC1 desc = {};
         desc.Width = (UINT)pxW;
         desc.Height = (UINT)pxH;
@@ -222731,10 +222762,39 @@ bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH) {
         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 
         desc.Scaling = DXGI_SCALING_NONE;
-        HRESULT hr = ctx->pa->dxgiFactory->CreateSwapChainForHwnd(
-            ctx->pa->d3d, hwnd, &desc, nullptr, nullptr, &t->swap);
+        HRESULT hr = S_OK;
+        if (t->transparent) {
+
+            desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+            desc.Scaling = DXGI_SCALING_STRETCH;
+            hr = ctx->pa->dxgiFactory->CreateSwapChainForComposition(
+                ctx->pa->d3d, &desc, nullptr, &t->swap);
+            if (SUCCEEDED(hr)) {
+                hr = DCompositionCreateDevice(ctx->pa->dxgi,
+                                              __uuidof(IDCompositionDevice),
+                                              (void**)&t->dcomp);
+            }
+            if (SUCCEEDED(hr)) {
+                hr = t->dcomp->CreateTargetForHwnd(hwnd, TRUE, &t->dcompTarget);
+            }
+            if (SUCCEEDED(hr)) {
+                hr = t->dcomp->CreateVisual(&t->dcompVisual);
+            }
+            if (SUCCEEDED(hr)) {
+                t->dcompVisual->SetContent(t->swap);
+                t->dcompTarget->SetRoot(t->dcompVisual);
+                hr = t->dcomp->Commit();
+            }
+        } else {
+            hr = ctx->pa->dxgiFactory->CreateSwapChainForHwnd(
+                ctx->pa->d3d, hwnd, &desc, nullptr, nullptr, &t->swap);
+        }
         if (FAILED(hr)) {
-            logf("CreateSwapChainForHwnd failed %08x", (unsigned)hr);
+            logf("creating the swap chain failed %08x", (unsigned)hr);
+            gpui_paint_win_Rel(&t->dcompVisual);
+            gpui_paint_win_Rel(&t->dcompTarget);
+            gpui_paint_win_Rel(&t->dcomp);
+            gpui_paint_win_Rel(&t->swap);
             delete t;
             return false;
         }
@@ -222749,6 +222809,10 @@ bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH) {
             return false;
         }
         t->dc->SetDpi(96.f, 96.f);
+        if (t->transparent) {
+
+            t->dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
         if (!BindBackBuffer(t)) {
             gpui_paint_win_Rel(&t->dc);
             gpui_paint_win_Rel(&t->swap);
@@ -230002,6 +230066,10 @@ void AppWindowSetOpacity(Window* win, int percent) {
     XFlush(gDpy);
 }
 
+bool PlatWindowCanBeTransparent() {
+    return false;
+}
+
 void AppWindowSetClickThrough(Window* win, bool on) {
     (void)win;
     (void)on;
@@ -231755,6 +231823,10 @@ void AppWindowSetOpacity(Window* win, int percent) {
     [win->plat->window setAlphaValue:clamped / 100.0];
 }
 
+bool PlatWindowCanBeTransparent() {
+    return false;
+}
+
 void AppWindowSetClickThrough(Window* win, bool on) {
     if (!win || !win->plat) {
         return;
@@ -233452,6 +233524,10 @@ void AppWindowSetClickThrough(Window* win, bool on) {
     (void)on;
 }
 
+bool PlatWindowCanBeTransparent() {
+    return false;
+}
+
 void AppDrag(Window* win) {
     (void)win;
 }
@@ -234652,6 +234728,10 @@ void AppWindowSetOpacity(Window* win, int percent) {
     }
     pw->opacity = percent < 20 ? 20 : percent > 100 ? 100 : percent;
     ApplyLayered(hwnd, pw);
+}
+
+bool PlatWindowCanBeTransparent() {
+    return PaintWindowCanBeTransparent();
 }
 
 void AppWindowSetClickThrough(Window* win, bool on) {
