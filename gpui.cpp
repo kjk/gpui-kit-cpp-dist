@@ -111446,6 +111446,27 @@ void ExecShutdown() {
 
 namespace gpui {
 
+static thread_local char gLastError[512];
+
+bool HttpSendPlatform(const HttpReq& req, HttpRsp* out);
+
+bool HttpSend(const HttpReq& req, HttpRsp* out) {
+    bool ok = HttpSendPlatform(req, out);
+    Str why = !ok && out ? out->error : Str{};
+    int n = len(why) < (int)sizeof(gLastError) - 1
+                ? len(why)
+                : (int)sizeof(gLastError) - 1;
+    if (n > 0) {
+        memcpy(gLastError, why.s, (size_t)n);
+    }
+    gLastError[n] = 0;
+    return ok;
+}
+
+Str HttpLastError() {
+    return Str(gLastError);
+}
+
 void HttpRspFree(HttpRsp* r) {
     if (!r) {
         return;
@@ -237642,7 +237663,7 @@ static size_t OnReadBody(char* buf, size_t size, size_t n, void* userp) {
     return (size_t)got;
 }
 
-bool HttpSend(const HttpReq& req, HttpRsp* out) {
+bool HttpSendPlatform(const HttpReq& req, HttpRsp* out) {
     Str url = req.url;
     bool noRedirect = req.noRedirect;
     if (!out || !HttpUrlIsRemote(url)) {
@@ -237834,10 +237855,12 @@ bool HttpGetNoRedirect(Str url, HttpRsp* out) {
 
 #else
 
-bool HttpSend(const HttpReq& req, HttpRsp* out) {
+bool HttpSendPlatform(const HttpReq& req, HttpRsp* out) {
 
     (void)req;
-    (void)out;
+    if (out) {
+        out->error = StrDup(StrL("built without libcurl"));
+    }
     return false;
 }
 
@@ -238141,7 +238164,7 @@ static bool HttpSendStreamed(const HttpReq& request, HttpRsp* out) {
     }
 }
 
-bool HttpSend(const HttpReq& request, HttpRsp* out) {
+bool HttpSendPlatform(const HttpReq& request, HttpRsp* out) {
     Str url = request.url;
     bool noRedirect = request.noRedirect;
     if (!out || !HttpUrlIsRemote(url)) {
@@ -238533,7 +238556,7 @@ bool HttpWasmSendAsync(const HttpReq& req, Func1<HttpAsyncResult> done) {
     return true;
 }
 
-bool HttpSend(const HttpReq& req, HttpRsp* out) {
+bool HttpSendPlatform(const HttpReq& req, HttpRsp* out) {
     (void)req;
     (void)out;
     return false;
@@ -238798,7 +238821,7 @@ static Str WinHttpErrorDup(DWORD code) {
     return b.TakeStr();
 }
 
-bool HttpSend(const HttpReq& req, HttpRsp* out) {
+bool HttpSendPlatform(const HttpReq& req, HttpRsp* out) {
     Str url = req.url;
     bool noRedirect = req.noRedirect;
     if (!out || !HttpUrlIsRemote(url)) {

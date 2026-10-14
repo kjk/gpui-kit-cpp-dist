@@ -36976,6 +36976,8 @@ struct HttpRsp {
 
 void HttpRspFree(HttpRsp* r);
 
+Str HttpLastError();
+
 Str HttpRspHeader(const HttpRsp& r, Str name);
 
 Str HttpHeadersFromRaw(Str raw);
