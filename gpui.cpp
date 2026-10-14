@@ -111534,6 +111534,10 @@ Str HttpHeadersFromRaw(Str raw) {
     return out.TakeStr();
 }
 
+int HttpWaitMs(const HttpReq& req) {
+    return req.waitMs < 0 ? 0 : req.waitMs > 0 ? req.waitMs : kHttpTimeoutMs;
+}
+
 bool HttpUrlIsRemote(Str url) {
     if (!url.s || len(url) <= 0) {
         return false;
@@ -237724,13 +237728,16 @@ bool HttpSendPlatform(const HttpReq& req, HttpRsp* out) {
     transfer.out = out;
     transfer.curl = c;
     bool streamed = req.readBody || req.onBody;
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, (long)kHttpTimeoutMs);
     if (streamed) {
 
-        curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, (long)kHttpTimeoutMs);
-        curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
-        curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+        if (req.waitMs >= 0) {
+            curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1L);
+            curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+        }
     } else {
-        curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)kHttpTimeoutMs);
+
+        curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)HttpWaitMs(req));
     }
     curl_easy_setopt(c, CURLOPT_USERAGENT, "gpui/1.0");
 
@@ -238053,6 +238060,11 @@ static NSString* NSFromStr(Str s) {
                                   encoding:NSUTF8StringEncoding];
 }
 
+static NSTimeInterval IdleSeconds(const HttpReq& request) {
+    int ms = HttpWaitMs(request);
+    return ms > 0 ? (NSTimeInterval)ms / 1000.0 : 7 * 24 * 3600.0;
+}
+
 static bool HttpSendStreamed(const HttpReq& request, HttpRsp* out) {
     @autoreleasepool {
         NSURL* u = [NSURL URLWithString:NSFromStr(request.url)];
@@ -238063,7 +238075,7 @@ static bool HttpSendStreamed(const HttpReq& request, HttpRsp* out) {
         NSMutableURLRequest* req = [NSMutableURLRequest
              requestWithURL:u
                 cachePolicy:NSURLRequestUseProtocolCachePolicy
-            timeoutInterval:(NSTimeInterval)kHttpTimeoutMs / 1000.0];
+            timeoutInterval:IdleSeconds(request)];
         [req setHTTPMethod:len(request.method) > 0 ? NSFromStr(request.method)
                                                    : @"GET"];
         [req setValue:@"gpui/1.0" forHTTPHeaderField:@"User-Agent"];
@@ -238184,7 +238196,7 @@ bool HttpSendPlatform(const HttpReq& request, HttpRsp* out) {
         NSMutableURLRequest* req = [NSMutableURLRequest
              requestWithURL:u
                 cachePolicy:NSURLRequestUseProtocolCachePolicy
-            timeoutInterval:(NSTimeInterval)kHttpTimeoutMs / 1000.0];
+            timeoutInterval:IdleSeconds(request)];
         NSString* verb =
             len(request.method) > 0 ? NSFromStr(request.method) : @"GET";
         [req setHTTPMethod:verb];
@@ -238230,8 +238242,11 @@ bool HttpSendPlatform(const HttpReq& request, HttpRsp* out) {
         [task resume];
 
         dispatch_time_t deadline =
-            dispatch_time(DISPATCH_TIME_NOW,
-                          (int64_t)(kHttpTimeoutMs + 5000) * NSEC_PER_MSEC);
+            HttpWaitMs(request) == 0
+                ? DISPATCH_TIME_FOREVER
+                : dispatch_time(
+                      DISPATCH_TIME_NOW,
+                      (int64_t)(HttpWaitMs(request) + 5000) * NSEC_PER_MSEC);
         if (dispatch_semaphore_wait(done, deadline) != 0) {
             [task cancel];
             if (noRedirect) [session invalidateAndCancel];
@@ -238933,8 +238948,9 @@ bool HttpSendPlatform(const HttpReq& req, HttpRsp* out) {
             failure = GetLastError();
         }
         if (session.h) {
+
             WinHttpSetTimeouts(session.h, kHttpTimeoutMs, kHttpTimeoutMs,
-                               kHttpTimeoutMs, kHttpTimeoutMs);
+                               HttpWaitMs(req), HttpWaitMs(req));
             WinHttpHandle conn;
             conn.h = WinHttpConnect(session.h, host, uc.nPort, 0);
             if (!conn.h) {

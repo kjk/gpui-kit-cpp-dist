@@ -37006,7 +37006,11 @@ struct HttpReq {
 
     HttpOnBodyFn onBody = nullptr;
     void* onBodyCtx = nullptr;
+
+    int waitMs = 0;
 };
+
+int HttpWaitMs(const HttpReq& req);
 
 bool HttpSend(const HttpReq& req, HttpRsp* out);
 

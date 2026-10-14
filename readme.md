@@ -161,7 +161,7 @@ No other dependencies, no nested build system, no STL containers.
 
 ## This copy
 
-Amalgamated from gpui-kit-cpp [`a47f9b573875dedc1a28e3ab545f56175e1c86cf`](https://github.com/kjk/gpui-kit-cpp/commit/a47f9b573875dedc1a28e3ab545f56175e1c86cf).
+Amalgamated from gpui-kit-cpp [`6e5e0e36b0e7a5197cbfc81983c6dc8367fa77a7`](https://github.com/kjk/gpui-kit-cpp/commit/6e5e0e36b0e7a5197cbfc81983c6dc8367fa77a7).
 
-[What has changed in gpui-kit-cpp since](https://github.com/kjk/gpui-kit-cpp/compare/a47f9b573875dedc1a28e3ab545f56175e1c86cf...main)
+[What has changed in gpui-kit-cpp since](https://github.com/kjk/gpui-kit-cpp/compare/6e5e0e36b0e7a5197cbfc81983c6dc8367fa77a7...main)
 shows every commit this copy is behind by; if that page is empty, it is current.
