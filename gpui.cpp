@@ -111459,6 +111459,8 @@ void HttpRspFree(HttpRsp* r) {
     r->redirectUrl = {};
     StrFree(r->headers);
     r->headers = {};
+    StrFree(r->error);
+    r->error = {};
     r->status = 0;
 }
 
@@ -237780,6 +237782,9 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
 
     CURLcode err = headersReady ? curl_easy_perform(c) : CURLE_OUT_OF_MEMORY;
     bool ok = err == CURLE_OK;
+    if (!ok) {
+        out->error = StrDup(Str(curl_easy_strerror(err)));
+    }
     if (ok) {
         long status = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
@@ -238176,6 +238181,7 @@ bool HttpSend(const HttpReq& request, HttpRsp* out) {
 
         __block NSData* body = nil;
         __block NSHTTPURLResponse* rsp = nil;
+        __block NSString* failure = nil;
         dispatch_semaphore_t done = dispatch_semaphore_create(0);
         GpuiNoRedirectDelegate* delegate =
             noRedirect ? [[GpuiNoRedirectDelegate alloc] init] : nil;
@@ -238193,6 +238199,8 @@ bool HttpSend(const HttpReq& request, HttpRsp* out) {
                 if (!e && [r isKindOfClass:[NSHTTPURLResponse class]]) {
                     body = d;
                     rsp = (NSHTTPURLResponse*)r;
+                } else if (e) {
+                    failure = [e localizedDescription];
                 }
                 dispatch_semaphore_signal(done);
               }];
@@ -238208,6 +238216,10 @@ bool HttpSend(const HttpReq& request, HttpRsp* out) {
         }
         if (noRedirect) [session finishTasksAndInvalidate];
         if (!rsp) {
+            const char* why = failure ? [failure UTF8String] : nullptr;
+            if (why) {
+                out->error = StrDup(Str(why));
+            }
             return false;
         }
         out->status = (int)[rsp statusCode];
@@ -238755,6 +238767,37 @@ static bool ReadResponse(HINTERNET req, const wchar_t* base,
     }
 }
 
+static Str WinHttpErrorDup(DWORD code) {
+    wchar_t* text = nullptr;
+    HMODULE winhttp = GetModuleHandleW(L"winhttp.dll");
+    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                                 FORMAT_MESSAGE_FROM_SYSTEM |
+                                 FORMAT_MESSAGE_IGNORE_INSERTS |
+                                 (winhttp ? FORMAT_MESSAGE_FROM_HMODULE : 0),
+                             winhttp, code, 0, (wchar_t*)&text, 0, nullptr);
+    while (n > 0 && (text[n - 1] == L'\r' || text[n - 1] == L'\n' ||
+                     text[n - 1] == L' ' || text[n - 1] == L'.')) {
+        n--;
+    }
+    StrBuilder b;
+    if (n > 0) {
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, text, (int)n, nullptr, 0,
+                                        nullptr, nullptr);
+        TempStr utf8 = bytes > 0 ? AllocStrTemp(bytes) : TempStr{};
+        if (utf8.s) {
+            WideCharToMultiByte(CP_UTF8, 0, text, (int)n, utf8.s, bytes,
+                                nullptr, nullptr);
+            b.Append(utf8);
+            b.Append(StrL(" "));
+        }
+    }
+    if (text) {
+        LocalFree(text);
+    }
+    b.Append(fmt("(error %d)", (int)code));
+    return b.TakeStr();
+}
+
 bool HttpSend(const HttpReq& req, HttpRsp* out) {
     Str url = req.url;
     bool noRedirect = req.noRedirect;
@@ -238793,6 +238836,7 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
     }
 
     bool ok = false;
+    DWORD failure = 0;
     {
         WinHttpHandle session;
 
@@ -238862,11 +238906,17 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
             Free(nullptr, bypass);
         }
         StrFree(proxy);
+        if (!session.h) {
+            failure = GetLastError();
+        }
         if (session.h) {
             WinHttpSetTimeouts(session.h, kHttpTimeoutMs, kHttpTimeoutMs,
                                kHttpTimeoutMs, kHttpTimeoutMs);
             WinHttpHandle conn;
             conn.h = WinHttpConnect(session.h, host, uc.nPort, 0);
+            if (!conn.h) {
+                failure = GetLastError();
+            }
             if (conn.h) {
                 DWORD flags = uc.nScheme == INTERNET_SCHEME_HTTPS
                                   ? WINHTTP_FLAG_SECURE
@@ -238923,6 +238973,8 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
                     (!streamed || WriteBody(request.h, req)) &&
                     WinHttpReceiveResponse(request.h, nullptr)) {
                     ok = ReadResponse(request.h, wurl, req, out);
+                } else {
+                    failure = GetLastError();
                 }
                 Free(nullptr, headers);
                 Free(nullptr, verb);
@@ -238933,6 +238985,9 @@ bool HttpSend(const HttpReq& req, HttpRsp* out) {
     Free(nullptr, wurl);
     if (!ok) {
         VecReset(out->body);
+        if (out->status == 0 && failure != 0 && len(out->error) == 0) {
+            out->error = WinHttpErrorDup(failure);
+        }
     }
     return ok;
 }

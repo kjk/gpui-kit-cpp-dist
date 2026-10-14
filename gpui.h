@@ -36970,6 +36970,8 @@ struct HttpRsp {
     Str redirectUrl;
 
     Str headers;
+
+    Str error;
 };
 
 void HttpRspFree(HttpRsp* r);
