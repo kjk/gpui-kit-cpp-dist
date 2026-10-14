@@ -8426,6 +8426,8 @@ struct PathPrompt {
     bool files = true;
     bool directories = false;
 
+    bool multiple = false;
+
     Str title = {};
 };
 

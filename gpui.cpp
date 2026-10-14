@@ -229249,6 +229249,13 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
                    title ? title.s : (char*)nullptr, (char*)nullptr);
             execlp("kdialog", "kdialog", "--getexistingdirectory", ".",
                    (char*)nullptr);
+        } else if (opts.multiple) {
+
+            execlp("zenity", "zenity", "--file-selection", "--multiple",
+                   "--separator=\n", title ? "--title" : (char*)nullptr,
+                   title ? title.s : (char*)nullptr, (char*)nullptr);
+            execlp("kdialog", "kdialog", "--getopenfilename", ".", "--multiple",
+                   "--separate-output", (char*)nullptr);
         } else {
             execlp("zenity", "zenity", "--file-selection",
                    title ? "--title" : (char*)nullptr,
@@ -229263,7 +229270,8 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
         close(fds[0]);
         return {};
     }
-    TempStr result = AllocStrTemp(kMaxPath - 1);
+    TempStr result =
+        AllocStrTemp(opts.multiple ? kMaxPath * 64 - 1 : kMaxPath - 1);
     if (!result.s) {
         close(fds[0]);
         int st = 0;
@@ -232401,7 +232409,7 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     NSOpenPanel* panel = [NSOpenPanel openPanel];
     [panel setCanChooseFiles:opts.files ? YES : NO];
     [panel setCanChooseDirectories:opts.directories ? YES : NO];
-    [panel setAllowsMultipleSelection:NO];
+    [panel setAllowsMultipleSelection:opts.multiple ? YES : NO];
     if (len(opts.title) > 0) {
         NSString* t =
             [[NSString alloc] initWithBytes:opts.title.s
@@ -232414,12 +232422,25 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     if ([panel runModal] != NSModalResponseOK) {
         return {};
     }
-    NSURL* url = [[panel URLs] firstObject];
-    const char* path = url ? [[url path] UTF8String] : nullptr;
-    if (!path) {
+
+    StrBuilder paths;
+    for (NSURL* url in [panel URLs]) {
+        const char* path = url ? [[url path] UTF8String] : nullptr;
+        if (!path) {
+            continue;
+        }
+        if (len(paths) > 0) {
+            paths.AppendChar('\n');
+        }
+        paths.Append(Str(path));
+        if (!opts.multiple) {
+            break;
+        }
+    }
+    if (len(paths) == 0) {
         return {};
     }
-    return StrDupTemp(Str(path));
+    return StrDupTemp(Str(paths.els, len(paths)));
 }
 
 void ClipboardSetText(Window* win, Str text) {
@@ -235162,6 +235183,9 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     } else {
         flags &= ~(DWORD)FOS_PICKFOLDERS;
     }
+    if (opts.multiple) {
+        flags |= FOS_ALLOWMULTISELECT;
+    }
     dlg->SetOptions(flags | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
     if (len(opts.title) > 0) {
         dlg->SetTitle(ToCWstrTemp(opts.title));
@@ -235170,27 +235194,51 @@ TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     hr = dlg->Show(owner);
     TempStr result;
     if (SUCCEEDED(hr)) {
+        IShellItemArray* items = nullptr;
         IShellItem* item = nullptr;
-        if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+        DWORD count = 0;
+        if (opts.multiple && SUCCEEDED(dlg->GetResults(&items)) && items) {
+            items->GetCount(&count);
+        } else if (SUCCEEDED(dlg->GetResult(&item)) && item) {
+            count = 1;
+        }
+        StrBuilder paths;
+        for (DWORD i = 0; i < count; i++) {
+            IShellItem* one = item;
+            if (items && FAILED(items->GetItemAt(i, &one))) {
+                continue;
+            }
             PWSTR wide = nullptr;
-            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &wide)) &&
+            if (one &&
+                SUCCEEDED(one->GetDisplayName(SIGDN_FILESYSPATH, &wide)) &&
                 wide) {
                 int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0,
                                             nullptr, nullptr);
                 if (n > 1) {
-                    result = AllocStrTemp(n - 1);
-                    if (result.s) {
-                        int wrote =
-                            WideCharToMultiByte(CP_UTF8, 0, wide, -1, result.s,
-                                                n, nullptr, nullptr);
-                        if (wrote != n) {
-                            result = {};
+                    TempStr path = AllocStrTemp(n - 1);
+                    if (path.s &&
+                        WideCharToMultiByte(CP_UTF8, 0, wide, -1, path.s, n,
+                                            nullptr, nullptr) == n) {
+                        if (len(paths) > 0) {
+                            paths.AppendChar('\n');
                         }
+                        paths.Append(path);
                     }
                 }
                 CoTaskMemFree(wide);
             }
+            if (items && one) {
+                one->Release();
+            }
+        }
+        if (item) {
             item->Release();
+        }
+        if (items) {
+            items->Release();
+        }
+        if (len(paths) > 0) {
+            result = StrDupTemp(Str(paths.els, len(paths)));
         }
     }
     dlg->Release();
