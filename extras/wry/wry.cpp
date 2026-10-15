@@ -2201,8 +2201,18 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #line 1 "src/base_android.cpp"
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace base {
+
+bool PlatGetExePath(char* out, int cap) {
+    if (!out || cap <= 0) return false;
+    out[0] = 0;
+    ssize_t n = readlink("/proc/self/exe", out, (size_t)cap - 1);
+    if (n <= 0) return false;
+    out[n] = 0;
+    return true;
+}
 
 uint64_t PlatStatModifiedNs(const struct stat* st) {
     return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
@@ -2212,14 +2222,23 @@ uint64_t PlatStatModifiedNs(const struct stat* st) {
 bool PlatSecondaryIsCommand() {
     return false;
 }
+bool PlatTitleBarCloseIsElement() {
+    return false;
+}
 bool PlatShowsWindowControls() {
     return true;
 }
 float PlatCaretWidth() {
-    return 2.f;
+    return 1.f;
 }
 bool PlatScrollBounce() {
     return true;
+}
+bool PlatScrollBounceTouch() {
+    return true;
+}
+bool PlatWebViewPartialClipHides() {
+    return false;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2254,6 +2273,11 @@ float PlatWindowShadowSize() {
 
 namespace base {
 
+bool PlatGetExePath(char* out, int cap) {
+    if (out && cap > 0) out[0] = 0;
+    return false;
+}
+
 uint64_t PlatStatModifiedNs(const struct stat* st) {
     return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
            (uint64_t)st->st_mtimespec.tv_nsec;
@@ -2262,14 +2286,23 @@ uint64_t PlatStatModifiedNs(const struct stat* st) {
 bool PlatSecondaryIsCommand() {
     return false;
 }
+bool PlatTitleBarCloseIsElement() {
+    return false;
+}
 bool PlatShowsWindowControls() {
     return true;
 }
 float PlatCaretWidth() {
-    return 2.f;
+    return 1.f;
 }
 bool PlatScrollBounce() {
     return true;
+}
+bool PlatScrollBounceTouch() {
+    return true;
+}
+bool PlatWebViewPartialClipHides() {
+    return false;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2309,16 +2342,17 @@ namespace base {
 
 void PlatDirNameInPlace(char* path);
 
-void PlatGetExeDir(char* out, int cap) {
-    if (!out || cap <= 0) {
-        return;
-    }
+bool PlatGetExePath(char* out, int cap) {
+    if (!out || cap <= 0) return false;
     out[0] = 0;
     ssize_t n = readlink("/proc/self/exe", out, (size_t)cap - 1);
-    if (n <= 0) {
-        return;
-    }
+    if (n <= 0) return false;
     out[n] = 0;
+    return true;
+}
+
+void PlatGetExeDir(char* out, int cap) {
+    if (!PlatGetExePath(out, cap)) return;
     PlatDirNameInPlace(out);
 }
 
@@ -2362,11 +2396,20 @@ bool PlatSecondaryIsCommand() {
 bool PlatShowsWindowControls() {
     return true;
 }
+bool PlatTitleBarCloseIsElement() {
+    return true;
+}
 float PlatCaretWidth() {
-    return 2.f;
+    return 1.f;
 }
 bool PlatScrollBounce() {
     return false;
+}
+bool PlatScrollBounceTouch() {
+    return false;
+}
+bool PlatWebViewPartialClipHides() {
+    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2405,17 +2448,17 @@ namespace base {
 
 void PlatDirNameInPlace(char* path);
 
-void PlatGetExeDir(char* out, int cap) {
-    if (!out || cap <= 0) {
-        return;
-    }
+bool PlatGetExePath(char* out, int cap) {
+    if (!out || cap <= 0) return false;
     out[0] = 0;
     uint32_t n = (uint32_t)cap;
-    if (_NSGetExecutablePath(out, &n) != 0) {
-        out[0] = 0;
-        return;
-    }
+    if (_NSGetExecutablePath(out, &n) != 0) return false;
     out[cap - 1] = 0;
+    return out[0] != 0;
+}
+
+void PlatGetExeDir(char* out, int cap) {
+    if (!PlatGetExePath(out, cap)) return;
     PlatDirNameInPlace(out);
 }
 
@@ -2457,14 +2500,23 @@ uint64_t PlatStatModifiedNs(const struct stat* st) {
 bool PlatSecondaryIsCommand() {
     return true;
 }
+bool PlatTitleBarCloseIsElement() {
+    return false;
+}
 bool PlatShowsWindowControls() {
     return false;
 }
 float PlatCaretWidth() {
-    return 1.5f;
+    return 1.f;
 }
 bool PlatScrollBounce() {
+    return true;
+}
+bool PlatScrollBounceTouch() {
     return false;
+}
+bool PlatWebViewPartialClipHides() {
+    return true;
 }
 const char* PlatMonoFontName() {
     return "Menlo";
@@ -2569,6 +2621,7 @@ uint64_t PlatArenaReserveSize() {
 #include <dirent.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -2611,6 +2664,31 @@ bool PlatDirExists(const char* path) {
     }
     struct stat st = {};
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+bool PlatFileIsExecutable(const char* path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    return (st.st_mode & 0111) != 0;
+}
+
+bool PlatMakeExecutable(const char* path) {
+    if (!path || !path[0]) return false;
+    return chmod(path, 0755) == 0;
+}
+
+extern "C" char** environ;
+
+bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
+    if (!visit) return false;
+    if (!environ) return true;
+    for (char** at = environ; *at; at++) {
+        char* eq = strchr(*at, '=');
+        if (!eq || eq == *at) continue;
+        visit(Str(*at, (int)(eq - *at)), Str(eq + 1), user);
+    }
+    return true;
 }
 
 bool PlatFileExists(const char* path) {
@@ -2840,6 +2918,11 @@ uint64_t PlatArenaReserveSize() {
     return 4ull * 1024ull * 1024ull;
 }
 
+bool PlatGetExePath(char* out, int cap) {
+    if (out && cap > 0) out[0] = 0;
+    return false;
+}
+
 void PlatGetExeDir(char* out, int cap) {
     if (!out || cap <= 0) {
         return;
@@ -2867,13 +2950,22 @@ uint64_t PlatStatModifiedNs(const struct stat* st) {
 bool PlatSecondaryIsCommand() {
     return false;
 }
+bool PlatTitleBarCloseIsElement() {
+    return false;
+}
 bool PlatShowsWindowControls() {
     return true;
 }
 float PlatCaretWidth() {
-    return 2.f;
+    return 1.f;
 }
 bool PlatScrollBounce() {
+    return false;
+}
+bool PlatScrollBounceTouch() {
+    return false;
+}
+bool PlatWebViewPartialClipHides() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -3075,19 +3167,75 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
     return true;
 }
 
-void PlatGetExeDir(char* out, int cap) {
-    if (!out || cap <= 0) {
-        return;
-    }
+bool PlatGetExePath(char* out, int cap) {
+    if (!out || cap <= 0) return false;
     out[0] = 0;
-    GetModuleFileNameA(nullptr, out, (DWORD)cap);
+    DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
+    if (n == 0 || n >= (DWORD)cap) {
+        out[0] = 0;
+        return false;
+    }
+
+    for (DWORD i = 0; i < n; i++) {
+        if (out[i] == '\\') out[i] = '/';
+    }
+    return true;
+}
+
+void PlatGetExeDir(char* out, int cap) {
+    if (!PlatGetExePath(out, cap)) return;
     int n = (int)strlen(out);
-    while (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') {
-        out[--n] = 0;
+    while (n > 0 && out[n - 1] != '/') out[--n] = 0;
+    while (n > 0 && out[n - 1] == '/') out[--n] = 0;
+}
+
+bool PlatFileIsExecutable(const char* path) {
+    (void)path;
+    return false;
+}
+
+bool PlatMakeExecutable(const char* path) {
+    (void)path;
+    return true;
+}
+
+static char* WideToUtf8Alloc(const WCHAR* text, int wlen) {
+    if (!text) return nullptr;
+    if (wlen < 0) wlen = (int)wcslen(text);
+    int bytes = wlen == 0
+                    ? 0
+                    : WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text,
+                                          wlen, nullptr, 0, nullptr, nullptr);
+    if (wlen != 0 && bytes <= 0) return nullptr;
+    char* out = (char*)malloc((size_t)bytes + 1);
+    if (!out) return nullptr;
+    if (bytes > 0) {
+        WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, wlen, out,
+                            bytes, nullptr, nullptr);
     }
-    while (n > 0 && (out[n - 1] == '\\' || out[n - 1] == '/')) {
-        out[--n] = 0;
+    out[bytes] = 0;
+    return out;
+}
+
+bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
+    if (!visit) return false;
+    LPWCH block = GetEnvironmentStringsW();
+    if (!block) return false;
+    for (WCHAR* at = block; *at;) {
+        int n = (int)wcslen(at);
+        WCHAR* eq = wcschr(at, L'=');
+
+        if (eq && eq != at && at[0] != L'=') {
+            char* name = WideToUtf8Alloc(at, (int)(eq - at));
+            char* value = WideToUtf8Alloc(eq + 1, -1);
+            if (name && value && name[0]) visit(Str(name), Str(value), user);
+            free(name);
+            free(value);
+        }
+        at += n + 1;
     }
+    FreeEnvironmentStringsW(block);
+    return true;
 }
 
 int PlatListDir(const char* dir, DirEntry* out, int max) {
@@ -3199,13 +3347,22 @@ bool PlatIsWindows() {
 bool PlatSecondaryIsCommand() {
     return false;
 }
+bool PlatTitleBarCloseIsElement() {
+    return false;
+}
 bool PlatShowsWindowControls() {
     return true;
 }
 float PlatCaretWidth() {
-    return 2.f;
+    return 1.f;
 }
 bool PlatScrollBounce() {
+    return false;
+}
+bool PlatScrollBounceTouch() {
+    return false;
+}
+bool PlatWebViewPartialClipHides() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -7004,7 +7161,9 @@ struct ICoreWebView2PrintCompletedHandler;
 struct ICoreWebView2PrintSettings;
 struct ICoreWebView2PrintToPdfCompletedHandler;
 struct ICoreWebView2PrintToPdfStreamCompletedHandler;
-struct ICoreWebView2ProcessFailedEventHandler;
+struct ICoreWebView2ProcessFailedEventArgs;
+struct DECLSPEC_UUID("79e0aea4-990b-42d9-aa1d-0fcc2e5bc7f1")
+    ICoreWebView2ProcessFailedEventHandler;
 struct ICoreWebView2ProcessInfoCollection;
 struct ICoreWebView2ProcessInfosChangedEventHandler;
 struct ICoreWebView2BrowserExtension;
@@ -8158,6 +8317,15 @@ struct ICoreWebView2NavigationCompletedEventHandler : IUnknown {
 struct ICoreWebView2ContentLoadingEventHandler : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE Invoke(
         ICoreWebView2* sender, ICoreWebView2ContentLoadingEventArgs* args) = 0;
+};
+
+struct ICoreWebView2ProcessFailedEventArgs : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_ProcessFailedKind(int* kind) = 0;
+};
+
+struct ICoreWebView2ProcessFailedEventHandler : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2* sender, ICoreWebView2ProcessFailedEventArgs* args) = 0;
 };
 
 struct ICoreWebView2DocumentTitleChangedEventHandler : IUnknown {
@@ -9822,6 +9990,7 @@ struct WebView {
     void (*documentTitleChangedHandler)(void* ctx, Str title) = nullptr;
     void (*onPageLoadHandler)(void* ctx, PageLoadEvent event,
                               Str url) = nullptr;
+    void (*processFailedHandler)(void* ctx, int kind) = nullptr;
     DownloadStartedHandler downloadStartedHandler = nullptr;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;
     DownloadCallbackState* downloadCallbacks = nullptr;
@@ -10951,6 +11120,20 @@ static HRESULT OnDocumentTitleChanged(void* ctx, ICoreWebView2* sender,
     return S_OK;
 }
 
+static HRESULT OnProcessFailed(void* ctx, ICoreWebView2*,
+                               ICoreWebView2ProcessFailedEventArgs* args) {
+    WebView* wv = LiveWebView(ctx);
+    if (!wv || !wv->processFailedHandler) {
+        return S_OK;
+    }
+    int kind = 0;
+    if (!args || FAILED(args->get_ProcessFailedKind(&kind))) {
+        kind = 0;
+    }
+    wv->processFailedHandler(wv->ctx, kind);
+    return S_OK;
+}
+
 static HRESULT OnContentLoading(void* ctx, ICoreWebView2* sender,
                                 ICoreWebView2ContentLoadingEventArgs*) {
     WebView* wv = LiveWebView(ctx);
@@ -11172,6 +11355,17 @@ static bool AttachHandlers(WebView* wv, EventRegistrationToken* token) {
             Handler2<ICoreWebView2DocumentTitleChangedEventHandler,
                      ICoreWebView2*, IUnknown*>>(wv, OnDocumentTitleChanged);
         HRESULT hr = wv->webview->add_DocumentTitleChanged(h, token);
+        h->Release();
+        if (FAILED(hr)) {
+            return false;
+        }
+    }
+    if (wv->processFailedHandler) {
+        auto* h = MkWebViewHandler<
+            Handler2<ICoreWebView2ProcessFailedEventHandler, ICoreWebView2*,
+                     ICoreWebView2ProcessFailedEventArgs*>>(wv,
+                                                            OnProcessFailed);
+        HRESULT hr = wv->webview->add_ProcessFailed(h, token);
         h->Release();
         if (FAILED(hr)) {
             return false;
@@ -11468,6 +11662,7 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
     wv->navigationHandler = attrs->navigationHandler;
     wv->documentTitleChangedHandler = attrs->documentTitleChangedHandler;
     wv->onPageLoadHandler = attrs->onPageLoadHandler;
+    wv->processFailedHandler = attrs->processFailedHandler;
     wv->downloadStartedHandler = attrs->downloadStartedHandler;
     wv->downloadCompletedHandler = attrs->downloadCompletedHandler;
     if (attrs->downloadCompletedHandler) {

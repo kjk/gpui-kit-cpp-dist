@@ -538,36 +538,35 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "02daace3522954eb8b3a8db77d59c3bbaa5a839d",
-  date: "2026-10-08",
-  subject: "tab: Scroll a clicked tab into view with the next one peeking (#3419)",
+  sha: "1188c11003b5cb5b83bc07d3fb9112e7674fbfa7",
+  date: "2026-10-14",
+  subject: "input: Fix the caret flashing off on click, and draw it crisp at 1px (#3515)",
   crates: {
-    "gpui-kit": "0.7.1",
-    "gpui-base": "0.7.1",
-    "gpui-component": "0.7.1",
-    "gpui-component-story": "0.7.1",
-    "gpui-webview": "0.7.1",
-    "gpui-shell": "0.7.1",
-    "gpui-component-shell": "0.7.1",
+    "gpui-kit": "0.7.3",
+    "gpui-base": "0.7.3",
+    "gpui-component": "0.7.3",
+    "gpui-component-story": "0.7.3",
+    "gpui-webview": "0.7.3",
+    "gpui-shell": "0.7.3",
   },
   dir: ".work/gpui-component",
 } as const;
 
 /**
- * Zed reference snapshot recorded in gpui-pre 0.3.6's package metadata.
+ * Zed reference snapshot recorded in gpui-pre 0.3.9's package metadata.
  * Cargo.lock now resolves registry packages rather than a Zed git source.
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "279fe070bb389b79652e52065b2f001edcc0b11b",
-  date: "2026-10-04",
-  subject: "languages: Fix JSON completion order for settings keys (#65139)",
+  sha: "93d745668805029476e6d7fbb19652116fed51de",
+  date: "2026-10-10",
+  subject: "git_ui: Fix commit editor button hover colors (#65448)",
   crates: {
-    "gpui-pre": "0.3.8",
-    "gpui-pre-platform": "0.3.8",
-    "gpui-pre-macros": "0.3.8",
+    "gpui-pre": "0.3.9",
+    "gpui-pre-platform": "0.3.9",
+    "gpui-pre-macros": "0.3.9",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.8",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.9",
 } as const;
 
 /**

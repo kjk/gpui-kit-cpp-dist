@@ -43,6 +43,7 @@ static const Stock kStocks[] = {
 
 enum {
     DtMenuSize = 1,
+    DtMenuHeaderH,
     DtMenuRows,
     DtMenuExtra,
     DtMenuOptions,
@@ -50,10 +51,11 @@ enum {
 };
 
 enum {
-    DtActSize = 480,   // + index into kSizes
-    DtActRows = 500,   // + index into kRowCounts
-    DtActExtra = 520,  // + index into kExtraCounts
-    DtActOption = 540, // + index into kDtOptions
+    DtActSize = 480,    // + index into kSizes
+    DtActHeaderH = 470, // + index into kHeaderRowH
+    DtActRows = 500,    // + index into kRowCounts
+    DtActExtra = 520,   // + index into kExtraCounts
+    DtActOption = 540,  // + index into kDtOptions
     DtActClear = 559,
     DtActGoTo = 560
 };
@@ -71,6 +73,10 @@ static const float kSizeRowH[] = {48, 40, 32, 30, 26};
 static const char* const kSizeLabels[] = {"48px", "Large", "Medium", "Small",
                                           "XSmall"};
 static const int kNSizes = 5;
+// header_row_height: 0 is unset (the body row height).
+static const float kHeaderRowH[] = {0, 40, 48};
+static const char* const kHeaderLabels[] = {"Default", "40px", "48px"};
+static const int kNHeaderRowH = 3;
 
 // The Options dropdown, in Rust's own order.
 enum {
@@ -102,9 +108,10 @@ static const int kNGoTo = 4;
 // The order the rows are shown in, which is what the delegate's perform_sort
 // rewrites. -1 means the table's own order.
 struct DataTableStory {
-    int rowCount = 2; // 5,000
-    int extra = 0;    // no extra columns
-    int size = 2;     // Medium
+    int rowCount = 2;   // 5,000
+    int extra = 0;      // no extra columns
+    int size = 2;       // Medium
+    int headerRowH = 0; // index into kHeaderRowH; 0 is Default
     int openMenu = 0;
     // TableState's own defaults: everything but cell selection and the four
     // switches under the separator.
@@ -288,6 +295,8 @@ static void DtMenuAct(DataTableStory* self, Ctx* cx, const ClickEvent*,
         self->rowCount = (int)(act - DtActRows);
     } else if (act >= DtActSize) {
         self->size = (int)(act - DtActSize);
+    } else if (act >= DtActHeaderH) {
+        self->headerRowH = (int)(act - DtActHeaderH);
     }
     self->openMenu = 0;
     Notify(cx);
@@ -709,6 +718,114 @@ static Str DtCellText(Ctx* cx, void* data, int row, int col) {
     return DtValueFor(cx, s, row, col).text;
 }
 
+// The columns the Rust delegate declares. Fields: title, width, right,
+// sortable, selectable, resizable, fixed. The first four are pinned.
+static const component::TableColumn kColumns[] = {
+    {StrL("ID"), 60, false, false, false, true, true},
+    {StrL("Market"), 60, false, false, true, true, true},
+    {StrL("Name"), 180, false, false, true, true, true},
+    {StrL("Symbol"), 100, false, true, true, true, true},
+    {StrL("Price"), 100, true, true, true},
+    {StrL("Chg"), 100, true, true, true},
+    {StrL("Chg%"), 110, true, true, true},
+    {StrL("Volume"), 100, true, false, true},
+    {StrL("Turnover"), 100, true, false, true},
+    {StrL("Market Cap"), 110, true, false, true},
+    {StrL("TTM"), 100, true, false, true},
+    {StrL("5m Ranking"), 110, true, false, true},
+    {StrL("60d Ranking"), 110, true, false, true},
+    {StrL("Year Chg%"), 110, true, false, true},
+    {StrL("Bid"), 100, true, false, true},
+    {StrL("Bid Vol"), 100, true, false, true},
+    {StrL("Ask"), 100, true, false, true},
+    {StrL("Ask Vol"), 100, true, false, true},
+    {StrL("Open"), 100, true, false, true},
+    {StrL("Prev Close"), 110, true, false, true},
+    {StrL("High"), 100, true, false, true},
+    {StrL("Low"), 100, true, false, true},
+    {StrL("Turnover Rate"), 120, true, false, true},
+    {StrL("Rise Rate"), 100, true, false, true},
+    {StrL("Amplitude"), 110, true, false, true},
+    {StrL("P/E"), 100, true, false, true},
+    {StrL("P/B"), 100, true, false, true},
+    {StrL("Volume Ratio"), 120, true, false, true},
+    {StrL("Bid Ask Ratio"), 120, true, false, true},
+    {StrL("Latest Pre Close"), 140, true, false, true},
+    {StrL("Latest Post Close"), 140, true, false, true},
+    {StrL("Pre Mkt Cap"), 120, true, false, true},
+    {StrL("Pre Mkt%"), 100, true, false, true},
+    {StrL("Pre Mkt Chg"), 120, true, false, true},
+    {StrL("Post Mkt Cap"), 120, true, false, true},
+    {StrL("Post Mkt%"), 110, true, false, true},
+    {StrL("Post Mkt Chg"), 120, true, false, true},
+    {StrL("Float Cap"), 110, true, false, true},
+    {StrL("Shares"), 100, true, false, true},
+    {StrL("Float Shares"), 120, true, false, true},
+    {StrL("5d Ranking"), 110, true, false, true},
+    {StrL("10d Ranking"), 110, true, false, true},
+    {StrL("30d Ranking"), 110, true, false, true},
+    {StrL("120d Ranking"), 120, true, false, true},
+    {StrL("250d Ranking"), 120, true, false, true},
+};
+
+// fit_column. Measures the heading and the text every row draws, so a
+// double-click fits the column to its widest text. The table adds the
+// cell padding itself. Symbol is medium and Price is semibold, which is
+// how those cells are drawn; the rest are the story's 16px text. A
+// sortable column's header also holds the 0.75rem sort icon with 2px of
+// padding on each side, counted even while sorting is off.
+static bool DtFitColumn(Ctx* cx, void* data, int col, float* out) {
+    DataTableStory* self = (DataTableStory*)data;
+    if (!self || !out || !cx || !cx->win) {
+        return false;
+    }
+    const int nBase = (int)(sizeof(kColumns) / sizeof(kColumns[0]));
+    const int nColumns = nBase + kExtraCounts[self->extra];
+    if (col < 0 || col >= nColumns) {
+        return false;
+    }
+    PaintCtx* paint = &cx->win->paint;
+    const float cellFont = 16.f;
+    int weight = (int)FontWeight::Normal;
+    if (col == 3) {
+        weight = (int)FontWeight::Medium;
+    } else if (col == 4) {
+        weight = (int)FontWeight::Semibold;
+    }
+    float widest = 0;
+    const int nStocks = (int)(sizeof(kStocks) / sizeof(kStocks[0]));
+    if (col == 0) {
+        int nRows = kRowCounts[self->rowCount];
+        if (nRows < 1) {
+            nRows = 1;
+        }
+        widest =
+            MeasureText(paint, fmt("%d", nRows - 1), cellFont, 0, false, weight)
+                .w;
+    } else {
+        for (int i = 0; i < nStocks; i++) {
+            float w = MeasureText(paint, DtCellText(cx, data, i, col), cellFont,
+                                  0, false, weight)
+                          .w;
+            if (w > widest) {
+                widest = w;
+            }
+        }
+    }
+    Str title = col < nBase ? kColumns[col].title
+                            : StoryFmt(cx, "Column %d", col - nBase + 1);
+    float heading =
+        MeasureText(paint, title, 14.f, 0, false, (int)FontWeight::Normal).w;
+    if (col < nBase && kColumns[col].sortable) {
+        heading += Rems(cx, 0.75f) + 4.f;
+    }
+    if (heading > widest) {
+        widest = heading;
+    }
+    *out = widest;
+    return true;
+}
+
 El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
@@ -735,6 +852,18 @@ El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
         cx, StrL("dt-size"), StoryFmt(cx, "Size: %s", kSizeLabels[self->size]),
         self->openMenu == DtMenuSize, ListenerArg(openMenu, DtMenuSize),
         sizeRows, kNSizes, act));
+    group->Child(StoryToolbarDivider(cx));
+    StoryToolbarOpt headerRows[kNHeaderRowH];
+    for (int i = 0; i < kNHeaderRowH; i++) {
+        headerRows[i].label = kHeaderLabels[i];
+        headerRows[i].checked = self->headerRowH == i;
+        headerRows[i].act = DtActHeaderH + i;
+    }
+    group->Child(StoryToolbarDropdown(
+        cx, StrL("dt-header-h"),
+        StoryFmt(cx, "Header Row Height: %s", kHeaderLabels[self->headerRowH]),
+        self->openMenu == DtMenuHeaderH, ListenerArg(openMenu, DtMenuHeaderH),
+        headerRows, kNHeaderRowH, act));
     group->Child(StoryToolbarDivider(cx));
     StoryToolbarOpt rowRows[kNRowCounts];
     for (int i = 0; i < kNRowCounts; i++) {
@@ -802,58 +931,8 @@ El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
     toolbarRow->Child(group);
     page->Child(toolbarRow);
 
-    // The columns the Rust delegate declares, in its own order. The first
-    // four are .fixed(ColumnFixed::Left); everything after them scrolls. The
-    // width is what a column starts at — dragging its right edge makes the
-    // width the table's own. Fields: title, width, right, sortable,
-    // selectable, resizable, fixed.
-    static const component::TableColumn kColumns[] = {
-        {StrL("ID"), 60, false, false, false, true, true},
-        {StrL("Market"), 60, false, false, true, true, true},
-        {StrL("Name"), 180, false, false, true, true, true},
-        {StrL("Symbol"), 100, false, true, true, true, true},
-        {StrL("Price"), 100, true, true, true},
-        {StrL("Chg"), 100, true, true, true},
-        {StrL("Chg%"), 110, true, true, true},
-        {StrL("Volume"), 100, true, false, true},
-        {StrL("Turnover"), 100, true, false, true},
-        {StrL("Market Cap"), 110, true, false, true},
-        {StrL("TTM"), 100, true, false, true},
-        {StrL("5m Ranking"), 110, true, false, true},
-        {StrL("60d Ranking"), 110, true, false, true},
-        {StrL("Year Chg%"), 110, true, false, true},
-        {StrL("Bid"), 100, true, false, true},
-        {StrL("Bid Vol"), 100, true, false, true},
-        {StrL("Ask"), 100, true, false, true},
-        {StrL("Ask Vol"), 100, true, false, true},
-        {StrL("Open"), 100, true, false, true},
-        {StrL("Prev Close"), 110, true, false, true},
-        {StrL("High"), 100, true, false, true},
-        {StrL("Low"), 100, true, false, true},
-        {StrL("Turnover Rate"), 120, true, false, true},
-        {StrL("Rise Rate"), 100, true, false, true},
-        {StrL("Amplitude"), 110, true, false, true},
-        {StrL("P/E"), 100, true, false, true},
-        {StrL("P/B"), 100, true, false, true},
-        {StrL("Volume Ratio"), 120, true, false, true},
-        {StrL("Bid Ask Ratio"), 120, true, false, true},
-        {StrL("Latest Pre Close"), 140, true, false, true},
-        {StrL("Latest Post Close"), 140, true, false, true},
-        {StrL("Pre Mkt Cap"), 120, true, false, true},
-        {StrL("Pre Mkt%"), 100, true, false, true},
-        {StrL("Pre Mkt Chg"), 120, true, false, true},
-        {StrL("Post Mkt Cap"), 120, true, false, true},
-        {StrL("Post Mkt%"), 110, true, false, true},
-        {StrL("Post Mkt Chg"), 120, true, false, true},
-        {StrL("Float Cap"), 110, true, false, true},
-        {StrL("Shares"), 100, true, false, true},
-        {StrL("Float Shares"), 120, true, false, true},
-        {StrL("5d Ranking"), 110, true, false, true},
-        {StrL("10d Ranking"), 110, true, false, true},
-        {StrL("30d Ranking"), 110, true, false, true},
-        {StrL("120d Ranking"), 120, true, false, true},
-        {StrL("250d Ranking"), 120, true, false, true},
-    };
+    // The columns live with DtFitColumn. The first four are pinned; the
+    // width is what a column starts at.
     const int nBase = (int)(sizeof(kColumns) / sizeof(kColumns[0]));
     // columns_count(): the delegate's own plus however many extras the
     // toolbar asked for, each of which the delegate names "Column N".
@@ -914,7 +993,11 @@ El* DataTableStory::Render(DataTableStory* self, Ctx* cx) {
             ->ContextMenu(DtContextMenu)
             ->OnVisibleRows(DtVisibleRows)
             ->OnVisibleCols(DtVisibleCols)
-            ->CellText(DtCellText);
+            ->CellText(DtCellText)
+            ->FitColumn(DtFitColumn);
+    if (kHeaderRowH[self->headerRowH] > 0) {
+        table->HeaderRowHeight(kHeaderRowH[self->headerRowH]);
+    }
     if (self->options[DtOptGroupHeaders]) {
         table->GroupHeader(kGroup1, 6)->GroupHeader(kGroup2, 12);
     }

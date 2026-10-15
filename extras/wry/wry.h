@@ -87,7 +87,7 @@ namespace base {
 template <typename T, size_t N>
 char (&DimofSizeHelper(T (&array)[N]) noexcept)[N];
 #ifndef dimof
-#define dimof(array) (sizeof(base::DimofSizeHelper(array)))
+#define dimof(array) (sizeof(::base::DimofSizeHelper(array)))
 #endif
 
 enum : uint16_t {
@@ -157,6 +157,14 @@ void PlatGetCwd(char* out, int cap);
 bool PlatCanonicalPath(const char* path, char* out, int cap);
 void PlatGetExeDir(char* out, int cap);
 
+bool PlatGetExePath(char* out, int cap);
+
+bool PlatFileIsExecutable(const char* path);
+
+bool PlatMakeExecutable(const char* path);
+
+bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user);
+
 struct DirEntry {
     char name[260] = {};
     bool isDir = false;
@@ -175,8 +183,15 @@ bool PlatPathsCaseFold();
 bool PlatIsWindows();
 bool PlatSecondaryIsCommand();
 bool PlatShowsWindowControls();
+
+bool PlatTitleBarCloseIsElement();
+
 float PlatCaretWidth();
 bool PlatScrollBounce();
+
+bool PlatScrollBounceTouch();
+
+bool PlatWebViewPartialClipHides();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
 const char* PlatShellPlatformName();
@@ -1491,6 +1506,8 @@ struct WebViewAttributes {
     void (*documentTitleChangedHandler)(void* ctx, Str title) = nullptr;
     void (*onPageLoadHandler)(void* ctx, PageLoadEvent event,
                               Str url) = nullptr;
+
+    void (*processFailedHandler)(void* ctx, int kind) = nullptr;
 
     DownloadStartedHandler downloadStartedHandler = AllowDownload;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;

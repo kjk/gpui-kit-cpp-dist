@@ -95,7 +95,7 @@ namespace base {
 template <typename T, size_t N>
 char (&DimofSizeHelper(T (&array)[N]) noexcept)[N];
 #ifndef dimof
-#define dimof(array) (sizeof(base::DimofSizeHelper(array)))
+#define dimof(array) (sizeof(::base::DimofSizeHelper(array)))
 #endif
 
 enum : uint16_t {
@@ -165,6 +165,14 @@ void PlatGetCwd(char* out, int cap);
 bool PlatCanonicalPath(const char* path, char* out, int cap);
 void PlatGetExeDir(char* out, int cap);
 
+bool PlatGetExePath(char* out, int cap);
+
+bool PlatFileIsExecutable(const char* path);
+
+bool PlatMakeExecutable(const char* path);
+
+bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user);
+
 struct DirEntry {
     char name[260] = {};
     bool isDir = false;
@@ -183,8 +191,15 @@ bool PlatPathsCaseFold();
 bool PlatIsWindows();
 bool PlatSecondaryIsCommand();
 bool PlatShowsWindowControls();
+
+bool PlatTitleBarCloseIsElement();
+
 float PlatCaretWidth();
 bool PlatScrollBounce();
+
+bool PlatScrollBounceTouch();
+
+bool PlatWebViewPartialClipHides();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
 const char* PlatShellPlatformName();
@@ -3408,6 +3423,8 @@ inline bool BackgroundIsSolid(const Background& b) {
 
 struct InputState;
 
+struct ScrollOverscroll;
+
 struct RangeDecorationsState;
 struct DecorationCollectionsState;
 
@@ -5288,7 +5305,7 @@ struct El {
     Rgba indentGuideColor = {0, 0, 0, 0};
     int16_t indentGuideCount = 0;
     uint8_t indentGuideTab = 0;
-    float caretW = 2;
+    float caretW = 1;
     float laidFont = 0;
     float laidMaxW = 0;
 
@@ -5555,7 +5572,7 @@ struct El {
     El* Spans(const TextSpan* runs, int n);
 
     El* MarkRange(int lo, int hi);
-    El* Caret(int off, Rgba color, float width = 2,
+    El* Caret(int off, Rgba color, float width = 1,
               bool lineEndAffinity = false);
     El* Child(El* c);
     El* Bold();
@@ -7040,6 +7057,10 @@ struct InputState {
     float contentW = 0;
     float contentH = 0;
 
+    bool scrollBounce = base::PlatScrollBounce();
+
+    ScrollOverscroll* overscroll = nullptr;
+
     bool emitEvents = true;
 
     Selection imeMarked = {};
@@ -7082,6 +7103,9 @@ void InputScrollToCaretWithPadding(InputState* s, float caretX, float caretY,
 float InputEmptyBottomHeight(bool isCodeEditor, int overrideRows,
                              float viewportH, float lineH);
 
+float InputClampVerticalScrollOffset(float scroll, float scrollHeight,
+                                     float viewportH);
+
 int InputLineNumberLen(int totalLines);
 int InputDisplayedLineNumber(int number);
 float InputCursorSurroundingPadding(bool isAutoGrow, int overrideLines,
@@ -7093,7 +7117,11 @@ bool InputUpdateScrollOffset(InputState* s, App* app, Window* win,
                              const Point* offset);
 
 bool InputOnScrollWheel(InputState* s, App* app, Window* win, float dx,
-                        float dy, TouchPhase phase = TouchPhase::Moved);
+                        float dy, TouchPhase phase = TouchPhase::Moved,
+                        bool precise = false);
+
+float InputBouncePaint(InputState* s, Window* win);
+void InputSetScrollBounce(InputState* s, bool on);
 void InputScrollToOffsetWithPadding(InputState* s, int offset, InputMoveDir dir,
                                     InputScrollPadding padding);
 
@@ -7345,6 +7373,9 @@ void InputSetAutoClose(InputState* s, bool enabled, App* app,
                        Window* win = nullptr);
 void InputSetSmartIndent(InputState* s, bool enabled, App* app,
                          Window* win = nullptr);
+
+void InputSetLineNumber(InputState* s, bool lineNumber, App* app,
+                        Window* win = nullptr);
 
 int Utf8OffsetToUtf16(Str s, int u8);
 int Utf16OffsetToUtf8(Str s, int u16);
@@ -7816,6 +7847,8 @@ struct Window {
 
     int hoverId = 0;
 
+    Bounds tooltipPressedTrigger = {0, 0, -1, 0};
+
     bool lastInputKeyboard = false;
 
     float remSize = 16;
@@ -8003,6 +8036,8 @@ struct IdScope {
 
 EntityId EntityNewRaw(App* app, void* ptr, RenderFn render, DropFn drop);
 void* EntityGet(App* app, EntityId id);
+
+bool EntityHasDrop(App* app, EntityId id, DropFn drop);
 void EntityDrop(App* app, EntityId id);
 void EntityDropAll(App* app);
 
@@ -8975,6 +9010,8 @@ struct AlertDialog {
 namespace gpui {
 
 float CubicBezier(float x1, float y1, float x2, float y2, float t);
+
+float UnclampedCubicBezier(float x1, float y1, float x2, float y2, float t);
 
 using EaseFn = float (*)(float);
 
@@ -10691,9 +10728,11 @@ const float PANEL_MIN_SIZE = 100.f;
 const float kResizablePanelMinSize = PANEL_MIN_SIZE;
 
 bool ResizablePanelResize(float* sizes, const float* mins, const float* maxs,
-                          int n, int ix, float size, float containerSize);
+                          int n, int ix, float size, float containerSize,
+                          const bool* fixed = nullptr);
 
-void ResizableAdjustToContainer(float* sizes, int n, float containerSize);
+void ResizableAdjustToContainer(float* sizes, int n, float containerSize,
+                                const bool* fixed = nullptr);
 
 const float kResizeHandleSize = 1.f;
 const float kResizeHandlePadding = 4.f;
@@ -10838,6 +10877,8 @@ struct ResizableState {
 
     Vec<bool> shown;
 
+    Vec<bool> fixed;
+
     Vec<Bounds> laid;
 
     Bounds bounds = {};
@@ -10853,6 +10894,7 @@ struct ResizableState {
         VecReset(maxs);
         VecReset(grows);
         VecReset(shown);
+        VecReset(fixed);
         VecReset(laid);
     }
 
@@ -10901,6 +10943,8 @@ struct ResizablePanelGroup {
     ArenaVec<bool> grows;
     ArenaVec<bool> shown;
 
+    ArenaVec<bool> fixed;
+
     ArenaVec<const struct ResizablePanel*> sources;
     void* handleAppearanceUser = nullptr;
     ResizeHandleRenderer handleAppearance = nullptr;
@@ -10948,11 +10992,15 @@ struct ResizablePanel {
     bool grow = true;
     bool visible = true;
 
+    bool fixed = false;
+
     static ResizablePanel* New(Ctx* cx);
     ResizablePanel* Child(El* value);
     ResizablePanel* Size(float value);
     ResizablePanel* SizeRange(float minValue, float maxValue = 0);
     ResizablePanel* FlexNone();
+
+    ResizablePanel* Fixed();
     ResizablePanel* Visible(bool value);
 };
 
@@ -13387,6 +13435,16 @@ bool InputLastActiveLine(const InputState* s, const Window* win, Bounds* out);
 void InputUpdateWrapMap(InputState* s, PaintCtx* ctx, float width,
                         float fontSize, uint16_t fontWord);
 
+struct InputDisplayMapRef {
+    const InputState* state = nullptr;
+};
+InputDisplayMapRef InputDisplayMap(const InputState* s);
+
+int InputWrapRowCount(InputDisplayMapRef map);
+
+void InputPrewrap(InputState* s, PaintCtx* ctx, float fontSize,
+                  uint16_t fontWord, float width);
+
 int InputWrapRows(const InputState* s, int line, const int** starts,
                   float* indent);
 
@@ -14004,6 +14062,9 @@ struct Popup {
     void* onPositionUser = nullptr;
 
     bool contentReady = false;
+
+    bool askFrame = false;
+    Window* win = nullptr;
 
     static Popup* New(Ctx* cx, Str id, El* trigger,
                       PopupAnchor anchor = PopupAnchor::TopLeft);
@@ -14956,8 +15017,16 @@ struct Scrollbar {
 namespace gpui {
 
 struct ScrollBounceMotion {
-    float tracking = 0.55f;
-    float responseMs = 524.f;
+    float tracking = 0.075f;
+    float responseMs = 502.655f;
+    float maxStretch = 36.f;
+    bool hasMaxStretch = true;
+
+    static ScrollBounceMotion Default();
+    float Tracking() const { return tracking; }
+    float Response() const { return responseMs; }
+    bool HasMaxStretch() const { return hasMaxStretch; }
+    float MaxStretch() const { return maxStretch; }
 
     ScrollBounceMotion WithTracking(float value) const {
         ScrollBounceMotion out = *this;
@@ -14967,6 +15036,14 @@ struct ScrollBounceMotion {
     ScrollBounceMotion WithResponse(float ms) const {
         ScrollBounceMotion out = *this;
         out.responseMs = std::max(0.f, ms);
+        return out;
+    }
+    ScrollBounceMotion WithMaxStretch(float px) const {
+        ScrollBounceMotion out = *this;
+        if (px > 0 && px == px) {
+            out.maxStretch = px;
+            out.hasMaxStretch = true;
+        }
         return out;
     }
 };
@@ -14982,14 +15059,93 @@ struct ScrollBouncePhysics {
     bool dragging = false;
     bool suppressMomentum = false;
     float extent = 0;
-    ScrollBounceMotion motion = {};
+    ScrollBounceMotion motion = ScrollBounceMotion::Default();
+
+    ScrollBouncePhysics() : motion(ScrollBounceMotion::Default()) {}
 
     float Offset() const;
     void Begin(float viewportExtent);
     float Pull(float delta);
     void Release();
+
+    void LetGo(float vel);
+    void Reset();
+    bool IsDragging() const { return dragging; }
+    bool IsMoving() const {
+        return !dragging && (position != 0 || velocity != 0);
+    }
     bool Step(float seconds);
 };
+
+struct ScrollOverscroll {
+    ScrollBouncePhysics physics;
+    double sampledAt = 0;
+    double lastPacketAt = 0;
+    double movedAt = 0;
+    float velocity = 0;
+    Vec<float> moveDy;
+    Vec<double> moveAt;
+    bool hasSampled = false;
+    bool hasLastPacket = false;
+    bool hasMoved = false;
+    bool resting = false;
+    bool spent = false;
+
+    void SetMotion(ScrollBounceMotion value);
+    float Offset() const { return physics.Offset(); }
+
+    bool Packet(float dy, TouchPhase phase, float extent, double now,
+                float (*scroll)(void* user, float dy), void* user);
+    bool Step(double now);
+    void Reset();
+    ~ScrollOverscroll();
+};
+
+bool ScrollBounceOwnedWheel(ScrollOverscroll* over, OngoingScroll* lock,
+                            ScrollbarHandle handle, bool enabled,
+                            const ScrollWheelEvent* ev, Ctx* cx,
+                            Listener onScroll);
+
+float ScrollBounceOwnedOffset(ScrollOverscroll* over, Window* win, bool enabled,
+                              float maxExtent);
+
+struct PositiveScroll {
+    float* offset = nullptr;
+    float* viewport = nullptr;
+    float* content = nullptr;
+
+    bool measureContent = false;
+};
+
+ScrollbarHandle PositiveScrollHandle(PositiveScroll* slot);
+
+struct ScrollBounceMetrics {
+    float offset = 0;
+    float viewport = 0;
+    float content = 0;
+    PositiveScroll slot = {};
+
+    static void OnScroll(ScrollBounceMetrics* self, Ctx* cx,
+                         const ScrollEvent* ev) {
+        if (!self || !ev) return;
+        self->offset = ev->offsetY;
+        Notify(cx);
+    }
+};
+
+inline Entity<ScrollBounceMetrics> ScrollBounceMetricsEntity(
+    Ctx* cx, Str id, bool measureContent) {
+    Entity<ScrollBounceMetrics> e = ElementStateEntity<ScrollBounceMetrics>(
+        cx, id.s ? id : StrL("scroll-bounce"), StrL("ScrollBounceMetrics"));
+    ScrollBounceMetrics* m = e.Get(cx);
+    if (m) {
+        m->slot.offset = &m->offset;
+        m->slot.viewport = &m->viewport;
+        m->slot.content = &m->content;
+        m->slot.measureContent = measureContent;
+    }
+    return e;
+}
 
 const float kCatchDragSlop = 8.f;
 
@@ -15017,14 +15173,24 @@ struct ScrollBounce {
     Ctx* cx = nullptr;
     Str id = {};
     El* child = nullptr;
-    ScrollBounceMotion motion = {};
+    ScrollBounceMotion motion = ScrollBounceMotion::Default();
+    ScrollbarHandle handle = {};
     bool enabled = false;
-    Listener onScroll = {};
 
+    bool scrollWheel = true;
+    Listener onScroll = {};
+    PositiveScroll* laidOut = nullptr;
+
+    static bool EnabledByDefault();
     static ScrollBounce* New(Ctx* cx, Str id, El* child);
+    static ScrollBounce* New(Ctx* cx, Str id, ScrollbarHandle handle,
+                             El* child);
     ScrollBounce* Enabled(bool value = true);
+    ScrollBounce* ScrollWheel(bool value = true);
     ScrollBounce* Motion(ScrollBounceMotion value);
     ScrollBounce* OnScroll(Listener listener);
+
+    ScrollBounce* Measure(PositiveScroll* slot);
     El* IntoEl();
 };
 
@@ -15475,8 +15641,10 @@ struct Sheet {
 namespace gpui {
 
 struct Slider {
+
     static El* New(Ctx* cx, SliderState* state = nullptr,
-                   Axis axis = Axis::Horizontal, int clickId = 0);
+                   Axis axis = Axis::Horizontal, int clickId = 0,
+                   Str accessibilityLabel = {});
 };
 
 struct SliderTrack {
@@ -17196,6 +17364,9 @@ struct MdRun {
     bool hasCustom = false;
     MdRun* next = nullptr;
     uint8_t marks = 0;
+
+    Rgba highlight = {};
+    bool hasHighlight = false;
 };
 
 enum class MdKind : uint8_t {
@@ -17936,8 +18107,8 @@ struct TextView {
 
     El* ImageRun(MdRun* r, float font, Rgba color, bool inFlow);
 
-    El* Word(Str w, float font, Rgba color, uint8_t marks, int weight,
-             Str href);
+    El* Word(Str w, float font, Rgba color, uint8_t marks, int weight, Str href,
+             Rgba highlight = {}, bool hasHighlight = false);
 
     El* Inline(MdNode* n, float font, Rgba color, int weight,
                uint8_t align = MdAlignDefault);
@@ -18081,6 +18252,12 @@ struct HtmlInlineTag {
 HtmlInlineTag HtmlParseInlineTag(Arena* a, Str tag);
 
 Str HtmlAttrValue(Arena* a, Str attrs, const char* name);
+
+inline Rgba DefaultMarkColor() {
+    return Rgba{0xfe, 0xf0, 0x8a, 0xff};
+}
+
+Rgba MarkColorFromValues(Str color, Str style);
 
 }
 
@@ -18770,6 +18947,8 @@ VirtualRange VirtualListVisibleRangeFromLayout(const float* origins,
 VirtualRange VirtualListVisibleRows(int count, float rowSize, float offset,
                                     float viewport);
 
+float VirtualListUniformAlong(int ix, float stride, float offset);
+
 float VirtualListItemOrigin(const float* sizes, int count, int ix);
 
 enum class ScrollStrategy : uint8_t {
@@ -18813,6 +18992,8 @@ void VirtualListScrollToItemDeferredWithOffset(VirtualListScrollHandle* h,
                                                int offset);
 
 void VirtualListScrollToBottomDeferred(VirtualListScrollHandle* h);
+
+ScrollbarHandle VirtualListScrollbar(VirtualListScrollHandle* handle);
 
 bool VirtualListHandleLayout(VirtualListScrollHandle* h, const float* sizes,
                              int count, float itemSize, float viewport);
@@ -18987,6 +19168,9 @@ struct TreeState {
     float scrollY = 0;
 
     float viewportH = 0;
+
+    float contentH = 0;
+    PositiveScroll bounce = {};
     Listener onEvent;
 
     Entity<TreeState> self = {};
@@ -22888,6 +23072,10 @@ struct ListState {
     float scrollY = 0;
     float viewportH = 0;
 
+    float contentH = 0;
+
+    PositiveScroll bounce = {};
+
     bool loading = false;
     bool hasMore = false;
     int loadMoreThreshold = 20;
@@ -23070,6 +23258,9 @@ struct List {
     List* SearchPlaceholder(Str value);
     List* WithSize(UiSize value);
     List* ScrollbarVisible(bool value);
+
+    int scrollBounce = -1;
+    List* ScrollBounce(bool value);
     List* Padding(float value);
     List* Loading(El* e);
     List* Initial(El* e);
@@ -23358,6 +23549,8 @@ struct SearchableList {
 
     bool inSelect = false;
 
+    int scrollBounce = -1;
+
     static SearchableList* New(Ctx* cx, Str id, Entity<SearchableListState> st,
                                InputState* query);
     SearchableList* Items(const SearchableItem* items, int n);
@@ -23371,6 +23564,8 @@ struct SearchableList {
     SearchableList* WithSize(UiSize value);
     SearchableList* Delegate(const SearchableListDelegate& value);
     SearchableList* InSelect(bool v);
+
+    SearchableList* ScrollBounce(bool v);
     El* IntoEl();
 };
 
@@ -23467,6 +23662,8 @@ struct Select {
     float width = kFill;
     float menuWidth = 0;
     float menuMaxH = 0;
+
+    int scrollBounce = -1;
     UiSize size = UiSize::Medium;
     IconName icon = IconName::None;
 
@@ -23515,6 +23712,8 @@ struct Select {
 
     Select* FocusRing(bool v);
     Select* Searchable(InputState* query, Listener onFocus);
+
+    Select* ScrollBounce(bool v);
     Select* Trigger(El* e);
     Select* Footer(El* e);
     Select* Delegate(const SearchableListDelegate& value);
@@ -23954,6 +24153,8 @@ struct Command {
 
     float maxH = -1;
     bool bordered = true;
+
+    int scrollBounce = -1;
     float w = kFill;
 
     Style style = {};
@@ -23977,6 +24178,7 @@ struct Command {
     Command* Footer(El* e);
     Command* MaxH(float v);
     Command* Bordered(bool v);
+    Command* ScrollBounce(bool v);
     Command* W(float v);
     Command* Refine(const Style& s, uint32_t fields);
     Command* OnQuery(Listener fn);
@@ -26056,6 +26258,8 @@ struct Editor {
     float height = 0;
     float fontSize = 0;
     Str fontFamily = {};
+
+    UiSize size = UiSize::Medium;
     bool appearance = true;
     bool bordered = true;
     bool disabled = false;
@@ -26084,6 +26288,7 @@ struct Editor {
     static Editor* New(Ctx* cx, InputState* state);
     static Editor* New(Ctx* cx, Str id, InputState* state);
     Editor* H(float value);
+    Editor* WithSize(UiSize value);
     Editor* Font(float value);
 
     Editor* FontFamily(Str family);
@@ -26677,6 +26882,8 @@ struct PopupMenuState {
     FocusHandle focus = {};
     FocusHandle previousFocus = {};
 
+    FocusHandle submenuFocus = {};
+
     FocusHandle triggerFocus = {};
 
     Entity<PopupMenuState> parent = {};
@@ -26950,6 +27157,8 @@ struct Scrollable {
     ScrollbarMode mode = ScrollbarMode::Scrolling;
     bool modeSet = false;
 
+    int scrollBounce = -1;
+
     Listener onScroll;
 
     static Scrollable* New(Ctx* cx);
@@ -26964,6 +27173,8 @@ struct Scrollable {
     Scrollable* Mode(ScrollbarMode v);
     Scrollable* H(float v);
     Scrollable* OnScroll(Listener fn);
+
+    Scrollable* ScrollBounce(bool v);
     El* IntoEl();
 };
 
@@ -26999,6 +27210,11 @@ const float kMessageScrollerBottomFadeTransitionMs = 200.f;
 
 const float kMessageScrollerEstimatedRowHeight = 64.f;
 
+struct ListOffset {
+    int itemIx = 0;
+    float offsetInItem = 0;
+};
+
 struct MessageScrollerState {
     VirtualListScrollHandle handle;
 
@@ -27016,6 +27232,8 @@ struct MessageScrollerState {
     bool IsScrolledUp() const;
 
     bool IsFollowingTail() const;
+
+    ListOffset LogicalScrollTop() const;
 
     void Reset(Ctx* cx, int itemCount);
 
@@ -29026,6 +29244,8 @@ struct Slider {
 
     Rgba bar = {};
     bool hasBar = false;
+
+    Str accessibilityLabel = {};
     Listener onChange;
 
     static Slider* New(Ctx* cx, Str id, SliderState* state);
@@ -29037,6 +29257,8 @@ struct Slider {
 
     Slider* WFill();
     Slider* Bg(Rgba c);
+
+    Slider* AccessibilityLabel(Str s);
 
     Slider* OnChange(Listener fn);
     El* IntoEl();
@@ -29901,6 +30123,13 @@ struct TableVisibleRange {
     int colEnd = 0;
 };
 
+struct TableColEdge {
+    uint8_t resizable = 1;
+    uint8_t hasPaddings = 0;
+    float padL = 0;
+    float padR = 0;
+};
+
 struct TableState {
     int rowCount = 0;
     int colCount = 0;
@@ -29939,6 +30168,12 @@ struct TableState {
 
     int resizingCol = -1;
 
+    int fittedCol = -1;
+
+    Edges cellPadding = Edges::New(8, 8, 4, 4);
+
+    Vec<TableColEdge> colFit;
+
     Vec<int> colOrder;
     bool colOrderSeeded = false;
 
@@ -29951,6 +30186,13 @@ struct TableState {
     float rowH = 32;
     float scrollY = 0;
     float viewportH = 0;
+
+    float contentH = 0;
+
+    bool bounceOn = false;
+    PositiveScroll bounce = {};
+    ScrollOverscroll* overscroll = nullptr;
+    OngoingScroll bounceLock = {};
 
     float scrollX = 0;
     float viewportW = 0;
@@ -29978,6 +30220,8 @@ struct TableState {
         VecReset(colMaxWidths);
         VecReset(colOrder);
         VecReset(colBounds);
+        VecReset(colFit);
+        delete overscroll;
     }
     Listener onLoadMore = {};
 
@@ -29986,6 +30230,9 @@ struct TableState {
                          ColumnSort sort) = nullptr;
     void (*delegateMoveColumn)(Ctx* cx, void* data, int from, int to) = nullptr;
     void (*delegateLoadMore)(Ctx* cx, void* data) = nullptr;
+
+    bool (*delegateFitColumn)(Ctx* cx, void* data, int col,
+                              float* width) = nullptr;
 
     static void OnRowClick(TableState* self, Ctx* cx, const ClickEvent* ev,
                            int64_t row);
@@ -30007,12 +30254,16 @@ struct TableState {
 
     static void OnResizeDrag(TableState* self, Ctx* cx,
                              const DragMoveEvent* ev);
+    static void OnResizeMouseDown(TableState* self, Ctx* cx,
+                                  const MouseDownEvent* ev, int64_t col);
     static void OnResizeEnd(TableState* self, Ctx* cx, const MouseUpEvent* ev);
     static void OnColDragMove(TableState* self, Ctx* cx,
                               const DragMoveEvent* ev);
     static void OnColDrop(TableState* self, Ctx* cx, const DropEvent* ev);
     static void OnColDragEnd(TableState* self, Ctx* cx, const MouseUpEvent* ev);
     static void OnScroll(TableState* self, Ctx* cx, const ScrollEvent* ev);
+    static void OnBounceWheel(TableState* self, Ctx* cx,
+                              const ScrollWheelEvent* ev);
 
     static void OnScrollXY(TableState* self, Ctx* cx, const ScrollEvent* ev);
 };
@@ -30064,7 +30315,14 @@ float TableClampColWidth(const TableState* s, int col, float width);
 void TableSetColConstraints(TableState* s, int col, float minWidth,
                             float maxWidth);
 
-void TableResizeCol(TableState* s, Ctx* cx, int col, float width);
+bool TableResizeCol(TableState* s, Ctx* cx, int col, float width);
+
+bool TableColWidthNow(const TableState* s, int col, float* out);
+
+bool TableFitCol(TableState* s, Ctx* cx, int col);
+
+void TableSetColEdge(TableState* s, int col, bool resizable, bool hasPaddings,
+                     float padL, float padR);
 
 ColumnSort TableNextSort(ColumnSort s);
 
@@ -30151,7 +30409,8 @@ struct TableColumn {
     ColumnFixed fixedSide = ColumnFixed::Left;
     bool movable = true;
     float minWidth = 20;
-    float maxWidth = 0;
+
+    float maxWidth = 1200;
 
     static TableColumn New(Str key, Str name);
     TableColumn Sort(ColumnSort value) const;
@@ -30207,6 +30466,8 @@ struct TableDelegate {
     PopupMenu* (*contextMenu)(Ctx* cx, void* data, int row,
                               PopupMenu* menu) = nullptr;
     void (*moveColumn)(Ctx* cx, void* data, int from, int to) = nullptr;
+
+    bool (*fitColumn)(Ctx* cx, void* data, int col, float* width) = nullptr;
     El* (*renderEmpty)(Ctx* cx, void* data) = nullptr;
     bool (*loading)(Ctx* cx, void* data) = nullptr;
     El* (*renderLoading)(Ctx* cx, void* data, UiSize size) = nullptr;
@@ -30237,8 +30498,12 @@ struct DataTable {
 
     bool bordered = true;
 
+    bool fixedColsBorder = true;
+
     bool scrollbarV = true;
     bool scrollbarH = true;
+
+    int scrollBounce = -1;
 
     ArenaVec<TableGroupHeader> groupHeaders;
 
@@ -30258,7 +30523,11 @@ struct DataTable {
 
     Str (*cellText)(Ctx* cx, void* data, int row, int col) = nullptr;
 
+    bool (*fitColumn)(Ctx* cx, void* data, int col, float* width) = nullptr;
+
     float rowHeight = 32;
+
+    float headerRowHeight = 0;
 
     UiSize size = UiSize::Medium;
     TableDelegate delegate = {};
@@ -30271,10 +30540,15 @@ struct DataTable {
                     El* (*cell)(Ctx* cx, void* data, int row, int col));
     DataTable* Stripe(bool v);
     DataTable* Bordered(bool v);
+    DataTable* FixedColsBorder(bool v);
     DataTable* ScrollbarVisible(bool vertical, bool horizontal);
+
+    DataTable* ScrollBounce(bool v);
     DataTable* WithSize(UiSize s);
 
     DataTable* RowHeight(float px);
+
+    DataTable* HeaderRowHeight(float px);
     DataTable* GroupHeader(const TableGroupCell* cells, int n);
     DataTable* H(float px);
     DataTable* Empty(El* e);
@@ -30283,6 +30557,8 @@ struct DataTable {
     DataTable* OnVisibleRows(void (*fn)(Ctx*, void*, int, int));
     DataTable* OnVisibleCols(void (*fn)(Ctx*, void*, int, int));
     DataTable* CellText(Str (*fn)(Ctx*, void*, int, int));
+
+    DataTable* FitColumn(bool (*fn)(Ctx*, void*, int, float*));
 
     void Dump(Vec<Str>* heads, Vec<Str>* cells);
 
@@ -30578,8 +30854,11 @@ struct TitleBar {
     El* bar = nullptr;
     El* content = nullptr;
 
+    Listener onCloseWindow = {};
+
     static TitleBar* New(Ctx* cx);
     TitleBar* Child(El* e);
+    TitleBar* OnCloseWindow(Listener listener);
     El* IntoEl();
 };
 
@@ -30764,12 +31043,16 @@ struct Tree {
     float h = 0;
 
     bool icons = true;
+
+    int scrollBounce = -1;
     TreeContextMenuFn contextMenu = nullptr;
     void* contextMenuUser = nullptr;
 
     static Tree* New(Ctx* cx, Str id, Entity<TreeState> state);
     Tree* H(float v);
     Tree* Icons(bool v);
+
+    Tree* ScrollBounce(bool v);
     Tree* ContextMenu(TreeContextMenuFn fn, void* user = nullptr);
     El* IntoEl();
 };
@@ -31582,6 +31865,8 @@ struct StateDescriptor {
     const char* documentation = nullptr;
     StateFactory factory = nullptr;
     Slice<StateMethodDescriptor> methods = {};
+
+    bool inputEvents = false;
 };
 
 enum class RegistryErrorKind : uint8_t {
@@ -32268,6 +32553,7 @@ bool RegisterDisplayClipboard(shell::ComponentRegistry*, shell::RegistryError*);
 bool RegisterDisplayGroupBox(shell::ComponentRegistry*, shell::RegistryError*);
 bool RegisterDisplayRating(shell::ComponentRegistry*, shell::RegistryError*);
 bool RegisterDisplayStatusBar(shell::ComponentRegistry*, shell::RegistryError*);
+bool RegisterDisplayTitleBar(shell::ComponentRegistry*, shell::RegistryError*);
 bool RegisterDisplayToolbar(shell::ComponentRegistry*, shell::RegistryError*);
 
 bool RegisterCompoundAvatar(shell::ComponentRegistry*, shell::RegistryError*);
@@ -32462,8 +32748,16 @@ inline constexpr MethodDescriptor kMethod = {
 
 namespace gpui::shell {
 
+struct TextStateSubscription {
+    InputEventKind kind = InputEventKind::Change;
+    CallbackId id = 0;
+};
+
 struct TextStateEntity {
     App* app = nullptr;
+
+    ShellRuntime* runtime = nullptr;
+    Vec<TextStateSubscription> subs;
     InputState input;
 
     TextStateEntity() = default;
@@ -32471,6 +32765,8 @@ struct TextStateEntity {
     TextStateEntity& operator=(const TextStateEntity&) = delete;
     ~TextStateEntity();
 };
+
+void TextStateNotify(InputState* state, const InputEvent* event, Ctx* cx);
 
 void TextStateInit(TextStateEntity* state, App* app, bool textarea,
                    Str placeholder, Str value);
@@ -35455,6 +35751,11 @@ enum class FsOperation : uint8_t {
     RemoveFile,
     RemoveDirectory,
     MakeDirectory,
+
+    Stat,
+    Lstat,
+    ReadLink,
+    Rename,
 };
 
 struct FsEntry {
@@ -35467,11 +35768,24 @@ struct FsResult {
     Vec<FsEntry> entries;
     bool exists = false;
 
+    bool hasStats = false;
+    bool isFile = false;
+    bool isDirectory = false;
+    bool isSymbolicLink = false;
+    uint64_t size = 0;
+    uint32_t mode = 0;
+    double mtimeMs = 0;
+    double atimeMs = 0;
+    double birthtimeMs = 0;
+
     void Free();
 };
 
 bool FsRun(FsOperation operation, Str root, Str relative, Str input,
            bool recursive, FsResult* result, Str* error);
+
+bool FsRename(Str fromRoot, Str fromRelative, Str toRoot, Str toRelative,
+              Str* error);
 
 }
 
@@ -35499,6 +35813,80 @@ struct AppAssets {
     bool List(Str path, Vec<Str>* out, Str* error = nullptr);
     bool Resolve(Str path, Str* relative, Str* error = nullptr) const;
 };
+
+}
+
+#line 1 "src/shell/bundle.h"
+
+namespace gpui::shell {
+
+struct PluginManifest;
+struct Invocation;
+
+enum class BundlePlatform : uint8_t {
+    MacOS,
+    Linux,
+    Windows,
+};
+
+bool BundlePlatformParse(Str value, BundlePlatform* out);
+
+BundlePlatform BundleHostPlatform();
+
+bool ShellBundle(Str directory, const Invocation& invocation, Str* report,
+                 Str* error);
+
+struct BundleNames {
+    Str display;
+    Str command;
+    Str appBundle;
+    Str archiveStem;
+
+    void Free() {
+        StrFree(display);
+        StrFree(command);
+        StrFree(appBundle);
+        StrFree(archiveStem);
+        display = command = appBundle = archiveStem = {};
+    }
+};
+
+bool BundleNamesFrom(const PluginManifest& manifest, BundlePlatform platform,
+                     BundleNames* out);
+
+bool BundleFileName(Str name, Str* out);
+Str BundleInfoPlist(const PluginManifest& manifest, const BundleNames& names,
+                    bool hasIcon);
+
+struct BundleScriptValues {
+    Str id;
+    Str name;
+    Str command;
+    Str appVersion;
+    Str runtimeVersion;
+    Str iconSize;
+    Str archive;
+    Str archiveSha256;
+    Str downloadUrl;
+    Str stem;
+};
+
+Str BundleShellScript(Str templ, const BundleScriptValues& values);
+bool BundleWriteIcns(const uint8_t* rgba, int width, Str* out, Str* error);
+bool BundleApplicationPaths(Str root, Str prefix, Str exclude, Str* paths,
+                            Str* error);
+bool BundleWriteSampleArchives(Str directory, Str* error);
+bool BundleTarMode(Str tarGz, Str path, uint32_t* mode, Str* error);
+bool BundleZipEntryCount(Str zipPath, int* count, Str* error);
+
+using BundleDownloadFn = bool (*)(Str url, void* data, Str* bytes, Str* error);
+bool BundleWindowsRuntimeFrom(Str cache, Str version, BundleDownloadFn download,
+                              void* data, Str* executable, Str* error);
+bool BundleZipEntry(Str archive, Str name, Str* out, Str* error);
+
+bool BundleReleaseZip(Str executable, Str* zip, Str* error);
+
+bool BundleMarkAsGuiProgram(Str bytes, Str* error);
 
 }
 
@@ -35575,6 +35963,9 @@ Str CapabilityErrorMessage(Arena* arena, const CapabilityError& error);
 
 bool IsOpenableUrl(Str url);
 
+int ShellDefaultEnvNameCount();
+const char* ShellDefaultEnvName(int index);
+
 struct CapabilityPath {
     Str root;
     Str relative;
@@ -35599,16 +35990,25 @@ class Capabilities {
     Capabilities& ClipboardWrite(bool allowed);
     Capabilities& Exit(bool allowed);
 
+    Capabilities& AddEnvVariable(Str name);
+
+    Capabilities& AddReadRootOnce(Str root);
+    Capabilities& AddWriteRootOnce(Str root);
+
     bool HasReadAccess() const;
     bool HasWriteAccess() const;
     bool HasStorage() const;
     bool IsClipboardReadable() const;
     bool IsClipboardWritable() const;
     bool MayExit() const;
+
+    bool MayShowEnvVariable(Str name) const;
     bool MayRun(Str command) const;
     bool MayReach(Str host) const;
     bool MayRequest(Str scheme, Str host, uint16_t port, bool hasPort,
                     Str method, Str path) const;
+
+    void AppendSummary(StrBuilder* out) const;
 
     bool ResolvePath(Str path, CapabilityAccess access, CapabilityPath* out,
                      CapabilityError* error = nullptr) const;
@@ -35623,67 +36023,12 @@ class Capabilities {
     bool clipboardRead = false;
     bool clipboardWrite = false;
     bool exit = false;
+    Vec<Str> envVariables;
 
     void Clear();
     void CopyFrom(const Capabilities& other);
 };
 
-}
-
-#line 1 "src/shell/metrics.h"
-
-namespace gpui {
-
-struct RuntimeMetrics {
-    uint64_t scriptRenders = 0;
-    uint64_t scriptRenderNanos = 0;
-    uint64_t slowestScriptRenderNanos = 0;
-    uint64_t nativeNanos = 0;
-
-    uint64_t frameScriptCalls = 0;
-    uint64_t materializations = 0;
-    uint64_t materializeNanos = 0;
-
-    uint64_t structureRepeats = 0;
-
-    uint64_t structureChanges = 0;
-
-    bool StructureRepeatRate(double* out) const;
-    uint64_t MeanScriptOnlyNanos() const;
-    uint64_t MeanNativeNanos() const;
-    uint64_t MeanScriptRenderNanos() const;
-    uint64_t MeanMaterializeNanos() const;
-    RuntimeMetrics Since(const RuntimeMetrics& earlier) const;
-};
-
-namespace shell {
-
-struct Metrics {
-    RuntimeMetrics value;
-};
-
-enum class MetricsTimerKind : uint8_t {
-    ScriptRender,
-    Native,
-
-    FrameScript,
-    Materialize,
-};
-
-struct MetricsTimer {
-    Metrics* metrics = nullptr;
-    MetricsTimerKind kind = MetricsTimerKind::ScriptRender;
-    double started = 0;
-};
-
-MetricsTimer MetricsBegin(Metrics* metrics, MetricsTimerKind kind);
-void MetricsEnd(MetricsTimer* timer);
-void MetricsAdd(Metrics* metrics, MetricsTimerKind kind, uint64_t nanos);
-RuntimeMetrics MetricsRead(const Metrics* metrics);
-
-void MetricsRecordStructure(Metrics* metrics, bool repeated);
-
-}
 }
 
 #line 1 "src/shell/host_modules.h"
@@ -35921,6 +36266,9 @@ const Capabilities& PolicyCapabilities(const Policy* policy);
 Str PolicyApplication(const Policy* policy);
 void PolicySetApplication(Policy* policy, Str name);
 
+void PolicySetDataDir(Policy* policy, Str path);
+Str PolicyDataDir(const Policy* policy);
+
 void PolicyUpdateDefaultApplication(Str name);
 
 Policy* PolicyDefault();
@@ -35934,6 +36282,194 @@ bool PolicyAddHostModule(Policy* policy, HostModule* module,
                          HostError* error = nullptr);
 void PolicyClearHostModules(Policy* policy);
 
+}
+
+#line 1 "src/shell/scope.h"
+
+namespace gpui {
+
+class ShellRuntime;
+
+enum class ScopePhase : uint8_t {
+    Render,
+    Event,
+    Task,
+    Layout,
+};
+
+const char* ScopePhaseName(ScopePhase phase);
+bool ScopePhaseAllowsNotify(ScopePhase phase);
+
+namespace shell {
+
+class CallScopeGuard {
+  public:
+    CallScopeGuard(CallScopeGuard&& other) noexcept;
+    CallScopeGuard& operator=(CallScopeGuard&& other) noexcept;
+    CallScopeGuard(const CallScopeGuard&) = delete;
+    CallScopeGuard& operator=(const CallScopeGuard&) = delete;
+    ~CallScopeGuard();
+
+    uint64_t Generation() const { return generation; }
+    bool IsActive() const { return active; }
+
+  private:
+    friend CallScopeGuard ScopeEnter(Window*, App*, ScopePhase, EntityId,
+                                     Policy*, ShellRuntime*, void*);
+    explicit CallScopeGuard(uint64_t generation);
+    void Leave();
+
+    uint64_t generation = 0;
+    bool active = false;
+};
+
+CallScopeGuard ScopeEnter(Window* window, App* app, ScopePhase phase,
+                          EntityId view = {}, Policy* policy = nullptr,
+                          ShellRuntime* runtime = nullptr,
+                          void* application = nullptr);
+void ScopeAdopt(uint64_t generation);
+uint64_t ScopeCurrentGeneration();
+ScopePhase ScopeCurrentPhase();
+bool ScopeHasCurrent();
+Policy* ScopeCurrentPolicy();
+ShellRuntime* ScopeCurrentRuntime();
+EntityId ScopeCurrentView();
+void* ScopeCurrentApplication();
+
+class ScopeHostContext {
+  public:
+    ScopeHostContext(ScopeHostContext&& other) noexcept;
+    ScopeHostContext& operator=(ScopeHostContext&& other) noexcept;
+    ScopeHostContext(const ScopeHostContext&) = delete;
+    ScopeHostContext& operator=(const ScopeHostContext&) = delete;
+    ~ScopeHostContext();
+
+    bool IsSet() const { return held; }
+    Window* GetWindow() const { return window; }
+    App* GetApp() const { return app; }
+
+  private:
+    friend ScopeHostContext ScopeCurrentHost();
+    friend ScopeHostContext ScopeHostForGeneration(uint64_t, ShellError*);
+    ScopeHostContext(Window* window, App* app, bool held);
+    static ScopeHostContext Acquire(Window* window, App* app);
+    void Release();
+
+    Window* window = nullptr;
+    App* app = nullptr;
+    bool held = false;
+};
+
+ScopeHostContext ScopeCurrentHost();
+ScopeHostContext ScopeHostForGeneration(uint64_t generation,
+                                        ShellError* error = nullptr);
+Str ScopeStaleContextMessage();
+
+}
+}
+
+#line 1 "src/shell/failure.h"
+
+namespace gpui {
+
+enum class ViewFailure : uint8_t {
+    Render,
+    Reload,
+};
+
+struct FailureChrome {
+    bool copied = false;
+    bool expanded = false;
+    Str payload;
+
+    ~FailureChrome() { StrFree(payload); }
+};
+
+struct FailureText {
+    Str summary;
+    Str detail;
+    bool expandable = false;
+};
+
+void SpokenDuration(double seconds, char* out, int cap);
+
+struct ScriptInterruption {
+    bool set = false;
+    bool scoped = false;
+    ScopePhase phase = ScopePhase::Render;
+    double budget = 0;
+};
+Str ExplainInterruption(Arena* arena, Str message, ScriptInterruption* slot);
+
+Str TidyStack(Arena* arena, Str stack);
+
+FailureText FailureTextParse(Arena* arena, Str message);
+
+const char* ViewFailureLabel(ViewFailure failure);
+const char* ViewFailureHeading(ViewFailure failure);
+const char* ViewFailureKeptNote(ViewFailure failure);
+const char* ViewFailureOverlayHeading(ViewFailure failure);
+const char* ViewFailureRecovery(ViewFailure failure);
+
+El* ShellErrorBanner(Ctx* cx, ViewFailure failure, Str message);
+El* ShellErrorOverlay(Ctx* cx, ViewFailure failure, Str message);
+
+}
+
+#line 1 "src/shell/metrics.h"
+
+namespace gpui {
+
+struct RuntimeMetrics {
+    uint64_t scriptRenders = 0;
+    uint64_t scriptRenderNanos = 0;
+    uint64_t slowestScriptRenderNanos = 0;
+    uint64_t nativeNanos = 0;
+
+    uint64_t frameScriptCalls = 0;
+    uint64_t materializations = 0;
+    uint64_t materializeNanos = 0;
+
+    uint64_t structureRepeats = 0;
+
+    uint64_t structureChanges = 0;
+
+    bool StructureRepeatRate(double* out) const;
+    uint64_t MeanScriptOnlyNanos() const;
+    uint64_t MeanNativeNanos() const;
+    uint64_t MeanScriptRenderNanos() const;
+    uint64_t MeanMaterializeNanos() const;
+    RuntimeMetrics Since(const RuntimeMetrics& earlier) const;
+};
+
+namespace shell {
+
+struct Metrics {
+    RuntimeMetrics value;
+};
+
+enum class MetricsTimerKind : uint8_t {
+    ScriptRender,
+    Native,
+
+    FrameScript,
+    Materialize,
+};
+
+struct MetricsTimer {
+    Metrics* metrics = nullptr;
+    MetricsTimerKind kind = MetricsTimerKind::ScriptRender;
+    double started = 0;
+};
+
+MetricsTimer MetricsBegin(Metrics* metrics, MetricsTimerKind kind);
+void MetricsEnd(MetricsTimer* timer);
+void MetricsAdd(Metrics* metrics, MetricsTimerKind kind, uint64_t nanos);
+RuntimeMetrics MetricsRead(const Metrics* metrics);
+
+void MetricsRecordStructure(Metrics* metrics, bool repeated);
+
+}
 }
 
 #line 1 "src/shell/retained.h"
@@ -36140,6 +36676,7 @@ namespace gpui::shell {
 struct MaterializedDependencies;
 class FrozenComponentRegistry;
 struct ComponentAppEffectInstall;
+struct TextStateEntity;
 }
 namespace gpui {
 struct ShellTaskDriver;
@@ -36164,6 +36701,8 @@ class ShellRuntime {
     uint64_t ComponentFailureCount() const;
     ShellRuntime* Retain();
     void Release();
+
+    void SetEditorFiles(bool enabled);
 
     LoadedApplication* LoadApplication(Str directory,
                                        Str entry = StrL("main.js"),
@@ -36265,6 +36804,11 @@ class ShellRuntime {
                                     App* app);
     void DispatchInputEvent(shell::EntityHandle handle, const InputEvent& event,
                             Window* window, App* app);
+
+    void DispatchComponentInput(shell::TextStateEntity* state,
+                                const InputEvent* event, Window* window,
+                                App* app);
+    void RetireTextState(shell::TextStateEntity* state);
     void DispatchSliderEvent(shell::EntityHandle handle,
                              const SliderEvent& event, Window* window,
                              App* app);
@@ -36318,6 +36862,9 @@ void ShellInit(App* app);
 
 void ShellInitWithComponents(App* app,
                              const shell::FrozenComponentRegistry* components);
+
+void ShellAppendAgentsModules(StrBuilder* out,
+                              const shell::FrozenComponentRegistry* components);
 
 }
 
@@ -36423,6 +36970,10 @@ struct ScriptView {
     Vec<RenderSnapshot*> frameSnapshots;
     Policy* policy = nullptr;
     ShellError error = {};
+
+    bool renderBroken = false;
+
+    ShellError reloadError = {};
     EntityId self = {};
 
     uint32_t themeRevision = 0;
@@ -36436,6 +36987,12 @@ struct ScriptView {
     static void Refresh(ScriptView* self, Ctx* cx);
     static bool Reload(ScriptView* self, Ctx* cx, Str directory, Str entry,
                        ShellError* error = nullptr);
+
+    static void SetReloadError(ScriptView* self, Ctx* cx, Str message);
+    static void OnFailureToggle(ScriptView* self, Ctx* cx,
+                                const ClickEvent* event, int64_t slot);
+    static void OnFailureCopy(ScriptView* self, Ctx* cx,
+                              const ClickEvent* event, int64_t slot);
 
     static void OnClick(ScriptView* self, Ctx* cx, const ClickEvent* event,
                         int64_t callback);
@@ -36665,7 +37222,7 @@ int64_t ShellRootNowMs();
 
 namespace gpui::shell {
 
-constexpr const char* kShellVersion = "0.6.0";
+constexpr const char* kShellVersion = "0.7.3";
 constexpr const char* kShellManifestFile = "gpui-shell.json";
 constexpr int kShellMaxManifestBytes = 1024 * 1024;
 
@@ -36711,6 +37268,12 @@ struct PluginManifest {
     bool clipboardWrite = false;
     bool exit = false;
 
+    Vec<Str> env;
+
+    bool hasWindow = false;
+    float windowW = 0;
+    float windowH = 0;
+
     PluginManifest();
     PluginManifest(const PluginManifest&) = delete;
     PluginManifest& operator=(const PluginManifest&) = delete;
@@ -36726,6 +37289,8 @@ bool PluginManifestRead(Str directory, PluginManifest* out,
 void PluginManifestSchema(StrBuilder* out);
 
 Str ShellDataHome();
+
+Str ShellHomeDirectory();
 Str ShellBundleIdForPath(Str root);
 Str ShellAppDataDirectory(Str id, Arena* arena, ShellError* error = nullptr);
 
@@ -36822,6 +37387,9 @@ Str GitDependencyCacheRoot(Str home);
 
 bool GitDependencyUserCacheRoot(Str home, Str userProfile, Str* out,
                                 Str* error);
+
+bool GitDependencyCacheFromEnvironment(Str shellHome, Str home, Str userProfile,
+                                       Str* out, Str* error);
 
 Str GitDependencyRemoteKey(Str git);
 
@@ -37155,23 +37723,77 @@ namespace gpui::shell {
 
 enum class InvocationKind : uint8_t {
     Run,
+
+    Bare,
+    List,
     Check,
     Types,
+    Agents,
+    New,
+
+    Bundle,
     Help,
     Version,
 };
 
+enum class ApplicationKind : uint8_t {
+    None,
+
+    Installed,
+
+    Path,
+
+    Bundled,
+
+    Current,
+};
+
 struct Invocation {
     InvocationKind kind = InvocationKind::Run;
+    ApplicationKind application = ApplicationKind::None;
 
     Str directory;
     bool watch = false;
+
+    bool verbose = false;
     bool development = false;
+
+    bool packaged = false;
     bool printSpec = false;
+
+    bool platformSet = false;
+    BundlePlatform platform = BundlePlatform::Linux;
+    Str icon;
+    Str out;
+    Str downloadUrl;
 };
 
 bool ShellParseInvocation(const char* const* arguments, int count,
                           Invocation* out, Str* error);
+
+void ShellFormatHelp(StrBuilder* out);
+
+Str ShellHome();
+
+Str ShellHomeFrom(Str shellHome, Str home, Str userProfile);
+
+Str ShellApplicationsDirectory();
+
+bool ShellBundledApplication(Str* directory);
+
+bool ShellResolveApplication(const Invocation& invocation, Str* directory,
+                             Str* error);
+
+int ShellListApplications();
+
+bool ShellCreateApplication(Str directory,
+                            const FrozenComponentRegistry* components,
+                            Str* created, Str* error);
+
+Str ShellAgentsText(const FrozenComponentRegistry* components);
+
+bool ShellWriteAgents(Str directory, const FrozenComponentRegistry* components,
+                      Str* written, Str* error);
 
 Window* ShellOpenWindow(App* app, const FrozenComponentRegistry* components,
                         const ComponentWindowOptions& options,
@@ -37213,90 +37835,6 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
                        ProcessCancellation* cancellation, ProcessOutput* out,
                        Str* error, const ProcessOptions* options = nullptr);
 
-}
-
-#line 1 "src/shell/scope.h"
-
-namespace gpui {
-
-class ShellRuntime;
-
-enum class ScopePhase : uint8_t {
-    Render,
-    Event,
-    Task,
-    Layout,
-};
-
-const char* ScopePhaseName(ScopePhase phase);
-bool ScopePhaseAllowsNotify(ScopePhase phase);
-
-namespace shell {
-
-class CallScopeGuard {
-  public:
-    CallScopeGuard(CallScopeGuard&& other) noexcept;
-    CallScopeGuard& operator=(CallScopeGuard&& other) noexcept;
-    CallScopeGuard(const CallScopeGuard&) = delete;
-    CallScopeGuard& operator=(const CallScopeGuard&) = delete;
-    ~CallScopeGuard();
-
-    uint64_t Generation() const { return generation; }
-    bool IsActive() const { return active; }
-
-  private:
-    friend CallScopeGuard ScopeEnter(Window*, App*, ScopePhase, EntityId,
-                                     Policy*, ShellRuntime*, void*);
-    explicit CallScopeGuard(uint64_t generation);
-    void Leave();
-
-    uint64_t generation = 0;
-    bool active = false;
-};
-
-CallScopeGuard ScopeEnter(Window* window, App* app, ScopePhase phase,
-                          EntityId view = {}, Policy* policy = nullptr,
-                          ShellRuntime* runtime = nullptr,
-                          void* application = nullptr);
-void ScopeAdopt(uint64_t generation);
-uint64_t ScopeCurrentGeneration();
-ScopePhase ScopeCurrentPhase();
-bool ScopeHasCurrent();
-Policy* ScopeCurrentPolicy();
-ShellRuntime* ScopeCurrentRuntime();
-EntityId ScopeCurrentView();
-void* ScopeCurrentApplication();
-
-class ScopeHostContext {
-  public:
-    ScopeHostContext(ScopeHostContext&& other) noexcept;
-    ScopeHostContext& operator=(ScopeHostContext&& other) noexcept;
-    ScopeHostContext(const ScopeHostContext&) = delete;
-    ScopeHostContext& operator=(const ScopeHostContext&) = delete;
-    ~ScopeHostContext();
-
-    bool IsSet() const { return held; }
-    Window* GetWindow() const { return window; }
-    App* GetApp() const { return app; }
-
-  private:
-    friend ScopeHostContext ScopeCurrentHost();
-    friend ScopeHostContext ScopeHostForGeneration(uint64_t, ShellError*);
-    ScopeHostContext(Window* window, App* app, bool held);
-    static ScopeHostContext Acquire(Window* window, App* app);
-    void Release();
-
-    Window* window = nullptr;
-    App* app = nullptr;
-    bool held = false;
-};
-
-ScopeHostContext ScopeCurrentHost();
-ScopeHostContext ScopeHostForGeneration(uint64_t generation,
-                                        ShellError* error = nullptr);
-Str ScopeStaleContextMessage();
-
-}
 }
 
 #line 1 "src/shell/watch.h"
@@ -37385,6 +37923,8 @@ bool SecureRandom(uint8_t* bytes, int count);
 
 bool ZlibDeflate(Str input, bool gzip, Str* output, Str* error = nullptr);
 bool ZlibInflate(Str input, bool gzip, Str* output, Str* error = nullptr);
+
+bool ZlibInflateRaw(Str input, Str* output, Str* error = nullptr);
 
 }
 
@@ -39363,6 +39903,8 @@ struct WebViewAttributes {
     void (*onPageLoadHandler)(void* ctx, PageLoadEvent event,
                               Str url) = nullptr;
 
+    void (*processFailedHandler)(void* ctx, int kind) = nullptr;
+
     DownloadStartedHandler downloadStartedHandler = AllowDownload;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;
     DragDropHandler dragDropHandler = nullptr;
@@ -39563,6 +40105,9 @@ struct WebViewHandle {
 struct WebView {
     WebViewHandle owned;
     bool visible = true;
+
+    bool nativeShown = true;
+    bool clipWarned = false;
 
     Bounds bounds = {};
 
