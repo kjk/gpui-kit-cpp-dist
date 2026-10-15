@@ -4556,7 +4556,8 @@ enum class FocusLine : uint8_t {
 struct Style {
 
     const BoxShadow* shadows = nullptr;
-    Str tooltip;
+
+    Str tooltip = {};
 
     float width = kAuto;
     float height = kAuto;
@@ -8455,6 +8456,8 @@ bool ClipboardReadAsync(Window* win, ClipboardReadFn done, void* data);
 void WindowSetTextContentType(Window* win, Str value);
 
 void OpenUrl(Str url);
+
+void OpenPath(Str path);
 
 struct PathPrompt {
 
@@ -26863,6 +26866,11 @@ struct PopupMenuRow {
     Str href = {};
 
     Listener handler = {};
+
+    uint32_t action = 0;
+    int64_t actionArg = 0;
+
+    FocusHandle actionFocus = {};
 };
 
 struct PopupMenuState {
@@ -36403,6 +36411,8 @@ Str ExplainInterruption(Arena* arena, Str message, ScriptInterruption* slot);
 
 Str TidyStack(Arena* arena, Str stack);
 
+Str ExplainOutOfMemory(Arena* arena, void* js, Str message, bool thrownNull);
+
 FailureText FailureTextParse(Arena* arena, Str message);
 
 const char* ViewFailureLabel(ViewFailure failure);
@@ -36742,6 +36752,8 @@ class ShellRuntime {
     void RecordMaterialize(uint64_t nanos);
     void RecordStructure(bool repeated);
     int LiveCallbacks() const;
+
+    int64_t MallocLimit() const;
     int LiveEntities() const;
     int LiveNestedViews() const;
     int LiveTasks() const;
@@ -37829,11 +37841,114 @@ struct ProcessOptions {
     int environmentCount = 0;
 
     bool inheritEnvironment = false;
+
+    double timeoutSeconds = 0;
 };
 
 bool ProcessRunBounded(Str command, const Str* args, int count,
                        ProcessCancellation* cancellation, ProcessOutput* out,
                        Str* error, const ProcessOptions* options = nullptr);
+
+constexpr int kProcessMaxLineBytes = 8 * 1024 * 1024;
+
+struct Utf8Carry {
+    uint8_t pending[4] = {};
+    int pendingLen = 0;
+};
+
+void Utf8CarryInit(Utf8Carry* carry);
+Str Utf8CarryDecode(Utf8Carry* carry, const uint8_t* bytes, int count);
+Str Utf8CarryFinish(Utf8Carry* carry);
+
+struct LineCarry {
+    StrBuilder partial;
+};
+
+void LineCarryInit(LineCarry* carry);
+void LineCarryFree(LineCarry* carry);
+bool LineCarryPush(LineCarry* carry, Str text, Vec<Str>* lines, Str* error);
+Str LineCarryFinish(LineCarry* carry);
+
+struct ProcessSpawnOptions {
+    Str cwd;
+    bool stdinPipe = false;
+    bool lines = false;
+    double timeoutSeconds = 0;
+};
+
+struct ProcessStreamEvent {
+    enum class Kind : uint8_t {
+        Out,
+        Err,
+        Exit
+    };
+    Kind kind = Kind::Out;
+    Str text;
+    bool hasCode = false;
+    int code = 0;
+    Str signal;
+    bool hasError = false;
+
+    void Free();
+};
+
+struct ProcessStream;
+
+bool ProcessStreamStart(Str command, const Str* args, int count,
+                        const ProcessSpawnOptions* options, ProcessStream** out,
+                        Str* error);
+uint32_t ProcessStreamPid(const ProcessStream* stream);
+void ProcessStreamPoll(ProcessStream* stream, Vec<ProcessStreamEvent>* out);
+bool ProcessStreamWrite(ProcessStream* stream, Str text, Str* error);
+void ProcessStreamEnd(ProcessStream* stream);
+void ProcessStreamKill(ProcessStream* stream);
+void ProcessStreamFree(ProcessStream* stream);
+
+struct ProcessEventBox {
+    Mutex mutex;
+    Vec<ProcessStreamEvent> pending;
+    bool killed = false;
+    bool reaped = false;
+    Str reason;
+    Mutex stdinMutex;
+    CondVar stdinCv;
+    Vec<char> stdinBytes;
+    bool stdinPiped = false;
+    bool stdinEnded = false;
+    bool stdinFailed = false;
+    bool stdinStop = false;
+};
+
+struct ProcessDecodeState {
+    Utf8Carry utf8;
+    LineCarry lines;
+    bool lineMode = false;
+};
+
+void ProcessEventBoxInit(ProcessEventBox* box, bool stdinPipe);
+void ProcessEventBoxFree(ProcessEventBox* box);
+void ProcessEventPush(ProcessEventBox* box, ProcessStreamEvent event);
+void ProcessEventTake(ProcessEventBox* box, Vec<ProcessStreamEvent>* out);
+void ProcessEventSetReason(ProcessEventBox* box, Str reason);
+Str ProcessEventTakeReason(ProcessEventBox* box);
+bool ProcessEventKilled(ProcessEventBox* box);
+void ProcessEventMarkKilled(ProcessEventBox* box);
+bool ProcessEventReaped(ProcessEventBox* box);
+void ProcessEventMarkReaped(ProcessEventBox* box);
+bool ProcessStdinEnqueue(ProcessEventBox* box, Str text, Str* error);
+void ProcessStdinEnd(ProcessEventBox* box);
+void ProcessStdinStop(ProcessEventBox* box);
+void ProcessStdinFail(ProcessEventBox* box);
+
+bool ProcessStdinTake(ProcessEventBox* box, Vec<char>* out, bool* ended);
+
+void ProcessDecodeInit(ProcessDecodeState* state, bool lines);
+void ProcessDecodeFree(ProcessDecodeState* state);
+bool ProcessDecodeFeed(ProcessDecodeState* state, ProcessEventBox* box,
+                       ProcessStreamEvent::Kind kind, const uint8_t* bytes,
+                       int count, Str* error);
+void ProcessDecodeFinish(ProcessDecodeState* state, ProcessEventBox* box,
+                         ProcessStreamEvent::Kind kind);
 
 }
 

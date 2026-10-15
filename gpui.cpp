@@ -50246,14 +50246,28 @@ void PopupMenuDismissAll(PopupMenuState* s, Ctx* cx) {
 
 void PopupMenuConfirm(PopupMenuState* s, Ctx* cx, int ix) {
 
-    if (ix >= 0 && ix < len(s->rows) && s->rows[ix].handler.IsValid()) {
-        Listener handler = s->rows[ix].handler;
+    PopupMenuRow row = {};
+    bool have = ix >= 0 && ix < len(s->rows);
+    if (have) {
+        row = s->rows[ix];
+    }
+
+    if (have && row.handler.IsValid()) {
         ClickEvent ev = {};
-        ListenerCall(cx->app, cx->win, handler, &ev);
+        ListenerCall(cx->app, cx->win, row.handler, &ev);
     }
     if (s->onConfirm.IsValid()) {
         ClickEvent ev = {};
         ListenerCall(cx->app, cx->win, ListenerFill(s->onConfirm, ix), &ev);
+    }
+
+    if (have && row.action && !row.handler.IsValid()) {
+        if (row.actionFocus.IsValid()) {
+            WindowDispatchActionAtFocus(cx->win, row.actionFocus, row.action,
+                                        row.actionArg);
+        } else {
+            WindowDispatchAction(cx->win, row.action, row.actionArg);
+        }
     }
 
     PopupMenuDismissAll(s, cx);
@@ -83857,9 +83871,19 @@ static float CodeActionWidth(float x, float windowW) {
 struct CaretMenuAnchor {
     CompletionMenu* completion = nullptr;
     CodeActionMenu* codeAction = nullptr;
+    App* app = nullptr;
+    Window* win = nullptr;
+    uint32_t path = 0;
     float maxW = 0;
     bool vertical = false;
 };
+
+static void AnchorFromCtx(CaretMenuAnchor* anchor, Ctx* cx) {
+    if (!anchor || !cx) return;
+    anchor->app = cx->app;
+    anchor->win = cx->win;
+    anchor->path = cx->path;
+}
 
 static void ShiftMenu(El* e, float dx, float dy) {
     if (!e || (dx == 0.f && dy == 0.f)) return;
@@ -83870,9 +83894,9 @@ static void ShiftMenu(El* e, float dx, float dy) {
     }
 }
 
-static El* CompletionMenuContent(CompletionMenu* self, float maxW,
+static El* CompletionMenuContent(CompletionMenu* self, Ctx* cx, float maxW,
                                  bool vertical);
-static El* CodeActionMenuContent(CodeActionMenu* self, float maxW);
+static El* CodeActionMenuContent(CodeActionMenu* self, Ctx* cx, float maxW);
 
 static void PlaceCaretMenu(PaintCtx* ctx, El* e, void* user) {
     auto* anchor = (CaretMenuAnchor*)user;
@@ -83883,8 +83907,13 @@ static void PlaceCaretMenu(PaintCtx* ctx, El* e, void* user) {
     if (!state) return;
     float x = CaretPopupX(state);
     float y = CaretPopupY(state);
-    Ctx* cx =
-        anchor->completion ? anchor->completion->cx : anchor->codeAction->cx;
+
+    Ctx frame = {};
+    frame.app = anchor->app ? anchor->app : (ctx ? ctx->app : nullptr);
+    frame.win = anchor->win ? anchor->win : (ctx ? ctx->window : nullptr);
+    frame.a = e->arena;
+    frame.path = anchor->path;
+    Ctx* cx = &frame;
     float windowW = PopupWindowW(cx, ctx);
     bool rebuild = false;
     float maxW = anchor->maxW;
@@ -83908,8 +83937,8 @@ static void PlaceCaretMenu(PaintCtx* ctx, El* e, void* user) {
     e->last = nullptr;
     El* content =
         anchor->completion
-            ? CompletionMenuContent(anchor->completion, maxW, vertical)
-            : CodeActionMenuContent(anchor->codeAction, maxW);
+            ? CompletionMenuContent(anchor->completion, cx, maxW, vertical)
+            : CodeActionMenuContent(anchor->codeAction, cx, maxW);
     if (!content) return;
     LayoutEl(ctx, content, x, y, 0, 0, e->laidFont, e->style.color);
     e->Child(content);
@@ -83931,11 +83960,12 @@ El* CompletionMenu::IntoEl() {
     MenuWidth width = CompletionWidth(x, editor->completionMenuMaxW, windowW);
     Entity<InputMenuViewState> view =
         InputMenuView(cx, editor, "completion-menu");
-    El* content = CompletionMenuContent(this, width.maxW, width.vertical);
+    El* content = CompletionMenuContent(this, cx, width.maxW, width.vertical);
     auto* anchor = ArenaNew<CaretMenuAnchor>(a);
     anchor->completion = this;
     anchor->maxW = width.maxW;
     anchor->vertical = width.vertical;
+    AnchorFromCtx(anchor, cx);
     El* root = Div(a)
                    ->Fixed()
                    ->Left(x)
@@ -83949,10 +83979,9 @@ El* CompletionMenu::IntoEl() {
     return root;
 }
 
-static El* CompletionMenuContent(CompletionMenu* self, float maxW,
+static El* CompletionMenuContent(CompletionMenu* self, Ctx* cx, float maxW,
                                  bool vertical) {
-    if (!self || !self->editor) return nullptr;
-    Ctx* cx = self->cx;
+    if (!self || !self->editor || !cx) return nullptr;
     Arena* a = self->a;
     InputState* editor = self->editor;
     const Theme& theme = ThemeNow(cx->app);
@@ -84072,10 +84101,11 @@ El* CodeActionMenu::IntoEl() {
     float maxW = CodeActionWidth(x, windowW);
     Entity<InputMenuViewState> view =
         InputMenuView(cx, state, "code-action-menu");
-    El* content = CodeActionMenuContent(this, maxW);
+    El* content = CodeActionMenuContent(this, cx, maxW);
     auto* anchor = ArenaNew<CaretMenuAnchor>(a);
     anchor->codeAction = this;
     anchor->maxW = maxW;
+    AnchorFromCtx(anchor, cx);
     El* root = Div(a)
                    ->Fixed()
                    ->Left(x)
@@ -84089,9 +84119,8 @@ El* CodeActionMenu::IntoEl() {
     return root;
 }
 
-static El* CodeActionMenuContent(CodeActionMenu* self, float maxW) {
-    if (!self || !self->state) return nullptr;
-    Ctx* cx = self->cx;
+static El* CodeActionMenuContent(CodeActionMenu* self, Ctx* cx, float maxW) {
+    if (!self || !self->state || !cx) return nullptr;
     Arena* a = self->a;
     InputState* state = self->state;
     const Theme& theme = ThemeNow(cx->app);
@@ -90461,6 +90490,27 @@ PopupMenu* PopupMenu::ExternalLinkIcon(bool v) {
     return this;
 }
 
+static FocusHandle MenuActionFocus(PopupMenuState* s, Ctx* cx,
+                                   const char* actionContext) {
+    FocusHandle target = {};
+    if (!actionContext || !s || !cx) {
+        return target;
+    }
+    target = s->previousFocus;
+    Entity<PopupMenuState> parent = s->parent;
+    while (parent.IsValid()) {
+        PopupMenuState* up = parent.Get(cx);
+        if (!up) {
+            break;
+        }
+        if (up->previousFocus.IsValid()) {
+            target = up->previousFocus;
+        }
+        parent = up->parent;
+    }
+    return target;
+}
+
 static void OnPopupLinkClick(PopupMenuState* state, Ctx* cx, const ClickEvent*,
                              int64_t hrefPtr) {
     const Str* href = (const Str*)hrefPtr;
@@ -90557,6 +90607,7 @@ El* PopupMenu::IntoEl() {
         ->OnAction(action::SelectLeft(), onAction)
         ->OnAction(action::SelectRight(), onAction);
 
+    FocusHandle actionFocus = MenuActionFocus(s, cx, actionContext);
     PopupMenuBeginRows(s);
     for (const MenuItem& it : items) {
         PopupMenuRow row;
@@ -90566,6 +90617,13 @@ El* PopupMenu::IntoEl() {
         row.link = it.isLink;
         row.href = it.href;
         row.handler = it.onClick;
+
+        if (it.action && !it.onClick.IsValid() && !it.submenu &&
+            !(it.isLink && it.href.s)) {
+            row.action = it.action;
+            row.actionArg = it.actionArg;
+            row.actionFocus = actionFocus;
+        }
         PopupMenuAddRow(s, row);
     }
 
@@ -90705,29 +90763,6 @@ El* PopupMenu::IntoEl() {
             } else {
                 BindClick(row, StrDup(a, fmt("%d", i)), ListenerArg(click, i));
 
-                if (it.action && !it.onClick.IsValid()) {
-
-                    FocusHandle target = {};
-                    if (actionContext && s) {
-                        target = s->previousFocus;
-                        Entity<PopupMenuState> parent = s->parent;
-                        while (parent.IsValid()) {
-                            PopupMenuState* up = parent.Get(cx);
-                            if (!up) {
-                                break;
-                            }
-                            if (up->previousFocus.IsValid()) {
-                                target = up->previousFocus;
-                            }
-                            parent = up->parent;
-                        }
-                    }
-                    if (target.IsValid()) {
-                        row->OnClickActionAt(it.action, target, it.actionArg);
-                    } else {
-                        row->OnClickAction(it.action, it.actionArg);
-                    }
-                }
                 row->OnHover(ListenerArg(hover, i));
             }
         }
@@ -160095,7 +160130,7 @@ Str TidyStack(Arena* arena, Str stack) {
         while (end < len(stack) && stack.s[end] != '\n') end++;
         Str raw(stack.s + at, end - at);
         at = end < len(stack) ? end + 1 : end + 1;
-        if (LineBlank(raw)) {
+        if (LineBlank(raw) || StrContains(raw, StrL("(eval_script:"))) {
             if (end >= len(stack)) break;
             continue;
         }
@@ -160139,6 +160174,43 @@ Str TidyStack(Arena* arena, Str stack) {
         }
     }
     return out.TakeStr();
+}
+
+static const char kMemoryAdvice[] =
+    "Keep less data in script \xE2\x80\x94 derive values instead of storing "
+    "them on every item \xE2\x80\x94 or move a large data set into a host "
+    "module.";
+
+static Str SpokenSize(Arena* arena, int64_t bytes) {
+    if (bytes >= ((int64_t)1 << 30) && (bytes % ((int64_t)1 << 30)) == 0) {
+        return Dup(arena, fmt("%d GiB", (int)(bytes >> 30)));
+    }
+    return Dup(arena, fmt("%d MiB", (int)(bytes >> 20)));
+}
+
+Str ExplainOutOfMemory(Arena* arena, void* js, Str message, bool thrownNull) {
+    if (!arena || !js) return {};
+    JSContext* ctx = (JSContext*)js;
+    JSRuntime* rt = JS_GetRuntime(ctx);
+    if (!rt) return {};
+    JSMemoryUsage usage;
+    memset(&usage, 0, sizeof(usage));
+    JS_ComputeMemoryUsage(rt, &usage);
+    bool limited =
+        usage.malloc_limit > 0 && usage.malloc_limit < (INT64_MAX / 2);
+    bool nearlyFull = limited && (double)usage.malloc_size >=
+                                     0.9 * (double)usage.malloc_limit;
+    bool oom = StrEq(message, StrL("out of memory"));
+    if (!oom && !(thrownNull && nearlyFull)) return {};
+    if (oom && !limited) {
+        return Dup(arena, fmt("The script ran out of memory: the system could "
+                              "not allocate more.\n%s",
+                              Str(kMemoryAdvice)));
+    }
+    Str size = SpokenSize(arena, usage.malloc_limit);
+    return Dup(arena, fmt("The script ran out of memory: its JavaScript heap "
+                          "reached the %s limit this host set.\n%s",
+                          size, Str(kMemoryAdvice)));
 }
 
 static bool shell_failure_IsSpace(char c) {
@@ -161460,6 +161532,35 @@ source of truth over this guide.
   "storage": true,
   "clipboard": { "write": true }
 }
+```
+
+- `process.run(command, args, { cwd, timeoutMs })` waits for a command to
+  finish (30 s unless `timeoutMs` says otherwise). For one that runs longer,
+  reads stdin, or should be read as it works — an AI command line in JSON-lines
+  mode — use `process.spawn`. Same grant (`capabilities.fs.execute`), same empty
+  environment; handlers run on the UI thread with a `cx`, `exit` fires once
+  after the last output, and the child is killed when the view goes away, the
+  application reloads or the window closes:
+
+```js
+import process from "process";
+
+const child = process.spawn("claude", ["-p", prompt, "--output-format", "stream-json"], {
+  cwd: projectDir, // inside capabilities.fs.read
+  lines: true,
+});
+child
+  .on("stdout", (line, cx) => {
+    if (!line.trim()) return;
+    this.events.push(JSON.parse(line));
+    cx.notify();
+  })
+  .on("exit", ({ code, signal, error }, cx) => {
+    this.running = false;
+    this.failure = error ?? (code === 0 ? null : `exited with ${code ?? signal}`);
+    cx.notify();
+  });
+// child.kill() to stop it; { stdin: "pipe" } and child.write(text) / child.end() to talk to it.
 ```
 
 - `console.log` / `console.error` go to the terminal running `{name}`.
@@ -167973,6 +168074,378 @@ void ProcessOutput::Free() {
     *this = {};
 }
 
+void ProcessStreamEvent::Free() {
+    StrFree(text);
+    StrFree(signal);
+    text = {};
+    signal = {};
+    hasCode = false;
+    hasError = false;
+    code = 0;
+    kind = Kind::Out;
+}
+
+void Utf8CarryInit(Utf8Carry* carry) {
+    if (carry) carry->pendingLen = 0;
+}
+
+static int Utf8Width(uint8_t lead) {
+    if ((lead & 0x80) == 0) return 1;
+    if ((lead & 0xE0) == 0xC0) return 2;
+    if ((lead & 0xF0) == 0xE0) return 3;
+    if ((lead & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+
+static bool Utf8SequenceOk(const uint8_t* bytes, int width) {
+    if (width <= 1) return width == 1;
+    for (int i = 1; i < width; i++) {
+        if ((bytes[i] & 0xC0) != 0x80) return false;
+    }
+    uint32_t cp = 0;
+    if (width == 2) {
+        cp = ((uint32_t)(bytes[0] & 0x1F) << 6) | (bytes[1] & 0x3F);
+        if (cp < 0x80) return false;
+    } else if (width == 3) {
+        cp = ((uint32_t)(bytes[0] & 0x0F) << 12) |
+             ((uint32_t)(bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+        if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+    } else {
+        cp = ((uint32_t)(bytes[0] & 0x07) << 18) |
+             ((uint32_t)(bytes[1] & 0x3F) << 12) |
+             ((uint32_t)(bytes[2] & 0x3F) << 6) | (bytes[3] & 0x3F);
+        if (cp < 0x10000 || cp > 0x10FFFF) return false;
+    }
+    return true;
+}
+
+static Str DecodeBytes(Utf8Carry* carry, const uint8_t* bytes, int count,
+                       bool finish) {
+    int incoming = count > 0 ? count : 0;
+    int total = carry->pendingLen + incoming;
+    if (total <= 0) {
+        carry->pendingLen = 0;
+        return {};
+    }
+    uint8_t* buf = AllocArray<uint8_t>(total);
+    if (!buf) return {};
+    for (int i = 0; i < carry->pendingLen; i++) buf[i] = carry->pending[i];
+    if (incoming > 0) memcpy(buf + carry->pendingLen, bytes, (size_t)incoming);
+    StrBuilder out;
+    int i = 0;
+    while (i < total) {
+        int width = Utf8Width(buf[i]);
+        if (width == 0) {
+            out.Append(StrL("\xEF\xBF\xBD"));
+            i++;
+            continue;
+        }
+        if (i + width > total) {
+            if (finish) {
+                out.Append(StrL("\xEF\xBF\xBD"));
+                i = total;
+            }
+            break;
+        }
+        if (!Utf8SequenceOk(buf + i, width)) {
+            out.Append(StrL("\xEF\xBF\xBD"));
+            i++;
+            continue;
+        }
+        out.Append(Str((const char*)buf + i, width));
+        i += width;
+    }
+    carry->pendingLen = 0;
+    if (!finish && i < total) {
+        int tail = total - i;
+        if (tail > 4) tail = 4;
+        for (int n = 0; n < tail; n++) carry->pending[n] = buf[i + n];
+        carry->pendingLen = tail;
+    }
+    Free(nullptr, buf);
+    return out.TakeStr();
+}
+
+Str Utf8CarryDecode(Utf8Carry* carry, const uint8_t* bytes, int count) {
+    if (!carry) return {};
+    return DecodeBytes(carry, bytes, count, false);
+}
+
+Str Utf8CarryFinish(Utf8Carry* carry) {
+    if (!carry) return {};
+    return DecodeBytes(carry, nullptr, 0, true);
+}
+
+void LineCarryInit(LineCarry* carry) {
+    (void)carry;
+}
+
+void LineCarryFree(LineCarry* carry) {
+    if (carry) VecReset(carry->partial);
+}
+
+bool LineCarryPush(LineCarry* carry, Str text, Vec<Str>* lines, Str* error) {
+    if (!carry) return false;
+    int at = 0;
+    while (at < len(text)) {
+        int newline = at;
+        while (newline < len(text) && text.s[newline] != '\n') newline++;
+        if (newline >= len(text)) break;
+        carry->partial.Append(Str(text.s + at, newline - at));
+        if (carry->partial.len > 0 &&
+            carry->partial.els[carry->partial.len - 1] == '\r') {
+            carry->partial.len--;
+        }
+        Str line = carry->partial.TakeStr();
+        if (lines) {
+            if (!VecAppend(*lines, line)) StrFree(line);
+        } else {
+            StrFree(line);
+        }
+        at = newline + 1;
+    }
+    if (at < len(text)) carry->partial.Append(Str(text.s + at, len(text) - at));
+    if (carry->partial.len > kProcessMaxLineBytes) {
+        if (error) {
+            StrFree(*error);
+            *error =
+                StrDup(fmt("a line of output exceeded %d MiB without a "
+                           "newline",
+                           kProcessMaxLineBytes >> 20));
+        }
+        return false;
+    }
+    return true;
+}
+
+Str LineCarryFinish(LineCarry* carry) {
+    if (!carry || carry->partial.len <= 0) return {};
+    return carry->partial.TakeStr();
+}
+
+void ProcessEventBoxInit(ProcessEventBox* box, bool stdinPipe) {
+    if (!box) return;
+    box->stdinPiped = stdinPipe;
+}
+
+void ProcessEventBoxFree(ProcessEventBox* box) {
+    if (!box) return;
+    for (int i = 0; i < len(box->pending); i++) box->pending[i].Free();
+    VecReset(box->pending);
+    StrFree(box->reason);
+    box->reason = {};
+    VecReset(box->stdinBytes);
+}
+
+void ProcessEventPush(ProcessEventBox* box, ProcessStreamEvent event) {
+    if (!box) {
+        event.Free();
+        return;
+    }
+    box->mutex.Lock();
+    if (!VecAppend(box->pending, event)) event.Free();
+    box->mutex.Unlock();
+}
+
+void ProcessEventTake(ProcessEventBox* box, Vec<ProcessStreamEvent>* out) {
+    if (!box || !out) return;
+    box->mutex.Lock();
+    for (int i = 0; i < len(box->pending); i++)
+        VecAppend(*out, box->pending[i]);
+    box->pending.len = 0;
+    box->mutex.Unlock();
+}
+
+void ProcessEventSetReason(ProcessEventBox* box, Str reason) {
+    if (!box) {
+        StrFree(reason);
+        return;
+    }
+    box->mutex.Lock();
+    if (box->reason) {
+        StrFree(reason);
+    } else {
+        box->reason = reason;
+    }
+    box->mutex.Unlock();
+}
+
+Str ProcessEventTakeReason(ProcessEventBox* box) {
+    if (!box) return {};
+    box->mutex.Lock();
+    Str reason = box->reason;
+    box->reason = {};
+    box->mutex.Unlock();
+    return reason;
+}
+
+bool ProcessEventKilled(ProcessEventBox* box) {
+    if (!box) return false;
+    box->mutex.Lock();
+    bool killed = box->killed;
+    box->mutex.Unlock();
+    return killed;
+}
+
+void ProcessEventMarkKilled(ProcessEventBox* box) {
+    if (!box) return;
+    box->mutex.Lock();
+    box->killed = true;
+    box->mutex.Unlock();
+}
+
+bool ProcessEventReaped(ProcessEventBox* box) {
+    if (!box) return false;
+    box->mutex.Lock();
+    bool reaped = box->reaped;
+    box->mutex.Unlock();
+    return reaped;
+}
+
+void ProcessEventMarkReaped(ProcessEventBox* box) {
+    if (!box) return;
+    box->mutex.Lock();
+    box->reaped = true;
+    box->mutex.Unlock();
+}
+
+bool ProcessStdinEnqueue(ProcessEventBox* box, Str text, Str* error) {
+    if (!box) return false;
+    box->stdinMutex.Lock();
+    if (!box->stdinPiped) {
+        box->stdinMutex.Unlock();
+        if (error)
+            *error = StrDup(StrL(
+                "ChildProcess.write(text) needs a child spawned with { stdin: "
+                "\"pipe\" }"));
+        return false;
+    }
+    if (box->stdinEnded) {
+        box->stdinMutex.Unlock();
+        if (error) *error = StrDup(StrL("stdin has already been closed"));
+        return false;
+    }
+    if (box->stdinFailed || box->stdinStop) {
+        box->stdinMutex.Unlock();
+        if (error)
+            *error = StrDup(
+                StrL("stdin is closed: the process is no longer reading it"));
+        return false;
+    }
+    for (int i = 0; i < len(text); i++) VecAppend(box->stdinBytes, text.s[i]);
+    box->stdinCv.WakeOne();
+    box->stdinMutex.Unlock();
+    return true;
+}
+
+void ProcessStdinEnd(ProcessEventBox* box) {
+    if (!box) return;
+    box->stdinMutex.Lock();
+    box->stdinEnded = true;
+    box->stdinCv.WakeOne();
+    box->stdinMutex.Unlock();
+}
+
+void ProcessStdinStop(ProcessEventBox* box) {
+    if (!box) return;
+    box->stdinMutex.Lock();
+    box->stdinStop = true;
+    box->stdinCv.WakeOne();
+    box->stdinMutex.Unlock();
+}
+
+void ProcessStdinFail(ProcessEventBox* box) {
+    if (!box) return;
+    box->stdinMutex.Lock();
+    box->stdinFailed = true;
+    box->stdinCv.WakeOne();
+    box->stdinMutex.Unlock();
+}
+
+bool ProcessStdinTake(ProcessEventBox* box, Vec<char>* out, bool* ended) {
+    if (ended) *ended = false;
+    if (!box || !out) return false;
+    box->stdinMutex.Lock();
+    while (box->stdinBytes.len == 0 && !box->stdinEnded && !box->stdinStop &&
+           !box->stdinFailed) {
+        box->stdinCv.Wait(&box->stdinMutex, 200);
+    }
+    bool stop = box->stdinStop || box->stdinFailed;
+    bool done = box->stdinEnded;
+    if (box->stdinBytes.len > 0 && !stop) {
+        for (int i = 0; i < box->stdinBytes.len; i++)
+            VecAppend(*out, box->stdinBytes[i]);
+        box->stdinBytes.len = 0;
+        if (ended) *ended = done;
+        box->stdinMutex.Unlock();
+        return true;
+    }
+    box->stdinMutex.Unlock();
+    if (ended) *ended = done;
+    return false;
+}
+
+void ProcessDecodeInit(ProcessDecodeState* state, bool lines) {
+    if (!state) return;
+    Utf8CarryInit(&state->utf8);
+    LineCarryInit(&state->lines);
+    state->lineMode = lines;
+}
+
+void ProcessDecodeFree(ProcessDecodeState* state) {
+    if (state) LineCarryFree(&state->lines);
+}
+
+static void PushText(ProcessEventBox* box, ProcessStreamEvent::Kind kind,
+                     Str text) {
+    if (!text) return;
+    ProcessStreamEvent event;
+    event.kind = kind;
+    event.text = text;
+    ProcessEventPush(box, event);
+}
+
+bool ProcessDecodeFeed(ProcessDecodeState* state, ProcessEventBox* box,
+                       ProcessStreamEvent::Kind kind, const uint8_t* bytes,
+                       int count, Str* error) {
+    if (!state || !box) return false;
+    Str text = Utf8CarryDecode(&state->utf8, bytes, count);
+    if (!state->lineMode) {
+        PushText(box, kind, text);
+        return true;
+    }
+    Vec<Str> lines;
+    bool ok = LineCarryPush(&state->lines, text, &lines, error);
+    StrFree(text);
+    for (int i = 0; i < len(lines); i++) {
+        if (ok)
+            PushText(box, kind, lines[i]);
+        else
+            StrFree(lines[i]);
+    }
+    VecReset(lines);
+    return ok;
+}
+
+void ProcessDecodeFinish(ProcessDecodeState* state, ProcessEventBox* box,
+                         ProcessStreamEvent::Kind kind) {
+    if (!state || !box) return;
+    Str rest = Utf8CarryFinish(&state->utf8);
+    if (!state->lineMode) {
+        PushText(box, kind, rest);
+        return;
+    }
+    Vec<Str> lines;
+    Str ignored;
+    LineCarryPush(&state->lines, rest, &lines, &ignored);
+    StrFree(rest);
+    StrFree(ignored);
+    for (int i = 0; i < len(lines); i++) PushText(box, kind, lines[i]);
+    VecReset(lines);
+    Str tail = LineCarryFinish(&state->lines);
+    PushText(box, kind, tail);
+}
+
 }
 
 #line 1 "src/shell/retained.cpp"
@@ -169155,6 +169628,7 @@ enum class ShellTaskKind : uint8_t {
     Fetch,
     StorageFlush,
     HostAsync,
+    ProcessStream,
 };
 
 struct ProcessJob;
@@ -169177,6 +169651,9 @@ struct ShellTask {
     ProcessJob* processJob = nullptr;
     FsJob* fsJob = nullptr;
     StorageFlushState* storageFlush = nullptr;
+
+    shell::ProcessStream* processStream = nullptr;
+    int streamId = 0;
 };
 
 struct ShellTaskDriver {
@@ -169210,6 +169687,8 @@ struct CallbackArena {
     int buildingStart = 0;
     bool building = false;
     bool tokenRender = false;
+
+    bool layoutHandlers = false;
     uint64_t tokenGeneration = 0;
     uint32_t tokenFrame = 0;
 
@@ -169372,6 +169851,8 @@ struct CallbackArena {
         }
         return count;
     }
+
+    bool HasStaged() const { return building && len(entries) > buildingStart; }
 };
 
 struct ScriptPanelClass;
@@ -169421,6 +169902,8 @@ struct ShellRuntimeImpl {
     Vec<ScriptPanelClass*> panelClasses;
     Vec<ChromeCacheEntry*> chromeCache;
     Vec<ShellTask*> tasks;
+
+    Vec<shell::ProcessStream*> streams;
     Entity<ShellTaskDriver> taskDriver = {};
     App* taskApp = nullptr;
     uint32_t nextTask = 1;
@@ -169570,6 +170053,9 @@ struct ProcessJob {
     shell::ProcessCancellation cancellation;
     Str command;
     Vec<Str> args;
+    Str cwd;
+
+    double timeoutSeconds = 0;
     shell::ProcessOutput output;
     Str error;
 
@@ -169577,6 +170063,7 @@ struct ProcessJob {
         for (int i = 0; i < len(args); i++) StrFree(args[i]);
         VecReset(args);
         StrFree(command);
+        StrFree(cwd);
         output.Free();
         StrFree(error);
     }
@@ -169710,6 +170197,15 @@ static void DestroyTask(ShellRuntimeImpl* impl, ShellTask* task,
         WindowCancelTimer(task->window, task->timer);
     }
     if (task->processJob) task->processJob->cancellation.Cancel();
+    if (task->processStream) {
+        shell::ProcessStreamKill(task->processStream);
+        shell::ProcessStreamFree(task->processStream);
+        task->processStream = nullptr;
+        if (impl && task->streamId > 0 && task->streamId <= impl->streams.len) {
+            impl->streams[task->streamId - 1] = nullptr;
+        }
+        task->streamId = 0;
+    }
     if (task->storageFlush) {
         StorageFlushState* state = task->storageFlush;
         state->storage->CancelWaiter(state->waiter);
@@ -169776,8 +170272,12 @@ static Str ExceptionText(Arena* arena, JSContext* ctx);
 static void DriveStorage(Policy* policy);
 
 static void ProcessJobWork(ProcessJob* job) {
+    shell::ProcessOptions options;
+    options.workingDirectory = job->cwd;
+    options.timeoutSeconds = job->timeoutSeconds;
     shell::ProcessRunBounded(job->command, job->args.els, job->args.len,
-                             &job->cancellation, &job->output, &job->error);
+                             &job->cancellation, &job->output, &job->error,
+                             &options);
 }
 
 static void DetachTaskJob(ShellTask* task) {
@@ -170289,6 +170789,7 @@ static Str ExceptionText(Arena* arena, JSContext* ctx) {
         Str raw = JsProp(arena, ctx, exception, "message");
         if (!raw) raw = JsText(arena, ctx, exception);
         Str explained = ExplainInterruption(arena, raw, &gInterruption);
+        if (!explained) explained = ExplainOutOfMemory(arena, ctx, raw, false);
         if (explained) {
             out.Append(explained);
         } else {
@@ -170321,12 +170822,19 @@ static Str ExceptionText(Arena* arena, JSContext* ctx) {
         Str text = JsText(arena, ctx, exception);
         out.Append(text ? text : StrL("JavaScript exception"));
     } else if (JS_IsNull(exception) || JS_IsUndefined(exception)) {
-        out.Append(StrL("A script threw "));
-        out.Append(JS_IsNull(exception) ? StrL("null") : StrL("undefined"));
-        out.Append(
-            StrL(" instead of an Error.\n"
-                 "Throw an Error with a message so the failure says what went "
-                 "wrong and where."));
+        Str explained = JS_IsNull(exception)
+                            ? ExplainOutOfMemory(arena, ctx, {}, true)
+                            : Str{};
+        if (explained) {
+            out.Append(explained);
+        } else {
+            out.Append(StrL("A script threw "));
+            out.Append(JS_IsNull(exception) ? StrL("null") : StrL("undefined"));
+            out.Append(StrL(
+                " instead of an Error.\n"
+                "Throw an Error with a message so the failure says what went "
+                "wrong and where."));
+        }
     } else {
         JSValue json =
             JS_JSONStringify(ctx, exception, JS_UNDEFINED, JS_UNDEFINED);
@@ -172597,7 +173105,7 @@ static JSValue NativeApply(JSContext* ctx, JSValueConst, int argc,
     if (actionCallback || buttonCallback) {
 
         if (shell::ScopeCurrentPhase() == ScopePhase::Layout &&
-            !impl->callbacks.tokenRender) {
+            !impl->callbacks.tokenRender && !impl->callbacks.layoutHandlers) {
             JSValue thrown = JS_ThrowTypeError(
                 ctx,
                 "`%.*s` cannot be registered from a virtual list's item "
@@ -172682,17 +173190,17 @@ static JSValue NativeApply(JSContext* ctx, JSValueConst, int argc,
     shell::SlotSiteKind slotSite = shell::SlotSiteKind::Handler;
     if (IsCallbackMethod(name)) {
         if (shell::ScopeCurrentPhase() == ScopePhase::Layout &&
-            !impl->callbacks.tokenRender) {
+            !impl->callbacks.tokenRender && !impl->callbacks.layoutHandlers) {
             ArenaDelete(arena);
             return JS_ThrowTypeError(
                 ctx,
-                "callbacks cannot be registered from a virtual list's item "
-                "renderer: the rows are rebuilt every frame, so a handler "
-                "registered there would pile up for as long as the view "
-                "stood. Use `on_item_click((key, cx) => ...)` or "
-                "`on_item_secondary_click((key, event, cx) => ...)` on the "
-                "list itself, and read the row out of your own data with the "
-                "stable key it gives you");
+                "`%.*s` cannot be registered here: this renderer runs during "
+                "layout with no handler lifetime of its own, so a handler "
+                "registered from it would pile up for as long as the view "
+                "stood. Register it from render(), or on a virtual list use "
+                "`on_item_click((key, cx) => ...)` and read the row out of "
+                "your own data with the key it gives you",
+                len(name), name.s);
         }
         JSValue handler =
             argCount > 0 ? JS_GetPropertyUint32(ctx, argv[2], 0) : JS_UNDEFINED;
@@ -175435,6 +175943,254 @@ static JSValue NativeOpenUrl(JSContext* ctx, JSValueConst, int argc,
     return JS_UNDEFINED;
 }
 
+static Str GrantDenial(Arena* arena, const CapabilityError& error) {
+    Str message = CapabilityErrorMessage(arena, error);
+    if (error.kind != CapabilityErrorKind::OutsideRoots) return message;
+    const char* access =
+        error.access == CapabilityAccess::Read ? "read" : "write";
+    return StrDup(arena, fmt("%s; add its directory to capabilities.fs.%s in "
+                             "the manifest",
+                             message, Str(access)));
+}
+
+static Str JoinGrantedPath(Arena* arena, const CapabilityPath& path) {
+    if (!path.relative.s || len(path.relative) == 0 ||
+        StrEq(path.relative, StrL("."))) {
+        return arena ? StrDup(arena, path.root) : StrDup(path.root);
+    }
+    char sep = '/';
+    for (int i = 0; path.root.s && i < len(path.root); i++) {
+        if (path.root.s[i] == '\\') {
+            sep = '\\';
+            break;
+        }
+    }
+    TempStr joined = fmt("%s%c%s", path.root, sep, path.relative);
+    return arena ? StrDup(arena, joined) : StrDup(joined);
+}
+
+static void ClearHeapStr(Str* value) {
+    if (!value) return;
+    StrFree(*value);
+    *value = {};
+}
+
+static bool ParseProcessOptions(JSContext* ctx, JSValueConst value,
+                                const char* api, bool spawn, Arena* arena,
+                                Str* cwd, double* timeoutSeconds,
+                                bool* stdinPipe, bool* lines) {
+    if (cwd) *cwd = {};
+    if (timeoutSeconds) *timeoutSeconds = 0;
+    if (stdinPipe) *stdinPipe = false;
+    if (lines) *lines = false;
+    if (JS_IsUndefined(value) || JS_IsNull(value) || JS_IsArray(value) ||
+        !JS_IsObject(value)) {
+        return true;
+    }
+
+    JSValue cwdValue = JS_GetPropertyStr(ctx, value, "cwd");
+    if (JS_IsException(cwdValue)) return false;
+    if (!JS_IsUndefined(cwdValue) && !JS_IsNull(cwdValue)) {
+        if (!JS_IsString(cwdValue)) {
+            JS_FreeValue(ctx, cwdValue);
+            JS_ThrowTypeError(ctx, "%s: options.cwd must be a string", api);
+            return false;
+        }
+        Str text;
+        if (!JsString(ctx, cwdValue, arena, &text)) {
+            JS_FreeValue(ctx, cwdValue);
+            return false;
+        }
+        JS_FreeValue(ctx, cwdValue);
+        bool release = false;
+        Policy* policy = CurrentPolicy(&release);
+        CapabilityPath granted;
+        CapabilityError denied = {};
+        bool resolved = PolicyCapabilities(policy).ResolvePath(
+            text, CapabilityAccess::Read, &granted, &denied);
+        if (release) PolicyRelease(policy);
+        if (!resolved) {
+            Str message = GrantDenial(arena, denied);
+            JS_ThrowTypeError(ctx, "%s: %.*s", api, len(message), message.s);
+            CapabilityErrorFree(&denied);
+            granted.Free();
+            return false;
+        }
+        CapabilityErrorFree(&denied);
+        shell::FsResult stat;
+        Str fsError;
+        bool directory =
+            shell::FsRun(shell::FsOperation::Stat, granted.root,
+                         granted.relative, {}, false, &stat, &fsError) &&
+            stat.isDirectory;
+        stat.Free();
+        StrFree(fsError);
+        if (!directory) {
+            JS_ThrowTypeError(ctx, "%s: options.cwd `%.*s` is not a directory",
+                              api, len(text), text.s);
+            granted.Free();
+            return false;
+        }
+        if (cwd) *cwd = JoinGrantedPath(nullptr, granted);
+        granted.Free();
+        if (cwd && !cwd->s) {
+            JS_ThrowOutOfMemory(ctx);
+            return false;
+        }
+    } else {
+        JS_FreeValue(ctx, cwdValue);
+    }
+
+    JSValue timeout = JS_GetPropertyStr(ctx, value, "timeoutMs");
+    if (JS_IsException(timeout)) {
+        ClearHeapStr(cwd);
+        return false;
+    }
+    if (!JS_IsUndefined(timeout) && !JS_IsNull(timeout)) {
+        double ms = 0;
+        bool number = JS_IsNumber(timeout) &&
+                      JS_ToFloat64(ctx, &ms, timeout) >= 0 && ms > 0 &&
+                      ms <= 4294967295.0;
+        JS_FreeValue(ctx, timeout);
+        if (!number) {
+            if (!JS_HasException(ctx)) {
+                JS_ThrowTypeError(ctx,
+                                  "%s: options.timeoutMs must be a positive "
+                                  "number of milliseconds",
+                                  api);
+            }
+            ClearHeapStr(cwd);
+            return false;
+        }
+        if (timeoutSeconds) *timeoutSeconds = ms / 1000.0;
+    } else {
+        JS_FreeValue(ctx, timeout);
+    }
+
+    if (!spawn) return true;
+
+    JSValue stdinValue = JS_GetPropertyStr(ctx, value, "stdin");
+    if (JS_IsException(stdinValue)) {
+        ClearHeapStr(cwd);
+        return false;
+    }
+    if (!JS_IsUndefined(stdinValue)) {
+        Str mode;
+        bool text =
+            JS_IsString(stdinValue) && JsString(ctx, stdinValue, arena, &mode);
+        JS_FreeValue(ctx, stdinValue);
+        if (!text ||
+            (!StrEq(mode, StrL("pipe")) && !StrEq(mode, StrL("null")))) {
+            if (!JS_HasException(ctx)) {
+                JS_ThrowTypeError(
+                    ctx, "%s: options.stdin must be \"pipe\" or \"null\"", api);
+            }
+            ClearHeapStr(cwd);
+            return false;
+        }
+        if (stdinPipe) *stdinPipe = StrEq(mode, StrL("pipe"));
+    } else {
+        JS_FreeValue(ctx, stdinValue);
+    }
+
+    JSValue linesValue = JS_GetPropertyStr(ctx, value, "lines");
+    if (JS_IsException(linesValue)) {
+        ClearHeapStr(cwd);
+        return false;
+    }
+    if (!JS_IsUndefined(linesValue)) {
+        if (!JS_IsBool(linesValue)) {
+            JS_FreeValue(ctx, linesValue);
+            JS_ThrowTypeError(ctx, "%s: options.lines must be a boolean", api);
+            ClearHeapStr(cwd);
+            return false;
+        }
+        if (lines) *lines = JS_ToBool(ctx, linesValue) != 0;
+        JS_FreeValue(ctx, linesValue);
+    } else {
+        JS_FreeValue(ctx, linesValue);
+    }
+    return true;
+}
+
+static JSValue NativeOpenPath(JSContext* ctx, JSValueConst, int argc,
+                              JSValueConst* argv) {
+    if (argc < 2 || !JS_IsString(argv[1])) {
+        return JS_ThrowTypeError(ctx, "cx.open_path(path) expects a path");
+    }
+    uint64_t generation = 0;
+    bool explicitGeneration = !JS_IsUndefined(argv[0]);
+    if (explicitGeneration && JS_ToIndex(ctx, &generation, argv[0]) < 0) {
+        return JS_EXCEPTION;
+    }
+    Arena* arena = ArenaNew();
+    Str path;
+    if (!JsString(ctx, argv[1], arena, &path)) {
+        ArenaDelete(arena);
+        return JS_EXCEPTION;
+    }
+    bool release = false;
+    Policy* policy = CurrentPolicy(&release);
+    CapabilityPath granted;
+    CapabilityError denied = {};
+    bool resolved = PolicyCapabilities(policy).ResolvePath(
+        path, CapabilityAccess::Read, &granted, &denied);
+    if (release) PolicyRelease(policy);
+    if (!resolved) {
+        Str message = GrantDenial(arena, denied);
+        JSValue result =
+            JS_ThrowTypeError(ctx, "%.*s", len(message), message.s);
+        CapabilityErrorFree(&denied);
+        granted.Free();
+        ArenaDelete(arena);
+        return result;
+    }
+    CapabilityErrorFree(&denied);
+    shell::FsResult stat;
+    Str fsError;
+
+    bool exists = shell::FsRun(shell::FsOperation::Stat, granted.root,
+                               granted.relative, {}, false, &stat, &fsError) &&
+                  stat.hasStats;
+    stat.Free();
+    if (!exists) {
+        Str detail = fsError.s && len(fsError) > 0
+                         ? fsError
+                         : StrL("the path does not exist");
+        JSValue result = JS_ThrowTypeError(
+            ctx, "cx.open_path(path) cannot open `%.*s`: %.*s", len(path),
+            path.s, len(detail), detail.s);
+        StrFree(fsError);
+        granted.Free();
+        ArenaDelete(arena);
+        return result;
+    }
+    StrFree(fsError);
+    ShellError error = {};
+    shell::ScopeHostContext host =
+        explicitGeneration ? shell::ScopeHostForGeneration(generation, &error)
+                           : shell::ScopeCurrentHost();
+    if (!host.IsSet()) {
+        Str message = error.IsSet()
+                          ? error.message
+                          : StrL(
+                                "cx.open_path(path) needs a live host call; "
+                                "call it from render, an event handler or a "
+                                "task");
+        JSValue result =
+            JS_ThrowTypeError(ctx, "%.*s", len(message), message.s);
+        ShellErrorClear(&error);
+        granted.Free();
+        ArenaDelete(arena);
+        return result;
+    }
+    OpenPath(JoinGrantedPath(arena, granted));
+    ShellErrorClear(&error);
+    granted.Free();
+    ArenaDelete(arena);
+    return JS_UNDEFINED;
+}
+
 static JSValue NativeNotify(JSContext* ctx, JSValueConst, int argc,
                             JSValueConst* argv) {
     uint64_t generation = 0;
@@ -177302,11 +178058,6 @@ static JSValue NativeProcessRun(JSContext* ctx, JSValueConst, int argc,
         ArenaDelete(arena);
         return JS_EXCEPTION;
     }
-    shell::ScopeHostContext host = shell::ScopeCurrentHost();
-    if (!host.IsSet()) {
-        ArenaDelete(arena);
-        return JS_ThrowTypeError(ctx, "process.run() needs a live host task");
-    }
 
     ProcessJob* job = new ProcessJob();
     job->command = StrDup(command);
@@ -177351,11 +178102,28 @@ static JSValue NativeProcessRun(JSContext* ctx, JSValueConst, int argc,
         }
         totalBytes += len(argument);
     }
+    Str cwd = {};
+    double timeoutSeconds = 0;
+    if (ok && argc > 2) {
+        ok = ParseProcessOptions(
+            ctx, argv[2], "process.run(command, args, options)", false, arena,
+            &cwd, &timeoutSeconds, nullptr, nullptr);
+    }
     ArenaDelete(arena);
     if (!ok) {
+        StrFree(cwd);
         job->Free();
         delete job;
         return JS_EXCEPTION;
+    }
+    job->cwd = cwd;
+    job->timeoutSeconds = timeoutSeconds;
+
+    shell::ScopeHostContext host = shell::ScopeCurrentHost();
+    if (!host.IsSet()) {
+        job->Free();
+        delete job;
+        return JS_ThrowTypeError(ctx, "process.run() needs a live host task");
     }
 
     JSValue resolving[2] = {JS_UNDEFINED, JS_UNDEFINED};
@@ -177394,6 +178162,237 @@ static JSValue NativeProcessRun(JSContext* ctx, JSValueConst, int argc,
             ctx, "process.run could not start background work");
     }
     return promise;
+}
+
+static void FreeArgCopies(Vec<Str>* args) {
+    if (!args) return;
+    for (int i = 0; i < len(*args); i++) StrFree((*args)[i]);
+    VecReset(*args);
+}
+
+static shell::ProcessStream* StreamById(ShellRuntimeImpl* impl, int id) {
+    if (!impl || id <= 0 || id > impl->streams.len) return nullptr;
+    return impl->streams[id - 1];
+}
+
+static void ReleaseStreamSlot(ShellRuntimeImpl* impl, int streamId,
+                              shell::ProcessStream* stream) {
+    if (stream) {
+        shell::ProcessStreamKill(stream);
+        shell::ProcessStreamFree(stream);
+    }
+    if (impl && streamId > 0 && streamId <= impl->streams.len) {
+        impl->streams[streamId - 1] = nullptr;
+    }
+}
+
+static JSValue NativeChildWrite(JSContext* ctx, JSValueConst, int argc,
+                                JSValueConst* argv, int magic) {
+    ShellRuntimeImpl* impl = (ShellRuntimeImpl*)JS_GetContextOpaque(ctx);
+    shell::ProcessStream* stream = StreamById(impl, magic);
+    if (!stream) {
+        return JS_ThrowPlainError(ctx, "the process is gone");
+    }
+    Arena* arena = ArenaNew();
+    Str text;
+    if (argc < 1 || !JsString(ctx, argv[0], arena, &text)) {
+        ArenaDelete(arena);
+        if (!JS_HasException(ctx)) {
+            JS_ThrowTypeError(ctx, "ChildProcess.write(text) expects a string");
+        }
+        return JS_EXCEPTION;
+    }
+    Str error;
+    bool wrote = shell::ProcessStreamWrite(stream, text, &error);
+    ArenaDelete(arena);
+    if (wrote) {
+        StrFree(error);
+        return JS_UNDEFINED;
+    }
+    if (!error.s) {
+        return JS_ThrowPlainError(ctx, "the process is gone");
+    }
+    JSValue thrown;
+    if (StrContains(error, StrL("needs a child spawned"))) {
+        thrown = JS_ThrowTypeError(ctx, "%.*s", len(error), error.s);
+    } else {
+        thrown = JS_ThrowPlainError(ctx, "ChildProcess.write(text): %.*s",
+                                    len(error), error.s);
+    }
+    StrFree(error);
+    return thrown;
+}
+
+static JSValue NativeChildEnd(JSContext* ctx, JSValueConst, int, JSValueConst*,
+                              int magic) {
+    ShellRuntimeImpl* impl = (ShellRuntimeImpl*)JS_GetContextOpaque(ctx);
+    shell::ProcessStreamEnd(StreamById(impl, magic));
+    return JS_UNDEFINED;
+}
+
+static JSValue NativeChildKill(JSContext* ctx, JSValueConst, int, JSValueConst*,
+                               int magic) {
+    ShellRuntimeImpl* impl = (ShellRuntimeImpl*)JS_GetContextOpaque(ctx);
+    shell::ProcessStreamKill(StreamById(impl, magic));
+    return JS_UNDEFINED;
+}
+
+static JSValue NativeProcessSpawn(JSContext* ctx, JSValueConst, int argc,
+                                  JSValueConst* argv) {
+    const char* api = "process.spawn(command, args, options)";
+    Arena* arena = ArenaNew();
+    Str command;
+    bool converted = argc >= 1 && JsString(ctx, argv[0], arena, &command);
+    bool release = false;
+    Policy* policy = CurrentPolicy(&release);
+    bool allowed = converted && PolicyCapabilities(policy).MayRun(command);
+    if (release) PolicyRelease(policy);
+    if (converted && !allowed) {
+        JSValue result = JS_ThrowTypeError(
+            ctx,
+            "running `%.*s` is not granted; add it to capabilities.fs.execute",
+            len(command), command.s);
+        ArenaDelete(arena);
+        return result;
+    }
+    if (!converted) {
+        ArenaDelete(arena);
+        return JS_EXCEPTION;
+    }
+    if (argc < 4 || !JS_IsFunction(ctx, argv[3])) {
+        ArenaDelete(arena);
+        return JS_ThrowTypeError(ctx, "%s expects a dispatch function", api);
+    }
+
+    Vec<Str> args;
+    bool ok = true;
+    int64_t argCount = 0;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        if (!JS_IsArray(argv[1]) || JS_GetLength(ctx, argv[1], &argCount) < 0) {
+            JS_ThrowTypeError(ctx, "%s expects args to be an array of strings",
+                              api);
+            ok = false;
+        } else if (argCount < 0 || argCount > 4096) {
+            JS_ThrowRangeError(ctx, "%s accepts at most 4096 arguments", api);
+            ok = false;
+        }
+    }
+    int totalBytes = 0;
+    for (int64_t i = 0; ok && i < argCount; i++) {
+        JSValue value = JS_GetPropertyUint32(ctx, argv[1], (uint32_t)i);
+        Str argument;
+        bool stringOk =
+            !JS_IsException(value) && JsString(ctx, value, arena, &argument);
+        JS_FreeValue(ctx, value);
+        if (!stringOk) {
+            ok = false;
+            break;
+        }
+        if (len(argument) > 1024 * 1024 - totalBytes) {
+            JS_ThrowRangeError(ctx, "%s arguments exceed the 1 MiB limit", api);
+            ok = false;
+            break;
+        }
+        Str copy = StrDup(argument);
+        if (!copy.s || !VecAppend(args, copy)) {
+            StrFree(copy);
+            JS_ThrowOutOfMemory(ctx);
+            ok = false;
+            break;
+        }
+        totalBytes += len(argument);
+    }
+    Str cwd = {};
+    double timeoutSeconds = 0;
+    bool stdinPipe = false;
+    bool lines = false;
+    if (ok && argc > 2) {
+        ok = ParseProcessOptions(ctx, argv[2], api, true, arena, &cwd,
+                                 &timeoutSeconds, &stdinPipe, &lines);
+    }
+    if (!ok) {
+        StrFree(cwd);
+        FreeArgCopies(&args);
+        ArenaDelete(arena);
+        return JS_EXCEPTION;
+    }
+
+    shell::ScopeHostContext host = shell::ScopeCurrentHost();
+    if (!host.IsSet()) {
+        StrFree(cwd);
+        FreeArgCopies(&args);
+        ArenaDelete(arena);
+        return JS_ThrowTypeError(ctx, "process.spawn() needs a live host task");
+    }
+
+    shell::ProcessSpawnOptions options;
+    options.cwd = cwd;
+    options.stdinPipe = stdinPipe;
+    options.lines = lines;
+    options.timeoutSeconds = timeoutSeconds;
+    shell::ProcessStream* stream = nullptr;
+    Str startError;
+    bool started = shell::ProcessStreamStart(command, args.els, len(args),
+                                             &options, &stream, &startError);
+    StrFree(cwd);
+    FreeArgCopies(&args);
+    ArenaDelete(arena);
+    if (!started || !stream) {
+        shell::ProcessStreamFree(stream);
+        const char* message =
+            startError.s ? startError.s : "process.spawn could not start";
+        int messageLen = startError.s ? len(startError) : (int)strlen(message);
+        JSValue thrown = JS_ThrowPlainError(ctx, "%.*s", messageLen, message);
+        StrFree(startError);
+        return thrown;
+    }
+    StrFree(startError);
+
+    ShellRuntimeImpl* impl = (ShellRuntimeImpl*)JS_GetContextOpaque(ctx);
+    if (!VecAppend(impl->streams, stream)) {
+        shell::ProcessStreamKill(stream);
+        shell::ProcessStreamFree(stream);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    int streamId = impl->streams.len;
+    Entity<ShellTaskDriver> driver = TaskDriver(impl, host.GetApp());
+    uint32_t taskId = driver.IsValid()
+                          ? NewTask(impl, ShellTaskKind::ProcessStream, argv[3],
+                                    host.GetApp(), host.GetWindow())
+                          : 0;
+    if (!taskId) {
+        ReleaseStreamSlot(impl, streamId, stream);
+        return driver.IsValid()
+                   ? JS_ThrowRangeError(
+                         ctx,
+                         "the runtime reached its outstanding host task limit")
+                   : JS_ThrowInternalError(
+                         ctx, "creating the shell task driver failed");
+    }
+    ShellTask* task = FindTask(impl, taskId);
+    task->processStream = stream;
+    task->streamId = streamId;
+    task->timer = WindowSetInterval(
+        host.GetWindow(), 10,
+        ListenTo(driver, &ShellTaskDriver::OnTimer, (int64_t)taskId));
+    if (!task->timer) {
+        ForgetTask(impl, taskId, false);
+        return JS_ThrowInternalError(ctx, "arming process.spawn failed");
+    }
+
+    JSValue child = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, child, "pid",
+                      JS_NewUint32(ctx, shell::ProcessStreamPid(stream)));
+    JS_SetPropertyStr(ctx, child, "write",
+                      JS_NewCFunctionMagic(ctx, NativeChildWrite, "write", 1,
+                                           JS_CFUNC_generic_magic, streamId));
+    JS_SetPropertyStr(ctx, child, "end",
+                      JS_NewCFunctionMagic(ctx, NativeChildEnd, "end", 0,
+                                           JS_CFUNC_generic_magic, streamId));
+    JS_SetPropertyStr(ctx, child, "kill",
+                      JS_NewCFunctionMagic(ctx, NativeChildKill, "kill", 0,
+                                           JS_CFUNC_generic_magic, streamId));
+    return child;
 }
 
 static JSValue NativeProcessExit(JSContext* ctx, JSValueConst, int argc,
@@ -177854,6 +178853,7 @@ globalThis.__gpui = (() => {
   globalThis.__context = (generation) => Object.freeze({
     theme: () => currentTheme(generation),
     open_url: (url) => __open_url(generation, String(url)),
+    open_path: (path) => __open_path(generation, String(path)),
     notify: () => __cx_notify(generation),
     focus_handle: () => focusHandle(__focus_handle_new()),
     new: (Class, props) => {
@@ -177884,6 +178884,7 @@ globalThis.__gpui = (() => {
   ambientContext = Object.freeze({
     theme: () => currentTheme(undefined),
     open_url: (url) => __open_url(undefined, String(url)),
+    open_path: (path) => __open_path(undefined, String(path)),
     notify: () => __cx_notify_current(),
     focus_handle: () => focusHandle(__focus_handle_new()),
     new: (Class, props) => {
@@ -178310,6 +179311,35 @@ globalThis.__gpui = (() => {
   });
   globalThis.process = Object.freeze({
     run: (...args) => __process_run(...args),
+    spawn: (() => {
+      const spawnNative = globalThis.__process_spawn;
+      delete globalThis.__process_spawn;
+      return function spawn(command, args, options) {
+        const handlers = { stdout: [], stderr: [], exit: [] };
+        const dispatch = (event, payload, cx) => {
+          for (const handler of handlers[event].slice()) handler(payload, cx);
+        };
+        const child = spawnNative(
+          String(command),
+          Array.from(args ?? [], String),
+          options ?? {},
+          dispatch,
+        );
+        child.on = function on(event, handler) {
+          if (!Object.hasOwn(handlers, event)) {
+            throw new TypeError(
+              "ChildProcess.on(event, handler): event must be \"stdout\", \"stderr\" or \"exit\", not " + JSON.stringify(event),
+            );
+          }
+          if (typeof handler !== "function") {
+            throw new TypeError("ChildProcess.on(event, handler) expects a function");
+          }
+          handlers[event].push(handler);
+          return child;
+        };
+        return Object.freeze(child);
+      };
+    })(),
     nextTick: (callback, ...args) => Promise.resolve().then(() => callback(...args)),
     exit: (code = 0) => __process_exit(Number(code)),
     platform: __shell_platform,
@@ -180359,6 +181389,7 @@ static bool InstallRuntime(ShellRuntimeImpl* impl, ShellError* error) {
                       NativeThemeRevision, 1);
     SetGlobalFunction(impl->context, global, "__set_theme", NativeSetTheme, 1);
     SetGlobalFunction(impl->context, global, "__open_url", NativeOpenUrl, 2);
+    SetGlobalFunction(impl->context, global, "__open_path", NativeOpenPath, 2);
     SetGlobalFunction(impl->context, global, "__host_call", NativeHostCall, 3);
     SetGlobalFunction(impl->context, global, "__host_async_call",
                       NativeHostAsyncCall, 3);
@@ -180490,7 +181521,9 @@ static bool InstallRuntime(ShellRuntimeImpl* impl, ShellError* error) {
     SetGlobalFunction(impl->context, global, "__component_input_on",
                       NativeComponentInputOn, 4);
     SetGlobalFunction(impl->context, global, "__process_run", NativeProcessRun,
-                      2);
+                      3);
+    SetGlobalFunction(impl->context, global, "__process_spawn",
+                      NativeProcessSpawn, 4);
     SetGlobalFunction(impl->context, global, "__process_exit",
                       NativeProcessExit, 1);
     SetGlobalFunction(impl->context, global, "__input_state_new",
@@ -180740,7 +181773,6 @@ ShellRuntime* ShellRuntime::New(
         runtime->Release();
         return nullptr;
     }
-    JS_SetMemoryLimit(runtime->impl->jsRuntime, (size_t)256 * 1024 * 1024);
     JS_SetMaxStackSize(runtime->impl->jsRuntime, (size_t)1024 * 1024);
     JS_SetInterruptHandler(runtime->impl->jsRuntime, Interrupt, runtime->impl);
     JS_SetModuleLoaderFunc(runtime->impl->jsRuntime, ModuleNormalize,
@@ -181164,6 +182196,13 @@ int ShellRuntime::LiveCallbacks() const {
     return impl->callbacks.Live();
 }
 
+int64_t ShellRuntime::MallocLimit() const {
+    if (!impl || !impl->jsRuntime) return 0;
+    JSMemoryUsage usage = {};
+    JS_ComputeMemoryUsage(impl->jsRuntime, &usage);
+    return usage.malloc_limit;
+}
+
 int ShellRuntime::LiveEntities() const {
     return impl->retained.Len();
 }
@@ -181291,12 +182330,97 @@ void ShellRuntime::ReleaseApplicationState(ViewObject* object) {
     }
 }
 
+static void DriveProcessStream(ShellRuntime* runtime, ShellRuntimeImpl* impl,
+                               ShellTask* task, Ctx* cx) {
+    if (!runtime || !impl || !task || !task->processStream) return;
+    Vec<shell::ProcessStreamEvent> events;
+    shell::ProcessStreamPoll(task->processStream, &events);
+    if (len(events) == 0) {
+        VecReset(events);
+        return;
+    }
+    uint32_t id = task->id;
+    EntityId owner = task->owner;
+    Policy* policy = PolicyRetain(task->policy);
+    AppModule* application = task->application;
+    JSValue callback = JS_DupValue(impl->context, task->callback);
+    shell::CallScopeGuard scope =
+        shell::ScopeEnter(cx->win, cx->app, ScopePhase::Task, owner, policy,
+                          runtime, application);
+    PolicyRelease(policy);
+    JSContext* ctx = impl->context;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue ambient = JS_GetPropertyStr(ctx, global, "__ambient_context");
+    bool sawExit = false;
+    for (int i = 0; i < len(events); i++) {
+        shell::ProcessStreamEvent& event = events[i];
+        const char* name = "stdout";
+        JSValue payload = JS_UNDEFINED;
+        if (event.kind == shell::ProcessStreamEvent::Kind::Err) {
+            name = "stderr";
+        } else if (event.kind == shell::ProcessStreamEvent::Kind::Exit) {
+            name = "exit";
+            sawExit = true;
+            payload = JS_NewObject(ctx);
+            JS_SetPropertyStr(
+                ctx, payload, "code",
+                event.hasCode ? JS_NewInt32(ctx, event.code) : JS_NULL);
+            if (event.signal.s && len(event.signal) > 0) {
+                JS_SetPropertyStr(ctx, payload, "signal",
+                                  JS_NewStringLen(ctx, event.signal.s,
+                                                  (size_t)len(event.signal)));
+            } else {
+                JS_SetPropertyStr(ctx, payload, "signal", JS_NULL);
+            }
+            if (event.hasError) {
+                JS_SetPropertyStr(
+                    ctx, payload, "error",
+                    JS_NewStringLen(ctx, event.text.s ? event.text.s : "",
+                                    (size_t)len(event.text)));
+            }
+        }
+        if (event.kind != shell::ProcessStreamEvent::Kind::Exit) {
+            payload = JS_NewStringLen(ctx, event.text.s ? event.text.s : "",
+                                      (size_t)len(event.text));
+        }
+        JSValue args[3] = {JS_NewString(ctx, name), payload,
+                           JS_DupValue(ctx, ambient)};
+        JSValue result = JS_Call(ctx, callback, JS_UNDEFINED, 3, args);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, args[1]);
+        JS_FreeValue(ctx, args[2]);
+        if (JS_IsException(result)) {
+            Arena* arena = ArenaNew();
+            log(ExceptionText(arena, ctx));
+            ArenaDelete(arena);
+        } else {
+            JS_FreeValue(ctx, result);
+        }
+        event.Free();
+    }
+    VecReset(events);
+    JS_FreeValue(ctx, ambient);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, callback);
+    if (sawExit) ForgetTask(impl, id, true);
+    ShellError error = {};
+    runtime->DrainJobs(kMaxJobBatch, &error);
+    if (error.IsSet()) {
+        log(error.message);
+        ShellErrorClear(&error);
+    }
+}
+
 void ShellRuntime::ResumeTask(uint32_t id, Ctx* cx) {
     if (!cx || !cx->app || !cx->win) return;
     ShellTask* task = FindTask(impl, id);
     if (!task || task->kind == ShellTaskKind::Spawn) return;
     if (task->owner.IsValid() && !EntityGet(cx->app, task->owner)) {
         ForgetTask(impl, id, false);
+        return;
+    }
+    if (task->kind == ShellTaskKind::ProcessStream) {
+        DriveProcessStream(this, impl, task, cx);
         return;
     }
 
@@ -181828,6 +182952,9 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
     if (!render || !key || !cx->win || !cx->app) return;
     if (render->view.IsValid() && !EntityGet(cx->app, render->view)) return;
 
+    EntityId outerSelf = cx->self;
+    cx->self = render->view;
+
     double started = TimeNow();
     shell::SpecArena* outer = impl->scratch;
 
@@ -181835,6 +182962,13 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
     impl->scratch = batch;
     Vec<shell::SpecId> roots;
     Vec<Str> itemKeys;
+
+    bool opened = !impl->callbacks.building;
+    uint64_t generation = 0;
+    if (opened) {
+        generation = impl->callbacks.Begin(impl->context);
+        impl->callbacks.layoutHandlers = true;
+    }
     bool succeeded = true;
     {
         shell::CallScopeGuard scope = shell::ScopeEnter(
@@ -181910,12 +183044,20 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
         VecReset(seen);
         ArenaDelete(keys);
     }
+    if (opened) impl->callbacks.layoutHandlers = false;
     impl->scratch = outer;
+    bool staged = false;
     if (!succeeded) {
+        if (opened) impl->callbacks.Abort(impl->context);
         Arena* arena = ArenaNew();
         log(ExceptionText(arena, impl->context));
         ArenaDelete(arena);
     } else {
+        staged = opened && impl->callbacks.HasStaged();
+        if (staged)
+            impl->callbacks.Commit();
+        else if (opened)
+            impl->callbacks.Abort(impl->context);
         ShellError error = {};
         for (int i = 0; i < len(roots); i++) {
             out[i] = ShellMaterializeSpec(cx, this, batch, roots[i], &error);
@@ -181951,6 +183093,18 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
                 out[i] = row;
             }
         }
+        if (staged) {
+
+            RenderSnapshot* snapshot = new RenderSnapshot(
+                generation, 0, new shell::SpecArena(), SnapshotLease(this));
+            Entity<ScriptView> owner;
+            owner.id = render->view;
+            if (ScriptView* view = owner.Get(cx)) {
+                VecAppend(view->frameSnapshots, snapshot);
+            } else {
+                snapshot->Release();
+            }
+        }
     }
     VecReset(itemKeys);
     VecReset(roots);
@@ -181958,6 +183112,7 @@ void ShellRuntime::RenderVirtualItems(shell::CallbackId renderId,
     double elapsed = TimeNow() - started;
     shell::MetricsAdd(&impl->metrics, shell::MetricsTimerKind::FrameScript,
                       elapsed <= 0 ? 0 : (uint64_t)(elapsed * 1e9));
+    cx->self = outerSelf;
 }
 
 static const int kMaxChromeCacheEntries = 4096;
@@ -187107,6 +188262,18 @@ declare module "gpui-kit" {
      * registered for its scheme.
      */
     open_url(url: string): void;
+    /**
+     * Opens a file or directory with whatever the system opens it with —
+     * the user's default application for its type, or the file manager for
+     * a directory. `App::open_with_system`.
+     *
+     * The path must be inside a directory granted in `capabilities.fs.read`
+     * and must exist; anything else throws. Use this rather than running
+     * `xdg-open` or `open` through `process.run`, which starts commands
+     * without the desktop session's environment, so the opener cannot find
+     * the default application.
+     */
+    open_path(path: string): void;
 
     /** `App::read_from_clipboard`. `undefined` when it holds no text. */
     read_from_clipboard(): string | undefined;
@@ -187607,20 +188774,12 @@ static const char kShellTypes2[] = R"GPUI_DTS(     * nothing at all. A `Popup` t
      * key names the item that was pressed; the index would name whatever slid
      * into its place.
      *
-     * One handler for the list rather than one per row, and that is a limit
-     * rather than a shorthand: a handler registered inside the item renderer
-     * throws. Handlers belong to the render pass that registered them and are
-     * released with it; a row is rebuilt on every frame the list is scrolled,
-     * so a per-row handler would accumulate for as long as the view stood —
-     * twenty visible rows over a thousand frames is twenty thousand functions
-     * nothing can reach and nothing releases.
-     *
-     * The key is normally enough: the script already holds the data the row was
-     * built from. A row with several independently clickable parts needs a
-     * handler lifetime scoped to one batch of items, which this runtime does
-     * not have yet; when it does, this restriction lifts and `on_click` inside
-     * an item renderer starts working, with no change to anything written
-     * against `on_item_click`.
+     * A row may also register handlers of its own — `row.on_click(...)` inside
+     * the item renderer works, and a row with several clickable parts needs it.
+     * Those handlers belong to the batch of rows that registered them and are
+     * released when the next frame replaces it. `on_item_click` remains the
+     * cheaper choice for a whole-row click: one handler for the list, and the
+     * key it reports names the item even after a filter or a sort.
      */
     on_item_click<Self extends Element>(this: Self, handler: (key: string, cx: Context) => void): Self;
     /**
@@ -187632,8 +188791,7 @@ static const char kShellTypes2[] = R"GPUI_DTS(     * nothing at all. A `Popup` t
      *
      * A press rather than a click, because that is when a context menu opens:
      * the row is still under the pointer, so the menu can name what it is for
-     * before it is drawn over it. And one handler for the list rather than one
-     * per row, for the reason `on_item_click` gives.
+     * before it is drawn over it.
      *
      * It is delivered on the row, so a handler for the same button on an
      * element around the list still fires after it, in the ordinary bubble
@@ -208075,8 +209233,9 @@ static const char kShellTypes62[] = R"GPUI_DTS(   * dismissal, no open state. Th
    * Two consequences follow from that, and both are enforced rather than
    * documented away:
    *
-   * * **No handlers inside the renderer.** `on_click` and the rest throw if
-   *   called there. Use `on_item_click` on the list — see its note for why.
+   * * **Handlers inside the renderer last one frame.** `on_click` and the rest
+   *   work on a row, and are released when the next frame redraws it. For a
+   *   whole-row click, `on_item_click` on the list is cheaper — see its note.
    * * **No state inside the renderer.** `InputState.new()`, `cx.focus_handle()`
    *   and the rest throw there as they do in `render()`, and `cx.notify()` is
    *   refused: asking for a re-render from inside layout is a loop.
@@ -208908,13 +210067,71 @@ declare module "console" {
 }
 declare module "process" {
   export interface CommandOutput { code: number; stdout: string; stderr: string; }
-  export function run(command: string, args?: string[]): Promise<CommandOutput>;
+  export interface RunOptions {
+    /** Must be inside a directory granted in `capabilities.fs.read`. */
+    cwd?: string;
+    /** Defaults to 30 seconds. */
+    timeoutMs?: number;
+  }
+  /**
+   * Runs a command to completion and resolves with what it did. Bounded: 30
+   * seconds unless `timeoutMs` says otherwise, 8 MiB of each stream. For a
+   * command that runs longer, talks over stdin, or should be read as it
+   * works, use `spawn`.
+   */
+  export function run(command: string, args?: string[], options?: RunOptions): Promise<CommandOutput>;
+  export interface SpawnOptions {
+    /** Must be inside a directory granted in `capabilities.fs.read`, or this throws. */
+    cwd?: string;
+    /** `"pipe"` to `write()` to the child; defaults to `"null"`. */
+    stdin?: "pipe" | "null";
+    /** No limit by default. When given, the whole process group is killed at the deadline. */
+    timeoutMs?: number;
+    /**
+     * Deliver stdout and stderr a line at a time, without the line ending —
+     * joined across reads, with a last unterminated line delivered at the end.
+     * A single line over 8 MiB kills the process and is reported on `exit`.
+     */
+    lines?: boolean;
+  }
+  export interface ExitResult {
+    code: number | null;
+    signal: string | null;
+    /** Set when the runtime stopped the process: a timeout, or a line too long. */
+    error?: string;
+  }
+  /**
+   * A running child. Handlers run on the UI thread with an async `cx`, like a
+   * `cx.spawn` task's. `exit` fires once, after the last `stdout`/`stderr`.
+   * Releasing the view that spawned it, reloading the application or closing
+   * the window kills it and everything it started.
+   */
+  export interface ChildProcess {
+    readonly pid: number;
+    on(event: "stdout" | "stderr", handler: (text: string, cx: import("gpui-kit").AsyncContext) => void): ChildProcess;
+    on(event: "exit", handler: (result: ExitResult, cx: import("gpui-kit").AsyncContext) => void): ChildProcess;
+    /** Needs `stdin: "pipe"`; throws otherwise, or after `end()`. */
+    write(text: string): void;
+    /** Closes stdin. */
+    end(): void;
+    /** Kills the whole process group (a Job Object on Windows). `exit` still fires once. */
+    kill(): void;
+  }
+  /**
+   * Starts a command and streams what it does: output as it arrives, no
+   * deadline unless asked for, stdin on request. The same grant as `run`
+   * (`capabilities.fs.execute`), the same host-PATH resolution and the same
+   * empty environment. UTF-8 output is decoded whole even when a character
+   * spans two reads; there is no limit on total output.
+   */
+  export function spawn(command: string, args?: string[], options?: SpawnOptions): ChildProcess;
   export function exit(code?: number): void;
   export function nextTick(callback: (...args: unknown[]) => void, ...args: unknown[]): void;
   export const platform: string;
   export const arch: string;
   const process: {
     run: typeof run;
+    spawn: typeof spawn;
     exit: typeof exit;
     nextTick: typeof nextTick;
     platform: string;
@@ -220740,6 +221957,7 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -236756,6 +237974,27 @@ void OpenUrl(Str url) {
     }
 }
 
+void OpenPath(Str path) {
+    if (!path.s || len(path) <= 0) {
+        return;
+    }
+
+    Str value = StrDup(path);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (fork() == 0) {
+            execlp("xdg-open", "xdg-open", value.s, (char*)nullptr);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    if (pid > 0) {
+        int st = 0;
+        waitpid(pid, &st, 0);
+    }
+    StrFree(value);
+}
+
 TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     (void)win;
     TempStr title =
@@ -239932,6 +241171,19 @@ void OpenUrl(Str url) {
     }
 }
 
+void OpenPath(Str path) {
+    if (!path.s || len(path) <= 0) {
+        return;
+    }
+    NSString* s = [[NSString alloc] initWithBytes:path.s
+                                           length:(NSUInteger)len(path)
+                                         encoding:NSUTF8StringEncoding];
+    NSURL* u = s ? [NSURL fileURLWithPath:s] : nil;
+    if (u) {
+        [[NSWorkspace sharedWorkspace] openURL:u];
+    }
+}
+
 TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     (void)win;
     NSOpenPanel* panel = [NSOpenPanel openPanel];
@@ -241210,6 +242462,8 @@ void OpenUrl(Str url) {
         GpJsOpenUrl(url.s, len(url));
     }
 }
+
+void OpenPath(Str) {}
 
 TempStr PromptForPathTemp(Window* win, const PathPrompt& opts) {
     (void)win;
@@ -242693,6 +243947,14 @@ void OpenUrl(Str url) {
         return;
     }
     ShellExecuteW(nullptr, L"open", ToCWstrTemp(url), nullptr, nullptr,
+                  SW_SHOWNORMAL);
+}
+
+void OpenPath(Str path) {
+    if (!path.s || len(path) <= 0) {
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", ToCWstrTemp(path), nullptr, nullptr,
                   SW_SHOWNORMAL);
 }
 
@@ -251785,26 +253047,40 @@ bool FsRun(FsOperation operation, Str rootName, Str relative, Str input,
             if (operation == FsOperation::Stat ||
                 operation == FsOperation::Lstat ||
                 operation == FsOperation::ReadLink) {
-                HANDLE target =
-                    OpenAt(parent, leaf, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                           FILE_OPEN, 0, &status);
-                if (!target) {
-                    NtError(error,
-                            operation == FsOperation::ReadLink ? "read link"
-                                                               : "stat",
-                            rootName, relative, status);
-                    ok = false;
-                } else if (operation == FsOperation::ReadLink) {
+
+                HANDLE target = nullptr;
+                if (wcscmp(leaf, L".") == 0) {
+                    if (!DuplicateHandle(GetCurrentProcess(), parent,
+                                         GetCurrentProcess(), &target, 0, FALSE,
+                                         DUPLICATE_SAME_ACCESS)) {
+                        FsError(error,
+                                fmt("cannot stat `%s/%s`: Windows error %u",
+                                    rootName, relative, GetLastError()));
+                        ok = false;
+                    }
+                } else {
+                    target =
+                        OpenAt(parent, leaf, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                               FILE_OPEN, 0, &status);
+                    if (!target) {
+                        NtError(error,
+                                operation == FsOperation::ReadLink ? "read link"
+                                                                   : "stat",
+                                rootName, relative, status);
+                        ok = false;
+                    }
+                }
+                if (target && operation == FsOperation::ReadLink) {
                     ok = ReadLinkHandle(target, rootName, relative, result,
                                         error);
-                } else if (operation == FsOperation::Stat &&
+                } else if (target && operation == FsOperation::Stat &&
                            IsReparse(target)) {
 
                     FsError(error, fmt("cannot stat `%s/%s`: symbolic links "
                                        "are not followed",
                                        rootName, relative));
                     ok = false;
-                } else {
+                } else if (target) {
                     ok = FillWinStats(target, result);
                     if (!ok) {
                         FsError(error,
@@ -251814,15 +253090,19 @@ bool FsRun(FsOperation operation, Str rootName, Str relative, Str input,
                 }
                 if (target) CloseHandle(target);
             } else if (operation == FsOperation::Exists) {
-                HANDLE target =
-                    OpenAt(parent, leaf, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                           FILE_OPEN, 0, &status);
-                result->exists = target != nullptr;
-                if (target)
-                    CloseHandle(target);
-                else if (!NtMissing(status)) {
-                    NtError(error, "inspect", rootName, relative, status);
-                    ok = false;
+                if (wcscmp(leaf, L".") == 0) {
+                    result->exists = true;
+                } else {
+                    HANDLE target =
+                        OpenAt(parent, leaf, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                               FILE_OPEN, 0, &status);
+                    result->exists = target != nullptr;
+                    if (target)
+                        CloseHandle(target);
+                    else if (!NtMissing(status)) {
+                        NtError(error, "inspect", rootName, relative, status);
+                        ok = false;
+                    }
                 }
             } else if (operation == FsOperation::MakeDirectory) {
                 HANDLE target =
@@ -251867,12 +253147,17 @@ extern "C" char** environ;
 namespace gpui::shell {
 
 constexpr int kProcessStreamLimit = 8 * 1024 * 1024;
-constexpr double kProcessTimeout = 30.0;
 
 static void ProcessError(Str* error, Str message) {
     if (!error) return;
     StrFree(*error);
     *error = StrDup(message);
+}
+
+static double WallSeconds() {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
 static bool HasSlash(Str command) {
@@ -252005,7 +253290,11 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
     StrBuilder stdoutText, stderrText;
     bool stdoutClosed = false, stderrClosed = false, done = false, ok = true;
     int status = 0;
-    double started = TimeNow();
+    double started = WallSeconds();
+    double timeoutSeconds = (options && options->timeoutSeconds > 0)
+                                ? options->timeoutSeconds
+                                : 30.0;
+    int timeoutMs = (int)(timeoutSeconds * 1000.0 + 0.5);
     while (!done || !stdoutClosed || !stderrClosed) {
         if (!stdoutClosed)
             ok = DrainFd(outPipe[0], &stdoutText, &stdoutClosed, error,
@@ -252014,12 +253303,12 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
             ok = DrainFd(errPipe[0], &stderrText, &stderrClosed, error,
                          "stderr");
         bool cancelled = cancellation && cancellation->IsCancelled();
-        if (!ok || cancelled || TimeNow() - started >= kProcessTimeout) {
+        if (!ok || cancelled || WallSeconds() - started >= timeoutSeconds) {
             if (ok && cancelled) {
                 ProcessError(error, fmt("`%s` was cancelled", command));
             } else if (ok) {
-                ProcessError(error,
-                             fmt("`%s` timed out after 30000 ms", command));
+                ProcessError(error, fmt("`%s` timed out after %d ms", command,
+                                        timeoutMs));
             }
             kill(-pid, SIGKILL);
             waitpid(pid, &status, 0);
@@ -252056,6 +253345,386 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
     return true;
 }
 
+static char* kEmptyEnv[] = {nullptr};
+
+struct ProcessStream {
+    ProcessEventBox box;
+    Str command;
+    Str cwd;
+    Vec<Str> owned;
+    char** argv = nullptr;
+    double timeoutSeconds = 0;
+    uint32_t pid = 0;
+    pid_t child = -1;
+    int outFd = -1;
+    int errFd = -1;
+    int inFd = -1;
+    pthread_t readerOut = {};
+    pthread_t readerErr = {};
+    pthread_t waiter = {};
+    pthread_t stdinThread = {};
+    bool haveReaderOut = false;
+    bool haveReaderErr = false;
+    bool haveWaiter = false;
+    bool haveStdin = false;
+    ProcessDecodeState outDecode;
+    ProcessDecodeState errDecode;
+};
+
+struct PosixReader {
+    ProcessStream* stream = nullptr;
+    int* fd = nullptr;
+    ProcessDecodeState* decode = nullptr;
+    ProcessStreamEvent::Kind kind = ProcessStreamEvent::Kind::Out;
+};
+
+static int TimeoutMilliseconds(double seconds) {
+    return (int)(seconds * 1000.0 + 0.5);
+}
+
+static Str SignalName(int signal) {
+    switch (signal) {
+        case SIGKILL:
+            return StrDup(StrL("SIGKILL"));
+        case SIGTERM:
+            return StrDup(StrL("SIGTERM"));
+        case SIGINT:
+            return StrDup(StrL("SIGINT"));
+        case SIGHUP:
+            return StrDup(StrL("SIGHUP"));
+        case SIGQUIT:
+            return StrDup(StrL("SIGQUIT"));
+        case SIGABRT:
+            return StrDup(StrL("SIGABRT"));
+        case SIGSEGV:
+            return StrDup(StrL("SIGSEGV"));
+        case SIGPIPE:
+            return StrDup(StrL("SIGPIPE"));
+        default:
+            return StrDup(fmt("signal %d", signal));
+    }
+}
+
+static void CloseFd(int* fd) {
+    if (fd && *fd >= 0) close(*fd);
+    if (fd) *fd = -1;
+}
+
+static void* PosixReaderMain(void* param) {
+    PosixReader* launch = (PosixReader*)param;
+    ProcessStream* stream = launch->stream;
+    int fd = launch->fd ? *launch->fd : -1;
+    uint8_t chunk[64 * 1024];
+    bool failed = false;
+    for (;;) {
+        ssize_t count = fd >= 0 ? read(fd, chunk, sizeof(chunk)) : 0;
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        Str error;
+        if (!ProcessDecodeFeed(launch->decode, &stream->box, launch->kind,
+                               chunk, (int)count, &error)) {
+            ProcessEventSetReason(&stream->box, error);
+            if (stream->child > 0 && !ProcessEventReaped(&stream->box))
+                kill(-stream->child, SIGKILL);
+            failed = true;
+            break;
+        }
+    }
+    if (!failed)
+        ProcessDecodeFinish(launch->decode, &stream->box, launch->kind);
+    ProcessDecodeFree(launch->decode);
+    if (fd >= 0) close(fd);
+    if (launch->fd) *launch->fd = -1;
+    delete launch;
+    return nullptr;
+}
+
+static void* PosixStdinMain(void* param) {
+    ProcessStream* stream = (ProcessStream*)param;
+    for (;;) {
+        Vec<char> bytes;
+        bool ended = false;
+        if (!ProcessStdinTake(&stream->box, &bytes, &ended)) break;
+        int offset = 0;
+        bool ok = true;
+        while (offset < bytes.len) {
+            ssize_t wrote = write(stream->inFd, bytes.els + offset,
+                                  (size_t)(bytes.len - offset));
+            if (wrote < 0) {
+                if (errno == EINTR) continue;
+                ok = false;
+                break;
+            }
+            if (wrote == 0) {
+                ok = false;
+                break;
+            }
+            offset += (int)wrote;
+        }
+        VecReset(bytes);
+        if (!ok) {
+            ProcessStdinFail(&stream->box);
+            break;
+        }
+        if (ended) break;
+    }
+    CloseFd(&stream->inFd);
+    return nullptr;
+}
+
+static void* PosixWaiterMain(void* param) {
+    ProcessStream* stream = (ProcessStream*)param;
+    double started = WallSeconds();
+    int status = 0;
+    bool waitFailed = false;
+    for (;;) {
+        pid_t got = waitpid(stream->child, &status, WNOHANG);
+        if (got == stream->child) break;
+        if (got < 0 && errno != EINTR) {
+            ProcessEventSetReason(
+                &stream->box,
+                StrDup(fmt("waiting for `%s` failed", stream->command)));
+            waitFailed = true;
+            break;
+        }
+        if (stream->timeoutSeconds > 0 &&
+            WallSeconds() - started >= stream->timeoutSeconds) {
+            ProcessEventSetReason(
+                &stream->box,
+                StrDup(fmt("`%s` timed out after %d ms", stream->command,
+                           TimeoutMilliseconds(stream->timeoutSeconds))));
+            if (stream->child > 0) kill(-stream->child, SIGKILL);
+        }
+        PlatSleepMs(20);
+    }
+    if (stream->child > 0) kill(-stream->child, SIGKILL);
+    ProcessEventMarkReaped(&stream->box);
+    if (stream->haveReaderOut) {
+        pthread_join(stream->readerOut, nullptr);
+        stream->haveReaderOut = false;
+    }
+    if (stream->haveReaderErr) {
+        pthread_join(stream->readerErr, nullptr);
+        stream->haveReaderErr = false;
+    }
+    ProcessStreamEvent event;
+    event.kind = ProcessStreamEvent::Kind::Exit;
+    if (!waitFailed) {
+        if (WIFSIGNALED(status)) {
+            event.signal = SignalName(WTERMSIG(status));
+        } else {
+            event.hasCode = true;
+            event.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+    }
+    Str reason = ProcessEventTakeReason(&stream->box);
+    if (reason) {
+        event.hasError = true;
+        event.text = reason;
+    }
+    ProcessEventPush(&stream->box, event);
+    return nullptr;
+}
+
+static bool StartPosixReader(ProcessStream* stream, pthread_t* thread, int* fd,
+                             ProcessDecodeState* decode,
+                             ProcessStreamEvent::Kind kind) {
+    PosixReader* launch = new PosixReader();
+    launch->stream = stream;
+    launch->fd = fd;
+    launch->decode = decode;
+    launch->kind = kind;
+    if (pthread_create(thread, nullptr, PosixReaderMain, launch) != 0) {
+        delete launch;
+        return false;
+    }
+    return true;
+}
+
+static void ReleaseStream(ProcessStream* stream) {
+    if (!stream) return;
+    if (stream->child > 0 && !ProcessEventReaped(&stream->box)) {
+        ProcessEventMarkKilled(&stream->box);
+        kill(-stream->child, SIGKILL);
+    }
+    ProcessStdinStop(&stream->box);
+    if (stream->haveWaiter) {
+        pthread_join(stream->waiter, nullptr);
+        stream->haveWaiter = false;
+    }
+    if (stream->haveReaderOut) {
+        pthread_join(stream->readerOut, nullptr);
+        stream->haveReaderOut = false;
+    }
+    if (stream->haveReaderErr) {
+        pthread_join(stream->readerErr, nullptr);
+        stream->haveReaderErr = false;
+    }
+    if (stream->haveStdin) {
+        pthread_join(stream->stdinThread, nullptr);
+        stream->haveStdin = false;
+    }
+    if (stream->child > 0 && !ProcessEventReaped(&stream->box)) {
+        int status = 0;
+        while (waitpid(stream->child, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
+    CloseFd(&stream->outFd);
+    CloseFd(&stream->errFd);
+    CloseFd(&stream->inFd);
+    ProcessDecodeFree(&stream->outDecode);
+    ProcessDecodeFree(&stream->errDecode);
+    ProcessEventBoxFree(&stream->box);
+    for (int i = 0; i < len(stream->owned); i++) StrFree(stream->owned[i]);
+    VecReset(stream->owned);
+    Free(nullptr, stream->argv);
+    StrFree(stream->command);
+    StrFree(stream->cwd);
+    delete stream;
+}
+
+bool ProcessStreamStart(Str command, const Str* args, int count,
+                        const ProcessSpawnOptions* options, ProcessStream** out,
+                        Str* error) {
+    if (out) *out = nullptr;
+    if (error) {
+        StrFree(*error);
+        *error = {};
+    }
+    Str executable = ResolveExecutable(command, error);
+    if (!executable) return false;
+    ProcessStream* stream = new ProcessStream();
+    bool stdinPipe = options && options->stdinPipe;
+    ProcessEventBoxInit(&stream->box, stdinPipe);
+    stream->command = StrDup(command);
+    stream->timeoutSeconds = options ? options->timeoutSeconds : 0;
+    if (options && options->cwd) stream->cwd = StrDup(options->cwd);
+    bool lines = options && options->lines;
+    ProcessDecodeInit(&stream->outDecode, lines);
+    ProcessDecodeInit(&stream->errDecode, lines);
+    VecAppend(stream->owned, executable);
+    for (int i = 0; i < count; i++) VecAppend(stream->owned, StrDup(args[i]));
+    stream->argv = AllocArray<char*>(len(stream->owned) + 1);
+    for (int i = 0; i < len(stream->owned); i++)
+        stream->argv[i] = stream->owned[i].s;
+
+    int outPipe[2] = {-1, -1};
+    int errPipe[2] = {-1, -1};
+    int inPipe[2] = {-1, -1};
+    if (pipe(outPipe) != 0 || pipe(errPipe) != 0 ||
+        (stdinPipe && pipe(inPipe) != 0)) {
+        CloseFd(&outPipe[0]);
+        CloseFd(&outPipe[1]);
+        CloseFd(&errPipe[0]);
+        CloseFd(&errPipe[1]);
+        CloseFd(&inPipe[0]);
+        CloseFd(&inPipe[1]);
+        ProcessError(error, StrL("creating child-process pipes failed"));
+        ReleaseStream(stream);
+        return false;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        setpgid(0, 0);
+        if (stream->cwd.s && chdir(stream->cwd.s) != 0) _exit(127);
+        dup2(outPipe[1], STDOUT_FILENO);
+        dup2(errPipe[1], STDERR_FILENO);
+        if (stdinPipe) {
+            dup2(inPipe[0], STDIN_FILENO);
+        } else {
+            int nullFd = open("/dev/null", O_RDONLY);
+            if (nullFd >= 0) dup2(nullFd, STDIN_FILENO);
+        }
+        close(outPipe[0]);
+        close(outPipe[1]);
+        close(errPipe[0]);
+        close(errPipe[1]);
+        if (inPipe[0] >= 0) close(inPipe[0]);
+        if (inPipe[1] >= 0) close(inPipe[1]);
+        execve(stream->argv[0], stream->argv, kEmptyEnv);
+        _exit(127);
+    }
+    close(outPipe[1]);
+    close(errPipe[1]);
+    if (inPipe[0] >= 0) close(inPipe[0]);
+    if (pid < 0) {
+        close(outPipe[0]);
+        close(errPipe[0]);
+        if (inPipe[1] >= 0) close(inPipe[1]);
+        ProcessError(error, fmt("running `%s` failed", command));
+        ReleaseStream(stream);
+        return false;
+    }
+    setpgid(pid, pid);
+    stream->child = pid;
+    stream->pid = (uint32_t)pid;
+    stream->outFd = outPipe[0];
+    stream->errFd = errPipe[0];
+    if (stdinPipe) stream->inFd = inPipe[1];
+
+    bool threadsOk =
+        StartPosixReader(stream, &stream->readerOut, &stream->outFd,
+                         &stream->outDecode, ProcessStreamEvent::Kind::Out);
+    if (threadsOk) stream->haveReaderOut = true;
+    if (threadsOk) {
+        threadsOk =
+            StartPosixReader(stream, &stream->readerErr, &stream->errFd,
+                             &stream->errDecode, ProcessStreamEvent::Kind::Err);
+        if (threadsOk) stream->haveReaderErr = true;
+    }
+    if (threadsOk && stdinPipe) {
+        threadsOk = pthread_create(&stream->stdinThread, nullptr,
+                                   PosixStdinMain, stream) == 0;
+        if (threadsOk) stream->haveStdin = true;
+    }
+    if (threadsOk) {
+        threadsOk = pthread_create(&stream->waiter, nullptr, PosixWaiterMain,
+                                   stream) == 0;
+        if (threadsOk) stream->haveWaiter = true;
+    }
+    if (!threadsOk) {
+        ProcessError(error, fmt("running `%s` failed: a stream thread could "
+                                "not be started",
+                                command));
+        ReleaseStream(stream);
+        return false;
+    }
+    if (out) *out = stream;
+    return true;
+}
+
+uint32_t ProcessStreamPid(const ProcessStream* stream) {
+    return stream ? stream->pid : 0;
+}
+
+void ProcessStreamPoll(ProcessStream* stream, Vec<ProcessStreamEvent>* out) {
+    if (stream) ProcessEventTake(&stream->box, out);
+}
+
+bool ProcessStreamWrite(ProcessStream* stream, Str text, Str* error) {
+    if (!stream) return false;
+    return ProcessStdinEnqueue(&stream->box, text, error);
+}
+
+void ProcessStreamEnd(ProcessStream* stream) {
+    if (stream) ProcessStdinEnd(&stream->box);
+}
+
+void ProcessStreamKill(ProcessStream* stream) {
+    if (!stream || stream->child <= 0 || ProcessEventReaped(&stream->box))
+        return;
+    ProcessEventMarkKilled(&stream->box);
+    kill(-stream->child, SIGKILL);
+    ProcessStdinStop(&stream->box);
+}
+
+void ProcessStreamFree(ProcessStream* stream) {
+    ReleaseStream(stream);
+}
+
 }
 
 #endif
@@ -252073,6 +253742,34 @@ bool ProcessRunBounded(Str command, const Str*, int, ProcessCancellation*,
     return false;
 }
 
+bool ProcessStreamStart(Str command, const Str*, int,
+                        const ProcessSpawnOptions*, ProcessStream** out,
+                        Str* error) {
+    if (out) *out = nullptr;
+    if (error)
+        *error =
+            StrDup(fmt("running `%s` is unavailable in a browser", command));
+    return false;
+}
+
+uint32_t ProcessStreamPid(const ProcessStream*) {
+    return 0;
+}
+
+void ProcessStreamPoll(ProcessStream*, Vec<ProcessStreamEvent>*) {}
+
+bool ProcessStreamWrite(ProcessStream*, Str, Str* error) {
+    if (error)
+        *error = StrDup(StrL("running a process is unavailable in a browser"));
+    return false;
+}
+
+void ProcessStreamEnd(ProcessStream*) {}
+
+void ProcessStreamKill(ProcessStream*) {}
+
+void ProcessStreamFree(ProcessStream*) {}
+
 }
 
 #endif
@@ -252083,12 +253780,24 @@ bool ProcessRunBounded(Str command, const Str*, int, ProcessCancellation*,
 namespace gpui::shell {
 
 constexpr int kProcessStreamLimit = 8 * 1024 * 1024;
-constexpr double kProcessTimeout = 30.0;
 
 static void ProcessError(Str* error, Str message) {
     if (!error) return;
     StrFree(*error);
     *error = StrDup(message);
+}
+
+static double WallSeconds() {
+    static LARGE_INTEGER freq = {};
+    static LARGE_INTEGER start = {};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&start);
+    }
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    if (freq.QuadPart == 0) return 0;
+    return (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart;
 }
 
 static WCHAR* shell_process_win_WideDup(Str value) {
@@ -252501,7 +254210,11 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
         StrBuilder stdoutText, stderrText;
         bool stdoutClosed = false, stderrClosed = false, done = false;
         DWORD exitCode = (DWORD)-1;
-        double started = TimeNow();
+        double started = WallSeconds();
+        double timeoutSeconds = (options && options->timeoutSeconds > 0)
+                                    ? options->timeoutSeconds
+                                    : 30.0;
+        int timeoutMs = (int)(timeoutSeconds * 1000.0 + 0.5);
         while (!done || !stdoutClosed || !stderrClosed) {
             if (!stdoutClosed)
                 ok = DrainPipe(&outRead, &stdoutText, &stdoutClosed, error,
@@ -252510,12 +254223,12 @@ bool ProcessRunBounded(Str command, const Str* args, int count,
                 ok = DrainPipe(&errRead, &stderrText, &stderrClosed, error,
                                "stderr");
             bool cancelled = cancellation && cancellation->IsCancelled();
-            if (!ok || cancelled || TimeNow() - started >= kProcessTimeout) {
+            if (!ok || cancelled || WallSeconds() - started >= timeoutSeconds) {
                 if (ok && cancelled)
                     ProcessError(error, fmt("`%s` was cancelled", command));
                 else if (ok)
-                    ProcessError(error,
-                                 fmt("`%s` timed out after 30000 ms", command));
+                    ProcessError(error, fmt("`%s` timed out after %d ms",
+                                            command, timeoutMs));
                 ok = false;
                 TerminateJobObject(job, 1);
                 WaitForSingleObject(process.hProcess, 5000);
@@ -252555,6 +254268,410 @@ cleanup:
     Free(nullptr, environment);
     Free(nullptr, directory);
     return ok;
+}
+
+struct ProcessStream {
+    ProcessEventBox box;
+    Str command;
+    Str cwd;
+    double timeoutSeconds = 0;
+    uint32_t pid = 0;
+    HANDLE process = nullptr;
+    HANDLE job = nullptr;
+    HANDLE outRead = nullptr;
+    HANDLE errRead = nullptr;
+    HANDLE inWrite = nullptr;
+    HANDLE readerOut = nullptr;
+    HANDLE readerErr = nullptr;
+    HANDLE waiter = nullptr;
+    HANDLE stdinThread = nullptr;
+    ProcessDecodeState outDecode;
+    ProcessDecodeState errDecode;
+};
+
+struct ReaderLaunch {
+    ProcessStream* stream = nullptr;
+    HANDLE* pipeSlot = nullptr;
+    ProcessDecodeState* decode = nullptr;
+    ProcessStreamEvent::Kind kind = ProcessStreamEvent::Kind::Out;
+};
+
+static int TimeoutMilliseconds(double seconds) {
+    return (int)(seconds * 1000.0 + 0.5);
+}
+
+static void JoinThread(HANDLE* thread) {
+    if (!thread || !*thread) return;
+    WaitForSingleObject(*thread, INFINITE);
+    CloseHandle(*thread);
+    *thread = nullptr;
+}
+
+static DWORD WINAPI StreamReaderMain(LPVOID param) {
+    ReaderLaunch* launch = (ReaderLaunch*)param;
+    ProcessStream* stream = launch->stream;
+    HANDLE pipe = launch->pipeSlot ? *launch->pipeSlot : nullptr;
+    uint8_t chunk[64 * 1024];
+    bool failed = false;
+    for (;;) {
+        if (!pipe) break;
+
+        DWORD available = 0;
+        DWORD count = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+
+            if (!ReadFile(pipe, chunk, sizeof(chunk), &count, nullptr) ||
+                count == 0) {
+                break;
+            }
+        } else if (available == 0) {
+            if (ProcessEventReaped(&stream->box)) break;
+            Sleep(5);
+            continue;
+        } else {
+            DWORD want =
+                available > sizeof(chunk) ? (DWORD)sizeof(chunk) : available;
+            if (!ReadFile(pipe, chunk, want, &count, nullptr) || count == 0) {
+                break;
+            }
+        }
+        Str error;
+        if (!ProcessDecodeFeed(launch->decode, &stream->box, launch->kind,
+                               chunk, (int)count, &error)) {
+            ProcessEventSetReason(&stream->box, error);
+            if (stream->job && !ProcessEventReaped(&stream->box))
+                TerminateJobObject(stream->job, 1);
+            failed = true;
+            break;
+        }
+    }
+    if (!failed)
+        ProcessDecodeFinish(launch->decode, &stream->box, launch->kind);
+    ProcessDecodeFree(launch->decode);
+    if (launch->pipeSlot) Close(launch->pipeSlot);
+    delete launch;
+    return 0;
+}
+
+static DWORD WINAPI StreamStdinMain(LPVOID param) {
+    ProcessStream* stream = (ProcessStream*)param;
+    for (;;) {
+        Vec<char> bytes;
+        bool ended = false;
+        if (!ProcessStdinTake(&stream->box, &bytes, &ended)) break;
+        int offset = 0;
+        bool ok = true;
+        while (offset < bytes.len) {
+            DWORD wrote = 0;
+            if (!WriteFile(stream->inWrite, bytes.els + offset,
+                           (DWORD)(bytes.len - offset), &wrote, nullptr) ||
+                wrote == 0) {
+                ok = false;
+                break;
+            }
+            offset += (int)wrote;
+        }
+        VecReset(bytes);
+        if (!ok) {
+            ProcessStdinFail(&stream->box);
+            break;
+        }
+        if (ended) break;
+    }
+    Close(&stream->inWrite);
+    return 0;
+}
+
+static DWORD WINAPI StreamWaiterMain(LPVOID param) {
+    ProcessStream* stream = (ProcessStream*)param;
+    double started = WallSeconds();
+    bool waitFailed = false;
+    for (;;) {
+        DWORD waited = WaitForSingleObject(stream->process, 20);
+        if (waited == WAIT_OBJECT_0) break;
+        if (waited != WAIT_TIMEOUT) {
+            ProcessEventSetReason(
+                &stream->box,
+                StrDup(fmt("waiting for `%s` failed with Windows error %u",
+                           stream->command, GetLastError())));
+            waitFailed = true;
+            break;
+        }
+        if (stream->timeoutSeconds > 0 &&
+            WallSeconds() - started >= stream->timeoutSeconds) {
+            ProcessEventSetReason(
+                &stream->box,
+                StrDup(fmt("`%s` timed out after %d ms", stream->command,
+                           TimeoutMilliseconds(stream->timeoutSeconds))));
+            if (stream->job) TerminateJobObject(stream->job, 1);
+            break;
+        }
+    }
+    if (stream->job) TerminateJobObject(stream->job, 1);
+
+    ProcessEventMarkReaped(&stream->box);
+    JoinThread(&stream->readerOut);
+    JoinThread(&stream->readerErr);
+    ProcessStreamEvent event;
+    event.kind = ProcessStreamEvent::Kind::Exit;
+    if (!waitFailed) {
+        DWORD code = 0;
+        if (GetExitCodeProcess(stream->process, &code)) {
+            event.hasCode = true;
+            event.code = (int)code;
+        }
+    }
+    Str reason = ProcessEventTakeReason(&stream->box);
+    if (reason) {
+        event.hasError = true;
+        event.text = reason;
+    }
+    ProcessEventPush(&stream->box, event);
+    return 0;
+}
+
+static HANDLE StartReader(ProcessStream* stream, HANDLE* pipe,
+                          ProcessDecodeState* decode,
+                          ProcessStreamEvent::Kind kind) {
+    ReaderLaunch* launch = new ReaderLaunch();
+    launch->stream = stream;
+    launch->pipeSlot = pipe;
+    launch->decode = decode;
+    launch->kind = kind;
+    HANDLE thread =
+        CreateThread(nullptr, 0, StreamReaderMain, launch, 0, nullptr);
+    if (!thread) delete launch;
+    return thread;
+}
+
+static void ReleaseStream(ProcessStream* stream) {
+    if (!stream) return;
+    if (!ProcessEventReaped(&stream->box)) {
+        ProcessEventMarkKilled(&stream->box);
+        if (stream->job) TerminateJobObject(stream->job, 1);
+    }
+    ProcessStdinStop(&stream->box);
+    JoinThread(&stream->waiter);
+    JoinThread(&stream->readerOut);
+    JoinThread(&stream->readerErr);
+    JoinThread(&stream->stdinThread);
+    Close(&stream->outRead);
+    Close(&stream->errRead);
+    Close(&stream->inWrite);
+    Close(&stream->process);
+    Close(&stream->job);
+    ProcessDecodeFree(&stream->outDecode);
+    ProcessDecodeFree(&stream->errDecode);
+    ProcessEventBoxFree(&stream->box);
+    StrFree(stream->command);
+    StrFree(stream->cwd);
+    delete stream;
+}
+
+bool ProcessStreamStart(Str command, const Str* args, int count,
+                        const ProcessSpawnOptions* options, ProcessStream** out,
+                        Str* error) {
+    if (out) *out = nullptr;
+    if (error) {
+        StrFree(*error);
+        *error = {};
+    }
+    WCHAR* executable = ResolveExecutable(command, error);
+    if (!executable) return false;
+    Vec<WCHAR> commandLine;
+    bool built = AppendArgument(&commandLine, command);
+    for (int i = 0; built && i < count; i++)
+        built = AppendArgument(&commandLine, args[i]);
+    if (built) built = VecAppend(commandLine, (WCHAR)0);
+    if (!built) {
+        Free(nullptr, executable);
+        ProcessError(error,
+                     StrL("building the child-process command line failed"));
+        return false;
+    }
+
+    ProcessStream* stream = new ProcessStream();
+    ProcessEventBoxInit(&stream->box, options && options->stdinPipe);
+    stream->command = StrDup(command);
+    stream->timeoutSeconds = options ? options->timeoutSeconds : 0;
+    if (options && options->cwd) stream->cwd = StrDup(options->cwd);
+    bool lines = options && options->lines;
+    ProcessDecodeInit(&stream->outDecode, lines);
+    ProcessDecodeInit(&stream->errDecode, lines);
+
+    SECURITY_ATTRIBUTES security = {};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+    HANDLE outWrite = nullptr;
+    HANDLE errWrite = nullptr;
+    HANDLE inRead = nullptr;
+    HANDLE nullInput = nullptr;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+    STARTUPINFOW startup = {};
+    PROCESS_INFORMATION process = {};
+    WCHAR emptyEnvironment[2] = {};
+    WCHAR* directory = nullptr;
+    bool ok = true;
+    bool wantStdin = false;
+    bool threadsOk = false;
+    if (!CreatePipe(&stream->outRead, &outWrite, &security, 0) ||
+        !CreatePipe(&stream->errRead, &errWrite, &security, 0) ||
+        !SetHandleInformation(stream->outRead, HANDLE_FLAG_INHERIT, 0) ||
+        !SetHandleInformation(stream->errRead, HANDLE_FLAG_INHERIT, 0)) {
+        ProcessError(error, fmt("creating child-process pipes failed with "
+                                "Windows error %u",
+                                GetLastError()));
+        ok = false;
+        goto done;
+    }
+    if (options && options->stdinPipe) {
+        if (!CreatePipe(&inRead, &stream->inWrite, &security, 0) ||
+            !SetHandleInformation(stream->inWrite, HANDLE_FLAG_INHERIT, 0)) {
+            ProcessError(error, fmt("creating the child stdin pipe failed with "
+                                    "Windows error %u",
+                                    GetLastError()));
+            ok = false;
+            goto done;
+        }
+    } else {
+        nullInput = CreateFileW(L"NUL", GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, &security,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (nullInput == INVALID_HANDLE_VALUE) {
+            nullInput = nullptr;
+            ProcessError(error, fmt("opening the child-process null input "
+                                    "failed with Windows error %u",
+                                    GetLastError()));
+            ok = false;
+            goto done;
+        }
+    }
+    stream->job = CreateJobObjectW(nullptr, nullptr);
+    if (!stream->job) {
+        ProcessError(error, fmt("creating the child-process Job Object failed "
+                                "with Windows error %u",
+                                GetLastError()));
+        ok = false;
+        goto done;
+    }
+    limits.BasicLimitInformation
+        .LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(stream->job, JobObjectExtendedLimitInformation,
+                                 &limits, sizeof(limits))) {
+        ProcessError(error, fmt("configuring the child-process Job Object "
+                                "failed with Windows error %u",
+                                GetLastError()));
+        ok = false;
+        goto done;
+    }
+    if (stream->cwd) {
+        directory = shell_process_win_WideDup(stream->cwd);
+        if (!directory) {
+            ProcessError(error, StrL("the child-process working directory is "
+                                     "not valid UTF-8"));
+            ok = false;
+            goto done;
+        }
+    }
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = (options && options->stdinPipe) ? inRead : nullInput;
+    startup.hStdOutput = outWrite;
+    startup.hStdError = errWrite;
+    if (!CreateProcessW(
+            executable, commandLine.els, nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            emptyEnvironment, directory, &startup, &process)) {
+        ProcessError(error, fmt("running `%s` failed with Windows error %u",
+                                command, GetLastError()));
+        ok = false;
+        goto done;
+    }
+    stream->process = process.hProcess;
+    stream->pid = process.dwProcessId;
+    if (!AssignProcessToJobObject(stream->job, stream->process) ||
+        ResumeThread(process.hThread) == (DWORD)-1) {
+        ProcessError(error,
+                     fmt("isolating `%s` process tree failed with Windows "
+                         "error %u",
+                         command, GetLastError()));
+        ok = false;
+        goto done;
+    }
+    CloseHandle(process.hThread);
+    process.hThread = nullptr;
+    Close(&outWrite);
+    Close(&errWrite);
+    Close(&inRead);
+    Close(&nullInput);
+
+    wantStdin = options && options->stdinPipe;
+    stream
+        ->readerOut = StartReader(stream, &stream->outRead, &stream->outDecode,
+                                  ProcessStreamEvent::Kind::Out);
+    stream
+        ->readerErr = StartReader(stream, &stream->errRead, &stream->errDecode,
+                                  ProcessStreamEvent::Kind::Err);
+    if (wantStdin) {
+        stream->stdinThread =
+            CreateThread(nullptr, 0, StreamStdinMain, stream, 0, nullptr);
+    }
+    threadsOk = stream->readerOut && stream->readerErr &&
+                (!wantStdin || stream->stdinThread);
+    if (threadsOk) {
+        stream->waiter =
+            CreateThread(nullptr, 0, StreamWaiterMain, stream, 0, nullptr);
+        threadsOk = stream->waiter != nullptr;
+    }
+    if (!threadsOk) {
+        ProcessError(error, fmt("running `%s` failed: a stream thread could "
+                                "not be started",
+                                command));
+        ok = false;
+    }
+
+done:
+    Close(&outWrite);
+    Close(&errWrite);
+    Close(&inRead);
+    Close(&nullInput);
+    if (process.hThread) CloseHandle(process.hThread);
+    Free(nullptr, executable);
+    Free(nullptr, directory);
+    if (!ok) {
+        ReleaseStream(stream);
+        return false;
+    }
+    if (out) *out = stream;
+    return true;
+}
+
+uint32_t ProcessStreamPid(const ProcessStream* stream) {
+    return stream ? stream->pid : 0;
+}
+
+void ProcessStreamPoll(ProcessStream* stream, Vec<ProcessStreamEvent>* out) {
+    if (stream) ProcessEventTake(&stream->box, out);
+}
+
+bool ProcessStreamWrite(ProcessStream* stream, Str text, Str* error) {
+    if (!stream) return false;
+    return ProcessStdinEnqueue(&stream->box, text, error);
+}
+
+void ProcessStreamEnd(ProcessStream* stream) {
+    if (stream) ProcessStdinEnd(&stream->box);
+}
+
+void ProcessStreamKill(ProcessStream* stream) {
+    if (!stream || ProcessEventReaped(&stream->box)) return;
+    ProcessEventMarkKilled(&stream->box);
+    if (stream->job) TerminateJobObject(stream->job, 1);
+    ProcessStdinStop(&stream->box);
+}
+
+void ProcessStreamFree(ProcessStream* stream) {
+    ReleaseStream(stream);
 }
 
 }
