@@ -224384,6 +224384,10 @@ static bool AccessibilityInvokePattern(const AccessibilityNode& node) {
              AccessibilitySelectionItemRole(node.info.role));
 }
 
+static float DipScale(const Window* win) {
+    return win && win->paint.dpi > 0 ? win->paint.dpi / 96.f : 1.f;
+}
+
 struct WinAccessibility : IRawElementProviderSimple,
                           IRawElementProviderFragment,
                           IRawElementProviderFragmentRoot {
@@ -224929,11 +224933,13 @@ HRESULT WinAccessibility::ElementProviderFromPoint(
     }
     POINT point = {(LONG)x, (LONG)y};
     ScreenToClient(hwnd, &point);
+    float scale = DipScale(win);
+    float px = (float)point.x / scale;
+    float py = (float)point.y / scale;
     int found = -1;
     for (int i = 0; i < win->accessibility.len; i++) {
         const Bounds& b = win->accessibility[i].bounds;
-        if ((float)point.x >= b.x && (float)point.x <= b.Right() &&
-            (float)point.y >= b.y && (float)point.y <= b.Bottom()) {
+        if (px >= b.x && px <= b.Right() && py >= b.y && py <= b.Bottom()) {
 
             found = i;
         }
@@ -225173,9 +225179,10 @@ HRESULT WinAccessibilityNode::GetPropertyValue(PROPERTYID property,
     } else if (property == UIA_IsOffscreenPropertyId && root->hwnd) {
         RECT client = {};
         GetClientRect(root->hwnd, &client);
+        float scale = DipScale(root->win);
         bool off = node->bounds.Right() <= 0 || node->bounds.Bottom() <= 0 ||
-                   node->bounds.x >= (float)client.right ||
-                   node->bounds.y >= (float)client.bottom;
+                   node->bounds.x * scale >= (float)client.right ||
+                   node->bounds.y * scale >= (float)client.bottom;
         VariantBool(out, off);
     }
     return S_OK;
@@ -225277,10 +225284,11 @@ HRESULT WinAccessibilityNode::get_BoundingRectangle(UiaRect* out) {
     }
     POINT origin = {};
     ClientToScreen(root->hwnd, &origin);
-    out->left = (float)origin.x + node->bounds.x;
-    out->top = (float)origin.y + node->bounds.y;
-    out->width = node->bounds.w;
-    out->height = node->bounds.h;
+    float scale = DipScale(root->win);
+    out->left = (float)origin.x + node->bounds.x * scale;
+    out->top = (float)origin.y + node->bounds.y * scale;
+    out->width = node->bounds.w * scale;
+    out->height = node->bounds.h * scale;
     return S_OK;
 }
 
@@ -226155,9 +226163,10 @@ HRESULT WinTextRange::GetBoundingRectangles(SAFEARRAY** out) {
     if (start != end) {
         POINT origin = {};
         ClientToScreen(root->hwnd, &origin);
-        double values[4] = {(double)origin.x + node->bounds.x,
-                            (double)origin.y + node->bounds.y, node->bounds.w,
-                            node->bounds.h};
+        double scale = DipScale(root->win);
+        double values[4] = {(double)origin.x + node->bounds.x * scale,
+                            (double)origin.y + node->bounds.y * scale,
+                            node->bounds.w * scale, node->bounds.h * scale};
         for (LONG i = 0; i < 4; i++) {
             HRESULT hr = SafeArrayPutElement(*out, &i, &values[i]);
             if (FAILED(hr)) {
@@ -231588,7 +231597,6 @@ bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH) {
             delete t;
             return false;
         }
-        t->dc->SetDpi(96.f, 96.f);
         if (t->transparent) {
 
             t->dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
@@ -231627,6 +231635,9 @@ bool PaintTargetBegin(PaintCtx* ctx, void* native, int pxW, int pxH) {
 
         scene::Invalidate(ctx);
     }
+
+    float dpi = ctx->dpi > 0 ? ctx->dpi : 96.f;
+    ctx->rt->rt->SetDpi(dpi, dpi);
     ctx->rt->rt->BeginDraw();
     ctx->rt->rt->SetTransform(D2D1::Matrix3x2F::Identity());
 
@@ -232222,8 +232233,10 @@ void PathRealize(PaintCtx* ctx, Path* p) {
         return;
     }
 
-    dc->CreateFilledGeometryRealization(g, D2D1_DEFAULT_FLATTENING_TOLERANCE,
-                                        &p->fillReal);
+    float dpi = ctx->dpi > 0 ? ctx->dpi : 96.f;
+    float tolerance = D2D1::ComputeFlatteningTolerance(
+        D2D1::Matrix3x2F::Identity(), dpi, dpi);
+    dc->CreateFilledGeometryRealization(g, tolerance, &p->fillReal);
 }
 
 static bool PathOffsetBegin(PaintCtx* ctx, float dx, float dy) {
@@ -242730,8 +242743,8 @@ static void ImeMoveCandidateWindow(Window* win, HIMC imc) {
     }
     float x = in->lastBounds.x + in->caretX - in->scrollX;
     float y = in->lastBounds.y - in->scrollY;
-
-    POINT pt = {(LONG)x, (LONG)(y + in->lastLineH)};
+    POINT pt = {DipToPx(&win->paint, x),
+                DipToPx(&win->paint, y + in->lastLineH)};
     COMPOSITIONFORM cf = {};
     cf.dwStyle = CFS_POINT;
     cf.ptCurrentPos = pt;
@@ -242803,6 +242816,31 @@ typedef UINT(WINAPI* GetDpiForWindowFn)(HWND);
 
 static GetDpiForWindowFn kNoDpiFn = (GetDpiForWindowFn)1;
 
+typedef UINT(WINAPI* GetDpiForSystemFn)();
+
+static float DpiOverride() {
+    static float dpi = -1;
+    if (dpi < 0) {
+        const char* env = getenv("GPUI_DPI");
+        dpi = env ? (float)atoi(env) : 0;
+        if (dpi < 48 || dpi > 960) {
+            dpi = 0;
+        }
+    }
+    return dpi;
+}
+
+static float DrawDpi(UINT monitorDpi) {
+    if (PaintGpuOn()) {
+        return 96;
+    }
+    float dpi = DpiOverride();
+    if (dpi > 0) {
+        return dpi;
+    }
+    return monitorDpi > 0 ? (float)monitorDpi : 96.f;
+}
+
 static float HostDpi(HWND hwnd) {
     static GetDpiForWindowFn getDpiForWindow = nullptr;
     if (!getDpiForWindow) {
@@ -242815,11 +242853,15 @@ static float HostDpi(HWND hwnd) {
             getDpiForWindow = kNoDpiFn;
         }
     }
-    UINT dpi = getDpiForWindow != kNoDpiFn ? getDpiForWindow(hwnd) : 96;
-    if (dpi == 0) {
-        dpi = 96;
-    }
-    return (float)dpi;
+    return DrawDpi(getDpiForWindow != kNoDpiFn ? getDpiForWindow(hwnd) : 96);
+}
+
+static float SystemDpi() {
+    HMODULE user = GetModuleHandleW(L"user32.dll");
+    auto getDpiForSystem =
+        user ? (GetDpiForSystemFn)GetProcAddress(user, "GetDpiForSystem")
+             : nullptr;
+    return DrawDpi(getDpiForSystem ? getDpiForSystem() : 96);
 }
 
 static void RenderFrame(Window* win) {
@@ -242829,14 +242871,14 @@ static void RenderFrame(Window* win) {
     }
     RECT rc = {};
     GetClientRect(hwnd, &rc);
-
-    win->paint.dpi = 96;
+    win->paint.dpi = HostDpi(hwnd);
     WINDOWPLACEMENT wp = {sizeof(wp)};
     GetWindowPlacement(hwnd, &wp);
     win->maximized = wp.showCmd == SW_SHOWMAXIMIZED;
     int pxW = rc.right - rc.left;
     int pxH = rc.bottom - rc.top;
-    WindowDrawFrame(win, hwnd, pxW, pxH, (float)pxW, (float)pxH);
+    WindowDrawFrame(win, hwnd, pxW, pxH, PxToDip(&win->paint, pxW),
+                    PxToDip(&win->paint, pxH));
 }
 
 static int BorderPx() {
@@ -243398,6 +243440,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left,
                          r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
             PaintTargetFree(&win->paint);
+
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         case WM_TIMER:
@@ -244403,8 +244447,11 @@ Window* WindowOpen(App* app, Str title, int dipW, int dipH, WinOpts opts) {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
     int sx = wa.right - wa.left;
     int sy = wa.bottom - wa.top;
-    WindowClampToDisplay(&dipW, &dipH, sx, sy);
-    RECT wr = {0, 0, dipW, dipH};
+    float scale = SystemDpi() / 96.f;
+    WindowClampToDisplay(&dipW, &dipH, (int)((float)sx / scale),
+                         (int)((float)sy / scale));
+    RECT wr = {0, 0, (LONG)lroundf((float)dipW * scale),
+               (LONG)lroundf((float)dipH * scale)};
     AdjustWindowRectEx(&wr, style, FALSE, 0);
     int pxW = wr.right - wr.left;
     int pxH = wr.bottom - wr.top;
