@@ -2135,11 +2135,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
+bool PlatCleanOnEscape() {
+    return false;
+}
 bool PlatScrollBounceTouch() {
     return true;
-}
-bool PlatWebViewPartialClipHides() {
-    return false;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2199,11 +2199,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
-bool PlatScrollBounceTouch() {
+bool PlatCleanOnEscape() {
     return true;
 }
-bool PlatWebViewPartialClipHides() {
-    return false;
+bool PlatScrollBounceTouch() {
+    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2306,11 +2306,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
+bool PlatCleanOnEscape() {
+    return true;
+}
 bool PlatScrollBounceTouch() {
     return false;
-}
-bool PlatWebViewPartialClipHides() {
-    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2413,11 +2413,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
+bool PlatCleanOnEscape() {
+    return true;
+}
 bool PlatScrollBounceTouch() {
     return false;
-}
-bool PlatWebViewPartialClipHides() {
-    return true;
 }
 const char* PlatMonoFontName() {
     return "Menlo";
@@ -2863,10 +2863,10 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
-bool PlatScrollBounceTouch() {
-    return false;
+bool PlatCleanOnEscape() {
+    return true;
 }
-bool PlatWebViewPartialClipHides() {
+bool PlatScrollBounceTouch() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -3260,10 +3260,10 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
-bool PlatScrollBounceTouch() {
-    return false;
+bool PlatCleanOnEscape() {
+    return true;
 }
-bool PlatWebViewPartialClipHides() {
+bool PlatScrollBounceTouch() {
     return false;
 }
 const char* PlatMonoFontName() {

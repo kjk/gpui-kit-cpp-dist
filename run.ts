@@ -538,35 +538,35 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "50dac1cafb34a4d453c92715219c0458d9a4727b",
-  date: "2026-10-14",
-  subject: "shell: Fix more runtime gaps found by the benchmark apps (#3510)",
+  sha: "18be16887bc2cb462f7b0a33c18bf6183344e7de",
+  date: "2026-10-28",
+  subject: "menu: Make submenu rows activatable (#3714)",
   crates: {
-    "gpui-kit": "0.7.3",
-    "gpui-base": "0.7.3",
-    "gpui-component": "0.7.3",
-    "gpui-component-story": "0.7.3",
-    "gpui-webview": "0.7.3",
-    "gpui-shell": "0.7.3",
+    "gpui-kit": "0.8.1",
+    "gpui-base": "0.8.1",
+    "gpui-component": "0.8.1",
+    "gpui-component-story": "0.8.1",
+    "gpui-webview": "0.8.1",
+    "gpui-shell": "0.8.1",
   },
   dir: ".work/gpui-component",
 } as const;
 
 /**
- * Zed reference snapshot recorded in gpui-pre 0.3.9's package metadata.
+ * Zed reference snapshot recorded in gpui-pre 0.3.10's package metadata.
  * Cargo.lock now resolves registry packages rather than a Zed git source.
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "93d745668805029476e6d7fbb19652116fed51de",
-  date: "2026-10-10",
-  subject: "git_ui: Fix commit editor button hover colors (#65448)",
+  sha: "08cbb88a152c3751a43e853425a70e9f631a5918",
+  date: "2026-10-25",
+  subject: "git_ui: Fix git graph lagging when toggling commit details panel (#66132)",
   crates: {
-    "gpui-pre": "0.3.9",
-    "gpui-pre-platform": "0.3.9",
-    "gpui-pre-macros": "0.3.9",
+    "gpui-pre": "0.3.10",
+    "gpui-pre-platform": "0.3.10",
+    "gpui-pre-macros": "0.3.10",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.9",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.10",
 } as const;
 
 /**
@@ -577,8 +577,8 @@ export const zedGpui = {
  */
 export const taffy = {
   repo: "https://github.com/DioxusLabs/taffy",
-  version: "0.13.0",
-  crateSha256: "c034e05f6ee85a12daa63863c2245797715075c70649947aa0da54f3f2ab1d0f",
+  version: "0.15.0",
+  crateSha256: "3c8480887e8803986d96a7173729565520d4bbb721ad6b7ad6941a22897207aa",
   dir: "src/taffy",
 } as const;
 

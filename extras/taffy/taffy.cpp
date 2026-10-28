@@ -2016,16 +2016,20 @@ struct PlacedFloatedBox {
     float y = 0.0f;
 };
 
+static constexpr float kFitTolerance = 0.001f;
+
 static bool FloatFitsHorizontally(float width, FloatDirection direction,
                                   float bfcWidth, const float floatInsets[2],
                                   const float cbInsets[2]) {
     int lead = (int)direction;
     int trail = 1 - lead;
     float xInset = F32Max(floatInsets[lead], cbInsets[lead]);
-    bool fitsOpposite = floatInsets[trail] == 0.0f ||
-                        xInset + width <= bfcWidth - floatInsets[trail];
-    bool fitsContaining = floatInsets[lead] == 0.0f ||
-                          xInset + width <= bfcWidth - cbInsets[trail];
+    bool fitsOpposite =
+        floatInsets[trail] == 0.0f ||
+        xInset + width <= bfcWidth - floatInsets[trail] + kFitTolerance;
+    bool fitsContaining =
+        floatInsets[lead] == 0.0f ||
+        xInset + width <= bfcWidth - cbInsets[trail] + kFitTolerance;
     return fitsOpposite && fitsContaining;
 }
 
@@ -2496,14 +2500,24 @@ BfcSlot FloatContext::FindBfcSlot(float minY,
 
 struct FloatIntrinsicWidthCalculator {
     AvailableSpace availableWidth;
+
+    float sideSums[2] = {};
     float contribution = 0.0f;
     float widest = 0.0f;
 
-    void AddFloat(float width) {
+    void AddFloat(float width, FloatDirection direction, Clear clear) {
         switch (availableWidth.kind) {
             case AvailableSpace::Kind::Definite:
             case AvailableSpace::Kind::MaxContent:
-                contribution += width;
+
+                if (clear == Clear::Left || clear == Clear::Both) {
+                    sideSums[0] = 0.0f;
+                }
+                if (clear == Clear::Right || clear == Clear::Both) {
+                    sideSums[1] = 0.0f;
+                }
+                sideSums[(int)direction] += width;
+                contribution = F32Max(contribution, sideSums[0] + sideSums[1]);
                 break;
             case AvailableSpace::Kind::MinContent:
                 contribution = F32Max(contribution, width);
@@ -2532,7 +2546,7 @@ struct BlockContext {
 
     float contentBoxInsets[2] = {0.0f, 0.0f};
 
-    float floatContentContribution = 0.0f;
+    float floatContentContribution = -INFINITY;
     bool isRoot = false;
     bool adjoiningFloats[2] = {false, false};
     bool topAdjoiningFloats[2] = {false, false};
@@ -2652,7 +2666,7 @@ struct BlockItem {
 
     bool isTable = false;
 
-    bool isReplaced = false;
+    bool isCompressibleReplaced = false;
 
     bool isInSameBfc = false;
 
@@ -2660,13 +2674,20 @@ struct BlockItem {
     Clear clear = Clear::None;
 
     SizeFOpt size = SizeFOptNone();
+
+    SizeDim sizeStyle;
     SizeFOpt minSize = SizeFOptNone();
     SizeFOpt maxSize = SizeFOptNone();
 
     PointOverflow overflow;
+    Contain contain;
     float scrollbarWidth = 0.0f;
 
-    Position position = Position::Relative;
+    Position position = Position::Static;
+
+    Direction direction = Direction::Ltr;
+    OptAlignSelf alignSelf;
+    OptAlignSelf justifySelf;
     RectLpa inset;
     RectLpa margin;
     RectF padding;
@@ -2680,6 +2701,9 @@ struct BlockItem {
 
     bool hasFinalLayout = false;
     Layout finalLayout;
+
+    int oofStart = 0;
+    int oofCount = 0;
 };
 
 void GenerateItemList(TaffyTree* tree, NodeId node, SizeFOpt nodeInnerSize,
@@ -2695,8 +2719,9 @@ void GenerateItemList(TaffyTree* tree, NodeId node, SizeFOpt nodeInnerSize,
         }
 
         Optf aspectRatio = cs.aspectRatio;
-        RectF padding = cs.padding.ResolveOrZero(nodeInnerSize, calc);
-        RectF border = cs.border.ResolveOrZero(nodeInnerSize, calc);
+
+        RectF padding = cs.padding.ResolveOrZero(nodeInnerSize.w, calc);
+        RectF border = cs.border.ResolveOrZero(nodeInnerSize.w, calc);
         SizeF pbSum = (padding + border).SumAxes();
         SizeF boxSizingAdjustment =
             cs.boxSizing == BoxSizing::ContentBox ? pbSum : SizeF::Zero();
@@ -2705,20 +2730,28 @@ void GenerateItemList(TaffyTree* tree, NodeId node, SizeFOpt nodeInnerSize,
         item.nodeId = childNodeId;
         item.order = order++;
         item.isTable = cs.itemIsTable;
-        item.isReplaced = cs.IsCompressibleReplaced();
+        item.isCompressibleReplaced = cs.IsCompressibleReplaced();
         item.floatMode = cs.floatMode;
         item.clear = cs.clear;
         item.position = cs.position;
+        item.direction = cs.direction;
+        item.alignSelf = cs.alignSelf;
+        item.justifySelf = cs.justifySelf;
         item.overflow = cs.overflow;
+        item.contain = cs.contain;
         item.scrollbarWidth = cs.scrollbarWidth;
 
         bool isNotFloated = cs.floatMode == Float::None;
         bool isScrollContainer = IsScrollContainer(cs.overflow.x) ||
                                  IsScrollContainer(cs.overflow.y);
-        item.isInSameBfc = cs.IsBlock() && !cs.itemIsTable &&
-                           cs.position != Position::Absolute && isNotFloated &&
-                           !isScrollContainer;
 
+        item.isInSameBfc =
+            cs.IsBlock() && !cs.itemIsTable && !IsOutOfFlow(cs.position) &&
+            isNotFloated && !isScrollContainer &&
+            !cs.contain.EstablishesIndependentFormattingContext() &&
+            cs.alignContent.keyword == AlignContentKeyword::Normal;
+
+        item.sizeStyle = cs.size;
         item.size = MaybeAdd(
             MaybeApplyAspectRatio(cs.size.MaybeResolve(nodeInnerSize, calc),
                                   aspectRatio),
@@ -2740,6 +2773,21 @@ void GenerateItemList(TaffyTree* tree, NodeId node, SizeFOpt nodeInnerSize,
     }
 }
 
+Optf ResolveStretchHeight(Dimension heightStyle, Optf containerInnerHeight,
+                          RectF itemMargin, LineBool marginsTreatedAsZero) {
+    if (!heightStyle.IsStretch() || !IsSome(containerInnerHeight)) {
+        return None();
+    }
+    float height = containerInnerHeight;
+    if (!marginsTreatedAsZero.start) {
+        height -= itemMargin.top;
+    }
+    if (!marginsTreatedAsZero.end) {
+        height -= itemMargin.bottom;
+    }
+    return Some(height);
+}
+
 float DetermineContentBasedContainerWidth(TaffyTree* tree,
                                           const Vec<BlockItem>& items,
                                           AvailableSpace availableWidth) {
@@ -2752,7 +2800,7 @@ float DetermineContentBasedContainerWidth(TaffyTree* tree,
 
     for (int i = 0; i < len(items); i++) {
         const BlockItem& item = items[i];
-        if (item.position == Position::Absolute) {
+        if (IsOutOfFlow(item.position)) {
             continue;
         }
         SizeFOpt knownDimensions =
@@ -2765,16 +2813,26 @@ float DetermineContentBasedContainerWidth(TaffyTree* tree,
             width = knownDimensions.w;
         } else {
             SizeAvail childAvail = availableSpace;
-            childAvail.width = MaybeSub(childAvail.width, itemXMarginSum);
+            SizingKeywordResolution keyword = ResolveSizingKeyword(
+                item.sizeStyle.width, None(), None(), calc);
+            if (keyword.isSome && keyword.kind == SizingKeywordKind::Exact) {
+                childAvail.width = AvailableSpace::Definite(keyword.exact);
+            } else if (keyword.isSome) {
+                childAvail.width = keyword.measure;
+            } else {
+                childAvail.width = MaybeSub(childAvail.width, itemXMarginSum);
+            }
+
             width = tree->MeasureChildSize(
                 item.nodeId, knownDimensions, SizeFOptNone(), childAvail,
                 SizingMode::InherentSize, AbsoluteAxis::Horizontal,
-                LineBool::True());
+                item.isInSameBfc ? LineBool::True() : LineBool::False());
         }
         width = F32Max(width, item.paddingBorderSum.w) + itemXMarginSum;
 
         if (IsFloated(item.floatMode)) {
-            floatContribution.AddFloat(width);
+            floatContribution
+                .AddFloat(width, FloatDir(item.floatMode).val, item.clear);
             continue;
         }
         maxChildWidth = F32Max(maxChildWidth, width);
@@ -2784,7 +2842,7 @@ float DetermineContentBasedContainerWidth(TaffyTree* tree,
 }
 
 struct InFlowResult {
-    SizeF inflowContentSize;
+    RectF inflowOverflowRect;
     float intrinsicOuterHeight = 0.0f;
     CollapsibleMarginSet firstChildTopMarginSet;
     CollapsibleMarginSet lastChildBottomMarginSet;
@@ -2793,13 +2851,18 @@ struct InFlowResult {
 
 InFlowResult PerformFinalLayoutOnInFlowChildren(
     TaffyTree* tree, RunMode runMode, Vec<BlockItem>* items,
-    float containerOuterWidth, Optf containerPercentageResolutionHeight,
-    RectF contentBoxInset, RectF resolvedContentBoxInset, RectF resolvedBorder,
-    TextAlign textAlign, Direction direction,
-    LineBool ownMarginsCollapseWithChildren, BlockContext* blockCtx) {
+    Vec<OofCandidate>* oofPool, float containerOuterWidth,
+    Optf containerPercentageResolutionHeight, RectF contentBoxInset,
+    RectF resolvedContentBoxInset, RectF resolvedBorder, TextAlign textAlign,
+    AlignItems justifyItems, Direction direction,
+    LineBool ownMarginsCollapseWithChildren,
+    LineBool childrenMarginsAdjoinOwnEdges, bool isScrollContainer,
+    BlockContext* blockCtx) {
     CalcResolver calc = tree->calc;
-    float containerInnerWidth = containerOuterWidth - resolvedContentBoxInset
-                                                          .HorizontalAxisSum();
+
+    float containerInnerWidth =
+        F32Max(0.0f, containerOuterWidth - resolvedContentBoxInset
+                                               .HorizontalAxisSum());
     Optf percentageResolutionHeight =
         MaybeSub(containerPercentageResolutionHeight, resolvedContentBoxInset
                                                           .VerticalAxisSum());
@@ -2830,7 +2893,7 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
 
     for (int itemIdx = 0; itemIdx < items->len; itemIdx++) {
         BlockItem& item = (*items)[itemIdx];
-        if (item.position == Position::Absolute) {
+        if (IsOutOfFlow(item.position)) {
             float x = direction == Direction::Ltr
                           ? resolvedContentBoxInset.left
                           : containerOuterWidth - resolvedContentBoxInset.right;
@@ -2853,11 +2916,28 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         if (floatDirection.IsSome()) {
             hasActiveFloats = true;
 
-            float availableWidth = containerInnerWidth - itemNonAutoXMarginSum;
+            float availableWidth =
+                F32Max(0.0f, containerInnerWidth - itemNonAutoXMarginSum);
+            Optf itemKnownWidth = None();
+            AvailableSpace itemAvailableWidth =
+                AvailableSpace::Definite(availableWidth);
+            SizingKeywordResolution keywordWidth =
+                ResolveSizingKeyword(item.sizeStyle.width, Some(availableWidth),
+                                     Some(containerInnerWidth), calc);
+            if (keywordWidth.isSome &&
+                keywordWidth.kind == SizingKeywordKind::Measure) {
+                itemAvailableWidth = keywordWidth.measure;
+            } else if (keywordWidth.isSome) {
+                itemKnownWidth = Some(keywordWidth.exact);
+                itemAvailableWidth =
+                    AvailableSpace::Definite(keywordWidth.exact);
+            }
+            Optf itemKnownHeight = ResolveStretchHeight(
+                item.sizeStyle.height, percentageResolutionHeight,
+                itemNonAutoMargin, LineBool::False());
             LayoutOutput itemLayout = tree->PerformChildLayout(
-                item.nodeId, SizeFOptNone(), parentSize,
-                {AvailableSpace::Definite(availableWidth),
-                 AvailableSpace::MaxContent()},
+                item.nodeId, {itemKnownWidth, itemKnownHeight}, parentSize,
+                {itemAvailableWidth, AvailableSpace::MaxContent()},
                 SizingMode::InherentSize, LineBool::False());
             SizeF marginBox = itemLayout.size + itemNonAutoMargin.SumAxes();
 
@@ -2874,26 +2954,30 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             location.y += itemNonAutoMargin.top;
             location.x += itemNonAutoMargin.left;
 
-            Layout layout;
-            layout.order = item.order;
-            layout.size = itemLayout.size;
-            layout.contentSize = itemLayout.contentSize;
-            layout.scrollbarSize = scrollbarSize;
-            layout.location = location;
-            layout.padding = item.padding;
-            layout.border = item.border;
-            layout.margin = itemNonAutoMargin;
-            tree->SetUnroundedLayout(item.nodeId, layout);
+            item.hasFinalLayout = true;
+            item.finalLayout.order = item.order;
+            item.finalLayout.size = itemLayout.size;
+            item.finalLayout
+                .scrollableOverflowRect = itemLayout.scrollableOverflowRect;
+            item.finalLayout.scrollbarSize = scrollbarSize;
+            item.finalLayout.location = location;
+            item.finalLayout.padding = item.padding;
+            item.finalLayout.border = item.border;
+            item.finalLayout.margin = itemNonAutoMargin;
+            OofCandRange range;
+            OofAppendRange(oofPool, &range, itemLayout.oofCandidates);
+            item.oofStart = range.start;
+            item.oofCount = range.count;
 
-            res.inflowContentSize = Max(
-                res.inflowContentSize,
-                ComputeContentSizeContribution(
+            res.inflowOverflowRect = res.inflowOverflowRect.Union(
+                ComputeScrollableOverflowContribution(
                     {IsRtl(direction) ? containerOuterWidth -
                                             (location.x + itemLayout.size.w) -
                                             resolvedBorder.right
                                       : location.x - resolvedBorder.left,
                      location.y - resolvedBorder.top},
-                    itemLayout.size, itemLayout.contentSize, item.overflow));
+                    itemLayout.size, itemLayout.scrollableOverflowRect,
+                    item.overflow, item.contain, isScrollContainer));
             continue;
         }
 
@@ -2905,7 +2989,8 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         bool itemPushedBelowFloat = false;
 
         if (item.isInSameBfc) {
-            stretchWidth = containerInnerWidth - itemNonAutoXMarginSum;
+            stretchWidth =
+                F32Max(0.0f, containerInnerWidth - itemNonAutoXMarginSum);
             floatAvoidingPosition = {0.0f, 0.0f};
             floatAvoidingWidth = 0.0f;
         } else {
@@ -2930,9 +3015,10 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
                     }
                     float width = MaybeClamp(
                         UnwrapOr(item.size.w,
-                                 F32Max(slot.stretchWidth, minAutoWidth)),
+                                 F32Max(F32Max(slot.stretchWidth, minAutoWidth),
+                                        0.0f)),
                         item.minSize.w, item.maxSize.w);
-                    if (width <= slot.borderWidth + 0.001f) {
+                    if (width <= slot.borderWidth + kFitTolerance) {
                         break;
                     }
                     after = slot.segmentId;
@@ -2940,21 +3026,53 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
                 itemPushedBelowFloat = slot.y > minY;
                 hasActiveFloats = slot.segmentId >= 0;
                 itemAvoidsFloats = true;
-                stretchWidth = F32Max(slot.stretchWidth, minAutoWidth);
+                stretchWidth =
+                    F32Max(F32Max(slot.stretchWidth, minAutoWidth), 0.0f);
                 floatAvoidingPosition = {slot.x, slot.y};
                 floatAvoidingWidth = slot.borderWidth;
             } else {
-                stretchWidth = containerInnerWidth - itemNonAutoXMarginSum;
+                stretchWidth =
+                    F32Max(0.0f, containerInnerWidth - itemNonAutoXMarginSum);
                 floatAvoidingPosition = {resolvedContentBoxInset.left, minY};
                 floatAvoidingWidth = containerInnerWidth;
             }
         }
 
+        AlignItems justifySelf =
+            ResolveSelfRelative(item.justifySelf.UnwrapOr(justifyItems),
+                                item.direction, direction, true);
+        bool isStretch = justifySelf.keyword == AlignItemsKeyword::Stretch;
+        bool hasNonStretchJustify =
+            justifySelf.keyword != AlignItemsKeyword::Normal && !isStretch;
+
         SizeFOpt knownDimensions = SizeFOptNone();
-        if (!item.isTable && !item.isReplaced) {
+        if (!(item.isTable || item.isCompressibleReplaced) || isStretch) {
+
+            Dimension widthStyle = item.sizeStyle.width;
+            if (hasNonStretchJustify && widthStyle.IsAuto()) {
+                widthStyle = Dimension::FitContent();
+            }
+            Optf keywordWidth = None();
+            SizingKeywordResolution keyword =
+                ResolveSizingKeyword(widthStyle, Some(stretchWidth),
+                                     Some(containerInnerWidth), calc);
+            if (keyword.isSome && keyword.kind == SizingKeywordKind::Exact) {
+                keywordWidth = Some(keyword.exact);
+            } else if (keyword.isSome) {
+                keywordWidth = Some(tree->MeasureChildSize(
+                    item.nodeId, SizeFOptNone(), parentSize,
+                    {keyword.measure, AvailableSpace::MaxContent()},
+                    SizingMode::InherentSize, AbsoluteAxis::Horizontal,
+                    item.isInSameBfc ? LineBool::True() : LineBool::False()));
+            }
+            Optf keywordHeight = ResolveStretchHeight(
+                item.sizeStyle.height, percentageResolutionHeight,
+                itemNonAutoMargin, childrenMarginsAdjoinOwnEdges);
             SizeFOpt sized = item.size;
-            sized.w = Some(MaybeClamp(UnwrapOr(sized.w, stretchWidth),
-                                      item.minSize.w, item.maxSize.w));
+            sized.w = Some(
+                MaybeClamp(UnwrapOr(Or(sized.w, keywordWidth), stretchWidth),
+                           item.minSize.w, item.maxSize.w));
+            sized.h = Or(sized.h, keywordHeight);
             knownDimensions = MaybeClamp(sized, item.minSize, item.maxSize);
         }
 
@@ -2963,6 +3081,9 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         inputs.sizingMode = SizingMode::InherentSize;
         inputs.axis = RequestedAxis::Both;
         inputs.knownDimensions = knownDimensions;
+
+        inputs.knownDimensionsAreDefiniteW = true;
+        inputs.knownDimensionsAreDefiniteH = true;
         inputs.parentSize = parentSize;
         inputs.availableSpace = availableSpace;
         inputs.availableSpace.width = AvailableSpace::Definite(stretchWidth);
@@ -2973,22 +3094,27 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
         float clearPos = UnwrapOr(clearThreshold, -INFINITY);
 
         LayoutOutput itemLayout;
+
+        float childFloatContribution = -INFINITY;
         if (item.isInSameBfc) {
 
-            float width = UnwrapOr(knownDimensions.w, stretchWidth);
+            float width = F32Max(UnwrapOr(knownDimensions.w, stretchWidth),
+                                 item.paddingBorderSum.w);
 
             float insetLeft = itemNonAutoMargin.left + contentBoxInset.left;
             float insetRight = containerOuterWidth - width - insetLeft;
             float insets[2] = {insetLeft, insetRight};
 
-            BlockContext childBlockCtx = blockCtx->SubContext(
-                F32Max(yOffsetForAbsolute + itemNonAutoMargin.top, clearPos),
-                insets);
+            float estimatedY = committedYOffset +
+                               activeCollapsibleMarginSet
+                                   .CollapseWithMargin(itemNonAutoMargin.top)
+                                   .Resolve();
+            BlockContext childBlockCtx =
+                blockCtx->SubContext(F32Max(estimatedY, clearPos), insets);
             itemLayout = tree->ComputeBlockChildLayout(item.nodeId, inputs,
                                                        &childBlockCtx);
-            blockCtx->AddChildFloatedContentHeightContribution(
-                yOffsetForAbsolute + childBlockCtx
-                                         .FloatedContentHeightContribution());
+            childFloatContribution = childBlockCtx
+                                         .FloatedContentHeightContribution();
             bool childFlags[2];
             childBlockCtx.GetTopAdjoiningFloats(childFlags);
             blockCtx->MergeAdjoiningFloats(childFlags);
@@ -3009,25 +3135,29 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
                               (IsSome(itemMargin.right) ? 0 : 1);
         float xAxisAutoMarginSize =
             autoMarginCount > 0 ? freeXSpace / (float)autoMarginCount : 0.0f;
+
         RectF resolvedMargin = {UnwrapOr(itemMargin.left, xAxisAutoMarginSize),
                                 UnwrapOr(itemMargin.right, xAxisAutoMarginSize),
-                                topMarginSet.Resolve(),
-                                bottomMarginSet.Resolve()};
+                                UnwrapOr(itemMargin.top, 0.0f),
+                                UnwrapOr(itemMargin.bottom, 0.0f)};
 
-        RectFOpt inset = item.inset.MaybeResolveZip(
-            {Some(containerInnerWidth), Some(0.0f)}, calc);
-        Optf negRight = inset.right;
-        if (IsSome(negRight)) {
-            negRight = -negRight;
+        PointF insetOffset = {0.0f, 0.0f};
+        if (item.position == Position::Relative) {
+            RectFOpt inset = item.inset.MaybeResolveZip(
+                {Some(containerInnerWidth), percentageResolutionHeight}, calc);
+            Optf negRight = inset.right;
+            if (IsSome(negRight)) {
+                negRight = -negRight;
+            }
+            Optf negBottom = inset.bottom;
+            if (IsSome(negBottom)) {
+                negBottom = -negBottom;
+            }
+            insetOffset = {IsRtl(direction)
+                               ? UnwrapOr(Or(negRight, inset.left), 0.0f)
+                               : UnwrapOr(Or(inset.left, negRight), 0.0f),
+                           UnwrapOr(Or(inset.top, negBottom), 0.0f)};
         }
-        Optf negBottom = inset.bottom;
-        if (IsSome(negBottom)) {
-            negBottom = -negBottom;
-        }
-        PointF insetOffset = {IsRtl(direction)
-                                  ? UnwrapOr(Or(negRight, inset.left), 0.0f)
-                                  : UnwrapOr(Or(inset.left, negRight), 0.0f),
-                              UnwrapOr(Or(inset.top, negBottom), 0.0f)};
 
         if (item.isInSameBfc && (!isCollapsingWithFirstMarginSet ||
                                  !ownMarginsCollapseWithChildren.start)) {
@@ -3100,9 +3230,43 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
                 floatAvoidingPosition.y + insetOffset.y};
         }
 
+        if (item.isInSameBfc) {
+            blockCtx->AddChildFloatedContentHeightContribution(
+                location.y - insetOffset.y + childFloatContribution);
+        }
+
         float itemOuterWidth = itemLayout.size.w + resolvedMargin
                                                        .HorizontalAxisSum();
-        if (itemOuterWidth < containerInnerWidth) {
+        bool hasAutoXMargin =
+            !IsSome(itemMargin.left) || !IsSome(itemMargin.right);
+        if (hasNonStretchJustify && !hasAutoXMargin) {
+
+            float containerStart;
+            float freeX;
+            if (itemAvoidsFloats) {
+                containerStart = floatAvoidingPosition.x - resolvedMargin.left;
+                freeX = floatAvoidingWidth - itemLayout.size.w;
+            } else {
+                containerStart = resolvedContentBoxInset.left;
+                freeX = containerInnerWidth - itemOuterWidth;
+            }
+            AlignItemsKeyword keyword = justifySelf.keyword;
+            if (justifySelf.safety == AlignmentSafety::Safe && freeX < 0.0f) {
+                keyword = AlignItemsKeyword::Start;
+            }
+            float offset;
+            if (keyword == AlignItemsKeyword::Center) {
+                offset = freeX / 2.0f;
+            } else {
+                bool alignToEnd = keyword == AlignItemsKeyword::End ||
+                                  keyword == AlignItemsKeyword::FlexEnd ||
+                                  keyword == AlignItemsKeyword::SelfEnd;
+                offset = (alignToEnd != IsRtl(direction)) ? freeX : 0.0f;
+            }
+            location.x =
+                containerStart + resolvedMargin.left + insetOffset.x + offset;
+        } else if (!hasNonStretchJustify &&
+                   itemOuterWidth < containerInnerWidth) {
             float free = containerInnerWidth - itemOuterWidth;
             switch (textAlign) {
                 case TextAlign::LegacyLeft:
@@ -3123,29 +3287,54 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
             }
         }
 
-        if (!IsSome(res.firstBaseline) && IsSome(itemLayout.firstBaselines.y)) {
-            res.firstBaseline = Some(location.y + itemLayout.firstBaselines.y);
+        if (!IsSome(res.firstBaseline)) {
+            Optf childBaseline = itemLayout.baselines.first;
+            if (IsScrollContainer(item.overflow.y)) {
+                float raw = UnwrapOr(childBaseline, itemLayout.size.h);
+                childBaseline =
+                    Some(F32Max(0.0f, F32Min(raw, itemLayout.size.h)));
+            }
+            if (IsSome(childBaseline)) {
+                res.firstBaseline = Some(location.y + childBaseline);
+            }
         }
 
         item.hasFinalLayout = true;
         item.finalLayout.order = item.order;
         item.finalLayout.size = itemLayout.size;
-        item.finalLayout.contentSize = itemLayout.contentSize;
+        item.finalLayout.scrollableOverflowRect = itemLayout
+                                                      .scrollableOverflowRect;
         item.finalLayout.scrollbarSize = scrollbarSize;
         item.finalLayout.location = location;
         item.finalLayout.padding = item.padding;
         item.finalLayout.border = item.border;
-        item.finalLayout.margin = resolvedMargin;
 
-        res.inflowContentSize =
-            Max(res.inflowContentSize,
-                ComputeContentSizeContribution(
-                    {IsRtl(direction)
-                         ? containerOuterWidth - (location.x + finalSize.w) -
-                               resolvedBorder.right
-                         : location.x - resolvedBorder.left,
-                     location.y - resolvedBorder.top},
-                    finalSize, itemLayout.contentSize, item.overflow));
+        if (itemAvoidsFloats) {
+            if (!IsSome(itemMargin.left)) {
+                resolvedMargin.left +=
+                    floatAvoidingPosition.x - resolvedContentBoxInset.left;
+            }
+            if (!IsSome(itemMargin.right)) {
+                resolvedMargin.right +=
+                    containerOuterWidth - resolvedContentBoxInset.right -
+                    floatAvoidingPosition.x - floatAvoidingWidth;
+            }
+        }
+        item.finalLayout.margin = resolvedMargin;
+        OofCandRange range;
+        OofAppendRange(oofPool, &range, itemLayout.oofCandidates);
+        item.oofStart = range.start;
+        item.oofCount = range.count;
+
+        res.inflowOverflowRect =
+            res.inflowOverflowRect.Union(ComputeScrollableOverflowContribution(
+                {IsRtl(direction)
+                     ? containerOuterWidth - (location.x + finalSize.w) -
+                           resolvedBorder.right
+                     : location.x - resolvedBorder.left,
+                 location.y - resolvedBorder.top},
+                finalSize, itemLayout.scrollableOverflowRect, item.overflow,
+                item.contain, isScrollContainer));
 
         if (isCollapsingWithFirstMarginSet && itemPushedBelowFloat) {
             isCollapsingWithFirstMarginSet = false;
@@ -3198,188 +3387,6 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
     committedYOffset += resolvedContentBoxInset.bottom + bottomYMarginOffset;
     res.intrinsicOuterHeight = F32Max(0.0f, committedYOffset);
     return res;
-}
-
-SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree,
-                                              const Vec<BlockItem>& items,
-                                              SizeF areaSize, PointF areaOffset,
-                                              Direction direction) {
-    CalcResolver calc = tree->calc;
-    float areaWidth = areaSize.w;
-    float areaHeight = areaSize.h;
-    SizeF absoluteContentSize = SizeF::Zero();
-
-    for (int i = 0; i < len(items); i++) {
-        const BlockItem& item = items[i];
-        if (item.position != Position::Absolute) {
-            continue;
-        }
-        const Style& cs = tree->GetStyle(item.nodeId);
-        if (cs.BoxGenMode() == BoxGenerationMode::None ||
-            cs.position != Position::Absolute) {
-            continue;
-        }
-
-        Optf aspectRatio = cs.aspectRatio;
-        RectFOpt margin = cs.margin.MaybeResolve(Some(areaWidth), calc);
-        RectF padding = cs.padding.ResolveOrZero(Some(areaWidth), calc);
-        RectF border = cs.border.ResolveOrZero(Some(areaWidth), calc);
-        SizeF paddingBorderSum = (padding + border).SumAxes();
-        SizeF boxSizingAdjustment = cs.boxSizing == BoxSizing::ContentBox
-                                        ? paddingBorderSum
-                                        : SizeF::Zero();
-
-        RectFOpt inset = cs.inset.MaybeResolveZip(AsOptional(areaSize), calc);
-        Optf left = inset.left;
-        Optf right = inset.right;
-        Optf top = inset.top;
-        Optf bottom = inset.bottom;
-
-        SizeFOpt styleSize = MaybeAdd(
-            MaybeApplyAspectRatio(
-                cs.size.MaybeResolve(AsOptional(areaSize), calc), aspectRatio),
-            boxSizingAdjustment);
-        SizeFOpt minSize = MaybeMax(
-            Or(MaybeAdd(MaybeApplyAspectRatio(
-                            cs.minSize.MaybeResolve(AsOptional(areaSize), calc),
-                            aspectRatio),
-                        boxSizingAdjustment),
-               AsOptional(paddingBorderSum)),
-            paddingBorderSum);
-        SizeFOpt maxSize =
-            MaybeAdd(MaybeApplyAspectRatio(
-                         cs.maxSize.MaybeResolve(AsOptional(areaSize), calc),
-                         aspectRatio),
-                     boxSizingAdjustment);
-        SizeFOpt knownDimensions = MaybeClamp(styleSize, minSize, maxSize);
-
-        if (!IsSome(knownDimensions.w) && IsSome(left) && IsSome(right)) {
-            float newWidthRaw =
-                MaybeSub(MaybeSub(areaWidth, margin.left), margin.right) -
-                left - right;
-            knownDimensions.w = Some(F32Max(newWidthRaw, 0.0f));
-            knownDimensions =
-                MaybeClamp(MaybeApplyAspectRatio(knownDimensions, aspectRatio),
-                           minSize, maxSize);
-        }
-        if (!IsSome(knownDimensions.h) && IsSome(top) && IsSome(bottom)) {
-            float newHeightRaw =
-                MaybeSub(MaybeSub(areaHeight, margin.top), margin.bottom) -
-                top - bottom;
-            knownDimensions.h = Some(F32Max(newHeightRaw, 0.0f));
-            knownDimensions =
-                MaybeClamp(MaybeApplyAspectRatio(knownDimensions, aspectRatio),
-                           minSize, maxSize);
-        }
-
-        SizeAvail childAvail = {AvailableSpace::Definite(MaybeClamp(
-                                    areaWidth, minSize.w, maxSize.w)),
-                                AvailableSpace::Definite(MaybeClamp(
-                                    areaHeight, minSize.h, maxSize.h))};
-
-        SizeF measuredSize = tree->MeasureChildSizeBoth(
-            item.nodeId, knownDimensions, AsOptional(areaSize), childAvail,
-            SizingMode::ContentSize, LineBool::False());
-        SizeF finalSize = MaybeClamp(UnwrapOr(knownDimensions, measuredSize),
-                                     minSize, maxSize);
-
-        LayoutOutput layoutOutput = tree->PerformChildLayout(
-            item.nodeId, AsOptional(finalSize), AsOptional(areaSize),
-            childAvail, SizingMode::ContentSize, LineBool::False());
-
-        RectF nonAutoMargin = {
-            IsSome(left) ? UnwrapOr(margin.left, 0.0f) : 0.0f,
-            IsSome(right) ? UnwrapOr(margin.right, 0.0f) : 0.0f,
-            IsSome(top) ? UnwrapOr(margin.top, 0.0f) : 0.0f,
-            IsSome(bottom) ? UnwrapOr(margin.bottom, 0.0f) : 0.0f};
-
-        PointF absoluteAutoMarginSpace = {
-            IsSome(right) ? areaSize.w - right - UnwrapOr(left, 0.0f)
-                          : finalSize.w,
-            IsSome(bottom) ? areaSize.h - bottom - UnwrapOr(top, 0.0f)
-                           : finalSize.h};
-        SizeF freeSpace = {absoluteAutoMarginSpace.x - finalSize.w -
-                               nonAutoMargin.HorizontalAxisSum(),
-                           absoluteAutoMarginSpace.y - finalSize.h -
-                               nonAutoMargin.VerticalAxisSum()};
-
-        int autoW =
-            (IsSome(margin.left) ? 0 : 1) + (IsSome(margin.right) ? 0 : 1);
-        int autoH =
-            (IsSome(margin.top) ? 0 : 1) + (IsSome(margin.bottom) ? 0 : 1);
-        SizeF autoMarginSize;
-        if (autoW == 2 &&
-            (!IsSome(styleSize.w) || styleSize.w >= freeSpace.w)) {
-            autoMarginSize.w = 0.0f;
-        } else if (autoW > 0) {
-            autoMarginSize.w = freeSpace.w / (float)autoW;
-        }
-        if (autoH == 2 &&
-            (!IsSome(styleSize.h) || styleSize.h >= freeSpace.h)) {
-            autoMarginSize.h = 0.0f;
-        } else if (autoH > 0) {
-            autoMarginSize.h = freeSpace.h / (float)autoH;
-        }
-        RectF autoMargin = {IsSome(margin.left) ? 0.0f : autoMarginSize.w,
-                            IsSome(margin.right) ? 0.0f : autoMarginSize.w,
-                            IsSome(margin.top) ? 0.0f : autoMarginSize.h,
-                            IsSome(margin.bottom) ? 0.0f : autoMarginSize.h};
-        RectF resolvedMargin = {UnwrapOr(margin.left, autoMargin.left),
-                                UnwrapOr(margin.right, autoMargin.right),
-                                UnwrapOr(margin.top, autoMargin.top),
-                                UnwrapOr(margin.bottom, autoMargin.bottom)};
-
-        float xOffset;
-        if (IsSome(left) && IsSome(right)) {
-            xOffset = IsRtl(direction) ? areaSize.w - finalSize.w - right -
-                                             resolvedMargin.right
-                                       : left + resolvedMargin.left;
-        } else if (IsSome(left)) {
-            xOffset = left + resolvedMargin.left;
-        } else if (IsSome(right)) {
-            xOffset = areaSize.w - finalSize.w - right - resolvedMargin.right;
-        } else {
-            xOffset = IsRtl(direction) ? item.staticPosition.x - finalSize.w -
-                                             resolvedMargin.right - areaOffset.x
-                                       : item.staticPosition.x +
-                                             resolvedMargin.left - areaOffset.x;
-        }
-
-        float yLocation;
-        if (IsSome(top)) {
-            yLocation = top + resolvedMargin.top + areaOffset.y;
-        } else if (IsSome(bottom)) {
-            yLocation = areaSize.h - finalSize.h - bottom -
-                        resolvedMargin.bottom + areaOffset.y;
-        } else {
-            yLocation = item.staticPosition.y + resolvedMargin.top;
-        }
-        PointF location = {xOffset + areaOffset.x, yLocation};
-
-        SizeF scrollbarSize = {
-            item.overflow.y == Overflow::Scroll ? item.scrollbarWidth : 0.0f,
-            item.overflow.x == Overflow::Scroll ? item.scrollbarWidth : 0.0f};
-
-        Layout layout;
-        layout.order = item.order;
-        layout.size = finalSize;
-        layout.contentSize = layoutOutput.contentSize;
-        layout.scrollbarSize = scrollbarSize;
-        layout.location = location;
-        layout.padding = padding;
-        layout.border = border;
-        layout.margin = resolvedMargin;
-        tree->SetUnroundedLayout(item.nodeId, layout);
-
-        PointF relativeLocation = {location.x - areaOffset.x,
-                                   location.y - areaOffset.y};
-        absoluteContentSize = Max(absoluteContentSize,
-                                  ComputeContentSizeContribution(
-                                      relativeLocation, finalSize,
-                                      layoutOutput.contentSize, item.overflow));
-    }
-
-    return absoluteContentSize;
 }
 
 LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
@@ -3435,28 +3442,40 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
                    minSize, maxSize);
     SizeFOpt knownDimensions = {Or(knownDimensionsIn.w, derived.w),
                                 Or(knownDimensionsIn.h, derived.h)};
+
+    SizeFOpt percentageBasisDimensions = knownDimensions;
+    if (!inputs.knownDimensionsAreDefiniteH) {
+        percentageBasisDimensions.h = None();
+    }
     SizeFOpt containerContentBoxSize =
-        MaybeSub(knownDimensions, contentBoxInset.SumAxes());
+        MaybeSub(percentageBasisDimensions, contentBoxInset.SumAxes());
 
     bool isScrollContainer = IsScrollContainer(style.overflow.x) ||
                              IsScrollContainer(style.overflow.y);
 
-    LineBool ownMarginsCollapseWithChildren = {
-        verticalMarginsAreCollapsible.start && !isScrollContainer &&
-            style.position == Position::Relative && padding.top == 0.0f &&
+    bool establishesNewBfc =
+        isScrollContainer ||
+        style.alignContent.keyword != AlignContentKeyword::Normal ||
+        style.contain.EstablishesIndependentFormattingContext();
+
+    LineBool childrenMarginsAdjoinOwnEdges = {
+        verticalMarginsAreCollapsible.start && !establishesNewBfc &&
+            !IsOutOfFlow(style.position) && padding.top == 0.0f &&
             border.top == 0.0f,
-        verticalMarginsAreCollapsible.end && !isScrollContainer &&
-            style.position == Position::Relative && padding.bottom == 0.0f &&
-            border.bottom == 0.0f && !IsSome(size.h)};
+        verticalMarginsAreCollapsible.end && !establishesNewBfc &&
+            !IsOutOfFlow(style.position) && padding.bottom == 0.0f &&
+            border.bottom == 0.0f};
+    LineBool ownMarginsCollapseWithChildren = {
+        childrenMarginsAdjoinOwnEdges.start,
+        childrenMarginsAdjoinOwnEdges.end && !IsSome(size.h)};
     bool hasStylesPreventingBeingCollapsedThrough =
-        !style.IsBlock() || blockCtx->IsBfcRoot() || isScrollContainer ||
-        style.position == Position::Absolute || padding.top > 0.0f ||
-        padding.bottom > 0.0f || border.top > 0.0f || border.bottom > 0.0f ||
-        (IsSome(size.h) && size.h > 0.0f) ||
-        (IsSome(minSize.h) && minSize.h > 0.0f);
+        !style.IsBlock() || blockCtx->IsBfcRoot() || establishesNewBfc ||
+        IsOutOfFlow(style.position) || padding.top > 0.0f ||
+        padding.bottom > 0.0f || border.top > 0.0f || border.bottom > 0.0f;
 
     TextAlign textAlign = style.textAlign;
-    OptAlignContent alignContent = style.alignContent;
+    AlignContent alignContent = style.alignContent;
+    AlignItems justifyItems = style.justifyItems;
 
     Vec<BlockItem> items;
     GenerateItemList(tree, nodeId, containerContentBoxSize, &items);
@@ -3484,25 +3503,32 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
         return LayoutOutput::FromOuterSize({containerOuterWidth, 0.0f});
     }
 
+    Optf ownHeightBasis = inputs.sizingMode == SizingMode::InherentSize
+                              ? MaybeMax(size.h, minSize.h)
+                              : None();
     Optf containerPercentageResolutionHeight =
-        Or(Or(knownDimensions.h, MaybeMax(size.h, minSize.h)), minSize.h);
+        Or(percentageBasisDimensions.h, ownHeightBasis);
 
-    RectF resolvedPadding = rawPadding
-                                .ResolveOrZero(Some(containerOuterWidth), calc);
-    RectF resolvedBorder = rawBorder
-                               .ResolveOrZero(Some(containerOuterWidth), calc);
+    float percentageResolutionWidth =
+        UnwrapOr(parentSize.w, containerOuterWidth);
+    RectF resolvedPadding =
+        rawPadding.ResolveOrZero(Some(percentageResolutionWidth), calc);
+    RectF resolvedBorder =
+        rawBorder.ResolveOrZero(Some(percentageResolutionWidth), calc);
     RectF resolvedContentBoxInset =
         resolvedPadding + resolvedBorder + scrollbarGutter;
 
+    Vec<OofCandidate> oofPool;
     InFlowResult inFlow = PerformFinalLayoutOnInFlowChildren(
-        tree, runMode, &items, containerOuterWidth,
+        tree, runMode, &items, &oofPool, containerOuterWidth,
         containerPercentageResolutionHeight, contentBoxInset,
-        resolvedContentBoxInset, resolvedBorder, textAlign, direction,
-        ownMarginsCollapseWithChildren, blockCtx);
-    SizeF inflowContentSize = inFlow.inflowContentSize;
+        resolvedContentBoxInset, resolvedBorder, textAlign, justifyItems,
+        direction, ownMarginsCollapseWithChildren,
+        childrenMarginsAdjoinOwnEdges, isScrollContainer, blockCtx);
+    RectF inflowOverflowRect = inFlow.inflowOverflowRect;
     float intrinsicOuterHeight = inFlow.intrinsicOuterHeight;
 
-    if (blockCtx->IsBfcRoot() || isScrollContainer) {
+    if (blockCtx->IsBfcRoot() || establishesNewBfc) {
         intrinsicOuterHeight = F32Max(
             intrinsicOuterHeight, blockCtx->FloatedContentHeightContribution());
     }
@@ -3513,47 +3539,51 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
         Some(paddingBorderSize.h));
     SizeF finalOuterSize = {containerOuterWidth, containerOuterHeight};
 
-    if (alignContent.IsSome()) {
+    bool heightConstrainedByMinHeight = IsSome(minSize.h) && minSize.h > 0.0f &&
+                                        minSize.h >= containerOuterHeight;
+    bool ownBottomMarginCollapsesWithChildren =
+        ownMarginsCollapseWithChildren.end && !heightConstrainedByMinHeight;
+
+    if (alignContent.keyword != AlignContentKeyword::Normal) {
         float containerInnerHeight =
             containerOuterHeight - resolvedContentBoxInset.VerticalAxisSum();
         float inflowContentHeight =
             intrinsicOuterHeight - resolvedContentBoxInset.VerticalAxisSum();
         float freeSpace = containerInnerHeight - inflowContentHeight;
+
+        AlignContentKeyword keyword =
+            ApplyAlignmentFallback(freeSpace, 1, alignContent);
+        float groupOffset =
+            ComputeAlignmentOffset(freeSpace, 1, 0.0f, keyword, false, true);
+        if (IsSome(inFlow.firstBaseline)) {
+            inFlow.firstBaseline += groupOffset;
+        }
         bool anyInFlow = false;
         for (int i = 0; i < len(items); i++) {
             if (items[i].hasFinalLayout) {
+                items[i].finalLayout.location.y += groupOffset;
                 anyInFlow = true;
-                break;
+            }
+            if (IsOutOfFlow(items[i].position)) {
+                items[i].staticPosition.y += groupOffset;
             }
         }
         if (anyInFlow) {
-            AlignContentKeyword keyword =
-                ApplyAlignmentFallback(freeSpace, 1, alignContent.val);
-            float groupOffset = ComputeAlignmentOffset(freeSpace, 1, 0.0f,
-                                                       keyword, false, true);
-            if (IsSome(inFlow.firstBaseline)) {
-                inFlow.firstBaseline += groupOffset;
-            }
-            for (int i = 0; i < len(items); i++) {
-                if (items[i].hasFinalLayout) {
-                    items[i].finalLayout.location.y += groupOffset;
-                }
-            }
-            inflowContentSize = SizeF::Zero();
+            inflowOverflowRect = RectF::Zero();
             for (int i = 0; i < len(items); i++) {
                 if (!items[i].hasFinalLayout) {
                     continue;
                 }
                 const Layout& l = items[i].finalLayout;
-                inflowContentSize = Max(
-                    inflowContentSize,
-                    ComputeContentSizeContribution(
+                inflowOverflowRect = inflowOverflowRect.Union(
+                    ComputeScrollableOverflowContribution(
                         {IsRtl(direction)
                              ? containerOuterWidth - (l.location.x + l.size.w) -
                                    resolvedBorder.right
                              : l.location.x - resolvedBorder.left,
                          l.location.y - resolvedBorder.top},
-                        l.size, l.contentSize, items[i].overflow));
+                        l.size, l.scrollableOverflowRect, items[i].overflow,
+                        items[i].contain, isScrollContainer));
             }
         }
     }
@@ -3563,25 +3593,27 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
         if (IsFloated(items[i].floatMode)) {
             continue;
         }
-        if (items[i].position != Position::Absolute &&
-            !items[i].canBeCollapsedThrough) {
+        if (!IsOutOfFlow(items[i].position) && !items[i]
+                                                    .canBeCollapsedThrough) {
             allInFlowChildrenCanBeCollapsedThrough = false;
             break;
         }
     }
+
     bool canBeCollapsedThrough = !hasStylesPreventingBeingCollapsedThrough &&
+                                 containerOuterHeight == 0.0f &&
                                  allInFlowChildrenCanBeCollapsedThrough;
 
     LayoutOutput output;
     output.size = finalOuterSize;
-    output.firstBaselines.y = inFlow.firstBaseline;
+    output.baselines = BaselinesFromFirst(inFlow.firstBaseline);
     output.topMargin =
         ownMarginsCollapseWithChildren.start
             ? inFlow.firstChildTopMarginSet
             : CollapsibleMarginSet::FromMargin(UnwrapOr(
                   rawMargin.MaybeResolve(parentSize.w, calc).top, 0.0f));
     output.bottomMargin =
-        ownMarginsCollapseWithChildren.end
+        ownBottomMarginCollapsesWithChildren
             ? inFlow.lastChildBottomMarginSet
             : CollapsibleMarginSet::FromMargin(UnwrapOr(
                   rawMargin.MaybeResolve(parentSize.w, calc).bottom, 0.0f));
@@ -3597,18 +3629,51 @@ LayoutOutput ComputeInner(TaffyTree* tree, NodeId nodeId,
         }
     }
 
-    RectF absolutePositionInset = resolvedBorder + scrollbarGutter;
-    SizeF absolutePositionArea = finalOuterSize - absolutePositionInset
-                                                      .SumAxes();
-    PointF absolutePositionOffset = {absolutePositionInset.left,
-                                     absolutePositionInset.top};
-    SizeF absoluteContentSize = PerformAbsoluteLayoutOnAbsoluteChildren(
-        tree, items, absolutePositionArea, absolutePositionOffset, direction);
+    OofCandidates candidates;
+    for (int i = 0; i < len(items); i++) {
+        BlockItem& item = items[i];
+        if (IsOutOfFlow(item.position)) {
+            OofCandidate candidate;
+            candidate.node = item.nodeId;
+            candidate.order = item.order;
+            candidate.position = item.position;
 
-    inflowContentSize
-        .w += IsRtl(direction) ? resolvedPadding.left : resolvedPadding.right;
-    inflowContentSize.h += resolvedPadding.bottom;
-    output.contentSize = Max(inflowContentSize, absoluteContentSize);
+            float inlineStart = resolvedContentBoxInset.left;
+            float inlineEnd = containerOuterWidth - resolvedContentBoxInset
+                                                        .right;
+            AlignItems itemJustify =
+                ResolveSelfRelative(item.justifySelf.UnwrapOr(justifyItems),
+                                    item.direction, direction, true);
+            AlignItems itemAlign = ResolveSelfRelative(
+                item.alignSelf.UnwrapOr(AlignItems{AlignItemsKeyword::Normal}),
+                item.direction, direction, false);
+            candidate.staticX = AxisStaticPosition::FromAlignment(
+                itemJustify, inlineStart, inlineEnd, IsRtl(direction));
+            candidate.staticY = AxisStaticPosition::FromAlignment(
+                itemAlign, item.staticPosition.y, item.staticPosition.y, false);
+            candidates.Push(candidate);
+        } else if (item.oofCount > 0) {
+            OofCandRange range = {item.oofStart, item.oofCount};
+            if (item.hasFinalLayout) {
+                OofTranslateRange(&oofPool, range, item.finalLayout.location);
+            }
+            OofAppendPoolRange(&candidates, oofPool, range);
+        }
+    }
+    RectF absolutePositionInset = resolvedBorder + scrollbarGutter;
+    output.oofCandidates = candidates;
+    output.hasOofPositioningArea = true;
+    output.oofPositioningArea.size = finalOuterSize - absolutePositionInset
+                                                          .SumAxes();
+    output.oofPositioningArea
+        .offset = {absolutePositionInset.left, absolutePositionInset.top};
+
+    if (isScrollContainer) {
+        inflowOverflowRect.right +=
+            IsRtl(direction) ? resolvedPadding.left : resolvedPadding.right;
+        inflowOverflowRect.bottom += resolvedPadding.bottom;
+    }
+    output.scrollableOverflowRect = inflowOverflowRect;
 
     int len = tree->ChildCount(nodeId);
     for (int order = 0; order < len; order++) {
@@ -3637,6 +3702,12 @@ LayoutOutput ComputeBlockLayout(TaffyTree* tree, NodeId nodeId,
 
     bool isScrollContainer = IsScrollContainer(style.overflow.x) ||
                              IsScrollContainer(style.overflow.y);
+
+    Contain contain = style.contain;
+    bool establishesNewBfc = isScrollContainer ||
+                             style.alignContent
+                                     .keyword != AlignContentKeyword::Normal ||
+                             contain.EstablishesIndependentFormattingContext();
     Optf aspectRatio = style.aspectRatio;
     RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
     RectF border = style.border.ResolveOrZero(parentSize.w, calc);
@@ -3690,17 +3761,23 @@ LayoutOutput ComputeBlockLayout(TaffyTree* tree, NodeId nodeId,
     LayoutInput next = inputs;
     next.knownDimensions = styledBasedKnownDimensions;
 
-    if (blockCtx && !isScrollContainer) {
-        return ComputeInner(tree, nodeId, next, blockCtx);
+    LayoutOutput out;
+    if (blockCtx && !establishesNewBfc) {
+        out = ComputeInner(tree, nodeId, next, blockCtx);
+    } else {
+        BlockFormattingContext rootBfc;
+        BlockContext rootCtx;
+        rootCtx.bfc = &rootBfc;
+        rootCtx.isRoot = true;
+        out = ComputeInner(tree, nodeId, next, &rootCtx);
+        VecReset(rootBfc.floatContext.leftFloats);
+        VecReset(rootBfc.floatContext.rightFloats);
+        VecReset(rootBfc.floatContext.segments);
     }
-    BlockFormattingContext rootBfc;
-    BlockContext rootCtx;
-    rootCtx.bfc = &rootBfc;
-    rootCtx.isRoot = true;
-    LayoutOutput out = ComputeInner(tree, nodeId, next, &rootCtx);
-    VecReset(rootBfc.floatContext.leftFloats);
-    VecReset(rootBfc.floatContext.rightFloats);
-    VecReset(rootBfc.floatContext.segments);
+
+    if (contain.SuppressesBaseline()) {
+        out.baselines = BaselinesFromFirst(None());
+    }
     return out;
 }
 
@@ -3729,19 +3806,24 @@ struct FlexItem {
     uint32_t order = 0;
 
     SizeFOpt size = SizeFOptNone();
+
+    SizeDim sizeStyle;
     SizeFOpt minSize = SizeFOptNone();
     SizeFOpt maxSize = SizeFOptNone();
     Optf aspectRatio = None();
     AlignSelf alignSelf;
 
     PointOverflow overflow;
+    Contain contain;
     float scrollbarWidth = 0.0f;
     float flexShrink = 0.0f;
     float flexGrow = 0.0f;
 
+    bool flexBasisIsDefinite = false;
+
     float resolvedMinimumMainSize = 0.0f;
 
-    RectFOpt inset = RectFOptNone();
+    SizeF relativeInset = SizeF::Zero();
     RectF margin;
     RectBool marginIsAuto;
     RectF padding;
@@ -3762,11 +3844,19 @@ struct FlexItem {
 
     float baseline = 0.0f;
 
+    int oofStart = 0;
+    int oofCount = 0;
+
     float offsetMain = 0.0f;
     float offsetCross = 0.0f;
 
     bool IsScroll() const {
         return IsScrollContainer(overflow.x) || IsScrollContainer(overflow.y);
+    }
+
+    bool ParticipatesInBaselineAlignment(FlexDirection dir) const {
+        return alignSelf.keyword == AlignItemsKeyword::Baseline &&
+               !marginIsAuto.CrossStart(dir) && !marginIsAuto.CrossEnd(dir);
     }
 };
 
@@ -3784,21 +3874,39 @@ struct AlgoConstants {
     bool isColumn = false;
     bool isWrap = false;
     bool isWrapReverse = false;
+    bool isBalance = false;
+
+    int lineCount = 0;
+
+    float DividedCrossSpace(float crossAvailable) const {
+        if (lineCount > 1) {
+            float n = (float)lineCount;
+            return (crossAvailable - (n - 1.0f) * Cross(gap, dir)) / n;
+        }
+        return crossAvailable;
+    }
 
     SizeFOpt minSize = SizeFOptNone();
     SizeFOpt maxSize = SizeFOptNone();
-    RectF margin;
     RectF border;
 
     RectF contentBoxInset;
     PointF scrollbarGutter;
+
+    bool isScrollContainer = false;
     SizeF gap;
     AlignItems alignItems;
     AlignContent alignContent;
-    OptJustifyContent justifyContent;
+    AlignContent justifyContent;
 
     SizeFOpt nodeOuterSize = SizeFOptNone();
     SizeFOpt nodeInnerSize = SizeFOptNone();
+
+    bool knownMainSizeIsDefinite = true;
+    bool hasDefiniteMainSize = false;
+    bool hasDefiniteCrossSize = false;
+
+    bool crossAxisAvailableSpaceIsDefinite = false;
 
     SizeF containerSize;
     SizeF innerContainerSize;
@@ -3816,19 +3924,32 @@ Optf Filter(Optf v, bool keep) {
     return keep ? v : None();
 }
 
+AlignItems ResolveNormalAlignment(AlignItems alignment) {
+    if (alignment.keyword == AlignItemsKeyword::Normal) {
+        return AlignItems{AlignItemsKeyword::Stretch};
+    }
+    return alignment;
+}
+
 AlgoConstants ComputeConstants(TaffyTree* tree, const Style& style,
-                               SizeFOpt knownDimensions, SizeFOpt parentSize) {
+                               SizeFOpt knownDimensions,
+                               bool knownDimensionsAreDefiniteW,
+                               bool knownDimensionsAreDefiniteH,
+                               SizeFOpt parentSize, SizeAvail availableSpace) {
     CalcResolver calc = tree->calc;
     AlgoConstants c;
     c.dir = style.flexDirection;
     c.isRow = IsRow(c.dir);
     c.isColumn = IsColumn(c.dir);
-    c.isWrap = style.flexWrap == FlexWrap::Wrap ||
-               style.flexWrap == FlexWrap::WrapReverse;
-    c.isWrapReverse = style.flexWrap == FlexWrap::WrapReverse;
+    c.isWrap = FlexWrapIsMultiLine(style.flexWrap);
+    c.isWrapReverse = FlexWrapIsReverse(style.flexWrap);
+    c.isBalance = FlexWrapIsBalance(style.flexWrap);
+    c.lineCount = 0;
+    if (c.isWrap) {
+        c.lineCount = style.flexLineCount < 1 ? 1 : (int)style.flexLineCount;
+    }
 
     Optf aspectRatio = style.aspectRatio;
-    c.margin = style.margin.ResolveOrZero(parentSize.w, calc);
     RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
     c.border = style.border.ResolveOrZero(parentSize.w, calc);
     SizeF paddingBorderSum = padding.SumAxes() + c.border.SumAxes();
@@ -3836,14 +3957,20 @@ AlgoConstants ComputeConstants(TaffyTree* tree, const Style& style,
                                     ? paddingBorderSum
                                     : SizeF::Zero();
 
-    c.alignItems = style.alignItems
-                       .UnwrapOr(AlignItems{AlignItemsKeyword::Stretch});
-    c.alignContent = style.alignContent
-                         .UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
-    c.justifyContent = style.justifyContent;
+    c.alignItems = ResolveNormalAlignment(style.alignItems);
+
+    c.alignContent = style.alignContent.keyword == AlignContentKeyword::Normal
+                         ? AlignContent{AlignContentKeyword::Stretch}
+                         : style.alignContent;
+    c.justifyContent = style.justifyContent
+                                   .keyword == AlignContentKeyword::Normal
+                           ? AlignContent{AlignContentKeyword::FlexStart}
+                           : style.justifyContent;
     c.layoutDirection = style.direction;
 
     PointOverflow t = style.overflow.Transpose();
+    c.isScrollContainer = IsScrollContainer(style.overflow.x) ||
+                          IsScrollContainer(style.overflow.y);
     c.scrollbarGutter = {t.x == Overflow::Scroll ? style.scrollbarWidth : 0.0f,
                          t.y == Overflow::Scroll ? style.scrollbarWidth : 0.0f};
     c.contentBoxInset = padding + c.border;
@@ -3856,6 +3983,18 @@ AlgoConstants ComputeConstants(TaffyTree* tree, const Style& style,
 
     c.nodeOuterSize = knownDimensions;
     c.nodeInnerSize = MaybeSub(c.nodeOuterSize, c.contentBoxInset.SumAxes());
+    bool knownMainDefinite =
+        c.isRow ? knownDimensionsAreDefiniteW : knownDimensionsAreDefiniteH;
+    bool knownCrossDefinite =
+        c.isRow ? knownDimensionsAreDefiniteH : knownDimensionsAreDefiniteW;
+    c.knownMainSizeIsDefinite = knownMainDefinite;
+    c.hasDefiniteMainSize =
+        knownMainDefinite && IsSome(Main(knownDimensions, c.dir));
+    c.hasDefiniteCrossSize =
+        knownCrossDefinite && IsSome(Cross(knownDimensions, c.dir));
+    c.crossAxisAvailableSpaceIsDefinite =
+        c.hasDefiniteCrossSize ||
+        availableSpace.Cross(c.dir).kind == AvailableSpace::Kind::Definite;
     c.gap = style.gap.ResolveOrZero(Or(c.nodeInnerSize, SizeFOpt{0, 0}), calc);
 
     c.minSize =
@@ -3867,6 +4006,38 @@ AlgoConstants ComputeConstants(TaffyTree* tree, const Style& style,
                      style.maxSize.MaybeResolve(parentSize, calc), aspectRatio),
                  boxSizingAdjustment);
     return c;
+}
+
+static SizeF ResolveRelativeInset(RectFOpt inset, const AlgoConstants& c) {
+    FlexDirection direction = c.dir;
+    bool isRtlRow = IsRow(direction) && IsRtl(c.layoutDirection);
+    bool isRtlColumn = IsColumn(direction) && IsRtl(c.layoutDirection);
+
+    Optf negMainStart = MainStart(inset, direction);
+    if (IsSome(negMainStart)) {
+        negMainStart = -negMainStart;
+    }
+    Optf negMainEnd = MainEnd(inset, direction);
+    if (IsSome(negMainEnd)) {
+        negMainEnd = -negMainEnd;
+    }
+    float main =
+        isRtlRow ? UnwrapOr(Or(MainEnd(inset, direction), negMainStart), 0.0f)
+                 : UnwrapOr(Or(MainStart(inset, direction), negMainEnd), 0.0f);
+
+    Optf negCrossEnd = CrossEnd(inset, direction);
+    if (IsSome(negCrossEnd)) {
+        negCrossEnd = -negCrossEnd;
+    }
+    float cross =
+        isRtlColumn
+            ? UnwrapOr(Or(negCrossEnd, CrossStart(inset, direction)), 0.0f)
+            : UnwrapOr(Or(CrossStart(inset, direction), negCrossEnd), 0.0f);
+
+    SizeF out = SizeF::Zero();
+    SetMain(&out, direction, main);
+    SetCross(&out, direction, cross);
+    return out;
 }
 
 void GenerateAnonymousFlexItems(TaffyTree* tree, NodeId node,
@@ -3881,7 +4052,7 @@ void GenerateAnonymousFlexItems(TaffyTree* tree, NodeId node,
     for (int index = 0; index < n; index++) {
         NodeId child = tree->GetChildId(node, index);
         const Style& cs = tree->GetStyle(child);
-        if (cs.position == Position::Absolute ||
+        if (IsOutOfFlow(cs.position) ||
             cs.BoxGenMode() == BoxGenerationMode::None) {
             continue;
         }
@@ -3893,29 +4064,41 @@ void GenerateAnonymousFlexItems(TaffyTree* tree, NodeId node,
         SizeF boxSizingAdjustment =
             cs.boxSizing == BoxSizing::ContentBox ? pbSum : SizeF::Zero();
 
+        SizeFOpt percentResolutionSize = c.nodeInnerSize;
+        if (!c.knownMainSizeIsDefinite) {
+            SetMain(&percentResolutionSize, c.dir, None());
+        }
+
         FlexItem item;
         item.node = child;
         item.order = (uint32_t)index;
+        item.sizeStyle = cs.size;
         item.size = MaybeAdd(
-            MaybeApplyAspectRatio(cs.size.MaybeResolve(c.nodeInnerSize, calc),
-                                  aspectRatio),
+            MaybeApplyAspectRatio(
+                cs.size.MaybeResolve(percentResolutionSize, calc), aspectRatio),
             boxSizingAdjustment);
-        item.minSize = MaybeAdd(cs.minSize.MaybeResolve(c.nodeInnerSize, calc),
-                                boxSizingAdjustment);
-        item.maxSize = MaybeAdd(cs.maxSize.MaybeResolve(c.nodeInnerSize, calc),
-                                boxSizingAdjustment);
+        item.minSize =
+            MaybeAdd(cs.minSize.MaybeResolve(percentResolutionSize, calc),
+                     boxSizingAdjustment);
+        item.maxSize =
+            MaybeAdd(cs.maxSize.MaybeResolve(percentResolutionSize, calc),
+                     boxSizingAdjustment);
         item.aspectRatio = aspectRatio;
 
-        item.inset = cs.inset.MaybeResolveZip(c.nodeInnerSize, calc);
+        if (cs.position == Position::Relative) {
+            RectFOpt inset = cs.inset.MaybeResolveZip(c.nodeInnerSize, calc);
+            item.relativeInset = ResolveRelativeInset(inset, c);
+        }
         item.margin = cs.margin.ResolveOrZero(c.nodeInnerSize.w, calc);
         item.marginIsAuto = {cs.margin.left.IsAuto(), cs.margin.right.IsAuto(),
                              cs.margin.top.IsAuto(), cs.margin.bottom.IsAuto()};
         item.padding = padding;
         item.border = border;
-        item.alignSelf =
-            ResolveSelfRelative(cs.alignSelf.UnwrapOr(c.alignItems),
-                                cs.direction, c.layoutDirection, c.isColumn);
+        item.alignSelf = ResolveSelfRelative(
+            ResolveNormalAlignment(cs.alignSelf.UnwrapOr(c.alignItems)),
+            cs.direction, c.layoutDirection, c.isColumn);
         item.overflow = cs.overflow;
+        item.contain = cs.contain;
         item.scrollbarWidth = cs.scrollbarWidth;
         item.flexGrow = cs.flexGrow;
         item.flexShrink = cs.flexShrink;
@@ -3929,20 +4112,20 @@ SizeAvail DetermineAvailableSpace(SizeFOpt knownDimensions,
 
     SizeAvail out;
     if (IsSome(knownDimensions.w)) {
-        out.width = AvailableSpace::Definite(
-            knownDimensions.w - c.contentBoxInset.HorizontalAxisSum());
+        out.width = AvailableSpace::Definite(F32Max(
+            0.0f, knownDimensions.w - c.contentBoxInset.HorizontalAxisSum()));
     } else {
-        out.width = MaybeSub(
-            MaybeSub(outerAvailableSpace.width, c.margin.HorizontalAxisSum()),
-            c.contentBoxInset.HorizontalAxisSum());
+        out.width = MaybeMax(MaybeSub(outerAvailableSpace.width,
+                                      c.contentBoxInset.HorizontalAxisSum()),
+                             0.0f);
     }
     if (IsSome(knownDimensions.h)) {
-        out.height = AvailableSpace::Definite(
-            knownDimensions.h - c.contentBoxInset.VerticalAxisSum());
+        out.height = AvailableSpace::Definite(F32Max(
+            0.0f, knownDimensions.h - c.contentBoxInset.VerticalAxisSum()));
     } else {
-        out.height = MaybeSub(
-            MaybeSub(outerAvailableSpace.height, c.margin.VerticalAxisSum()),
-            c.contentBoxInset.VerticalAxisSum());
+        out.height = MaybeMax(MaybeSub(outerAvailableSpace.height,
+                                       c.contentBoxInset.VerticalAxisSum()),
+                              0.0f);
     }
     return out;
 }
@@ -3960,23 +4143,22 @@ void DetermineFlexBaseSize(TaffyTree* tree, const AlgoConstants& c,
         Optf crossAxisParentSize = Cross(c.nodeInnerSize, dir);
         SizeFOpt childParentSize = SizeFOptFromCross(dir, crossAxisParentSize);
 
-        float crossAxisMarginSum = CrossAxisSum(c.margin, dir);
         SizeFOpt transferredMinSize =
             MaybeApplyAspectRatio(child.minSize, child.aspectRatio);
         SizeFOpt transferredMaxSize =
             MaybeApplyAspectRatio(child.maxSize, child.aspectRatio);
-        Optf childMinCross =
-            MaybeAdd(Cross(transferredMinSize, dir), crossAxisMarginSum);
-        Optf childMaxCross =
-            MaybeAdd(Cross(transferredMaxSize, dir), crossAxisMarginSum);
+        Optf childMinCross = Cross(transferredMinSize, dir);
+        Optf childMaxCross = Cross(transferredMaxSize, dir);
 
         AvailableSpace crossAxisAvailableSpace;
         AvailableSpace crossIn = availableSpace.Cross(dir);
         switch (crossIn.kind) {
             case AvailableSpace::Kind::Definite:
-                crossAxisAvailableSpace = AvailableSpace::Definite(
-                    MaybeClamp(UnwrapOr(crossAxisParentSize, crossIn.value),
-                               childMinCross, childMaxCross));
+                crossAxisAvailableSpace = AvailableSpace::Definite(MaybeClamp(
+                    F32Max(0.0f, c.DividedCrossSpace(UnwrapOr(
+                                     crossAxisParentSize, crossIn.value)) -
+                                     CrossAxisSum(child.margin, dir)),
+                    childMinCross, childMaxCross));
                 break;
             case AvailableSpace::Kind::MinContent:
                 crossAxisAvailableSpace =
@@ -3992,6 +4174,7 @@ void DetermineFlexBaseSize(TaffyTree* tree, const AlgoConstants& c,
                 break;
         }
 
+        bool childCrossSizeIsDefinite = IsSome(Cross(child.size, dir));
         SizeFOpt childKnownDimensions = child.size;
         SetMain(&childKnownDimensions, dir, None());
         SetCross(&childKnownDimensions, dir,
@@ -4003,33 +4186,89 @@ void DetermineFlexBaseSize(TaffyTree* tree, const AlgoConstants& c,
             !child.marginIsAuto.CrossEnd(dir) &&
             !IsSome(Cross(childKnownDimensions, dir))) {
             SetCross(&childKnownDimensions, dir,
-                     MaybeSub(crossAxisAvailableSpace.IntoOption(),
-                              CrossAxisSum(child.margin, dir)));
+                     crossAxisAvailableSpace.IntoOption());
+
+            childCrossSizeIsDefinite = !c.isWrap && c.hasDefiniteCrossSize &&
+                                       IsSome(crossAxisParentSize);
         }
 
-        Optf containerWidth = Main(c.nodeInnerSize, dir);
+        Optf containerWidth = c.nodeInnerSize.w;
+
+        Optf percentResolutionMainSize =
+            c.knownMainSizeIsDefinite ? Main(c.nodeInnerSize, dir) : None();
         float boxSizingAdjustment = 0.0f;
         if (cs.boxSizing == BoxSizing::ContentBox) {
             RectF padding = cs.padding.ResolveOrZero(containerWidth, calc);
             RectF border = cs.border.ResolveOrZero(containerWidth, calc);
             boxSizingAdjustment = Main((padding + border).SumAxes(), dir);
         }
-        Optf flexBasis =
-            MaybeAdd(cs.flexBasis.MaybeResolve(containerWidth, calc),
-                     boxSizingAdjustment);
+        Dimension flexBasisStyle = cs.flexBasis;
+        Optf flexBasis = MaybeAdd(
+            flexBasisStyle.MaybeResolve(percentResolutionMainSize, calc),
+            boxSizingAdjustment);
 
         Optf mainSize = Main(child.size, dir);
-        Optf definiteBasis = Or(flexBasis, mainSize);
-        if (IsSome(definiteBasis)) {
-            child.flexBasis = definiteBasis;
-        } else {
+        Optf mainStretch =
+            MaybeMax(MaybeSub(percentResolutionMainSize,
+                              Some(MainAxisSum(child.margin, dir))),
+                     0.0f);
 
+        bool measureBasis = true;
+        AvailableSpace keywordMain = AvailableSpace::MaxContent();
+        bool hasKeywordMain = false;
+        if (flexBasisStyle.IsContent()) {
+
+        } else if (flexBasisStyle.IsSizingKeyword()) {
+            SizingKeywordResolution keyword = ResolveSizingKeyword(
+                flexBasisStyle, mainStretch, percentResolutionMainSize, calc);
+            if (keyword.isSome && keyword.kind == SizingKeywordKind::Exact) {
+                child.flexBasisIsDefinite = true;
+                child.flexBasis = keyword.exact;
+                measureBasis = false;
+            } else if (keyword.isSome) {
+                keywordMain = keyword.measure;
+                hasKeywordMain = true;
+            }
+        } else if (IsSome(flexBasis) ||
+                   (flexBasisStyle.IsAuto() && IsSome(mainSize))) {
+            child.flexBasisIsDefinite = true;
+            child.flexBasis = IsSome(flexBasis) ? flexBasis : mainSize;
+            measureBasis = false;
+        } else if (flexBasisStyle.IsAuto()) {
+            SizingKeywordResolution keyword =
+                ResolveSizingKeyword(child.sizeStyle.Main(dir), mainStretch,
+                                     percentResolutionMainSize, calc);
+            if (keyword.isSome && keyword.kind == SizingKeywordKind::Exact) {
+                child.flexBasisIsDefinite = true;
+                child.flexBasis = keyword.exact;
+                measureBasis = false;
+            } else if (keyword.isSome) {
+                keywordMain = keyword.measure;
+                hasKeywordMain = true;
+            }
+        }
+        if (measureBasis && childCrossSizeIsDefinite) {
+
+            Optf cross = Cross(childKnownDimensions, dir);
+            if (IsSome(child.aspectRatio) && IsSome(cross)) {
+                child.flexBasisIsDefinite = true;
+                child.flexBasis = c.isRow ? cross * child.aspectRatio
+                                          : cross / child.aspectRatio;
+                measureBasis = false;
+            }
+        }
+        if (measureBasis) {
+
+            AvailableSpace mainAvailable =
+                availableSpace.Main(dir)
+                            .kind == AvailableSpace::Kind::MinContent
+                    ? AvailableSpace::MinContent()
+                    : AvailableSpace::MaxContent();
+            if (hasKeywordMain) {
+                mainAvailable = keywordMain;
+            }
             SizeAvail childAvailableSpace = SizeAvail::MaxContent();
-            childAvailableSpace
-                .SetMain(dir, availableSpace.Main(dir).kind ==
-                                      AvailableSpace::Kind::MinContent
-                                  ? AvailableSpace::MinContent()
-                                  : AvailableSpace::MaxContent());
+            childAvailableSpace.SetMain(dir, mainAvailable);
             childAvailableSpace.SetCross(dir, crossAxisAvailableSpace);
             child.flexBasis = tree->MeasureChildSize(
                 child.node, childKnownDimensions, childParentSize,
@@ -4089,7 +4328,7 @@ void CollectFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
     FlexItem* items = flexItems->els;
     int total = flexItems->len;
 
-    if (!c.isWrap) {
+    if (!c.isWrap || !c.knownMainSizeIsDefinite) {
         VecAppend(*lines, {items, total, 0.0f, 0.0f});
         return;
     }
@@ -4097,9 +4336,19 @@ void CollectFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
     AvailableSpace mainAxisAvailableSpace;
     Optf maxMain = Main(c.maxSize, c.dir);
     if (IsSome(maxMain)) {
+        float available =
+            UnwrapOr(availableSpace.Main(c.dir).IntoOption(), maxMain);
+
+        if (!c.hasDefiniteMainSize) {
+            available = F32Min(available, maxMain);
+        }
         mainAxisAvailableSpace = AvailableSpace::Definite(
-            MaybeMax(UnwrapOr(availableSpace.Main(c.dir).IntoOption(), maxMain),
-                     Main(c.minSize, c.dir)));
+            MaybeMax(available, Main(c.minSize, c.dir)));
+    } else if (!c.isRow && !c.hasDefiniteMainSize &&
+               availableSpace.Main(c.dir)
+                       .kind == AvailableSpace::Kind::Definite) {
+
+        mainAxisAvailableSpace = AvailableSpace::MaxContent();
     } else {
         mainAxisAvailableSpace = availableSpace.Main(c.dir);
     }
@@ -4137,6 +4386,64 @@ void CollectFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
         }
         VecAppend(*lines, {items + start, index - start, 0.0f, 0.0f});
         start = index;
+    }
+}
+
+void CollectBalancedFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
+                              Vec<FlexItem>* flexItems, Vec<FlexLine>* lines) {
+    FlexItem* items = flexItems->els;
+    int total = flexItems->len;
+    if (total == 0) {
+        return;
+    }
+
+    AvailableSpace mainAxisAvailableSpace;
+    if (!c.knownMainSizeIsDefinite) {
+        mainAxisAvailableSpace = AvailableSpace::MaxContent();
+    } else {
+        Optf maxMain = Main(c.maxSize, c.dir);
+        if (IsSome(maxMain)) {
+            float available =
+                UnwrapOr(availableSpace.Main(c.dir).IntoOption(), maxMain);
+            if (!c.hasDefiniteMainSize) {
+                available = F32Min(available, maxMain);
+            }
+            mainAxisAvailableSpace = AvailableSpace::Definite(
+                MaybeMax(available, Main(c.minSize, c.dir)));
+        } else if (!c.isRow && !c.hasDefiniteMainSize &&
+                   availableSpace.Main(c.dir)
+                           .kind == AvailableSpace::Kind::Definite) {
+            mainAxisAvailableSpace = AvailableSpace::MaxContent();
+        } else {
+            mainAxisAvailableSpace = availableSpace.Main(c.dir);
+        }
+    }
+
+    if (mainAxisAvailableSpace.kind == AvailableSpace::Kind::MinContent) {
+        for (int i = 0; i < total; i++) {
+            VecAppend(*lines, {items + i, 1, 0.0f, 0.0f});
+        }
+        return;
+    }
+
+    float lineBreak = mainAxisAvailableSpace
+                                  .kind == AvailableSpace::Kind::Definite
+                          ? mainAxisAvailableSpace.value
+                          : INFINITY;
+    Vec<float> itemSizes;
+    for (int i = 0; i < total; i++) {
+        VecAppend(itemSizes, Main(items[i].hypotheticalOuterSize, c.dir));
+    }
+    Vec<int> counts;
+    int* slots = VecAppendBlanks(counts, total);
+    int minLines = c.lineCount < 1 ? 1 : c.lineCount;
+    int nLines = BalancedLineItemCounts(itemSizes.els, total, lineBreak,
+                                        Main(c.gap, c.dir), minLines, slots);
+    int start = 0;
+    for (int i = 0; i < nLines; i++) {
+        int count = slots[i];
+        VecAppend(*lines, {items + start, count, 0.0f, 0.0f});
+        start += count;
     }
 }
 
@@ -4180,8 +4487,54 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
         if (mainAvail.kind == AvailableSpace::Kind::Definite) {
             float longest = LongestLineLength(lines, *c);
             float size = longest + mainContentBoxInset;
-            outerMainSize =
-                lines->len > 1 ? F32Max(size, mainAvail.value) : size;
+            if (c->isBalance) {
+
+                int itemCount = 0;
+                for (int i = 0; i < lines->len; i++) {
+                    itemCount += (*lines)[i].count;
+                }
+                if (itemCount == 0) {
+                    outerMainSize = size;
+                } else {
+                    Vec<float> itemLengths;
+                    for (int li = 0; li < lines->len; li++) {
+                        FlexLine& line = (*lines)[li];
+                        for (int ii = 0; ii < line.count; ii++) {
+                            const FlexItem& child = line.items[ii];
+                            float paddingBorderSum =
+                                MainAxisSum(child.padding + child.border, dir);
+                            float itemLen =
+                                F32Max(MaybeMax(child.flexBasis,
+                                                Main(child.minSize, dir)) +
+                                           MainAxisSum(child.margin, dir),
+                                       paddingBorderSum);
+                            VecAppend(itemLengths, itemLen);
+                        }
+                    }
+                    Vec<int> counts;
+                    int* slots = VecAppendBlanks(counts, itemCount);
+                    int minLines = c->lineCount < 1 ? 1 : c->lineCount;
+                    int nLines = BalancedLineItemCounts(
+                        itemLengths.els, itemCount, INFINITY, Main(c->gap, dir),
+                        minLines, slots);
+                    float widest = 0.0f;
+                    int index = 0;
+                    for (int li = 0; li < nLines; li++) {
+                        float lineLength = 0.0f;
+                        for (int k = 0; k < slots[li]; k++) {
+                            lineLength += itemLengths[index++];
+                        }
+                        lineLength += SumAxisGaps(Main(c->gap, dir), slots[li]);
+                        widest = F32Max(widest, lineLength);
+                    }
+                    float maxContent = widest + mainContentBoxInset;
+                    outerMainSize =
+                        F32Max(size, F32Min(maxContent, mainAvail.value));
+                }
+            } else {
+                outerMainSize =
+                    lines->len > 1 ? F32Max(size, mainAvail.value) : size;
+            }
         } else if (mainAvail.kind == AvailableSpace::Kind::MinContent &&
                    c->isWrap) {
             outerMainSize = LongestLineLength(lines, *c) + mainContentBoxInset;
@@ -4197,7 +4550,9 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
                     Optf styleMax = Main(item.maxSize, dir);
 
                     Optf clampingBasis =
-                        MaybeMax(Some(item.flexBasis), stylePreferred);
+                        c->isRow
+                            ? MaybeMax(Some(item.flexBasis), stylePreferred)
+                            : Some(item.flexBasis);
                     Optf flexBasisMin =
                         Filter(clampingBasis, item.flexShrink == 0.0f);
                     Optf flexBasisMax =
@@ -4227,20 +4582,38 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
                     } else if (item.IsScroll()) {
                         contentContribution =
                             item.flexBasis + MainAxisSum(item.margin, dir);
+                    } else if (IsSome(stylePreferred)) {
+
+                        float itemPbMain = MainAxisSum(item.padding, dir) +
+                                           MainAxisSum(item.border, dir);
+                        float innerMainSize =
+                            F32Max(stylePreferred, itemPbMain);
+                        float marginSum = MainAxisSum(item.margin, dir);
+
+                        if (c->isRow) {
+                            contentContribution = MaybeClamp(
+                                innerMainSize + marginSum, styleMin, styleMax);
+                        } else {
+                            contentContribution = MaybeClamp(
+                                F32Max(innerMainSize, item.flexBasis) +
+                                    marginSum,
+                                styleMin, styleMax);
+                        }
                     } else {
                         Optf crossAxisParentSize = Cross(c->nodeInnerSize, dir);
-                        float crossAxisMarginSum = CrossAxisSum(c->margin, dir);
-                        Optf childMinCross = MaybeAdd(Cross(item.minSize, dir),
-                                                      crossAxisMarginSum);
-                        Optf childMaxCross = MaybeAdd(Cross(item.maxSize, dir),
-                                                      crossAxisMarginSum);
+
+                        Optf childMinCross = Cross(item.minSize, dir);
+                        Optf childMaxCross = Cross(item.maxSize, dir);
                         AvailableSpace crossAxisAvailableSpace =
                             availableSpace.Cross(dir);
                         if (crossAxisAvailableSpace
                                 .kind == AvailableSpace::Kind::Definite) {
-                            crossAxisAvailableSpace = AvailableSpace::Definite(
-                                UnwrapOr(crossAxisParentSize,
-                                         crossAxisAvailableSpace.value));
+                            crossAxisAvailableSpace =
+                                AvailableSpace::Definite(F32Max(
+                                    0.0f, c->DividedCrossSpace(UnwrapOr(
+                                              crossAxisParentSize,
+                                              crossAxisAvailableSpace.value)) -
+                                              CrossAxisSum(item.margin, dir)));
                         }
                         crossAxisAvailableSpace =
                             MaybeClamp(crossAxisAvailableSpace, childMinCross,
@@ -4252,29 +4625,44 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
 
                         SizeFOpt childKnownDimensions = item.size;
                         SetMain(&childKnownDimensions, dir, None());
+
+                        SizeFOpt transferredMinSize = MaybeApplyAspectRatio(
+                            item.minSize, item.aspectRatio);
+                        SizeFOpt transferredMaxSize = MaybeApplyAspectRatio(
+                            item.maxSize, item.aspectRatio);
+                        SetCross(&childKnownDimensions, dir,
+                                 MaybeClamp(Cross(childKnownDimensions, dir),
+                                            Cross(transferredMinSize, dir),
+                                            Cross(transferredMaxSize, dir)));
                         if (item.alignSelf
                                     .keyword == AlignItemsKeyword::Stretch &&
                             !IsSome(Cross(childKnownDimensions, dir))) {
-                            SetCross(
-                                &childKnownDimensions, dir,
-                                MaybeSub(crossAxisAvailableSpace.IntoOption(),
-                                         CrossAxisSum(item.margin, dir)));
+                            SetCross(&childKnownDimensions, dir,
+                                     crossAxisAvailableSpace.IntoOption());
                         }
 
-                        float contentMainSize =
-                            tree->MeasureChildSize(
-                                item.node, childKnownDimensions,
-                                c->nodeInnerSize, childAvailableSpace,
-                                SizingMode::InherentSize, MainAxis(dir),
-                                LineBool::False()) +
-                            MainAxisSum(item.margin, dir);
+                        float measuredMainSize = tree->MeasureChildSize(
+                            item.node, childKnownDimensions, c->nodeInnerSize,
+                            childAvailableSpace, SizingMode::ContentSize,
+                            MainAxis(dir), LineBool::False());
+
+                        Optf cross = Cross(childKnownDimensions, dir);
+                        float innerMainSize = measuredMainSize;
+                        if (IsSome(item.aspectRatio) && IsSome(cross)) {
+                            float transferred = c->isRow
+                                                    ? cross * item.aspectRatio
+                                                    : cross / item.aspectRatio;
+                            innerMainSize = F32Max(innerMainSize, transferred);
+                        }
+                        float marginSum = MainAxisSum(item.margin, dir);
 
                         if (c->isRow) {
-                            contentContribution =
-                                MaybeClamp(contentMainSize, styleMin, styleMax);
+                            contentContribution = MaybeClamp(
+                                innerMainSize + marginSum, styleMin, styleMax);
                         } else {
                             contentContribution = MaybeClamp(
-                                F32Max(contentMainSize, item.flexBasis),
+                                F32Max(innerMainSize, item.flexBasis) +
+                                    marginSum,
                                 styleMin, styleMax);
                         }
                     }
@@ -4285,7 +4673,7 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
                             diff / F32Max(1.0f, item.flexGrow);
                     } else if (diff < 0.0f) {
                         float scaledShrinkFactor =
-                            F32Max(1.0f, item.flexShrink * item.innerFlexBasis);
+                            F32Max(1.0f, item.flexShrink) * item.innerFlexBasis;
                         item.contentFlexFraction = diff / scaledShrinkFactor;
                     } else {
                         item.contentFlexFraction = 0.0f;
@@ -4303,7 +4691,10 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
                     } else if (item.contentFlexFraction < 0.0f) {
                         float scaledShrinkFactor =
                             F32Max(1.0f, item.flexShrink) * item.innerFlexBasis;
-                        flexContribution = scaledShrinkFactor * flexFraction;
+                        flexContribution =
+                            scaledShrinkFactor == 0.0f
+                                ? 0.0f
+                                : scaledShrinkFactor * flexFraction;
                     }
                     float size = item.flexBasis + flexContribution;
                     SetMain(&item.outerTargetSize, dir, size);
@@ -4482,6 +4873,38 @@ void ResolveFlexibleLengths(FlexLine* line, const AlgoConstants& c) {
     }
 }
 
+bool ItemCrossIsDefinite(const AlgoConstants& c, const FlexItem& item) {
+    FlexDirection dir = c.dir;
+    bool hasCrossAutoMargins =
+        item.marginIsAuto.CrossStart(dir) || item.marginIsAuto.CrossEnd(dir);
+    Dimension crossSize = item.sizeStyle.Cross(dir);
+    bool isStretched =
+        !hasCrossAutoMargins &&
+        (crossSize.IsStretch() ||
+         (item.alignSelf == AlignSelf{AlignItemsKeyword::Stretch} &&
+          crossSize.IsAuto()));
+    return isStretched || IsSome(Cross(item.size, dir)) ||
+           (!c.isRow && c.crossAxisAvailableSpaceIsDefinite);
+}
+
+LayoutInput ItemLayoutInput(const AlgoConstants& c, const FlexItem& item,
+                            RunMode runMode, RequestedAxis axis, SizeFOpt known,
+                            SizeAvail available) {
+    bool mainDefinite = c.hasDefiniteMainSize || item.flexBasisIsDefinite;
+    bool crossDefinite = ItemCrossIsDefinite(c, item);
+    LayoutInput in;
+    in.runMode = runMode;
+    in.sizingMode = SizingMode::ContentSize;
+    in.axis = axis;
+    in.knownDimensions = known;
+    in.knownDimensionsAreDefiniteW = c.isRow ? mainDefinite : crossDefinite;
+    in.knownDimensionsAreDefiniteH = c.isRow ? crossDefinite : mainDefinite;
+    in.parentSize = c.nodeInnerSize;
+    in.availableSpace = available;
+    in.verticalMarginsAreCollapsible = LineBool::False();
+    return in;
+}
+
 void DetermineHypotheticalCrossSize(TaffyTree* tree, FlexLine* line,
                                     const AlgoConstants& c,
                                     SizeAvail availableSpace) {
@@ -4491,8 +4914,8 @@ void DetermineHypotheticalCrossSize(TaffyTree* tree, FlexLine* line,
         float paddingBorderSum =
             CrossAxisSum(child.padding + child.border, dir);
 
-        AvailableSpace childKnownMain =
-            AvailableSpace::Definite(Main(c.containerSize, dir));
+        AvailableSpace childAvailableMain = AvailableSpace::Definite(F32Max(
+            0.0f, Main(c.containerSize, dir) - MainAxisSum(child.margin, dir)));
 
         Optf transferredMinCross =
             Cross(MaybeApplyAspectRatio(child.minSize, child.aspectRatio), dir);
@@ -4504,10 +4927,29 @@ void DetermineHypotheticalCrossSize(TaffyTree* tree, FlexLine* line,
                                 transferredMaxCross),
                      paddingBorderSum);
 
-        AvailableSpace childAvailableCross =
-            MaybeMax(MaybeClamp(availableSpace.Cross(dir), transferredMinCross,
-                                transferredMaxCross),
-                     paddingBorderSum);
+        AvailableSpace crossAvail = availableSpace.Cross(dir);
+        if (crossAvail.kind == AvailableSpace::Kind::Definite) {
+            crossAvail = AvailableSpace::Definite(
+                F32Max(0.0f, c.DividedCrossSpace(crossAvail.value) -
+                                 CrossAxisSum(child.margin, dir)));
+        }
+        AvailableSpace childAvailableCross = MaybeMax(
+            MaybeClamp(crossAvail, transferredMinCross, transferredMaxCross),
+            paddingBorderSum);
+
+        Optf innerCross = Cross(c.nodeInnerSize, dir);
+        if (IsSome(innerCross)) {
+            innerCross = Some(c.DividedCrossSpace(innerCross));
+        }
+        Optf crossStretch = MaybeMax(
+            MaybeSub(innerCross, Some(CrossAxisSum(child.margin, dir))), 0.0f);
+        SizingKeywordResolution crossKeyword =
+            ResolveSizingKeyword(child.sizeStyle.Cross(dir), crossStretch,
+                                 Cross(c.nodeInnerSize, dir), tree->calc);
+        if (crossKeyword.isSome &&
+            crossKeyword.kind == SizingKeywordKind::Measure) {
+            childAvailableCross = crossKeyword.measure;
+        }
 
         float childInnerCross;
         if (IsSome(childCross)) {
@@ -4515,11 +4957,15 @@ void DetermineHypotheticalCrossSize(TaffyTree* tree, FlexLine* line,
         } else {
             SizeFOpt known = {c.isRow ? Some(child.targetSize.w) : childCross,
                               c.isRow ? childCross : Some(child.targetSize.h)};
-            SizeAvail avail = {c.isRow ? childKnownMain : childAvailableCross,
-                               c.isRow ? childAvailableCross : childKnownMain};
-            float measured = tree->MeasureChildSize(
-                child.node, known, c.nodeInnerSize, avail,
-                SizingMode::ContentSize, CrossAxis(dir), LineBool::False());
+            SizeAvail avail = {
+                c.isRow ? childAvailableMain : childAvailableCross,
+                c.isRow ? childAvailableCross : childAvailableMain};
+            LayoutOutput measuredOut = tree->ComputeChildLayout(
+                child.node, ItemLayoutInput(c, child, RunMode::ComputeSize,
+                                            c.isRow ? RequestedAxis::Vertical
+                                                    : RequestedAxis::Horizontal,
+                                            known, avail));
+            float measured = GetAbs(measuredOut.size, CrossAxis(dir));
             childInnerCross = F32Max(
                 MaybeClamp(measured, transferredMinCross, transferredMaxCross),
                 paddingBorderSum);
@@ -4545,8 +4991,7 @@ void CalculateChildrenBaseLines(TaffyTree* tree, SizeFOpt nodeSize,
 
         int participating = 0;
         for (int i = 0; i < line.count; i++) {
-            if (line.items[i]
-                    .alignSelf.keyword == AlignItemsKeyword::Baseline) {
+            if (line.items[i].ParticipatesInBaselineAlignment(c.dir)) {
                 participating++;
             }
         }
@@ -4556,22 +5001,28 @@ void CalculateChildrenBaseLines(TaffyTree* tree, SizeFOpt nodeSize,
 
         for (int i = 0; i < line.count; i++) {
             FlexItem& child = line.items[i];
-            if (child.alignSelf.keyword != AlignItemsKeyword::Baseline) {
+            if (!child.ParticipatesInBaselineAlignment(c.dir)) {
                 continue;
             }
             SizeFOpt known = {c.isRow ? Some(child.targetSize.w)
                                       : Some(child.hypotheticalInnerSize.w),
                               c.isRow ? Some(child.hypotheticalInnerSize.h)
                                       : Some(child.targetSize.h)};
+
             SizeAvail avail = {
                 c.isRow ? AvailableSpace::Definite(c.containerSize.w)
                         : availableSpace.width.MaybeSet(nodeSize.w),
                 c.isRow ? availableSpace.height.MaybeSet(nodeSize.h)
                         : AvailableSpace::Definite(c.containerSize.h)};
-            LayoutOutput out = tree->PerformChildLayout(
-                child.node, known, c.nodeInnerSize, avail,
-                SizingMode::ContentSize, LineBool::False());
-            float baseline = UnwrapOr(out.firstBaselines.y, out.size.h);
+            SizeF marginSum = child.margin.SumAxes();
+            avail.width =
+                MaybeMax(MaybeSub(avail.width, Some(marginSum.w)), Some(0.0f));
+            avail.height =
+                MaybeMax(MaybeSub(avail.height, Some(marginSum.h)), Some(0.0f));
+            LayoutOutput out = tree->ComputeChildLayout(
+                child.node, ItemLayoutInput(c, child, RunMode::PerformLayout,
+                                            RequestedAxis::Both, known, avail));
+            float baseline = UnwrapOr(out.baselines.first, out.size.h);
             if (IsScrollContainer(child.overflow.y)) {
                 baseline = F32Max(0.0f, F32Min(baseline, out.size.h));
             }
@@ -4609,9 +5060,7 @@ void CalculateCrossSize(Vec<FlexLine>* lines, SizeFOpt nodeSize,
         for (int i = 0; i < line.count; i++) {
             FlexItem& child = line.items[i];
             float v;
-            if (child.alignSelf.keyword == AlignItemsKeyword::Baseline &&
-                !child.marginIsAuto.CrossStart(dir) &&
-                !child.marginIsAuto.CrossEnd(dir)) {
+            if (child.ParticipatesInBaselineAlignment(dir)) {
                 v = maxBaseline - child.baseline +
                     Cross(child.hypotheticalOuterSize, dir);
             } else {
@@ -4674,14 +5123,18 @@ void DetermineUsedCrossSize(TaffyTree* tree, Vec<FlexLine>* lines,
         for (int i = 0; i < line.count; i++) {
             FlexItem& child = line.items[i];
             const Style& cs = tree->GetStyle(child.node);
-            float used;
-            if (child.alignSelf.keyword == AlignItemsKeyword::Stretch &&
-                !child.marginIsAuto.CrossStart(dir) &&
-                !child.marginIsAuto.CrossEnd(dir) &&
-                cs.size.Cross(dir).IsAuto()) {
 
-                RectF padding = cs.padding.ResolveOrZero(c.nodeInnerSize, calc);
-                RectF border = cs.border.ResolveOrZero(c.nodeInnerSize, calc);
+            bool crossIsStretch = child.sizeStyle.Cross(dir).IsStretch();
+            float used;
+            if (!child.marginIsAuto.CrossStart(dir) &&
+                !child.marginIsAuto.CrossEnd(dir) &&
+                (crossIsStretch ||
+                 (child.alignSelf.keyword == AlignItemsKeyword::Stretch &&
+                  cs.size.Cross(dir).IsAuto()))) {
+
+                RectF padding = cs.padding
+                                    .ResolveOrZero(c.nodeInnerSize.w, calc);
+                RectF border = cs.border.ResolveOrZero(c.nodeInnerSize.w, calc);
                 SizeF pbSum = (padding + border).SumAxes();
                 SizeF boxSizingAdjustment =
                     cs.boxSizing == BoxSizing::ContentBox ? pbSum
@@ -4689,10 +5142,11 @@ void DetermineUsedCrossSize(TaffyTree* tree, Vec<FlexLine>* lines,
                 SizeFOpt maxSizeIgnoringAspectRatio =
                     MaybeAdd(cs.maxSize.MaybeResolve(c.nodeInnerSize, calc),
                              boxSizingAdjustment);
-                used =
-                    MaybeClamp(lineCrossSize - CrossAxisSum(child.margin, dir),
-                               Cross(child.minSize, dir),
-                               Cross(maxSizeIgnoringAspectRatio, dir));
+                used = MaybeClamp(
+                    F32Max(0.0f,
+                           lineCrossSize - CrossAxisSum(child.margin, dir)),
+                    Cross(child.minSize, dir),
+                    Cross(maxSizeIgnoringAspectRatio, dir));
             } else {
                 used = Cross(child.hypotheticalInnerSize, dir);
             }
@@ -4745,16 +5199,15 @@ void DistributeRemainingFreeSpace(Vec<FlexLine>* lines,
                     }
                 }
             }
+
+            freeSpace = 0.0f;
         }
 
         int numItems = line.count;
         bool layoutReverse = IsReverse(dir);
         float gap = Main(c.gap, dir);
-        JustifyContent rawMode =
-            c.justifyContent
-                .UnwrapOr(AlignContent{AlignContentKeyword::FlexStart});
         AlignContentKeyword mode =
-            ApplyAlignmentFallback(freeSpace, numItems, rawMode);
+            ApplyAlignmentFallback(freeSpace, numItems, c.justifyContent);
 
         for (int i = 0; i < numItems; i++) {
             FlexItem& child =
@@ -4820,8 +5273,7 @@ void ResolveCrossAxisAutoMargins(Vec<FlexLine>* lines, const AlgoConstants& c) {
         float maxBaselineToBottomDistance = 0.0f;
         for (int i = 0; i < line.count; i++) {
             maxBaseline = F32Max(maxBaseline, line.items[i].baseline);
-            if (line.items[i]
-                    .alignSelf.keyword == AlignItemsKeyword::Baseline) {
+            if (line.items[i].ParticipatesInBaselineAlignment(c.dir)) {
                 maxBaselineToBottomDistance =
                     F32Max(maxBaselineToBottomDistance,
                            Cross(line.items[i].outerTargetSize, c.dir) -
@@ -4911,42 +5363,39 @@ void AlignFlexLinesPerAlignContent(Vec<FlexLine>* lines, const AlgoConstants& c,
 
 void CalculateFlexItem(TaffyTree* tree, FlexItem* item, float* totalOffsetMain,
                        float totalOffsetCross, float lineOffsetCross,
-                       SizeF* totalContentSize, SizeF containerSize,
-                       SizeFOpt nodeInnerSize, FlexDirection direction,
-                       Direction layoutDirection) {
-    LayoutOutput layoutOutput = tree->PerformChildLayout(
-        item->node, AsOptional(item->targetSize), nodeInnerSize,
-        SizeAvail::Definite(containerSize), SizingMode::ContentSize,
-        LineBool::False());
+                       RectF* totalOverflowRect, const AlgoConstants& c,
+                       Vec<OofCandidate>* oofPool) {
+    FlexDirection direction = c.dir;
+    Direction layoutDirection = c.layoutDirection;
+    SizeF containerSize = c.containerSize;
+    bool mainDefinite = c.hasDefiniteMainSize || item->flexBasisIsDefinite;
+    bool crossDefinite = ItemCrossIsDefinite(c, *item);
+    LayoutInput childInput;
+    childInput.runMode = RunMode::PerformLayout;
+    childInput.sizingMode = SizingMode::ContentSize;
+    childInput.axis = RequestedAxis::Both;
+    childInput.knownDimensions = AsOptional(item->targetSize);
+    childInput.knownDimensionsAreDefiniteW =
+        IsRow(direction) ? mainDefinite : crossDefinite;
+    childInput.knownDimensionsAreDefiniteH =
+        IsRow(direction) ? crossDefinite : mainDefinite;
+    childInput.parentSize = c.nodeInnerSize;
+
+    SizeF childMarginSum = item->margin.SumAxes();
+    childInput.availableSpace =
+        SizeAvail::Definite({F32Max(0.0f, containerSize.w - childMarginSum.w),
+                             F32Max(0.0f, containerSize.h - childMarginSum.h)});
+    childInput.verticalMarginsAreCollapsible = LineBool::False();
+    LayoutOutput layoutOutput =
+        tree->ComputeChildLayout(item->node, childInput);
     SizeF size = layoutOutput.size;
-    SizeF contentSize = layoutOutput.contentSize;
+    RectF scrollableOverflowRect = layoutOutput.scrollableOverflowRect;
 
     bool isRtlRow = IsRow(direction) && IsRtl(layoutDirection);
     bool isRtlColumn = IsColumn(direction) && IsRtl(layoutDirection);
 
-    Optf negMainStart = MainStart(item->inset, direction);
-    if (IsSome(negMainStart)) {
-        negMainStart = -negMainStart;
-    }
-    Optf negMainEnd = MainEnd(item->inset, direction);
-    if (IsSome(negMainEnd)) {
-        negMainEnd = -negMainEnd;
-    }
-    float mainRelativeInset =
-        isRtlRow
-            ? UnwrapOr(Or(MainEnd(item->inset, direction), negMainStart), 0.0f)
-            : UnwrapOr(Or(MainStart(item->inset, direction), negMainEnd), 0.0f);
-
-    Optf negCrossEnd = CrossEnd(item->inset, direction);
-    if (IsSome(negCrossEnd)) {
-        negCrossEnd = -negCrossEnd;
-    }
-    float crossRelativeInset =
-        isRtlColumn
-            ? UnwrapOr(Or(negCrossEnd, CrossStart(item->inset, direction)),
-                       0.0f)
-            : UnwrapOr(Or(CrossStart(item->inset, direction), negCrossEnd),
-                       0.0f);
+    float mainRelativeInset = Main(item->relativeInset, direction);
+    float crossRelativeInset = Cross(item->relativeInset, direction);
 
     float effectiveLineOffsetCross = isRtlColumn ? 0.0f : lineOffsetCross;
 
@@ -4961,7 +5410,7 @@ void CalculateFlexItem(TaffyTree* tree, FlexItem* item, float* totalOffsetMain,
         totalOffsetCross + item->offsetCross + effectiveLineOffsetCross +
         CrossStart(item->margin, direction) + crossRelativeInset;
 
-    float innerBaseline = UnwrapOr(layoutOutput.firstBaselines.y, size.h);
+    float innerBaseline = UnwrapOr(layoutOutput.baselines.first, size.h);
     if (IsRow(direction) && IsScrollContainer(item->overflow.y)) {
         innerBaseline = F32Max(0.0f, F32Min(innerBaseline, size.h));
     }
@@ -4985,13 +5434,21 @@ void CalculateFlexItem(TaffyTree* tree, FlexItem* item, float* totalOffsetMain,
     Layout layout;
     layout.order = item->order;
     layout.size = size;
-    layout.contentSize = contentSize;
+    layout.scrollableOverflowRect = scrollableOverflowRect;
     layout.scrollbarSize = scrollbarSize;
     layout.location = location;
     layout.padding = item->padding;
     layout.border = item->border;
     layout.margin = item->margin;
     tree->SetUnroundedLayout(item->node, layout);
+
+    OofCandRange range;
+    OofAppendRange(oofPool, &range, layoutOutput.oofCandidates);
+    if (range.count > 0) {
+        OofTranslateRange(oofPool, range, location);
+    }
+    item->oofStart = range.start;
+    item->oofCount = range.count;
 
     float advance = item->offsetMain + MainAxisSum(item->margin, direction) +
                     Main(size, direction);
@@ -5003,19 +5460,22 @@ void CalculateFlexItem(TaffyTree* tree, FlexItem* item, float* totalOffsetMain,
 
     PointF contributionLocation =
         IsRtl(layoutDirection)
-            ? PointF{containerSize.w - (location.x + size.w), location.y}
-            : location;
-    *totalContentSize =
-        Max(*totalContentSize,
-            ComputeContentSizeContribution(contributionLocation, size,
-                                           contentSize, item->overflow));
+            ? PointF{containerSize.w - (location.x + size.w) - c.border.right,
+                     location.y - c.border.top}
+            : PointF{location.x - c.border.left, location.y - c.border.top};
+    *totalOverflowRect =
+        totalOverflowRect->Union(ComputeScrollableOverflowContribution(
+            contributionLocation, size, scrollableOverflowRect, item->overflow,
+            item->contain, c.isScrollContainer));
 }
 
 void CalculateLayoutLine(TaffyTree* tree, FlexLine* line,
-                         float* totalOffsetCross, SizeF* contentSize,
-                         SizeF containerSize, SizeFOpt nodeInnerSize,
-                         RectF paddingBorder, FlexDirection direction,
-                         Direction layoutDirection) {
+                         float* totalOffsetCross, RectF* overflowRect,
+                         const AlgoConstants& c, Vec<OofCandidate>* oofPool) {
+    FlexDirection direction = c.dir;
+    Direction layoutDirection = c.layoutDirection;
+    SizeF containerSize = c.containerSize;
+    RectF paddingBorder = c.contentBoxInset;
     float totalOffsetMain =
         (IsRtl(layoutDirection) && IsRow(direction))
             ? containerSize.w - MainEnd(paddingBorder, direction)
@@ -5032,8 +5492,7 @@ void CalculateLayoutLine(TaffyTree* tree, FlexLine* line,
                              ? &line->items[line->count - 1 - i]
                              : &line->items[i];
         CalculateFlexItem(tree, item, &totalOffsetMain, *totalOffsetCross,
-                          lineOffsetCross, contentSize, containerSize,
-                          nodeInnerSize, direction, layoutDirection);
+                          lineOffsetCross, overflowRect, c, oofPool);
     }
 
     if (!isRtlColumn) {
@@ -5041,332 +5500,170 @@ void CalculateLayoutLine(TaffyTree* tree, FlexLine* line,
     }
 }
 
-SizeF FinalLayoutPass(TaffyTree* tree, Vec<FlexLine>* lines,
-                      const AlgoConstants& c) {
+RectF FinalLayoutPass(TaffyTree* tree, Vec<FlexLine>* lines,
+                      const AlgoConstants& c, Vec<OofCandidate>* oofPool) {
     float totalOffsetCross =
         (c.isColumn && IsRtl(c.layoutDirection))
             ? c.containerSize.w - CrossEnd(c.contentBoxInset, c.dir)
             : CrossStart(c.contentBoxInset, c.dir);
 
-    SizeF contentSize = SizeF::Zero();
+    RectF overflowRect = RectF::Zero();
 
     for (int i = 0; i < lines->len; i++) {
         FlexLine& line =
             c.isWrapReverse ? (*lines)[lines->len - 1 - i] : (*lines)[i];
-        CalculateLayoutLine(tree, &line, &totalOffsetCross, &contentSize,
-                            c.containerSize, c.nodeInnerSize, c.contentBoxInset,
-                            c.dir, c.layoutDirection);
+        CalculateLayoutLine(tree, &line, &totalOffsetCross, &overflowRect, c,
+                            oofPool);
     }
 
-    contentSize.w +=
-        IsRtl(c.layoutDirection)
-            ? c.contentBoxInset.left - c.border.left - c.scrollbarGutter.x
-            : c.contentBoxInset.right - c.border.right - c.scrollbarGutter.x;
-    contentSize
-        .h += c.contentBoxInset.bottom - c.border.bottom - c.scrollbarGutter.y;
+    if (c.isScrollContainer) {
+        overflowRect.right +=
+            IsRtl(c.layoutDirection)
+                ? c.contentBoxInset.left - c.border.left - c.scrollbarGutter.x
+                : c.contentBoxInset.right - c.border.right -
+                      c.scrollbarGutter.x;
+        overflowRect.bottom +=
+            c.contentBoxInset.bottom - c.border.bottom - c.scrollbarGutter.y;
+    }
 
-    return contentSize;
+    return overflowRect;
 }
 
-SizeF PerformAbsoluteLayoutOnAbsoluteChildren(TaffyTree* tree, NodeId node,
-                                              const AlgoConstants& c) {
-    CalcResolver calc = tree->calc;
-    float containerWidth = c.containerSize.w;
-    float containerHeight = c.containerSize.h;
-    SizeF insetRelativeSize =
-        c.containerSize - c.border.SumAxes() - IntoSize(c.scrollbarGutter);
+void CollectOofCandidates(TaffyTree* tree, NodeId node, const AlgoConstants& c,
+                          Vec<FlexLine>* flexLines, Vec<OofCandidate>* pool,
+                          OofCandidates* candidates) {
+    int lineIx = 0;
+    int itemIx = 0;
+    auto nextWithCandidates = [&]() -> FlexItem* {
+        while (lineIx < len(*flexLines)) {
+            FlexLine& line = (*flexLines)[lineIx];
+            while (itemIx < line.count) {
+                FlexItem* item = &line.items[itemIx];
+                itemIx += 1;
+                if (item->oofCount > 0) {
+                    return item;
+                }
+            }
+            lineIx += 1;
+            itemIx = 0;
+        }
+        return nullptr;
+    };
+    FlexItem* next = nextWithCandidates();
 
-    SizeF contentSize = SizeF::Zero();
+    FlexDirection dir = c.dir;
+    bool mainIsRtl = c.isRow && IsRtl(c.layoutDirection);
+    bool crossIsRtl = !c.isRow && IsRtl(c.layoutDirection);
+    bool mainReversed = IsReverse(dir) != mainIsRtl;
+    bool crossReversed = c.isWrapReverse != crossIsRtl;
+
+    float mainStart = MainStart(c.contentBoxInset, dir);
+    float mainEnd =
+        Main(c.containerSize, dir) - MainEnd(c.contentBoxInset, dir);
+    float crossStart = CrossStart(c.contentBoxInset, dir);
+    float crossEnd =
+        Cross(c.containerSize, dir) - CrossEnd(c.contentBoxInset, dir);
+
+    auto crossEdge = [&](AlignItemsKeyword keyword) {
+        bool startPosition = true;
+        if (keyword == AlignItemsKeyword::Start ||
+            keyword == AlignItemsKeyword::Baseline) {
+            startPosition = !crossIsRtl;
+        } else if (keyword == AlignItemsKeyword::End) {
+            startPosition = crossIsRtl;
+        }
+        if (keyword == AlignItemsKeyword::Start ||
+            keyword == AlignItemsKeyword::End ||
+            keyword == AlignItemsKeyword::Baseline) {
+            return startPosition ? AxisStaticEdge::Start : AxisStaticEdge::End;
+        }
+        if (keyword == AlignItemsKeyword::Center) {
+            return AxisStaticEdge::Center;
+        }
+        if (keyword == AlignItemsKeyword::FlexEnd) {
+            return crossReversed ? AxisStaticEdge::Start : AxisStaticEdge::End;
+        }
+
+        return crossReversed ? AxisStaticEdge::End : AxisStaticEdge::Start;
+    };
 
     int n = tree->ChildCount(node);
     for (int order = 0; order < n; order++) {
         NodeId child = tree->GetChildId(node, order);
         const Style& cs = tree->GetStyle(child);
-
-        if (cs.BoxGenMode() == BoxGenerationMode::None ||
-            cs.position != Position::Absolute) {
+        if (cs.BoxGenMode() == BoxGenerationMode::None) {
+            continue;
+        }
+        if (!IsOutOfFlow(cs.position)) {
+            if (next && next->order == (uint32_t)order) {
+                OofCandRange range = {next->oofStart, next->oofCount};
+                OofAppendPoolRange(candidates, *pool, range);
+                next = nextWithCandidates();
+            }
             continue;
         }
 
-        PointOverflow overflow = cs.overflow;
-        float scrollbarWidth = cs.scrollbarWidth;
-        Optf aspectRatio = cs.aspectRatio;
-        AlignSelf alignSelf =
-            ResolveSelfRelative(cs.alignSelf.UnwrapOr(c.alignItems),
-                                cs.direction, c.layoutDirection, c.isColumn);
-        RectFOpt margin = cs.margin
-                              .MaybeResolve(Some(insetRelativeSize.w), calc);
-        RectF padding = cs.padding
-                            .ResolveOrZero(Some(insetRelativeSize.w), calc);
-        RectF border = cs.border.ResolveOrZero(Some(insetRelativeSize.w), calc);
-        SizeF paddingBorderSum = (padding + border).SumAxes();
-        SizeF boxSizingAdjustment = cs.boxSizing == BoxSizing::ContentBox
-                                        ? paddingBorderSum
-                                        : SizeF::Zero();
+        AlignItems alignSelf = ResolveSelfRelative(
+            ResolveNormalAlignment(cs.alignSelf.UnwrapOr(c.alignItems)),
+            cs.direction, c.layoutDirection, c.isColumn);
 
-        RectFOpt inset =
-            cs.inset.MaybeResolveZip(AsOptional(insetRelativeSize), calc);
-        Optf left = inset.left;
-        Optf right = inset.right;
-        Optf top = inset.top;
-        Optf bottom = inset.bottom;
-
-        SizeFOpt styleSize = MaybeAdd(
-            MaybeApplyAspectRatio(
-                cs.size.MaybeResolve(AsOptional(insetRelativeSize), calc),
-                aspectRatio),
-            boxSizingAdjustment);
-        SizeFOpt minSize =
-            MaybeMax(Or(MaybeAdd(MaybeApplyAspectRatio(
-                                     cs.minSize.MaybeResolve(
-                                         AsOptional(insetRelativeSize), calc),
-                                     aspectRatio),
-                                 boxSizingAdjustment),
-                        AsOptional(paddingBorderSum)),
-                     paddingBorderSum);
-        SizeFOpt maxSize = MaybeAdd(
-            MaybeApplyAspectRatio(
-                cs.maxSize.MaybeResolve(AsOptional(insetRelativeSize), calc),
-                aspectRatio),
-            boxSizingAdjustment);
-        SizeFOpt knownDimensions = MaybeClamp(styleSize, minSize, maxSize);
-
-        if (!IsSome(knownDimensions.w) && IsSome(left) && IsSome(right)) {
-            float newWidthRaw =
-                MaybeSub(MaybeSub(insetRelativeSize.w, margin.left),
-                         margin.right) -
-                left - right;
-            knownDimensions.w = Some(F32Max(newWidthRaw, 0.0f));
-            knownDimensions =
-                MaybeClamp(MaybeApplyAspectRatio(knownDimensions, aspectRatio),
-                           minSize, maxSize);
+        AlignContentKeyword mainKeyword = c.justifyContent.Keyword();
+        bool mainStartPosition = true;
+        if (mainKeyword == AlignContentKeyword::Start) {
+            mainStartPosition = !mainIsRtl;
+        } else if (mainKeyword == AlignContentKeyword::End) {
+            mainStartPosition = mainIsRtl;
         }
-        if (!IsSome(knownDimensions.h) && IsSome(top) && IsSome(bottom)) {
-            float newHeightRaw =
-                MaybeSub(MaybeSub(insetRelativeSize.h, margin.top),
-                         margin.bottom) -
-                top - bottom;
-            knownDimensions.h = Some(F32Max(newHeightRaw, 0.0f));
-            knownDimensions =
-                MaybeClamp(MaybeApplyAspectRatio(knownDimensions, aspectRatio),
-                           minSize, maxSize);
+        AxisStaticEdge mainEdge = AxisStaticEdge::Center;
+        switch (mainKeyword) {
+            case AlignContentKeyword::SpaceBetween:
+            case AlignContentKeyword::Normal:
+            case AlignContentKeyword::Stretch:
+            case AlignContentKeyword::FlexStart:
+                mainEdge =
+                    mainReversed ? AxisStaticEdge::End : AxisStaticEdge::Start;
+                break;
+            case AlignContentKeyword::FlexEnd:
+                mainEdge =
+                    mainReversed ? AxisStaticEdge::Start : AxisStaticEdge::End;
+                break;
+            case AlignContentKeyword::Start:
+            case AlignContentKeyword::End:
+                mainEdge = mainStartPosition ? AxisStaticEdge::Start
+                                             : AxisStaticEdge::End;
+                break;
+            default:
+                mainEdge = AxisStaticEdge::Center;
+                break;
         }
 
-        SizeAvail childAvail = {AvailableSpace::Definite(MaybeClamp(
-                                    containerWidth, minSize.w, maxSize.w)),
-                                AvailableSpace::Definite(MaybeClamp(
-                                    containerHeight, minSize.h, maxSize.h))};
+        AxisStaticAlign crossAlign;
+        crossAlign.keyword = crossEdge(alignSelf.keyword);
+        crossAlign.safety = alignSelf.safety;
+        crossAlign
+            .fallback = crossEdge(ResolveSelfAlignmentSafety(alignSelf, true));
+        AxisStaticPosition mainPos;
+        mainPos.start = mainStart;
+        mainPos.end = mainEnd;
+        mainPos.align = AxisStaticAlign::FromKeyword(mainEdge);
+        AxisStaticPosition crossPos;
+        crossPos.start = crossStart;
+        crossPos.end = crossEnd;
+        crossPos.align = crossAlign;
 
-        SizeF measuredSize = tree->MeasureChildSizeBoth(
-            child, knownDimensions, c.nodeInnerSize, childAvail,
-            SizingMode::InherentSize, LineBool::False());
-        SizeF finalSize = MaybeClamp(UnwrapOr(knownDimensions, measuredSize),
-                                     minSize, maxSize);
-
-        LayoutOutput layoutOutput = tree->PerformChildLayout(
-            child, AsOptional(finalSize), c.nodeInnerSize, childAvail,
-            SizingMode::InherentSize, LineBool::False());
-
-        RectF nonAutoMargin = {
-            UnwrapOr(margin.left, 0.0f), UnwrapOr(margin.right, 0.0f),
-            UnwrapOr(margin.top, 0.0f), UnwrapOr(margin.bottom, 0.0f)};
-
-        SizeF freeSpace = Max(SizeF{c.containerSize.w - finalSize.w -
-                                        nonAutoMargin.HorizontalAxisSum(),
-                                    c.containerSize.h - finalSize.h -
-                                        nonAutoMargin.VerticalAxisSum()},
-                              SizeF::Zero());
-
-        int autoW =
-            (IsSome(margin.left) ? 0 : 1) + (IsSome(margin.right) ? 0 : 1);
-        int autoH =
-            (IsSome(margin.top) ? 0 : 1) + (IsSome(margin.bottom) ? 0 : 1);
-        SizeF autoMarginSize = {autoW > 0 && IsSome(left) && IsSome(right)
-                                    ? freeSpace.w / (float)autoW
-                                    : 0.0f,
-                                autoH > 0 && IsSome(top) && IsSome(bottom)
-                                    ? freeSpace.h / (float)autoH
-                                    : 0.0f};
-        RectF resolvedMargin = {UnwrapOr(margin.left, autoMarginSize.w),
-                                UnwrapOr(margin.right, autoMarginSize.w),
-                                UnwrapOr(margin.top, autoMarginSize.h),
-                                UnwrapOr(margin.bottom, autoMarginSize.h)};
-
-        Optf startMain = c.isRow ? left : top;
-        Optf endMain = c.isRow ? right : bottom;
-        Optf startCross = c.isRow ? top : left;
-        Optf endCross = c.isRow ? bottom : right;
-        bool mainIsRtl = c.isRow && IsRtl(c.layoutDirection);
-        bool crossIsRtl = !c.isRow && IsRtl(c.layoutDirection);
-        bool mainAxisFlexStartReversed = IsReverse(c.dir) != mainIsRtl;
-        bool crossAxisFlexStartReversed = c.isWrapReverse != crossIsRtl;
-        float mainStartScrollbarOffset =
-            mainIsRtl ? Main(c.scrollbarGutter, c.dir) : 0.0f;
-        float crossStartScrollbarOffset =
-            crossIsRtl ? Cross(c.scrollbarGutter, c.dir) : 0.0f;
-        float mainEndScrollbarOffset =
-            mainIsRtl ? 0.0f : Main(c.scrollbarGutter, c.dir);
-        float crossEndScrollbarOffset =
-            crossIsRtl ? 0.0f : Cross(c.scrollbarGutter, c.dir);
-
-        float alignedToMainEnd =
-            Main(c.containerSize, c.dir) - MainEnd(c.border, c.dir) -
-            mainEndScrollbarOffset - Main(finalSize, c.dir) -
-            UnwrapOr(endMain, 0.0f) - MainEnd(resolvedMargin, c.dir);
-        float offsetMain;
-        if (IsSome(startMain) || IsSome(endMain)) {
-            if (IsSome(startMain) && !(mainIsRtl && IsSome(endMain))) {
-                offsetMain = startMain + MainStart(c.border, c.dir) +
-                             mainStartScrollbarOffset +
-                             MainStart(resolvedMargin, c.dir);
-            } else {
-                offsetMain = alignedToMainEnd;
-            }
+        OofCandidate candidate;
+        candidate.node = child;
+        candidate.order = (uint32_t)order;
+        candidate.position = cs.position;
+        if (c.isRow) {
+            candidate.staticX = mainPos;
+            candidate.staticY = crossPos;
         } else {
-
-            float startPos = MainStart(c.contentBoxInset, c.dir) +
-                             MainStart(resolvedMargin, c.dir);
-            float endPos = Main(c.containerSize, c.dir) -
-                           MainEnd(c.contentBoxInset, c.dir) -
-                           Main(finalSize, c.dir) -
-                           MainEnd(resolvedMargin, c.dir);
-            AlignContentKeyword jc =
-                c.justifyContent
-                    .UnwrapOr(AlignContent{AlignContentKeyword::FlexStart})
-                    .Keyword();
-            bool rev = mainAxisFlexStartReversed;
-            bool startPosition = jc == AlignContentKeyword::Start ? !mainIsRtl
-                                 : jc == AlignContentKeyword::End ? mainIsRtl
-                                                                  : true;
-            switch (jc) {
-                case AlignContentKeyword::SpaceBetween:
-                case AlignContentKeyword::Stretch:
-                case AlignContentKeyword::FlexStart:
-                    offsetMain = rev ? endPos : startPos;
-                    break;
-                case AlignContentKeyword::FlexEnd:
-                    offsetMain = rev ? startPos : endPos;
-                    break;
-                case AlignContentKeyword::Start:
-                case AlignContentKeyword::End:
-                    offsetMain = startPosition ? startPos : endPos;
-                    break;
-                default:
-                    offsetMain = (Main(c.containerSize, c.dir) +
-                                  MainStart(c.contentBoxInset, c.dir) -
-                                  MainEnd(c.contentBoxInset, c.dir) -
-                                  Main(finalSize, c.dir) +
-                                  MainStart(resolvedMargin, c.dir) -
-                                  MainEnd(resolvedMargin, c.dir)) /
-                                 2.0f;
-                    break;
-            }
+            candidate.staticX = crossPos;
+            candidate.staticY = mainPos;
         }
-
-        float alignedToCrossEnd =
-            Cross(c.containerSize, c.dir) - CrossEnd(c.border, c.dir) -
-            crossEndScrollbarOffset - Cross(finalSize, c.dir) -
-            UnwrapOr(endCross, 0.0f) - CrossEnd(resolvedMargin, c.dir);
-        float offsetCross;
-        if (IsSome(startCross) || IsSome(endCross)) {
-            if (IsSome(startCross) && !(crossIsRtl && IsSome(endCross))) {
-                offsetCross = startCross + CrossStart(c.border, c.dir) +
-                              crossStartScrollbarOffset +
-                              CrossStart(resolvedMargin, c.dir);
-            } else {
-                offsetCross = alignedToCrossEnd;
-            }
-        } else {
-            bool crossOverflows =
-                Cross(finalSize, c.dir) + CrossAxisSum(resolvedMargin, c.dir) >
-                Cross(c.containerSize, c.dir) -
-                    CrossAxisSum(c.contentBoxInset, c.dir);
-            AlignItemsKeyword ck =
-                ResolveSelfAlignmentSafety(alignSelf, crossOverflows);
-            float startPos = CrossStart(c.contentBoxInset, c.dir) +
-                             CrossStart(resolvedMargin, c.dir);
-            float endPos = Cross(c.containerSize, c.dir) -
-                           CrossEnd(c.contentBoxInset, c.dir) -
-                           Cross(finalSize, c.dir) -
-                           CrossEnd(resolvedMargin, c.dir);
-            bool rev = crossAxisFlexStartReversed;
-            bool startPosition = ck == AlignItemsKeyword::Start ||
-                                         ck == AlignItemsKeyword::Baseline
-                                     ? !crossIsRtl
-                                 : ck == AlignItemsKeyword::End ? crossIsRtl
-                                                                : true;
-            switch (ck) {
-                case AlignItemsKeyword::Start:
-                case AlignItemsKeyword::End:
-                case AlignItemsKeyword::Baseline:
-                    offsetCross = startPosition ? startPos : endPos;
-                    break;
-                case AlignItemsKeyword::Center:
-                    offsetCross = (Cross(c.containerSize, c.dir) +
-                                   CrossStart(c.contentBoxInset, c.dir) -
-                                   CrossEnd(c.contentBoxInset, c.dir) -
-                                   Cross(finalSize, c.dir) +
-                                   CrossStart(resolvedMargin, c.dir) -
-                                   CrossEnd(resolvedMargin, c.dir)) /
-                                  2.0f;
-                    break;
-                case AlignItemsKeyword::FlexEnd:
-                    offsetCross = rev ? startPos : endPos;
-                    break;
-                default:
-
-                    offsetCross = rev ? endPos : startPos;
-                    break;
-            }
-        }
-
-        PointF location = c.isRow ? PointF{offsetMain, offsetCross}
-                                  : PointF{offsetCross, offsetMain};
-        SizeF scrollbarSize = {
-            overflow.y == Overflow::Scroll ? scrollbarWidth : 0.0f,
-            overflow.x == Overflow::Scroll ? scrollbarWidth : 0.0f};
-
-        Layout layout;
-        layout.order = (uint32_t)order;
-        layout.size = finalSize;
-        layout.contentSize = layoutOutput.contentSize;
-        layout.scrollbarSize = scrollbarSize;
-        layout.location = location;
-        layout.padding = padding;
-        layout.border = border;
-        layout.margin = resolvedMargin;
-        tree->SetUnroundedLayout(child, layout);
-
-        SizeF sizeContribution = {
-            overflow.x == Overflow::Visible
-                ? F32Max(finalSize.w, layoutOutput.contentSize.w)
-                : finalSize.w,
-            overflow.y == Overflow::Visible
-                ? F32Max(finalSize.h, layoutOutput.contentSize.h)
-                : finalSize.h};
-        if (HasNonZeroArea(sizeContribution)) {
-            PointF absoluteAreaOffset = {
-                c.border.left +
-                    (IsRtl(c.layoutDirection) ? c.scrollbarGutter.x : 0.0f),
-                c.border.top};
-            PointF relativeLocation = {location.x - absoluteAreaOffset.x,
-                                       location.y - absoluteAreaOffset.y};
-            SizeF contribution;
-            if (IsRtl(c.layoutDirection)) {
-                float overflowExtraWidth =
-                    F32Max(sizeContribution.w - finalSize.w, 0.0f);
-                contribution.w =
-                    F32Max(insetRelativeSize.w - relativeLocation.x, 0.0f) +
-                    overflowExtraWidth;
-            } else {
-                contribution.w = relativeLocation.x + sizeContribution.w;
-            }
-            contribution.h = relativeLocation.y + sizeContribution.h;
-            contentSize = Max(contentSize, contribution);
-        }
+        candidates->Push(candidate);
     }
-
-    return contentSize;
 }
 
 LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
@@ -5375,8 +5672,10 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
     SizeFOpt parentSize = inputs.parentSize;
     RunMode runMode = inputs.runMode;
 
-    AlgoConstants constants = ComputeConstants(tree, tree->GetStyle(node),
-                                               knownDimensions, parentSize);
+    AlgoConstants constants = ComputeConstants(
+        tree, tree->GetStyle(node), knownDimensions,
+        inputs.knownDimensionsAreDefiniteW, inputs.knownDimensionsAreDefiniteH,
+        parentSize, inputs.availableSpace);
 
     Vec<FlexItem> flexItems;
 
@@ -5392,7 +5691,12 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
     DetermineFlexBaseSize(tree, constants, availableSpace, flexItems.els,
                           len(flexItems));
 
-    CollectFlexLines(constants, availableSpace, &flexItems, &flexLines);
+    if (constants.isBalance) {
+        CollectBalancedFlexLines(constants, availableSpace, &flexItems,
+                                 &flexLines);
+    } else {
+        CollectFlexLines(constants, availableSpace, &flexItems, &flexLines);
+    }
 
     Optf innerMainKnown = Main(constants.nodeInnerSize, constants.dir);
     if (IsSome(innerMainKnown)) {
@@ -5416,6 +5720,20 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
             style.gap.ResolveOrZero(Some(innerContainerSize), tree->calc);
         SetMain(&constants.gap, constants.dir,
                 Main(resolvedGap, constants.dir));
+    }
+
+    if (runMode == RunMode::ComputeSize) {
+        bool mainIsRequested =
+            (inputs.axis == RequestedAxis::Horizontal && constants.isRow) ||
+            (inputs.axis == RequestedAxis::Vertical && !constants.isRow);
+        if (mainIsRequested) {
+            SizeF size = SizeF::Zero();
+            SetMain(&size, constants.dir,
+                    Main(constants.containerSize, constants.dir));
+            VecReset(flexItems);
+            VecReset(flexLines);
+            return LayoutOutput::FromOuterSize(size);
+        }
     }
 
     for (int i = 0; i < len(flexLines); i++) {
@@ -5451,10 +5769,13 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
 
     AlignFlexLinesPerAlignContent(&flexLines, constants, totalLineCrossSize);
 
-    SizeF inflowContentSize = FinalLayoutPass(tree, &flexLines, constants);
+    Vec<OofCandidate> oofPool;
+    RectF inflowOverflowRect =
+        FinalLayoutPass(tree, &flexLines, constants, &oofPool);
 
-    SizeF absoluteContentSize =
-        PerformAbsoluteLayoutOnAbsoluteChildren(tree, node, constants);
+    OofCandidates candidates;
+    CollectOofCandidates(tree, node, constants, &flexLines, &oofPool,
+                         &candidates);
 
     int nChildren = tree->ChildCount(node);
     for (int order = 0; order < nChildren; order++) {
@@ -5463,7 +5784,7 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
             tree->SetUnroundedLayout(child, Layout::WithOrder((uint32_t)order));
             tree->PerformChildLayout(
                 child, SizeFOptNone(), SizeFOptNone(), SizeAvail::MaxContent(),
-                SizingMode::InherentSize, LineBool::False());
+                SizingMode::ContentSize, LineBool::False());
         }
     }
 
@@ -5471,27 +5792,48 @@ LayoutOutput ComputePreliminary(TaffyTree* tree, NodeId node,
     int firstLineIdx = constants.isWrapReverse ? len(flexLines) - 1 : 0;
     if (firstLineIdx >= 0 && flexLines[firstLineIdx].count > 0) {
         FlexLine& firstLine = flexLines[firstLineIdx];
+
         const FlexItem* chosen = nullptr;
-        for (int i = 0; i < firstLine.count; i++) {
-            const FlexItem& item = firstLine.items[i];
-            if (constants.isColumn ||
-                item.alignSelf.keyword == AlignItemsKeyword::Baseline) {
-                chosen = &item;
-                break;
+        if (constants.isColumn) {
+            chosen = IsReverse(constants.dir)
+                         ? &firstLine.items[firstLine.count - 1]
+                         : &firstLine.items[0];
+        } else {
+            for (int i = 0; i < firstLine.count; i++) {
+                const FlexItem& item = firstLine.items[i];
+                if (item.ParticipatesInBaselineAlignment(constants.dir)) {
+                    chosen = &item;
+                    break;
+                }
             }
-        }
-        if (!chosen) {
-            chosen = &firstLine.items[0];
+            if (!chosen) {
+                chosen = &firstLine.items[0];
+            }
         }
         firstVerticalBaseline = Some(chosen->baseline);
     }
 
+    RectF areaInset = constants.border;
+    if (IsRtl(constants.layoutDirection)) {
+        areaInset.left += constants.scrollbarGutter.x;
+    } else {
+        areaInset.right += constants.scrollbarGutter.x;
+    }
+    areaInset.bottom += constants.scrollbarGutter.y;
+
     VecReset(flexItems);
     VecReset(flexLines);
+    VecReset(oofPool);
 
-    return LayoutOutput::FromSizesAndBaselines(
-        constants.containerSize, Max(inflowContentSize, absoluteContentSize),
-        PointFOpt{None(), firstVerticalBaseline});
+    LayoutOutput output = LayoutOutput::FromSizesAndBaselines(
+        constants.containerSize, inflowOverflowRect,
+        BaselinesFromFirst(firstVerticalBaseline));
+    output.oofCandidates = candidates;
+    output.hasOofPositioningArea = true;
+    output.oofPositioningArea.size = constants.containerSize - areaInset
+                                                                   .SumAxes();
+    output.oofPositioningArea.offset = {areaInset.left, areaInset.top};
+    return output;
 }
 
 }
@@ -5503,6 +5845,7 @@ LayoutOutput ComputeFlexboxLayout(TaffyTree* tree, NodeId node,
     SizeFOpt parentSize = inputs.parentSize;
     RunMode runMode = inputs.runMode;
     const Style& style = tree->GetStyle(node);
+    Contain contain = style.contain;
 
     Optf aspectRatio = style.aspectRatio;
     RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
@@ -5556,7 +5899,16 @@ LayoutOutput ComputeFlexboxLayout(TaffyTree* tree, NodeId node,
 
     LayoutInput next = inputs;
     next.knownDimensions = styledBasedKnownDimensions;
-    return ComputePreliminary(tree, node, next);
+    next.knownDimensionsAreDefiniteW =
+        inputs.knownDimensionsAreDefiniteW || !IsSome(knownDimensions.w);
+    next.knownDimensionsAreDefiniteH =
+        inputs.knownDimensionsAreDefiniteH || !IsSome(knownDimensions.h);
+    LayoutOutput out = ComputePreliminary(tree, node, next);
+
+    if (contain.SuppressesBaseline()) {
+        out.baselines = BaselinesFromFirst(None());
+    }
+    return out;
 }
 
 }
@@ -5640,6 +5992,8 @@ struct GridTrack {
 
     bool infinitelyGrowable = false;
 
+    float fitContentLimit = INFINITY;
+
     static GridTrack New(MinTrackSizingFunction mn, MaxTrackSizingFunction mx) {
         GridTrack t;
         t.kind = GridTrackKind::Track;
@@ -5658,6 +6012,7 @@ struct GridTrack {
         isCollapsed = true;
         minTrackSizingFunction = MinTrackSizingFunction::Zero();
         maxTrackSizingFunction = MaxTrackSizingFunction::Zero();
+        fitContentLimit = INFINITY;
     }
     bool IsFlexible() const { return maxTrackSizingFunction.IsFr(); }
     bool UsesPercentage() const {
@@ -5668,21 +6023,14 @@ struct GridTrack {
         return minTrackSizingFunction.raw.IsIntrinsic() ||
                maxTrackSizingFunction.IsIntrinsic();
     }
-    float FitContentLimit(Optf axisAvailableGridSpace) const {
-        switch (maxTrackSizingFunction.raw.Tag()) {
-            case CompactLength::kFitContentPxTag:
-                return maxTrackSizingFunction.raw.Value();
-            case CompactLength::kFitContentPercentTag:
-                return IsSome(axisAvailableGridSpace)
-                           ? axisAvailableGridSpace * maxTrackSizingFunction.raw
-                                                          .Value()
-                           : INFINITY;
-            default:
-                return INFINITY;
-        }
+    void ResolveFitContentLimit(Optf axisInnerNodeSize, CalcResolver calc) {
+        fitContentLimit = UnwrapOr(
+            maxTrackSizingFunction.FitContentLimit(axisInnerNodeSize, calc),
+            INFINITY);
     }
-    float FitContentLimitedGrowthLimit(Optf axisAvailableGridSpace) const {
-        return F32Min(growthLimit, FitContentLimit(axisAvailableGridSpace));
+    float FitContentLimit() const { return fitContentLimit; }
+    float FitContentLimitedGrowthLimit() const {
+        return F32Min(growthLimit, fitContentLimit);
     }
     float FlexFactor() const {
         return maxTrackSizingFunction.IsFr()
@@ -5697,12 +6045,62 @@ enum class CellOccupancyState : uint8_t {
     AutoPlaced
 };
 
+struct SparseCursor {
+    bool set = false;
+    int16_t line = 0;
+};
+
 struct CellOccupancyMatrix {
     Vec<uint8_t> inner;
+    Vec<SparseCursor> rowCursor;
+    Vec<SparseCursor> colCursor;
     int nRows = 0;
     int nCols = 0;
     TrackCounts columns;
     TrackCounts rows;
+
+    static void ResetCursors(Vec<SparseCursor>& cursors, int count) {
+        VecReset(cursors);
+        if (count <= 0) {
+            return;
+        }
+        SparseCursor* p = VecAppendBlanks(cursors, count);
+        if (p) {
+
+            for (int i = 0; i < count; i++) {
+                p[i] = {};
+            }
+        }
+    }
+
+    static void ShiftCursors(Vec<SparseCursor>& cursors, int oldCount,
+                             int reqNeg, int reqPos) {
+        if (reqNeg == 0 && reqPos == 0) {
+            return;
+        }
+        int newCount = oldCount + reqNeg + reqPos;
+        Vec<SparseCursor> next;
+        SparseCursor* p =
+            newCount > 0 ? VecAppendBlanks(next, newCount) : nullptr;
+        if (newCount > 0 && !p) {
+            return;
+        }
+        if (p) {
+            for (int i = 0; i < newCount; i++) {
+                p[i] = {};
+            }
+            if (oldCount > 0 && cursors.els) {
+                for (int i = 0; i < oldCount; i++) {
+                    p[reqNeg + i] = cursors.els[i];
+                }
+            }
+        }
+        VecReset(cursors);
+        cursors = next;
+        next.els = nullptr;
+        next.len = 0;
+        next.cap = 0;
+    }
 
     void Init(TrackCounts cols, TrackCounts rws) {
         columns = cols;
@@ -5717,8 +6115,14 @@ struct CellOccupancyMatrix {
                 memset(p, 0, (size_t)n);
             }
         }
+        ResetCursors(rowCursor, nRows);
+        ResetCursors(colCursor, nCols);
     }
-    void Free() { VecReset(inner); }
+    void Free() {
+        VecReset(inner);
+        VecReset(rowCursor);
+        VecReset(colCursor);
+    }
 
     CellOccupancyState Get(int row, int col) const {
         if (row < 0 || row >= nRows || col < 0 || col >= nCols) {
@@ -5787,6 +6191,36 @@ struct CellOccupancyMatrix {
             (uint16_t)(columns.negativeImplicit + reqNegCols);
         columns.positiveImplicit =
             (uint16_t)(columns.positiveImplicit + reqPosCols);
+        ShiftCursors(rowCursor, oldRowCount, reqNegRows, reqPosRows);
+        ShiftCursors(colCursor, oldColCount, reqNegCols, reqPosCols);
+    }
+
+    void AdvanceAutoPlacementCursor(AbsoluteAxis primaryAxis,
+                                    OriginZeroLine secondaryStart,
+                                    OriginZeroLine primaryEnd) {
+        int trackIndex = Counts(OtherAxis(primaryAxis))
+                             .OzLineToNextTrack(secondaryStart);
+        Vec<SparseCursor>& tracks =
+            primaryAxis == AbsoluteAxis::Horizontal ? rowCursor : colCursor;
+        if (trackIndex < 0 || trackIndex >= len(tracks)) {
+            return;
+        }
+        SparseCursor& cursor = tracks.els[trackIndex];
+        if (!cursor.set || primaryEnd.v > cursor.line) {
+            cursor.set = true;
+            cursor.line = primaryEnd.v;
+        }
+    }
+
+    OptOriginZeroLine AutoPlacementCursor(AbsoluteAxis trackType,
+                                          OriginZeroLine startAt) const {
+        int idx = Counts(OtherAxis(trackType)).OzLineToNextTrack(startAt);
+        const Vec<SparseCursor>& tracks =
+            trackType == AbsoluteAxis::Horizontal ? rowCursor : colCursor;
+        if (idx < 0 || idx >= len(tracks) || !tracks.els[idx].set) {
+            return OptOriginZeroLine();
+        }
+        return OptOriginZeroLine(OriginZeroLine{tracks.els[idx].line});
     }
 
     void MarkAreaAs(AbsoluteAxis primaryAxis, LineOzl primarySpan,
@@ -5810,6 +6244,13 @@ struct CellOccupancyMatrix {
             colEnd = columns.OzLineToNextTrack(colSpan.end);
             rowStart = rows.OzLineToNextTrack(rowSpan.start);
             rowEnd = rows.OzLineToNextTrack(rowSpan.end);
+        }
+
+        if (value == CellOccupancyState::AutoPlaced &&
+            primarySpan.start < primarySpan.end &&
+            secondarySpan.start < secondarySpan.end) {
+            AdvanceAutoPlacementCursor(primaryAxis, secondarySpan.start,
+                                       primarySpan.end);
         }
 
         for (int x = rowStart; x < rowEnd; x++) {
@@ -5854,8 +6295,7 @@ struct CellOccupancyMatrix {
 
     OptOriginZeroLine LineAreaCollisionJump(AbsoluteAxis primaryAxis,
                                             LineOzl primarySpan,
-                                            LineOzl secondarySpan,
-                                            bool reversed) const {
+                                            LineOzl secondarySpan) const {
         const TrackCounts& pc = Counts(primaryAxis);
         const TrackCounts& sc = Counts(OtherAxis(primaryAxis));
         int primaryStart = pc.OzLineToNextTrack(primarySpan.start);
@@ -5884,35 +6324,18 @@ struct CellOccupancyMatrix {
                 }
 
                 int extent = primary;
-                if (reversed) {
-                    while (extent > 0) {
-                        int r = primaryAxis == AbsoluteAxis::Horizontal
-                                    ? secondary
-                                    : extent - 1;
-                        int c = primaryAxis == AbsoluteAxis::Horizontal
-                                    ? extent - 1
-                                    : secondary;
-                        if (Get(r, c) == CellOccupancyState::Unoccupied) {
-                            break;
-                        }
-                        extent--;
+                while (extent + 1 < primaryLen) {
+                    int r = primaryAxis == AbsoluteAxis::Horizontal
+                                ? secondary
+                                : extent + 1;
+                    int c = primaryAxis == AbsoluteAxis::Horizontal ? extent + 1
+                                                                    : secondary;
+                    if (Get(r, c) == CellOccupancyState::Unoccupied) {
+                        break;
                     }
-                    best = !found || extent < best ? extent : best;
-                } else {
-                    while (extent + 1 < primaryLen) {
-                        int r = primaryAxis == AbsoluteAxis::Horizontal
-                                    ? secondary
-                                    : extent + 1;
-                        int c = primaryAxis == AbsoluteAxis::Horizontal
-                                    ? extent + 1
-                                    : secondary;
-                        if (Get(r, c) == CellOccupancyState::Unoccupied) {
-                            break;
-                        }
-                        extent++;
-                    }
-                    best = !found || extent > best ? extent : best;
+                    extent++;
                 }
+                best = !found || extent > best ? extent : best;
                 found = true;
             }
         }
@@ -5920,7 +6343,7 @@ struct CellOccupancyMatrix {
             return OptOriginZeroLine();
         }
         OriginZeroLine line = pc.TrackToPrevOzLine((uint16_t)best);
-        int32_t next = (int32_t)line.v + (reversed ? -1 : 1);
+        int32_t next = (int32_t)line.v + 1;
         next = next < INT16_MIN   ? INT16_MIN
                : next > INT16_MAX ? INT16_MAX
                                   : next;
@@ -5949,59 +6372,6 @@ struct CellOccupancyMatrix {
         }
         return false;
     }
-
-    OptOriginZeroLine LastOfType(AbsoluteAxis trackType, OriginZeroLine startAt,
-                                 CellOccupancyState kind) const {
-        const TrackCounts& tc = Counts(OtherAxis(trackType));
-        int idx = tc.OzLineToNextTrack(startAt);
-        if (trackType == AbsoluteAxis::Horizontal) {
-            if (idx < 0 || idx >= nRows) {
-                return OptOriginZeroLine();
-            }
-            for (int c = nCols - 1; c >= 0; c--) {
-                if (Get(idx, c) == kind) {
-                    return OptOriginZeroLine(tc.TrackToPrevOzLine((uint16_t)c));
-                }
-            }
-        } else {
-            if (idx < 0 || idx >= nCols) {
-                return OptOriginZeroLine();
-            }
-            for (int r = nRows - 1; r >= 0; r--) {
-                if (Get(r, idx) == kind) {
-                    return OptOriginZeroLine(tc.TrackToPrevOzLine((uint16_t)r));
-                }
-            }
-        }
-        return OptOriginZeroLine();
-    }
-
-    OptOriginZeroLine FirstOfType(AbsoluteAxis trackType,
-                                  OriginZeroLine startAt,
-                                  CellOccupancyState kind) const {
-        const TrackCounts& tc = Counts(OtherAxis(trackType));
-        int idx = tc.OzLineToNextTrack(startAt);
-        if (trackType == AbsoluteAxis::Horizontal) {
-            if (idx < 0 || idx >= nRows) {
-                return OptOriginZeroLine();
-            }
-            for (int c = 0; c < nCols; c++) {
-                if (Get(idx, c) == kind) {
-                    return OptOriginZeroLine(tc.TrackToPrevOzLine((uint16_t)c));
-                }
-            }
-        } else {
-            if (idx < 0 || idx >= nCols) {
-                return OptOriginZeroLine();
-            }
-            for (int r = 0; r < nRows; r++) {
-                if (Get(r, idx) == kind) {
-                    return OptOriginZeroLine(tc.TrackToPrevOzLine((uint16_t)r));
-                }
-            }
-        }
-        return OptOriginZeroLine();
-    }
 };
 
 struct GridItem {
@@ -6013,6 +6383,8 @@ struct GridItem {
     LineOzl column;
 
     bool isCompressibleReplaced = false;
+
+    bool isReplaced = false;
     PointOverflow overflow;
     BoxSizing boxSizing = BoxSizing::BorderBox;
     SizeDim size;
@@ -6027,6 +6399,13 @@ struct GridItem {
     Optf baseline = None();
 
     float baselineShim = 0.0f;
+
+    bool IsStretchAligned(AlignSelf alignment) const {
+        if (alignment.keyword == AlignItemsKeyword::Stretch) {
+            return true;
+        }
+        return alignment.keyword == AlignItemsKeyword::Normal && !isReplaced;
+    }
 
     LineU16 rowIndexes;
     LineU16 columnIndexes;
@@ -6045,6 +6424,22 @@ struct GridItem {
     float yPosition = 0.0f;
     float height = 0.0f;
 
+    int oofStart = 0;
+    int oofCount = 0;
+
+    bool HasAutoBlockMargin() const {
+        return margin.top.IsAuto() || margin.bottom.IsAuto();
+    }
+
+    bool HasCyclicBlockSizeDependency() const {
+        return size.height.raw.UsesPercentage() &&
+               (crossesIntrinsicRow || crossesFlexibleRow);
+    }
+    bool ParticipatesInBaselineAlignment() const {
+        return alignSelf.keyword == AlignItemsKeyword::Baseline &&
+               !HasAutoBlockMargin() && !HasCyclicBlockSizeDependency();
+    }
+
     LineOzl Placement(AbstractAxis axis) const {
         return axis == AbstractAxis::Block ? row : column;
     }
@@ -6057,6 +6452,19 @@ struct GridItem {
     }
     int TrackRangeEnd(AbstractAxis axis) const {
         return (int)PlacementIndexes(axis).end;
+    }
+
+    template <typename Pred>
+    bool SpansTrackMatching(AbstractAxis axis, const GridTrack* tracks,
+                            Pred pred) const {
+        int from = TrackRangeStart(axis);
+        int end = TrackRangeEnd(axis);
+        for (int k = from; k < end; k++) {
+            if (pred(tracks[k])) {
+                return true;
+            }
+        }
+        return false;
     }
     uint16_t Span(AbstractAxis axis) const { return Placement(axis).Span(); }
     bool CrossesFlexibleTrack(AbstractAxis axis) const {
@@ -6143,22 +6551,50 @@ void StableSort(T* items, int n, Less less) {
     base::Free(nullptr, (void*)scratch);
 }
 
-enum class NameSuffix : uint8_t {
-    None,
-    Start,
-    End
-};
-
 struct LineNameEntry {
     Str name;
-    NameSuffix suffix = NameSuffix::None;
     Vec<uint32_t> lines;
 };
+
+struct AreaLines {
+    Str name;
+    uint32_t rowStart = 0;
+    uint32_t rowEnd = 0;
+    uint32_t colStart = 0;
+    uint32_t colEnd = 0;
+
+    uint32_t Edge(GridAreaAxis axis, GridAreaEnd end) const {
+        if (axis == GridAreaAxis::Row) {
+            return end == GridAreaEnd::Start ? rowStart : rowEnd;
+        }
+        return end == GridAreaEnd::Start ? colStart : colEnd;
+    }
+    uint32_t& EdgeMut(GridAreaAxis axis, GridAreaEnd end) {
+        if (axis == GridAreaAxis::Row) {
+            return end == GridAreaEnd::Start ? rowStart : rowEnd;
+        }
+        return end == GridAreaEnd::Start ? colStart : colEnd;
+    }
+};
+
+bool SplitAreaEdgeName(Str name, Str* area, GridAreaEnd* end) {
+    if (StrEndsWith(name, "-start") && len(name) > 6) {
+        *area = Str(name.s, len(name) - 6);
+        *end = GridAreaEnd::Start;
+        return true;
+    }
+    if (StrEndsWith(name, "-end") && len(name) > 4) {
+        *area = Str(name.s, len(name) - 4);
+        *end = GridAreaEnd::End;
+        return true;
+    }
+    return false;
+}
 
 struct NamedLineResolver {
     Vec<LineNameEntry> rowLines;
     Vec<LineNameEntry> columnLines;
-    Slice<GridTemplateArea> areas;
+    Vec<AreaLines> areaLines;
     uint16_t areaColumnCount = 0;
     uint16_t areaRowCount = 0;
     uint16_t explicitColumnCount = 0;
@@ -6173,13 +6609,51 @@ struct NamedLineResolver {
         }
         VecReset(rowLines);
         VecReset(columnLines);
+        VecReset(areaLines);
     }
 
-    static void Upsert(Vec<LineNameEntry>* map, Str name, NameSuffix suffix,
-                       uint32_t value) {
+    AreaLines* FindArea(Str name) {
+        for (int i = 0; i < len(areaLines); i++) {
+            if (base::StrEq(areaLines[i].name, name)) {
+                return &areaLines[i];
+            }
+        }
+        return nullptr;
+    }
+    const AreaLines* FindArea(Str name) const {
+        for (int i = 0; i < len(areaLines); i++) {
+            if (base::StrEq(areaLines[i].name, name)) {
+                return &areaLines[i];
+            }
+        }
+        return nullptr;
+    }
+    uint32_t AreaEdge(Str name, GridAreaAxis axis, GridAreaEnd end) const {
+        const AreaLines* area = FindArea(name);
+        return area ? area->Edge(axis, end) : 0;
+    }
+
+    void Upsert(Vec<LineNameEntry>* map, GridAreaAxis axis, Str name,
+                uint32_t value) {
+        uint32_t priorEdge = 0;
+        Str areaName;
+        GridAreaEnd edgeEnd;
+        if (SplitAreaEdgeName(name, &areaName, &edgeEnd)) {
+            AreaLines* area = FindArea(areaName);
+            if (!area) {
+                AreaLines created;
+                created.name = areaName;
+                VecAppend(areaLines, created);
+                area = &areaLines[len(areaLines) - 1];
+            }
+            uint32_t& edge = area->EdgeMut(axis, edgeEnd);
+            priorEdge = edge;
+            edge = priorEdge == 0 || value < priorEdge ? value : priorEdge;
+        }
+
         for (int i = 0; i < map->len; i++) {
             LineNameEntry& e = (*map)[i];
-            if (e.suffix == suffix && base::StrEq(e.name, name)) {
+            if (base::StrEq(e.name, name)) {
                 for (int k = 0; k < e.lines.len; k++) {
                     if (e.lines[k] == value) {
                         return;
@@ -6191,20 +6665,41 @@ struct NamedLineResolver {
         }
         LineNameEntry e;
         e.name = name;
-        e.suffix = suffix;
-        VecAppend(e.lines, value);
+        if (priorEdge != 0) {
+            VecAppend(e.lines, priorEdge);
+        }
+        if (priorEdge != value) {
+            VecAppend(e.lines, value);
+        }
         VecAppend(*map, e);
     }
 
-    static const Vec<uint32_t>* Find(const Vec<LineNameEntry>& map, Str name,
-                                     NameSuffix suffix) {
+    static const Vec<uint32_t>* Find(const Vec<LineNameEntry>& map, Str name) {
         for (int i = 0; i < len(map); i++) {
-            const LineNameEntry& e = map[i];
-            if (e.suffix == suffix && base::StrEq(e.name, name)) {
-                return &e.lines;
+            if (base::StrEq(map[i].name, name)) {
+                return &map[i].lines;
             }
         }
         return nullptr;
+    }
+
+    static void SortUnique(Vec<uint32_t>& lines) {
+        for (int i = 1; i < lines.len; i++) {
+            uint32_t v = lines[i];
+            int j = i;
+            while (j > 0 && lines[j - 1] > v) {
+                lines[j] = lines[j - 1];
+                j--;
+            }
+            lines[j] = v;
+        }
+        int w = 0;
+        for (int i = 0; i < lines.len; i++) {
+            if (w == 0 || lines[w - 1] != lines[i]) {
+                lines[w++] = lines[i];
+            }
+        }
+        lines.len = w;
     }
 
     void Init(const Style& style, uint16_t columnAutoRepetitions,
@@ -6217,21 +6712,54 @@ struct NamedLineResolver {
         return ResolveLineNames(line, GridAreaAxis::Column);
     }
 
-    GridLine FindLineIndex(Str name, int32_t idx, GridAreaAxis axis,
-                           GridAreaEnd end, int filterFrom, int filterTo) const;
+    GridLine FindNamedLine(Str name, int16_t idx, GridAreaAxis axis,
+                           GridAreaEnd end) const;
+    OriginZeroLine LastExplicitLine(GridAreaAxis axis) const;
+
+    OriginZeroLine NthLineForwards(const uint32_t* lines, int count,
+                                   int32_t firstOz, int32_t n,
+                                   GridAreaAxis axis) const;
+    OriginZeroLine NthLineBackwards(const uint32_t* lines, int count,
+                                    int32_t lastOz, int32_t n,
+                                    GridAreaAxis axis) const;
+
+    int CollectLines(Str name, GridAreaAxis axis, const uint32_t** data,
+                     uint32_t* single) const;
 };
+
+static int32_t OzOfStored(uint32_t line) {
+    return (int32_t)line - 1;
+}
+
+static OriginZeroLine ClampedOz(int32_t line) {
+    if (line < (int32_t)kMinOzLine) {
+        line = kMinOzLine;
+    } else if (line > (int32_t)kMaxOzLine) {
+        line = kMaxOzLine;
+    }
+    return OriginZeroLine{(int16_t)line};
+}
+
+static GridLine IntoGridLine(OriginZeroLine line, uint16_t explicitTrackCount) {
+    int32_t explicitLineCount = (int32_t)explicitTrackCount + 1;
+    int32_t value =
+        line.v >= 0 ? (int32_t)line.v + 1 : (int32_t)line.v - explicitLineCount;
+    return GridLine{(int16_t)value};
+}
 
 void NamedLineResolver::Init(const Style& style, uint16_t columnAutoRepetitions,
                              uint16_t rowAutoRepetitions) {
-    areas = style.gridTemplateAreas.areas;
     areaColumnCount = style.gridTemplateAreas.columnCount;
     areaRowCount = style.gridTemplateAreas.rowCount;
-    for (int i = 0; i < areas.len; i++) {
-        const GridTemplateArea& area = areas[i];
-        Upsert(&columnLines, area.name, NameSuffix::Start, area.columnStart);
-        Upsert(&columnLines, area.name, NameSuffix::End, area.columnEnd);
-        Upsert(&rowLines, area.name, NameSuffix::Start, area.rowStart);
-        Upsert(&rowLines, area.name, NameSuffix::End, area.rowEnd);
+    for (int i = 0; i < style.gridTemplateAreas.areas.len; i++) {
+        const GridTemplateArea& area = style.gridTemplateAreas.areas[i];
+        AreaLines lines;
+        lines.name = area.name;
+        lines.rowStart = area.rowStart;
+        lines.rowEnd = area.rowEnd;
+        lines.colStart = area.columnStart;
+        lines.colEnd = area.columnEnd;
+        VecAppend(areaLines, lines);
     }
 
     struct Axis {
@@ -6239,11 +6767,12 @@ void NamedLineResolver::Init(const Style& style, uint16_t columnAutoRepetitions,
         Slice<LineNameSet> names;
         uint16_t autoRepetitions;
         Vec<LineNameEntry>* map;
+        GridAreaAxis axis;
     };
     Axis axes[2] = {{style.gridTemplateColumns, style.gridTemplateColumnNames,
-                     columnAutoRepetitions, &columnLines},
+                     columnAutoRepetitions, &columnLines, GridAreaAxis::Column},
                     {style.gridTemplateRows, style.gridTemplateRowNames,
-                     rowAutoRepetitions, &rowLines}};
+                     rowAutoRepetitions, &rowLines, GridAreaAxis::Row}};
 
     for (const Axis& ax : axes) {
         uint32_t currentLine = 0;
@@ -6252,7 +6781,7 @@ void NamedLineResolver::Init(const Style& style, uint16_t columnAutoRepetitions,
             currentLine += 1;
             const LineNameSet& set = ax.names[i];
             for (int k = 0; k < set.names.len; k++) {
-                Upsert(ax.map, set.names[k], NameSuffix::None, currentLine);
+                Upsert(ax.map, ax.axis, set.names[k], currentLine);
             }
             if (trackIdx >= ax.tracks.len) {
                 continue;
@@ -6265,92 +6794,141 @@ void NamedLineResolver::Init(const Style& style, uint16_t columnAutoRepetitions,
             uint16_t repeatCount = comp.repeat.count.IsAuto()
                                        ? ax.autoRepetitions
                                        : comp.repeat.count.count;
-            for (uint16_t r = 0; r < repeatCount; r++) {
-                for (int s = 0; s < comp.repeat.lineNames.len; s++) {
-                    const LineNameSet& ls = comp.repeat.lineNames[s];
-                    for (int k = 0; k < ls.names.len; k++) {
-                        Upsert(ax.map, ls.names[k], NameSuffix::None,
-                               currentLine);
-                    }
-                    currentLine += 1;
-                }
 
-                currentLine -= 1;
+            uint32_t lineNameSetCount = (uint32_t)comp.repeat.lineNames.len;
+            uint32_t linesPerRep = comp.repeat.TrackCount();
+            bool namesOk =
+                lineNameSetCount == 0 || lineNameSetCount == linesPerRep + 1;
+            for (uint16_t r = 0; r < repeatCount; r++) {
+                if (namesOk) {
+                    for (int s = 0; s < comp.repeat.lineNames.len; s++) {
+                        uint32_t line = currentLine + (uint32_t)s;
+                        const LineNameSet& ls = comp.repeat.lineNames[s];
+                        for (int k = 0; k < ls.names.len; k++) {
+                            Upsert(ax.map, ax.axis, ls.names[k], line);
+                        }
+                    }
+                }
+                currentLine += linesPerRep;
+
+                if (currentLine > kMaxGridTracks) {
+                    break;
+                }
             }
-            if (repeatCount > 0) {
+
+            if (repeatCount > 0 && currentLine > 0) {
                 currentLine -= 1;
             }
         }
     }
 
+    for (int i = 0; i < len(columnLines); i++) {
+        SortUnique(columnLines[i].lines);
+    }
+    for (int i = 0; i < len(rowLines); i++) {
+        SortUnique(rowLines[i].lines);
+    }
 }
 
-GridLine NamedLineResolver::FindLineIndex(Str name, int32_t idx,
-                                          GridAreaAxis axis, GridAreaEnd end,
-                                          int filterFrom, int filterTo) const {
-    int32_t explicitTrackCount =
-        axis == GridAreaAxis::Row ? explicitRowCount : explicitColumnCount;
-    auto gridLine = [](int64_t value) {
-        value = value < INT16_MIN   ? INT16_MIN
-                : value > INT16_MAX ? INT16_MAX
-                                    : value;
-        return GridLine{(int16_t)value};
-    };
-
-    if (idx == 0) {
-        idx = 1;
-    }
-
+int NamedLineResolver::CollectLines(Str name, GridAreaAxis axis,
+                                    const uint32_t** data,
+                                    uint32_t* single) const {
     const Vec<LineNameEntry>& lookup =
         axis == GridAreaAxis::Row ? rowLines : columnLines;
-    const Vec<uint32_t>* lines = Find(lookup, name, NameSuffix::None);
-    if (!lines) {
-        lines = Find(
-            lookup, name,
-            end == GridAreaEnd::Start ? NameSuffix::Start : NameSuffix::End);
+    const Vec<uint32_t>* lines = Find(lookup, name);
+    if (lines && lines->len > 0) {
+        *data = lines->els;
+        return lines->len;
     }
-
-    if (lines) {
-        int from = filterFrom < 0 ? 0 : filterFrom;
-        int to = filterTo < 0 || filterTo > lines->len ? lines->len : filterTo;
-        int count = to - from;
-        if (count < 0) {
-            count = 0;
+    Str areaName;
+    GridAreaEnd edge;
+    if (SplitAreaEdgeName(name, &areaName, &edge)) {
+        uint32_t value = AreaEdge(areaName, axis, edge);
+        if (value != 0) {
+            *single = value;
+            *data = single;
+            return 1;
         }
-        uint32_t absIdx = idx < 0 ? (uint32_t)(-(int64_t)idx) : (uint32_t)idx;
-        if (absIdx <= (uint32_t)count) {
-            if (idx > 0) {
-                return gridLine((*lines)[from + (int)absIdx - 1]);
-            }
-            return gridLine((*lines)[from + count - (int)absIdx]);
-        }
-        int64_t remaining =
-            (int64_t)(absIdx - (uint32_t)count) * (idx > 0 ? 1 : -1);
-        if (idx > 0) {
-            return gridLine((int64_t)explicitTrackCount + 1 + remaining);
-        }
-        return gridLine(-((int64_t)explicitTrackCount + 1 + remaining));
     }
-
-    if (idx > 0) {
-        return gridLine((int64_t)explicitTrackCount + 1 + idx);
-    }
-    return gridLine(-((int64_t)explicitTrackCount + 1 + idx));
+    *data = nullptr;
+    return 0;
 }
 
-int PartitionPoint(const Vec<uint32_t>* lines, uint32_t bound, bool inclusive) {
-    if (!lines) {
-        return 0;
+OriginZeroLine NamedLineResolver::LastExplicitLine(GridAreaAxis axis) const {
+    uint16_t tracks =
+        axis == GridAreaAxis::Row ? explicitRowCount : explicitColumnCount;
+    return OriginZeroLine{(int16_t)tracks};
+}
+
+OriginZeroLine NamedLineResolver::NthLineForwards(const uint32_t* lines,
+                                                  int count, int32_t firstOz,
+                                                  int32_t n,
+                                                  GridAreaAxis axis) const {
+
+    int32_t first = firstOz > 0 ? firstOz : 0;
+    int start = 0;
+    while (start < count && OzOfStored(lines[start]) < first) {
+        start++;
     }
-    int n = 0;
-    for (int i = 0; i < lines->len; i++) {
-        bool keep = inclusive ? ((*lines)[i] <= bound) : ((*lines)[i] < bound);
-        if (!keep) {
-            break;
+    int kept = count - start;
+    int32_t oz;
+    if (n >= 1 && (n - 1) < kept) {
+        oz = OzOfStored(lines[start + (int)(n - 1)]);
+    } else {
+
+        int32_t afterExplicit = (int32_t)LastExplicitLine(axis).v + 1;
+        int32_t base = first > afterExplicit ? first : afterExplicit;
+        oz = base + (n - kept) - 1;
+    }
+    return ClampedOz(oz);
+}
+
+OriginZeroLine NamedLineResolver::NthLineBackwards(const uint32_t* lines,
+                                                   int count, int32_t lastOz,
+                                                   int32_t n,
+                                                   GridAreaAxis axis) const {
+    int32_t lastExplicit = LastExplicitLine(axis).v;
+    int32_t last = lastOz < lastExplicit ? lastOz : lastExplicit;
+    int end = 0;
+    while (end < count && OzOfStored(lines[end]) <= last) {
+        end++;
+    }
+    int32_t oz;
+    if (n >= 0 && (uint32_t)n <= (uint32_t)end) {
+        oz = OzOfStored(lines[end - (int)n]);
+    } else {
+
+        int32_t base = last < -1 ? last : -1;
+        oz = base - (n - end) + 1;
+    }
+    return ClampedOz(oz);
+}
+
+GridLine NamedLineResolver::FindNamedLine(Str name, int16_t idx,
+                                          GridAreaAxis axis,
+                                          GridAreaEnd end) const {
+    uint16_t explicitCount =
+        axis == GridAreaAxis::Row ? explicitRowCount : explicitColumnCount;
+
+    if (idx == 0) {
+        uint32_t edge = AreaEdge(name, axis, end);
+        if (edge != 0) {
+            return IntoGridLine(ClampedOz(OzOfStored(edge)), explicitCount);
         }
-        n++;
     }
-    return n;
+
+    uint32_t single = 0;
+    const uint32_t* data = nullptr;
+    int count = CollectLines(name, axis, &data, &single);
+    OriginZeroLine line;
+    if (idx >= 0) {
+        int32_t n = idx < 1 ? 1 : (int32_t)idx;
+        line = NthLineForwards(data, count, 0, n, axis);
+    } else {
+        line = NthLineBackwards(data, count, (int32_t)LastExplicitLine(axis).v,
+                                -(int32_t)idx, axis);
+    }
+    return IntoGridLine(line, explicitCount);
 }
 
 LinePlain NamedLineResolver::ResolveLineNames(LinePlacement line,
@@ -6360,47 +6938,43 @@ LinePlain NamedLineResolver::ResolveLineNames(LinePlacement line,
 
     if (start.kind == GridPlacementKind::NamedLine) {
         start = GridPlacement::FromLineIndex(
-            FindLineIndex(start.name, start.line, axis, GridAreaEnd::Start, -1,
-                          -1)
-                .v);
+            FindNamedLine(start.name, start.line, axis, GridAreaEnd::Start).v);
     }
     if (end.kind == GridPlacementKind::NamedLine) {
         end = GridPlacement::FromLineIndex(
-            FindLineIndex(end.name, end.line, axis, GridAreaEnd::End, -1, -1)
-                .v);
+            FindNamedLine(end.name, end.line, axis, GridAreaEnd::End).v);
     }
 
-    int16_t explicitTrackCount = axis == GridAreaAxis::Row
-                                     ? (int16_t)explicitRowCount
-                                     : (int16_t)explicitColumnCount;
-    const Vec<LineNameEntry>& lookup =
-        axis == GridAreaAxis::Row ? rowLines : columnLines;
+    uint16_t explicitTrackCount =
+        axis == GridAreaAxis::Row ? explicitRowCount : explicitColumnCount;
 
     if (start.kind == GridPlacementKind::Line &&
-        end.kind == GridPlacementKind::NamedSpan) {
-        int16_t normalizedStart =
-            start.line > 0
-                ? start.line
-                : (int16_t)F32Max((float)(explicitTrackCount + 1 + start.line),
-                                  0.0f);
-        const Vec<uint32_t>* lines = Find(lookup, end.name, NameSuffix::None);
-        int point = PartitionPoint(lines, (uint32_t)normalizedStart, true);
-        GridLine endLine = FindLineIndex(end.name, (int32_t)end.span, axis,
-                                         GridAreaEnd::End, point, -1);
+        end.kind == GridPlacementKind::NamedSpan && start.line != 0) {
+        int32_t after = (int32_t)IntoOriginZeroLine(GridLine{start.line},
+                                                    explicitTrackCount)
+                            .v +
+                        1;
+        uint32_t single = 0;
+        const uint32_t* data = nullptr;
+        int count = CollectLines(end.name, axis, &data, &single);
+        int32_t n = end.span < 1 ? 1 : (int32_t)end.span;
+        GridLine endLine = IntoGridLine(
+            NthLineForwards(data, count, after, n, axis), explicitTrackCount);
         return {PlainPlacement::AtLine(start.line),
                 PlainPlacement::AtLine(endLine.v)};
     }
     if (start.kind == GridPlacementKind::NamedSpan &&
-        end.kind == GridPlacementKind::Line) {
-        int16_t normalizedEnd =
-            end.line > 0
-                ? end.line
-                : (int16_t)F32Max((float)(explicitTrackCount + 1 + end.line),
-                                  0.0f);
-        const Vec<uint32_t>* lines = Find(lookup, start.name, NameSuffix::None);
-        int point = PartitionPoint(lines, (uint32_t)normalizedEnd, false);
-        GridLine startLine = FindLineIndex(start.name, (int32_t)start.span,
-                                           axis, GridAreaEnd::Start, 0, point);
+        end.kind == GridPlacementKind::Line && end.line != 0) {
+        int32_t before =
+            (int32_t)IntoOriginZeroLine(GridLine{end.line}, explicitTrackCount)
+                .v -
+            1;
+        uint32_t single = 0;
+        const uint32_t* data = nullptr;
+        int count = CollectLines(start.name, axis, &data, &single);
+        int32_t n = start.span < 1 ? 1 : (int32_t)start.span;
+        GridLine startLine = IntoGridLine(
+            NthLineBackwards(data, count, before, n, axis), explicitTrackCount);
         return {PlainPlacement::AtLine(startLine.v),
                 PlainPlacement::AtLine(end.line)};
     }
@@ -6427,10 +7001,19 @@ struct MinMaxSpan {
     uint16_t span = 0;
 };
 
-MinMaxSpan ChildMinLineMaxLineSpan(LinePlacement line,
-                                   uint16_t explicitTrackCount) {
+struct PlacementChild {
+    int index = 0;
+    NodeId node;
+    LinePlain horizontal;
+    LinePlain vertical;
 
-    LinePlain oz = line.IntoOriginZeroIgnoringNamed(explicitTrackCount);
+    LinePlain Get(AbsoluteAxis a) const {
+        return a == AbsoluteAxis::Horizontal ? horizontal : vertical;
+    }
+};
+
+MinMaxSpan ChildMinLineMaxLineSpan(LinePlain oz) {
+
     OriginZeroLine t1 = oz.start.Ozl();
     OriginZeroLine t2 = oz.end.Ozl();
 
@@ -6445,7 +7028,8 @@ MinMaxSpan ChildMinLineMaxLineSpan(LinePlacement line,
         out.minLine = t1;
         out.maxLine = t1 + oz.end.span;
     } else if (oz.start.IsAuto() && oz.end.IsLine()) {
-        out.minLine = t2;
+
+        out.minLine = t2 - (uint16_t)1;
         out.maxLine = t2;
     } else if (oz.start.IsSpan() && oz.end.IsLine()) {
         out.minLine = t2 - oz.start.span;
@@ -6462,14 +7046,9 @@ MinMaxSpan ChildMinLineMaxLineSpan(LinePlacement line,
     return out;
 }
 
-struct ChildPlacementStyles {
-    LinePlacement column;
-    LinePlacement row;
-};
-
 void ComputeGridSizeEstimate(uint16_t explicitColCount,
-                             uint16_t explicitRowCount, Direction direction,
-                             const ChildPlacementStyles* children, int n,
+                             uint16_t explicitRowCount,
+                             const PlacementChild* children, int n,
                              TrackCounts* outCols, TrackCounts* outRows) {
     OriginZeroLine colMin{0};
     OriginZeroLine colMax{0};
@@ -6479,19 +7058,9 @@ void ComputeGridSizeEstimate(uint16_t explicitColCount,
     uint16_t rowMaxSpan = 0;
 
     for (int i = 0; i < n; i++) {
-        MinMaxSpan colEst =
-            ChildMinLineMaxLineSpan(children[i].column, explicitColCount);
-        MinMaxSpan rowEst =
-            ChildMinLineMaxLineSpan(children[i].row, explicitRowCount);
+        MinMaxSpan colEst = ChildMinLineMaxLineSpan(children[i].horizontal);
+        MinMaxSpan rowEst = ChildMinLineMaxLineSpan(children[i].vertical);
 
-        if (IsRtl(direction) && (colEst.minLine != OriginZeroLine{0} ||
-                                 colEst.maxLine != OriginZeroLine{0})) {
-            int16_t endLine = (int16_t)explicitColCount;
-            OriginZeroLine mirroredMin{(int16_t)(endLine - colEst.maxLine.v)};
-            OriginZeroLine mirroredMax{(int16_t)(endLine - colEst.minLine.v)};
-            colEst.minLine = mirroredMin;
-            colEst.maxLine = mirroredMax;
-        }
         if (colEst.minLine < colMin) {
             colMin = colEst.minLine;
         }
@@ -6980,31 +7549,53 @@ SizeFOpt ItemKnownDimensions(const GridItem& item, TaffyTree* tree,
         MaybeAdd(MaybeApplyAspectRatio(
                      item.size.MaybeResolve(gridAreaSize, calc), aspectRatio),
                  boxSizingAdjustment);
+
     SizeFOpt minSize = MaybeAdd(
         MaybeApplyAspectRatio(item.minSize.MaybeResolve(gridAreaSize, calc),
                               aspectRatio),
         boxSizingAdjustment);
+    minSize = Or(minSize, paddingBorderSize);
+    minSize = MaybeMax(minSize, paddingBorderSize);
     SizeFOpt maxSize = MaybeAdd(
         MaybeApplyAspectRatio(item.maxSize.MaybeResolve(gridAreaSize, calc),
                               aspectRatio),
         boxSizingAdjustment);
 
-    SizeFOpt gridAreaMinusItemMargins = MaybeSub(gridAreaSize, margins);
+    SizeFOpt gridAreaMinusItemMargins =
+        MaybeMax(MaybeSub(gridAreaSize, margins), SizeFOpt{0.0f, 0.0f});
 
     Optf width = inherentSize.w;
-    if (!IsSome(width) && !item.margin.left.IsAuto() &&
-        !item.margin.right.IsAuto() &&
-        item.justifySelf.keyword == AlignItemsKeyword::Stretch) {
-        width = gridAreaMinusItemMargins.w;
+    if (!IsSome(width)) {
+
+        if (item.size.width.IsSizingKeyword()) {
+            SizingKeywordResolution keyword = ResolveSizingKeyword(
+                item.size.width, gridAreaMinusItemMargins.w, gridAreaSize.w,
+                calc);
+            if (keyword.isSome && keyword.kind == SizingKeywordKind::Exact) {
+                width = Some(keyword.exact);
+            }
+        } else if (!item.margin.left.IsAuto() && !item.margin.right.IsAuto() &&
+                   item.IsStretchAligned(item.justifySelf)) {
+
+            width = gridAreaMinusItemMargins.w;
+        }
     }
     SizeFOpt sized =
         MaybeApplyAspectRatio(SizeFOpt{width, inherentSize.h}, aspectRatio);
 
     Optf height = sized.h;
-    if (!IsSome(height) && !item.margin.top.IsAuto() &&
-        !item.margin.bottom.IsAuto() &&
-        item.alignSelf.keyword == AlignItemsKeyword::Stretch) {
-        height = gridAreaMinusItemMargins.h;
+    if (!IsSome(height)) {
+        if (item.size.height.IsSizingKeyword()) {
+            SizingKeywordResolution keyword = ResolveSizingKeyword(
+                item.size.height, gridAreaMinusItemMargins.h, gridAreaSize.h,
+                calc);
+            if (keyword.isSome && keyword.kind == SizingKeywordKind::Exact) {
+                height = Some(keyword.exact);
+            }
+        } else if (!item.margin.top.IsAuto() && !item.margin.bottom.IsAuto() &&
+                   item.IsStretchAligned(item.alignSelf)) {
+            height = gridAreaMinusItemMargins.h;
+        }
     }
     sized = MaybeApplyAspectRatio(SizeFOpt{sized.w, height}, aspectRatio);
     return MaybeClamp(sized, minSize, maxSize);
@@ -7074,16 +7665,69 @@ SizeFOpt ItemGridAreaSizeCached(GridItem* item, AbstractAxis axis,
     return s;
 }
 
+SizeAvail KeywordAdjustedAvailableSpace(const GridItem& item,
+                                        SizeFOpt gridAreaSize,
+                                        SizeAvail available, TaffyTree* tree) {
+    if (!item.size.width.IsSizingKeyword() && !item.size.height
+                                                   .IsSizingKeyword()) {
+        return available;
+    }
+    SizeF margins =
+        MarginsAxisSumsWithBaselineShims(item, gridAreaSize.w, tree->calc);
+    SizeAvail adjusted = available;
+    AbstractAxis axes[2] = {AbstractAxis::Inline, AbstractAxis::Block};
+    for (int i = 0; i < 2; i++) {
+        AbstractAxis axis = axes[i];
+        Dimension sizeStyle = item.size.Get(axis);
+        if (!sizeStyle.IsSizingKeyword()) {
+            continue;
+        }
+        Optf stretch = MaybeMax(
+            MaybeSub(Get(gridAreaSize, axis), Some(Get(margins, axis))), 0.0f);
+        SizingKeywordResolution keyword = ResolveSizingKeyword(
+            sizeStyle, stretch, Get(gridAreaSize, axis), tree->calc);
+        if (keyword.isSome && keyword.kind == SizingKeywordKind::Measure) {
+            adjusted.Set(axis, keyword.measure);
+        }
+    }
+    return adjusted;
+}
+
+SizeFOpt AvailableSpaceMinusMargins(const GridItem& item, SizeFOpt gridAreaSize,
+                                    SizeFOpt availableSpace, TaffyTree* tree) {
+    if (!IsSome(availableSpace.w) && !IsSome(availableSpace.h)) {
+        return availableSpace;
+    }
+    RectF margin = item.margin.ResolveOrZero(gridAreaSize.w, tree->calc);
+    SizeFOpt out = availableSpace;
+    if (IsSome(out.w)) {
+        out.w = F32Max(out.w - margin.HorizontalAxisSum(), 0.0f);
+    }
+    if (IsSome(out.h)) {
+        out.h =
+            F32Max(out.h - margin.VerticalAxisSum() - item.baselineShim, 0.0f);
+    }
+    return out;
+}
+
 float ItemMinContentContribution(const GridItem& item, AbstractAxis axis,
                                  TaffyTree* tree, SizeFOpt gridAreaSize,
                                  SizeFOpt availableSpace) {
     SizeFOpt knownDimensions = ItemKnownDimensions(item, tree, gridAreaSize);
 
+    Optf known = Get(knownDimensions, axis);
+    if (IsSome(known)) {
+        return known;
+    }
+
+    availableSpace =
+        AvailableSpaceMinusMargins(item, gridAreaSize, availableSpace, tree);
     SizeAvail avail = {
         IsSome(availableSpace.w) ? AvailableSpace::Definite(availableSpace.w)
                                  : AvailableSpace::MinContent(),
         IsSome(availableSpace.h) ? AvailableSpace::Definite(availableSpace.h)
                                  : AvailableSpace::MinContent()};
+    avail = KeywordAdjustedAvailableSpace(item, gridAreaSize, avail, tree);
     return tree->MeasureChildSize(item.node, knownDimensions, gridAreaSize,
                                   avail, SizingMode::InherentSize,
                                   AsAbsNaive(axis), LineBool::False());
@@ -7106,11 +7750,18 @@ float ItemMaxContentContribution(const GridItem& item, AbstractAxis axis,
                                  TaffyTree* tree, SizeFOpt gridAreaSize,
                                  SizeFOpt availableSpace) {
     SizeFOpt knownDimensions = ItemKnownDimensions(item, tree, gridAreaSize);
+    Optf known = Get(knownDimensions, axis);
+    if (IsSome(known)) {
+        return known;
+    }
+    availableSpace =
+        AvailableSpaceMinusMargins(item, gridAreaSize, availableSpace, tree);
     SizeAvail avail = {
         IsSome(availableSpace.w) ? AvailableSpace::Definite(availableSpace.w)
                                  : AvailableSpace::MaxContent(),
         IsSome(availableSpace.h) ? AvailableSpace::Definite(availableSpace.h)
                                  : AvailableSpace::MaxContent()};
+    avail = KeywordAdjustedAvailableSpace(item, gridAreaSize, avail, tree);
     return tree->MeasureChildSize(item.node, knownDimensions, gridAreaSize,
                                   avail, SizingMode::InherentSize,
                                   AsAbsNaive(axis), LineBool::False());
@@ -7146,10 +7797,37 @@ float ItemMinimumContribution(GridItem* item, TaffyTree* tree,
                                  item->aspectRatio),
                              boxSizingAdjustment),
                     axis);
+
+    if (IsSome(size) && (!item->minSize.Get(axis).IsAuto() ||
+                         !item->maxSize.Get(axis).IsAuto())) {
+        Optf basis =
+            axis == AbstractAxis::Inline ? gridAreaSize.w : gridAreaSize.h;
+        Optf maxBasis =
+            item->isCompressibleReplaced ? Or(basis, Some(0.0f)) : basis;
+        float adjustment = Get(boxSizingAdjustment, axis);
+        Optf minResolved =
+            MaybeAdd(item->minSize.Get(axis).MaybeResolve(basis, calc),
+                     Some(adjustment));
+        Optf maxResolved =
+            MaybeAdd(item->maxSize.Get(axis).MaybeResolve(maxBasis, calc),
+                     Some(adjustment));
+        size = MaybeClamp(size, minResolved, maxResolved);
+    }
     if (!IsSome(size)) {
-        size = Get(MaybeAdd(MaybeApplyAspectRatio(
-                                item->minSize.MaybeResolve(gridAreaSize, calc),
-                                item->aspectRatio),
+
+        Dimension pref = item->size.Get(axis);
+        if (pref.IsSizingKeyword() && !pref.IsStretch()) {
+            size = Some(ItemMinContentContributionCached(
+                item, axis, tree, gridAreaSize, gridAreaSize));
+        }
+    }
+    if (!IsSome(size)) {
+
+        SizeFOpt cyclicMinBasis = {Some(UnwrapOr(gridAreaSize.w, 0.0f)),
+                                   Some(UnwrapOr(gridAreaSize.h, 0.0f))};
+        size = Get(MaybeAdd(MaybeApplyAspectRatio(item->minSize.MaybeResolve(
+                                                      cyclicMinBasis, calc),
+                                                  item->aspectRatio),
                             boxSizingAdjustment),
                    axis);
     }
@@ -7160,10 +7838,14 @@ float ItemMinimumContribution(GridItem* item, TaffyTree* tree,
     }
     if (!IsSome(size)) {
 
+        (void)axisTrackCount;
         bool spansAutoMinTrack = false;
         bool spansAFlexibleTrack = false;
-        for (int i = 0; i < axisTrackCount; i++) {
-            if (axisTracks[i].minTrackSizingFunction.IsAuto()) {
+        int from = item->TrackRangeStart(axis);
+        int to = item->TrackRangeEnd(axis);
+        for (int i = from; i < to; i++) {
+            if (axisTracks[i].minTrackSizingFunction.BehavesAsAuto(
+                    Get(innerNodeSize, axis))) {
                 spansAutoMinTrack = true;
             }
             if (axisTracks[i].maxTrackSizingFunction.IsFr()) {
@@ -7186,15 +7868,19 @@ float ItemMinimumContribution(GridItem* item, TaffyTree* tree,
                 minimumContribution =
                     MaybeMin(MaybeMin(minimumContribution, pref), mx);
             }
-            size = Some(minimumContribution);
+
+            Optf limit = SpannedFixedTrackLimit(*item, axis, axisTracks,
+                                                Get(innerNodeSize, axis), calc);
+            if (IsSome(limit)) {
+                limit = F32Max(limit, Get(paddingBorderSize, axis));
+            }
+            size = Some(MaybeMin(minimumContribution, limit));
         } else {
             size = Some(0.0f);
         }
     }
 
-    Optf limit = SpannedFixedTrackLimit(*item, axis, axisTracks,
-                                        Get(innerNodeSize, axis), calc);
-    return MaybeMin(size, limit);
+    return UnwrapOr(size, 0.0f);
 }
 
 float ItemMinimumContributionCached(GridItem* item, TaffyTree* tree,
@@ -7213,97 +7899,45 @@ float ItemMinimumContributionCached(GridItem* item, TaffyTree* tree,
     return size;
 }
 
-bool AxisIsReversed(Direction direction, AbsoluteAxis axis) {
-    return IsRtl(direction) && axis == AbsoluteAxis::Horizontal;
-}
-
-OriginZeroLine AdvancePosition(OriginZeroLine position, bool reversed) {
-    int32_t value = (int32_t)position.v + (reversed ? -1 : 1);
+OriginZeroLine AdvancePosition(OriginZeroLine position) {
+    int32_t value = (int32_t)position.v + 1;
     value = value < INT16_MIN   ? INT16_MIN
             : value > INT16_MAX ? INT16_MAX
                                 : value;
     return OriginZeroLine{(int16_t)value};
 }
 
-OriginZeroLine SearchStartLine(OriginZeroLine gridStartLine,
-                               OriginZeroLine gridEndLine, bool reversed) {
-    return reversed ? gridEndLine - (uint16_t)1 : gridStartLine;
-}
-
-LineOzl ResolveIndefiniteGridSpan(OriginZeroLine position, uint16_t span,
-                                  bool reversed) {
+LineOzl ResolveIndefiniteGridSpan(OriginZeroLine position, uint16_t span) {
     auto line = [](int32_t value) {
         value = value < INT16_MIN   ? INT16_MIN
                 : value > INT16_MAX ? INT16_MAX
                                     : value;
         return OriginZeroLine{(int16_t)value};
     };
-    if (reversed) {
-        return {line((int32_t)position.v - span + 1),
-                line((int32_t)position.v + 1)};
-    }
     return {position, line((int32_t)position.v + span)};
 }
 
-LineOzl ClampSpanToLimitedGrid(LineOzl span, int16_t minLine, int16_t maxLine) {
+LineOzl ClampSpanToLimitedGrid(LineOzl span) {
     int32_t start = span.start.v;
-    start = start<minLine ? minLine : start>(int32_t) maxLine - 1
-                ? (int32_t)maxLine - 1
+    start = start<kMinOzLine ? kMinOzLine : start>(int32_t) kMaxOzLine - 1
+                ? (int32_t)kMaxOzLine - 1
                 : start;
     int32_t end = span.end.v;
-    end = end < start + 1 ? start + 1 : end > maxLine ? maxLine : end;
+    end = end<start + 1 ? start + 1 : end>(int32_t) kMaxOzLine
+              ? (int32_t)kMaxOzLine
+              : end;
     return {OriginZeroLine{(int16_t)start}, OriginZeroLine{(int16_t)end}};
 }
-
-LineOzl MirrorHorizontalSpan(LineOzl span, uint16_t explicitColCount) {
-    int16_t endLine = (int16_t)explicitColCount;
-    return {OriginZeroLine{(int16_t)(endLine - span.end.v)},
-            OriginZeroLine{(int16_t)(endLine - span.start.v)}};
-}
-
-LineOzl MaybeMirrorSpan(LineOzl span, AbsoluteAxis axis, Direction direction,
-                        uint16_t explicitColCount) {
-    if (axis == AbsoluteAxis::Horizontal && IsRtl(direction)) {
-        return MirrorHorizontalSpan(
-            ClampSpanToLimitedGrid(span, kMinOzLine, kMaxOzLine),
-            explicitColCount);
-    }
-    return span;
-}
-
-LineOzl ClampSpanForAxis(LineOzl span, AbsoluteAxis axis, Direction direction,
-                         uint16_t explicitColCount) {
-    if (axis == AbsoluteAxis::Horizontal && IsRtl(direction)) {
-        int16_t explicitEnd = (int16_t)explicitColCount;
-        return ClampSpanToLimitedGrid(span, (int16_t)(explicitEnd - kMaxOzLine),
-                                      (int16_t)(explicitEnd - kMinOzLine));
-    }
-    return ClampSpanToLimitedGrid(span, kMinOzLine, kMaxOzLine);
-}
-
-struct PlacementChild {
-    int index = 0;
-    NodeId node;
-    LinePlain horizontal;
-    LinePlain vertical;
-
-    LinePlain Get(AbsoluteAxis a) const {
-        return a == AbsoluteAxis::Horizontal ? horizontal : vertical;
-    }
-};
 
 void RecordGridPlacement(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
                          TaffyTree* tree, NodeId node, int index,
                          AlignItems parentAlignItems,
                          AlignItems parentJustifyItems,
-                         AbsoluteAxis primaryAxis, Direction direction,
-                         uint16_t explicitColCount, LineOzl primarySpan,
+                         AbsoluteAxis primaryAxis, LineOzl primarySpan,
                          LineOzl secondarySpan,
                          CellOccupancyState placementType) {
-    primarySpan =
-        ClampSpanForAxis(primarySpan, primaryAxis, direction, explicitColCount);
-    secondarySpan = ClampSpanForAxis(secondarySpan, OtherAxis(primaryAxis),
-                                     direction, explicitColCount);
+    primarySpan = ClampSpanToLimitedGrid(primarySpan);
+    secondarySpan = ClampSpanToLimitedGrid(secondarySpan);
     matrix->MarkAreaAs(primaryAxis, primarySpan, secondarySpan, placementType);
 
     LineOzl colSpan =
@@ -7318,6 +7952,7 @@ void RecordGridPlacement(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
     item.row = rowSpan;
     item.column = colSpan;
     item.isCompressibleReplaced = s.IsCompressibleReplaced();
+    item.isReplaced = s.IsReplaced();
     item.overflow = s.overflow;
     item.boxSizing = s.boxSizing;
     item.size = s.size;
@@ -7333,10 +7968,8 @@ void RecordGridPlacement(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
 }
 
 LineOzl PlaceDefiniteGridItemAxis(const PlacementChild& child,
-                                  AbsoluteAxis axis, Direction direction,
-                                  uint16_t explicitColCount) {
-    return MaybeMirrorSpan(child.Get(axis).ResolveDefiniteGridLines(), axis,
-                           direction, explicitColCount);
+                                  AbsoluteAxis axis) {
+    return child.Get(axis).ResolveDefiniteGridLines();
 }
 
 struct SpanPair {
@@ -7346,44 +7979,31 @@ struct SpanPair {
 
 SpanPair PlaceDefiniteSecondaryAxisItem(const CellOccupancyMatrix& matrix,
                                         const PlacementChild& child,
-                                        GridAutoFlow autoFlow,
-                                        Direction direction,
-                                        uint16_t explicitColCount) {
+                                        GridAutoFlow autoFlow) {
     AbsoluteAxis primaryAxis = PrimaryAxis(autoFlow);
     AbsoluteAxis secondaryAxis = OtherAxis(primaryAxis);
-    bool primaryReversed = AxisIsReversed(direction, primaryAxis);
     OriginZeroLine primaryStart = matrix.Counts(primaryAxis)
                                       .ImplicitStartLine();
-    OriginZeroLine primaryEnd = matrix.Counts(primaryAxis).ImplicitEndLine();
 
-    LineOzl secondaryPlacement =
-        MaybeMirrorSpan(child.Get(secondaryAxis).ResolveDefiniteGridLines(),
-                        secondaryAxis, direction, explicitColCount);
+    LineOzl secondaryPlacement = child.Get(secondaryAxis)
+                                     .ResolveDefiniteGridLines();
 
-    OriginZeroLine startingPosition;
-    if (IsDense(autoFlow)) {
-        startingPosition =
-            SearchStartLine(primaryStart, primaryEnd, primaryReversed);
-    } else {
+    OriginZeroLine startingPosition = primaryStart;
+    if (!IsDense(autoFlow)) {
         OptOriginZeroLine lookup =
-            primaryReversed
-                ? matrix.FirstOfType(primaryAxis, secondaryPlacement.start,
-                                     CellOccupancyState::AutoPlaced)
-                : matrix.LastOfType(primaryAxis, secondaryPlacement.start,
-                                    CellOccupancyState::AutoPlaced);
-        startingPosition =
-            lookup.IsSome()
-                ? lookup.val
-                : SearchStartLine(primaryStart, primaryEnd, primaryReversed);
+            matrix.AutoPlacementCursor(primaryAxis, secondaryPlacement.start);
+        if (lookup.IsSome()) {
+            startingPosition = lookup.val;
+        }
     }
     uint16_t primarySpanLen = child.Get(primaryAxis).IndefiniteSpan();
 
     OriginZeroLine position = startingPosition;
     while (true) {
-        LineOzl primaryPlacement = ResolveIndefiniteGridSpan(
-            position, primarySpanLen, primaryReversed);
+        LineOzl primaryPlacement =
+            ResolveIndefiniteGridSpan(position, primarySpanLen);
         OptOriginZeroLine collision = matrix.LineAreaCollisionJump(
-            primaryAxis, primaryPlacement, secondaryPlacement, primaryReversed);
+            primaryAxis, primaryPlacement, secondaryPlacement);
         if (!collision.IsSome()) {
             return {primaryPlacement, secondaryPlacement};
         }
@@ -7395,13 +8015,9 @@ SpanPair PlaceIndefinitelyPositionedItem(const CellOccupancyMatrix& matrix,
                                          const PlacementChild& child,
                                          GridAutoFlow autoFlow,
                                          OriginZeroLine gridPrimary,
-                                         OriginZeroLine gridSecondary,
-                                         Direction direction,
-                                         uint16_t explicitColCount) {
+                                         OriginZeroLine gridSecondary) {
     AbsoluteAxis primaryAxis = PrimaryAxis(autoFlow);
     AbsoluteAxis secondaryAxis = OtherAxis(primaryAxis);
-    bool primaryReversed = AxisIsReversed(direction, primaryAxis);
-    bool secondaryReversed = AxisIsReversed(direction, secondaryAxis);
 
     LinePlain primaryStyle = child.Get(primaryAxis);
     LinePlain secondaryStyle = child.Get(secondaryAxis);
@@ -7414,36 +8030,23 @@ SpanPair PlaceIndefinitelyPositionedItem(const CellOccupancyMatrix& matrix,
                                         .ImplicitEndLine();
     OriginZeroLine secondaryGridStart = matrix.Counts(secondaryAxis)
                                             .ImplicitStartLine();
-    OriginZeroLine secondaryGridEnd = matrix.Counts(secondaryAxis)
-                                          .ImplicitEndLine();
-    OriginZeroLine primaryStartPosition =
-        SearchStartLine(primaryGridStart, primaryGridEnd, primaryReversed);
-    OriginZeroLine secondaryStartPosition = SearchStartLine(
-        secondaryGridStart, secondaryGridEnd, secondaryReversed);
 
     OriginZeroLine primaryIdx = gridPrimary;
     OriginZeroLine secondaryIdx = gridSecondary;
 
     if (hasDefinitePrimary) {
-        LineOzl primarySpan =
-            MaybeMirrorSpan(primaryStyle.ResolveDefiniteGridLines(),
-                            primaryAxis, direction, explicitColCount);
+        LineOzl primarySpan = primaryStyle.ResolveDefiniteGridLines();
         if (IsDense(autoFlow)) {
-            secondaryIdx = secondaryStartPosition;
-        } else {
-            bool shouldAdvance = primaryReversed
-                                     ? primarySpan.start > primaryIdx
-                                     : primarySpan.start < primaryIdx;
-            if (shouldAdvance) {
-                secondaryIdx = AdvancePosition(secondaryIdx, secondaryReversed);
-            }
+            secondaryIdx = secondaryGridStart;
+        } else if (primarySpan.start < primaryIdx) {
+            secondaryIdx = AdvancePosition(secondaryIdx);
         }
 
         while (true) {
-            LineOzl secondarySpan = ResolveIndefiniteGridSpan(
-                secondaryIdx, secondarySpanLen, secondaryReversed);
+            LineOzl secondarySpan =
+                ResolveIndefiniteGridSpan(secondaryIdx, secondarySpanLen);
             OptOriginZeroLine collision = matrix.LineAreaCollisionJump(
-                secondaryAxis, secondarySpan, primarySpan, secondaryReversed);
+                secondaryAxis, secondarySpan, primarySpan);
             if (!collision.IsSome()) {
                 return {primarySpan, secondarySpan};
             }
@@ -7454,21 +8057,22 @@ SpanPair PlaceIndefinitelyPositionedItem(const CellOccupancyMatrix& matrix,
     uint16_t primarySpanLen = primaryStyle.IndefiniteSpan();
 
     while (true) {
-        LineOzl primarySpan = ResolveIndefiniteGridSpan(
-            primaryIdx, primarySpanLen, primaryReversed);
-        LineOzl secondarySpan = ResolveIndefiniteGridSpan(
-            secondaryIdx, secondarySpanLen, secondaryReversed);
+        LineOzl primarySpan =
+            ResolveIndefiniteGridSpan(primaryIdx, primarySpanLen);
+        LineOzl secondarySpan =
+            ResolveIndefiniteGridSpan(secondaryIdx, secondarySpanLen);
 
-        bool primaryOutOfBounds = primaryReversed
-                                      ? primarySpan.start < primaryGridStart
-                                      : primarySpan.end > primaryGridEnd;
-        if (primaryOutOfBounds) {
-            secondaryIdx = AdvancePosition(secondaryIdx, secondaryReversed);
-            primaryIdx = primaryStartPosition;
+        if (primarySpan.end > primaryGridEnd) {
+
+            if (primaryIdx == primaryGridStart) {
+                return {primarySpan, secondarySpan};
+            }
+            secondaryIdx = AdvancePosition(secondaryIdx);
+            primaryIdx = primaryGridStart;
             continue;
         }
         OptOriginZeroLine collision = matrix.LineAreaCollisionJump(
-            primaryAxis, primarySpan, secondarySpan, primaryReversed);
+            primaryAxis, primarySpan, secondarySpan);
         if (collision.IsSome()) {
             primaryIdx = collision.val;
             continue;
@@ -7479,25 +8083,21 @@ SpanPair PlaceIndefinitelyPositionedItem(const CellOccupancyMatrix& matrix,
 
 void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
                     TaffyTree* tree, const Vec<PlacementChild>& children,
-                    Direction direction, GridAutoFlow gridAutoFlow,
-                    AlignItems alignItems, AlignItems justifyItems) {
+                    GridAutoFlow gridAutoFlow, AlignItems alignItems,
+                    AlignItems justifyItems) {
     AbsoluteAxis primaryAxis = PrimaryAxis(gridAutoFlow);
     AbsoluteAxis secondaryAxis = OtherAxis(primaryAxis);
-    uint16_t explicitColCount = matrix->Counts(AbsoluteAxis::Horizontal)
-                                    .explicitCount;
 
     for (int i = 0; i < len(children); i++) {
         const PlacementChild& c = children[i];
         if (!c.horizontal.IsDefinite() || !c.vertical.IsDefinite()) {
             continue;
         }
-        LineOzl primarySpan = PlaceDefiniteGridItemAxis(
-            c, primaryAxis, direction, explicitColCount);
-        LineOzl secondarySpan = PlaceDefiniteGridItemAxis(
-            c, secondaryAxis, direction, explicitColCount);
+        LineOzl primarySpan = PlaceDefiniteGridItemAxis(c, primaryAxis);
+        LineOzl secondarySpan = PlaceDefiniteGridItemAxis(c, secondaryAxis);
         RecordGridPlacement(matrix, items, tree, c.node, c.index, alignItems,
-                            justifyItems, primaryAxis, direction,
-                            explicitColCount, primarySpan, secondarySpan,
+                            justifyItems, primaryAxis, primarySpan,
+                            secondarySpan,
                             CellOccupancyState::DefinitelyPlaced);
     }
 
@@ -7507,22 +8107,17 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
                                                       .IsDefinite()) {
             continue;
         }
-        SpanPair spans = PlaceDefiniteSecondaryAxisItem(
-            *matrix, c, gridAutoFlow, direction, explicitColCount);
+        SpanPair spans =
+            PlaceDefiniteSecondaryAxisItem(*matrix, c, gridAutoFlow);
         RecordGridPlacement(matrix, items, tree, c.node, c.index, alignItems,
-                            justifyItems, primaryAxis, direction,
-                            explicitColCount, spans.primary, spans.secondary,
-                            CellOccupancyState::AutoPlaced);
+                            justifyItems, primaryAxis, spans.primary,
+                            spans.secondary, CellOccupancyState::AutoPlaced);
     }
 
-    bool primaryReversed = AxisIsReversed(direction, primaryAxis);
-    OriginZeroLine startPrimary = SearchStartLine(
-        matrix->Counts(primaryAxis).ImplicitStartLine(),
-        matrix->Counts(primaryAxis).ImplicitEndLine(), primaryReversed);
-    OriginZeroLine startSecondary =
-        SearchStartLine(matrix->Counts(secondaryAxis).ImplicitStartLine(),
-                        matrix->Counts(secondaryAxis).ImplicitEndLine(),
-                        AxisIsReversed(direction, secondaryAxis));
+    OriginZeroLine startPrimary = matrix->Counts(primaryAxis)
+                                      .ImplicitStartLine();
+    OriginZeroLine startSecondary = matrix->Counts(secondaryAxis)
+                                        .ImplicitStartLine();
     OriginZeroLine posPrimary = startPrimary;
     OriginZeroLine posSecondary = startSecondary;
 
@@ -7532,19 +8127,16 @@ void PlaceGridItems(CellOccupancyMatrix* matrix, Vec<GridItem>* items,
             continue;
         }
         SpanPair spans = PlaceIndefinitelyPositionedItem(
-            *matrix, c, gridAutoFlow, posPrimary, posSecondary, direction,
-            explicitColCount);
+            *matrix, c, gridAutoFlow, posPrimary, posSecondary);
         RecordGridPlacement(matrix, items, tree, c.node, c.index, alignItems,
-                            justifyItems, primaryAxis, direction,
-                            explicitColCount, spans.primary, spans.secondary,
-                            CellOccupancyState::AutoPlaced);
+                            justifyItems, primaryAxis, spans.primary,
+                            spans.secondary, CellOccupancyState::AutoPlaced);
 
         if (IsDense(gridAutoFlow)) {
             posPrimary = startPrimary;
             posSecondary = startSecondary;
         } else {
-            posPrimary =
-                primaryReversed ? spans.primary.start : spans.primary.end;
+            posPrimary = spans.primary.end;
             posSecondary = spans.secondary.start;
         }
     }
@@ -7672,6 +8264,7 @@ float ComputeAlignmentGutterAdjustment(AlignContent alignment,
             outerGutterWeight = 1;
             innerGutterWeight = 0;
             break;
+        case AlignContentKeyword::Normal:
         case AlignContentKeyword::Stretch:
             outerGutterWeight = 0;
             innerGutterWeight = 0;
@@ -7822,7 +8415,7 @@ void ResolveItemBaselines(TaffyTree* tree, AbstractAxis axis, GridItem* items,
 
         int baselineCount = 0;
         for (int i = start; i < end; i++) {
-            if (items[i].alignSelf.keyword == AlignItemsKeyword::Baseline) {
+            if (items[i].ParticipatesInBaselineAlignment()) {
                 baselineCount++;
             }
         }
@@ -7833,6 +8426,9 @@ void ResolveItemBaselines(TaffyTree* tree, AbstractAxis axis, GridItem* items,
 
         for (int i = start; i < end; i++) {
             GridItem& item = items[i];
+            if (!item.ParticipatesInBaselineAlignment()) {
+                continue;
+            }
             LayoutOutput out = tree->PerformChildLayout(
                 item.node, SizeFOptNone(), innerNodeSize,
                 SizeAvail::MinContent(), SizingMode::InherentSize,
@@ -7842,16 +8438,26 @@ void ResolveItemBaselines(TaffyTree* tree, AbstractAxis axis, GridItem* items,
                                LengthPercentageAuto::Zero()};
             float marginTop = topOnly.ResolveOrZero(innerNodeSize.w, tree->calc)
                                   .top;
-            item.baseline =
-                Some(UnwrapOr(out.firstBaselines.y, out.size.h) + marginTop);
+
+            float baseline = UnwrapOr(out.baselines.first, out.size.h);
+            if (IsScrollContainer(item.overflow.y)) {
+                baseline = F32Max(0.0f, F32Min(baseline, out.size.h));
+            }
+            item.baseline = Some(baseline + marginTop);
         }
 
         float rowMaxBaseline = 0.0f;
         for (int i = start; i < end; i++) {
+            if (!items[i].ParticipatesInBaselineAlignment()) {
+                continue;
+            }
             rowMaxBaseline =
                 F32Max(rowMaxBaseline, UnwrapOr(items[i].baseline, 0.0f));
         }
         for (int i = start; i < end; i++) {
+            if (!items[i].ParticipatesInBaselineAlignment()) {
+                continue;
+            }
             items[i].baselineShim =
                 rowMaxBaseline - UnwrapOr(items[i].baseline, 0.0f);
         }
@@ -7869,7 +8475,11 @@ float DistributeSpaceUpToLimits(float spaceToDistribute, GridTrack* tracks,
 
     const float kThreshold = 0.01f;
 
-    while (spaceToDistribute > kThreshold) {
+    int maxIterations = n + 1;
+    for (int iter = 0; iter < maxIterations; iter++) {
+        if (spaceToDistribute <= kThreshold) {
+            break;
+        }
         float proportionSum = 0.0f;
         for (int i = 0; i < n; i++) {
             const GridTrack& t = tracks[i];
@@ -7926,8 +8536,7 @@ template <typename Affected, typename Proportion, typename Limit>
 void DistributeItemSpaceToBaseSizeInner(
     float space, GridTrack* tracks, int n, Affected trackIsAffected,
     Proportion trackDistributionProportion, Limit trackLimit,
-    IntrinsicContributionType intrinsicContributionType,
-    Optf axisInnerNodeSize) {
+    IntrinsicContributionType intrinsicContributionType) {
     if (space == 0.0f) {
         return;
     }
@@ -7990,9 +8599,8 @@ void DistributeItemSpaceToBaseSizeInner(
         };
         DistributeSpaceUpToLimits(
             extraSpace, tracks, n, filter, trackDistributionProportion,
-            getBaseSize, [&](const GridTrack& t) {
-                return t.FitContentLimit(axisInnerNodeSize);
-            });
+            getBaseSize,
+            [](const GridTrack& t) { return t.FitContentLimit(); });
     }
 
     for (int i = 0; i < n; i++) {
@@ -8008,8 +8616,7 @@ template <typename Affected, typename Limit>
 void DistributeItemSpaceToBaseSize(
     bool isFlex, bool, float space, GridTrack* tracks, int n,
     Affected trackIsAffected, Limit trackLimit,
-    IntrinsicContributionType intrinsicContributionType,
-    Optf axisInnerNodeSize) {
+    IntrinsicContributionType intrinsicContributionType) {
     auto one = [](const GridTrack&) { return 1.0f; };
     if (isFlex) {
         auto filter = [&](const GridTrack& t) {
@@ -8023,25 +8630,23 @@ void DistributeItemSpaceToBaseSize(
         }
         if (flexFactorSum > 0.0f) {
             auto flexFactor = [](const GridTrack& t) { return t.FlexFactor(); };
-            DistributeItemSpaceToBaseSizeInner(
-                space, tracks, n, filter, flexFactor, trackLimit,
-                intrinsicContributionType, axisInnerNodeSize);
+            DistributeItemSpaceToBaseSizeInner(space, tracks, n, filter,
+                                               flexFactor, trackLimit,
+                                               intrinsicContributionType);
         } else {
-            DistributeItemSpaceToBaseSizeInner(
-                space, tracks, n, filter, one, trackLimit,
-                intrinsicContributionType, axisInnerNodeSize);
+            DistributeItemSpaceToBaseSizeInner(space, tracks, n, filter, one,
+                                               trackLimit,
+                                               intrinsicContributionType);
         }
         return;
     }
     DistributeItemSpaceToBaseSizeInner(space, tracks, n, trackIsAffected, one,
-                                       trackLimit, intrinsicContributionType,
-                                       axisInnerNodeSize);
+                                       trackLimit, intrinsicContributionType);
 }
 
 template <typename Affected>
 void DistributeItemSpaceToGrowthLimit(float space, GridTrack* tracks, int n,
-                                      Affected trackIsAffected,
-                                      Optf axisInnerNodeSize) {
+                                      Affected trackIsAffected) {
     if (space == 0.0f) {
         return;
     }
@@ -8062,35 +8667,24 @@ void DistributeItemSpaceToGrowthLimit(float space, GridTrack* tracks, int n,
     }
     float extraSpace = F32Max(0.0f, space - trackSizes);
 
+    auto growthLimitOrBaseSize = [](const GridTrack& t) {
+        return t.growthLimit == INFINITY ? t.baseSize : t.growthLimit;
+    };
+    auto one = [](const GridTrack&) { return 1.0f; };
+    auto fitContentLimit = [](const GridTrack& t) {
+        return t.FitContentLimit();
+    };
     auto growable = [&](const GridTrack& t) {
         return trackIsAffected(t) &&
-               (t.infinitelyGrowable ||
-                t.FitContentLimitedGrowthLimit(axisInnerNodeSize) == INFINITY);
+               (t.infinitelyGrowable || t.growthLimit == INFINITY);
     };
-    int growableCount = 0;
-    for (int i = 0; i < n; i++) {
-        if (growable(tracks[i])) {
-            growableCount++;
-        }
-    }
-    if (growableCount > 0) {
-        float increase = extraSpace / (float)growableCount;
-        for (int i = 0; i < n; i++) {
-            if (growable(tracks[i])) {
-                tracks[i].itemIncurredIncrease = increase;
-            }
-        }
-    } else {
+    extraSpace =
+        DistributeSpaceUpToLimits(extraSpace, tracks, n, growable, one,
+                                  growthLimitOrBaseSize, fitContentLimit);
 
-        DistributeSpaceUpToLimits(
-            extraSpace, tracks, n, trackIsAffected,
-            [](const GridTrack&) { return 1.0f; },
-            [](const GridTrack& t) {
-                return t.growthLimit == INFINITY ? t.baseSize : t.growthLimit;
-            },
-            [&](const GridTrack& t) {
-                return t.FitContentLimit(axisInnerNodeSize);
-            });
+    if (extraSpace > 0.0f) {
+        DistributeSpaceUpToLimits(extraSpace, tracks, n, trackIsAffected, one,
+                                  growthLimitOrBaseSize, fitContentLimit);
     }
 
     for (int i = 0; i < n; i++) {
@@ -8100,6 +8694,26 @@ void DistributeItemSpaceToGrowthLimit(float space, GridTrack* tracks, int n,
         }
         t.itemIncurredIncrease = 0.0f;
     }
+}
+
+float CrossedFlexFactorSum(const GridTrack* tracks, int count) {
+    float sum = 0.0f;
+    for (int i = 0; i < count; i++) {
+        if (tracks[i].maxTrackSizingFunction.IsFr()) {
+            sum += tracks[i].FlexFactor();
+        }
+    }
+    return sum;
+}
+
+float InflexibleTrackBaseSizes(const GridTrack* tracks, int count) {
+    float sum = 0.0f;
+    for (int i = 0; i < count; i++) {
+        if (!tracks[i].maxTrackSizingFunction.IsFr()) {
+            sum += tracks[i].baseSize;
+        }
+    }
+    return sum;
 }
 
 void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
@@ -8143,103 +8757,82 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                                             : item->overflow.y;
 
                 float newBaseSize = track.baseSize;
-                switch (track.minTrackSizingFunction.raw.Tag()) {
-                    case CompactLength::kMinContentTag:
-                        newBaseSize = F32Max(
-                            track.baseSize,
-                            sizer.MinContentContribution(item, axisTracks));
-                        break;
-                    case CompactLength::kPercentTag:
+                uint64_t minTag = track.minTrackSizingFunction.raw.Tag();
+                if (minTag == CompactLength::kMinContentTag) {
+                    newBaseSize =
+                        F32Max(track.baseSize,
+                               sizer.MinContentContribution(item, axisTracks));
+                } else if (minTag == CompactLength::kMaxContentTag) {
+                    newBaseSize =
+                        F32Max(track.baseSize,
+                               sizer.MaxContentContribution(item, axisTracks));
+                } else if (track.minTrackSizingFunction
+                               .BehavesAsAuto(axisInnerNodeSize)) {
 
-                        if (!IsSome(axisInnerNodeSize)) {
-                            newBaseSize = F32Max(
-                                track.baseSize,
-                                sizer.MinContentContribution(item, axisTracks));
-                        }
-                        break;
-                    case CompactLength::kMaxContentTag:
-                        newBaseSize = F32Max(
-                            track.baseSize,
-                            sizer.MaxContentContribution(item, axisTracks));
-                        break;
-                    case CompactLength::kAutoTag: {
-                        float space;
-                        bool minOrMaxConstraint =
-                            axisAvailableGridSpace
-                                    .kind == AvailableSpace::Kind::MinContent ||
-                            axisAvailableGridSpace
-                                    .kind == AvailableSpace::Kind::MaxContent;
+                    float space;
+                    bool minOrMaxConstraint =
+                        axisAvailableGridSpace
+                                .kind == AvailableSpace::Kind::MinContent ||
+                        axisAvailableGridSpace
+                                .kind == AvailableSpace::Kind::MaxContent;
 
-                        if (minOrMaxConstraint &&
-                            !IsScrollContainer(axisOverflow)) {
-                            float axisMinimumSize = sizer.MinimumContribution(
-                                item, axisTracks, nAxisTracks);
-                            float axisMinContentSize =
-                                sizer.MinContentContribution(item, axisTracks);
-                            Optf limit =
-                                track.maxTrackSizingFunction
-                                    .DefiniteLimit(axisInnerNodeSize, calc);
-                            space = F32Max(MaybeMin(axisMinContentSize, limit),
-                                           axisMinimumSize);
-                        } else {
-                            space = sizer.MinimumContribution(item, axisTracks,
-                                                              nAxisTracks);
-                        }
-                        newBaseSize = F32Max(track.baseSize, space);
-                        break;
+                    if (minOrMaxConstraint &&
+                        !IsScrollContainer(axisOverflow)) {
+                        float axisMinimumSize = sizer.MinimumContribution(
+                            item, axisTracks, nAxisTracks);
+                        float axisMinContentSize =
+                            sizer.MinContentContribution(item, axisTracks);
+                        Optf limit = track.maxTrackSizingFunction.DefiniteLimit(
+                            axisInnerNodeSize, calc);
+                        space = F32Max(MaybeMin(axisMinContentSize, limit),
+                                       axisMinimumSize);
+                    } else {
+                        space = sizer.MinimumContribution(item, axisTracks,
+                                                          nAxisTracks);
                     }
-                    case CompactLength::kLengthTag:
-
-                        break;
-                    default:
-
-                        if (track.minTrackSizingFunction.raw.IsCalc() &&
-                            !IsSome(axisInnerNodeSize)) {
-                            newBaseSize = F32Max(
-                                track.baseSize,
-                                sizer.MinContentContribution(item, axisTracks));
-                        }
-                        break;
+                    newBaseSize = F32Max(track.baseSize, space);
                 }
-
-                bool haveGrowthLimitMinContent =
-                    !IsScrollContainer(axisOverflow);
-                float growthLimitMinContent =
-                    haveGrowthLimitMinContent
-                        ? sizer.MinContentContribution(item, axisTracks)
-                        : 0.0f;
-                float growthLimitMaxContent =
-                    sizer.MaxContentContribution(item, axisTracks);
-                float growthLimitIntrinsicMinContent =
-                    sizer.MinContentContribution(item, axisTracks);
 
                 GridTrack& t = axisTracks[trackIndex];
                 t.baseSize = newBaseSize;
 
-                if (t.maxTrackSizingFunction.IsFitContent()) {
-
-                    if (haveGrowthLimitMinContent) {
-                        t.growthLimitPlannedIncrease =
-                            F32Max(t.growthLimitPlannedIncrease,
-                                   growthLimitMinContent);
-                    }
-
-                    float fitContentLimit =
-                        t.FitContentLimit(axisInnerNodeSize);
+                MaxTrackSizingFunction maxFn = t.maxTrackSizingFunction;
+                bool hasMinContent = t.HasIntrinsicSizingFunction();
+                float minContentContribution = 0.0f;
+                if (hasMinContent) {
+                    minContentContribution =
+                        sizer.MinContentContribution(item, axisTracks);
+                }
+                bool havePlanned = false;
+                float planned = 0.0f;
+                if (maxFn.IsFitContent()) {
+                    float fitContentLimit = t.FitContentLimit();
                     float maxContentContribution =
-                        F32Min(growthLimitMaxContent, fitContentLimit);
-                    t.growthLimitPlannedIncrease = F32Max(
-                        t.growthLimitPlannedIncrease, maxContentContribution);
-                } else if (t.maxTrackSizingFunction.IsMaxContentAlike() ||
-                           (t.maxTrackSizingFunction.UsesPercentage() &&
+                        F32Min(sizer.MaxContentContribution(item, axisTracks),
+                               fitContentLimit);
+
+                    if (hasMinContent && !IsScrollContainer(axisOverflow)) {
+                        planned = F32Max(minContentContribution,
+                                         maxContentContribution);
+                    } else {
+                        planned = maxContentContribution;
+                    }
+                    havePlanned = true;
+                } else if (maxFn.IsMaxContentAlike() ||
+                           (maxFn.UsesPercentage() &&
                             !IsSome(axisInnerNodeSize))) {
 
-                    t.growthLimitPlannedIncrease = F32Max(
-                        t.growthLimitPlannedIncrease, growthLimitMaxContent);
-                } else if (t.maxTrackSizingFunction.IsIntrinsic()) {
+                    planned = sizer.MaxContentContribution(item, axisTracks);
+                    havePlanned = true;
+                } else if (maxFn.IsIntrinsic()) {
+                    if (hasMinContent) {
+                        planned = minContentContribution;
+                        havePlanned = true;
+                    }
+                }
+                if (havePlanned) {
                     t.growthLimitPlannedIncrease =
-                        F32Max(t.growthLimitPlannedIncrease,
-                               growthLimitIntrinsicMinContent);
+                        F32Max(t.growthLimitPlannedIncrease, planned);
                 }
             }
 
@@ -8282,8 +8875,22 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                     sizer.MinContentContribution(item, axisTracks);
                 Optf limit = SpannedTrackLimit(*item, axis, axisTracks,
                                                axisInnerNodeSize, calc);
-                space = F32Max(MaybeMin(axisMinContentSize, limit),
-                               axisMinimumSize);
+                float limitedMinContent = F32Max(
+                    MaybeMin(axisMinContentSize, limit), axisMinimumSize);
+
+                if (isFlex) {
+                    int from = item->TrackRangeStart(axis);
+                    int count = item->TrackRangeEnd(axis) - from;
+                    float inflexible =
+                        InflexibleTrackBaseSizes(axisTracks + from, count);
+                    float scale = F32Min(
+                        CrossedFlexFactorSum(axisTracks + from, count), 1.0f);
+                    float excess = F32Max(limitedMinContent - inflexible, 0.0f);
+                    space =
+                        F32Max(axisMinimumSize, inflexible + excess * scale);
+                } else {
+                    space = limitedMinContent;
+                }
             } else {
                 space = sizer
                             .MinimumContribution(item, axisTracks, nAxisTracks);
@@ -8299,17 +8906,16 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasIntrinsicMin,
-                        [&](const GridTrack& t) {
-                            return t.FitContentLimitedGrowthLimit(
-                                axisInnerNodeSize);
+                        [](const GridTrack& t) {
+                            return t.FitContentLimitedGrowthLimit();
                         },
-                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum);
                 } else {
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasIntrinsicMin,
                         [](const GridTrack& t) { return t.growthLimit; },
-                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum);
                 }
             }
         }
@@ -8320,6 +8926,10 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
         };
         for (int bi = 0; bi < batchLen; bi++) {
             GridItem* item = &batch[bi];
+            if (!item->SpansTrackMatching(axis, axisTracks,
+                                          hasMinOrMaxContentMin)) {
+                continue;
+            }
             Overflow axisOverflow = axis == AbstractAxis::Inline
                                         ? item->overflow.x
                                         : item->overflow.y;
@@ -8331,17 +8941,16 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasMinOrMaxContentMin,
-                        [&](const GridTrack& t) {
-                            return t.FitContentLimitedGrowthLimit(
-                                axisInnerNodeSize);
+                        [](const GridTrack& t) {
+                            return t.FitContentLimitedGrowthLimit();
                         },
-                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum);
                 } else {
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasMinOrMaxContentMin,
                         [](const GridTrack& t) { return t.growthLimit; },
-                        IntrinsicContributionType::Minimum, axisInnerNodeSize);
+                        IntrinsicContributionType::Minimum);
                 }
             }
         }
@@ -8358,11 +8967,29 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
             };
             for (int bi = 0; bi < batchLen; bi++) {
                 GridItem* item = &batch[bi];
+                if (!item->SpansTrackMatching(
+                        axis, axisTracks, [&](const GridTrack& t) {
+                            return hasAutoMin(t) || hasMaxContentMin(t);
+                        })) {
+                    continue;
+                }
                 float axisMaxContentSize =
                     sizer.MaxContentContribution(item, axisTracks);
                 Optf limit = SpannedTrackLimit(*item, axis, axisTracks,
                                                axisInnerNodeSize, calc);
                 float space = MaybeMin(axisMaxContentSize, limit);
+
+                if (isFlex) {
+                    int fromFlex = item->TrackRangeStart(axis);
+                    int countFlex = item->TrackRangeEnd(axis) - fromFlex;
+                    float inflexible = InflexibleTrackBaseSizes(
+                        axisTracks + fromFlex, countFlex);
+                    float scale = F32Min(
+                        CrossedFlexFactorSum(axisTracks + fromFlex, countFlex),
+                        1.0f);
+                    space =
+                        inflexible + F32Max(space - inflexible, 0.0f) * scale;
+                }
                 int from = item->TrackRangeStart(axis);
                 int count = item->TrackRangeEnd(axis) - from;
                 if (space <= 0.0f || count <= 0) {
@@ -8381,16 +9008,15 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasMaxContentMin,
                         [](const GridTrack&) { return INFINITY; },
-                        IntrinsicContributionType::Maximum, axisInnerNodeSize);
+                        IntrinsicContributionType::Maximum);
                 } else {
                     DistributeItemSpaceToBaseSize(
                         isFlex, useFlexFactorForDistribution, space,
                         axisTracks + from, count, hasAutoMin,
-                        [&](const GridTrack& t) {
-                            return t.FitContentLimitedGrowthLimit(
-                                axisInnerNodeSize);
+                        [](const GridTrack& t) {
+                            return t.FitContentLimitedGrowthLimit();
                         },
-                        IntrinsicContributionType::Maximum, axisInnerNodeSize);
+                        IntrinsicContributionType::Maximum);
                 }
             }
             FlushPlannedBaseSizeIncreases(axisTracks, nAxisTracks);
@@ -8401,6 +9027,10 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
         };
         for (int bi = 0; bi < batchLen; bi++) {
             GridItem* item = &batch[bi];
+            if (!item->SpansTrackMatching(axis, axisTracks,
+                                          hasMaxContentMinFn)) {
+                continue;
+            }
             float space = sizer.MaxContentContribution(item, axisTracks);
             int from = item->TrackRangeStart(axis);
             int count = item->TrackRangeEnd(axis) - from;
@@ -8409,7 +9039,7 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
                     isFlex, useFlexFactorForDistribution, space,
                     axisTracks + from, count, hasMaxContentMinFn,
                     [](const GridTrack& t) { return t.growthLimit; },
-                    IntrinsicContributionType::Maximum, axisInnerNodeSize);
+                    IntrinsicContributionType::Maximum);
             }
         }
         FlushPlannedBaseSizeIncreases(axisTracks, nAxisTracks);
@@ -8428,13 +9058,16 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
             };
             for (int bi = 0; bi < batchLen; bi++) {
                 GridItem* item = &batch[bi];
+                if (!item->SpansTrackMatching(axis, axisTracks,
+                                              hasIntrinsicMax)) {
+                    continue;
+                }
                 float space = sizer.MinContentContribution(item, axisTracks);
                 int from = item->TrackRangeStart(axis);
                 int count = item->TrackRangeEnd(axis) - from;
                 if (space > 0.0f && count > 0) {
                     DistributeItemSpaceToGrowthLimit(space, axisTracks + from,
-                                                     count, hasIntrinsicMax,
-                                                     axisInnerNodeSize);
+                                                     count, hasIntrinsicMax);
                 }
             }
 
@@ -8447,13 +9080,16 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
             };
             for (int bi = 0; bi < batchLen; bi++) {
                 GridItem* item = &batch[bi];
+                if (!item->SpansTrackMatching(axis, axisTracks,
+                                              hasMaxContentMax)) {
+                    continue;
+                }
                 float space = sizer.MaxContentContribution(item, axisTracks);
                 int from = item->TrackRangeStart(axis);
                 int count = item->TrackRangeEnd(axis) - from;
                 if (space > 0.0f && count > 0) {
                     DistributeItemSpaceToGrowthLimit(space, axisTracks + from,
-                                                     count, hasMaxContentMax,
-                                                     axisInnerNodeSize);
+                                                     count, hasMaxContentMax);
                 }
             }
             FlushPlannedGrowthLimitIncreases(axisTracks, nAxisTracks, false);
@@ -8467,7 +9103,7 @@ void ResolveIntrinsicTrackSizes(TaffyTree* tree, AbstractAxis axis,
     }
 }
 
-void MaximiseTracks(GridTrack* axisTracks, int n, Optf axisInnerNodeSize,
+void MaximiseTracks(GridTrack* axisTracks, int n,
                     AvailableSpace axisAvailableGridSpace) {
     float usedSpace = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -8483,8 +9119,8 @@ void MaximiseTracks(GridTrack* axisTracks, int n, Optf axisInnerNodeSize,
             freeSpace, axisTracks, n, [](const GridTrack&) { return true; },
             [](const GridTrack&) { return 1.0f; },
             [](const GridTrack& t) { return t.baseSize; },
-            [&](const GridTrack& t) {
-                return t.FitContentLimitedGrowthLimit(axisInnerNodeSize);
+            [](const GridTrack& t) {
+                return t.FitContentLimitedGrowthLimit();
             });
         for (int i = 0; i < n; i++) {
             axisTracks[i].baseSize += axisTracks[i].itemIncurredIncrease;
@@ -8501,7 +9137,9 @@ float FindSizeOfFr(const GridTrack* tracks, int n, float spaceToFill) {
 
     float hypotheticalFrSize = INFINITY;
     float previousIterHypotheticalFrSize;
-    while (true) {
+
+    int maxIterations = n + 1;
+    for (int iter = 0; iter < maxIterations; iter++) {
         float usedSpace = 0.0f;
         float naiveFlexFactorSum = 0.0f;
         for (int i = 0; i < n; i++) {
@@ -8542,9 +9180,10 @@ float FindSizeOfFr(const GridTrack* tracks, int n, float spaceToFill) {
 
 void ExpandFlexibleTracks(TaffyTree* tree, AbstractAxis axis,
                           GridTrack* axisTracks, int nAxisTracks,
-                          GridItem* items, int nItems, Optf axisMinSize,
-                          Optf axisMaxSize,
-                          AvailableSpace axisAvailableSpaceForExpansion) {
+                          const GridTrack* otherAxisTracks, GridItem* items,
+                          int nItems, Optf axisMinSize, Optf axisMaxSize,
+                          AvailableSpace axisAvailableSpaceForExpansion,
+                          SizeFOpt innerNodeSize, TrackSizeEstimate estimate) {
     float flexFraction = 0.0f;
     if (axisAvailableSpaceForExpansion.kind == AvailableSpace::Kind::Definite) {
         float availableSpace = axisAvailableSpaceForExpansion.value;
@@ -8573,6 +9212,12 @@ void ExpandFlexibleTracks(TaffyTree* tree, AbstractAxis axis,
             trackMax = F32Max(trackMax, v);
         }
         float itemMax = 0.0f;
+        IntrinsicSizeMeasurer sizer;
+        sizer.tree = tree;
+        sizer.otherAxisTracks = otherAxisTracks;
+        sizer.estimate = estimate;
+        sizer.axis = axis;
+        sizer.innerNodeSize = innerNodeSize;
         for (int i = 0; i < nItems; i++) {
             GridItem* item = &items[i];
             if (!item->CrossesFlexibleTrack(axis)) {
@@ -8581,8 +9226,8 @@ void ExpandFlexibleTracks(TaffyTree* tree, AbstractAxis axis,
             int from = item->TrackRangeStart(axis);
             int count = item->TrackRangeEnd(axis) - from;
 
-            float maxContentContribution = ItemMaxContentContributionCached(
-                item, axis, tree, SizeFOptNone(), SizeFOptNone());
+            float maxContentContribution =
+                sizer.MaxContentContribution(item, axisTracks);
             itemMax = F32Max(itemMax, FindSizeOfFr(axisTracks + from, count,
                                                    maxContentContribution));
         }
@@ -8663,13 +9308,21 @@ void TrackSizingAlgorithm(TaffyTree* tree, AbstractAxis axis, Optf axisMinSize,
     Optf percentageBasis = Or(Get(innerNodeSize, axis), axisMinSize);
     InitializeTrackSizes(tree, axisTracks, nAxisTracks, percentageBasis);
 
+    Optf axisInnerNodeSize = Get(innerNodeSize, axis);
+    for (int i = 0; i < nAxisTracks; i++) {
+        axisTracks[i].ResolveFitContentLimit(axisInnerNodeSize, tree->calc);
+    }
+
     if (hasBaselineAlignedItem) {
         ResolveItemBaselines(tree, axis, items, nItems, innerNodeSize);
     }
 
     bool allAtLimit = true;
     for (int i = 0; i < nAxisTracks; i++) {
-        if (axisTracks[i].baseSize != axisTracks[i].growthLimit) {
+        const GridTrack& t = axisTracks[i];
+        if (t.baseSize != t.growthLimit ||
+            !IsSome(t.minTrackSizingFunction
+                        .DefiniteValue(percentageBasis, tree->calc))) {
             allAtLimit = false;
             break;
         }
@@ -8692,23 +9345,24 @@ void TrackSizingAlgorithm(TaffyTree* tree, AbstractAxis axis, Optf axisMinSize,
         tree, axis, axisTracks, nAxisTracks, otherAxisTracks, items, nItems,
         availableGridSpace.Get(axis), innerNodeSize, estimate);
 
-    MaximiseTracks(axisTracks, nAxisTracks, Get(innerNodeSize, axis),
-                   availableGridSpace.Get(axis));
+    MaximiseTracks(axisTracks, nAxisTracks, availableGridSpace.Get(axis));
 
     AvailableSpace axisAvailableSpaceForExpansion;
     Optf innerAxis = Get(innerNodeSize, axis);
     if (IsSome(innerAxis)) {
         axisAvailableSpaceForExpansion = AvailableSpace::Definite(innerAxis);
-    } else if (availableGridSpace.Get(axis)
-                   .kind == AvailableSpace::Kind::MinContent) {
+    } else if (axis == AbstractAxis::Inline &&
+               availableGridSpace.Get(axis)
+                       .kind == AvailableSpace::Kind::MinContent) {
         axisAvailableSpaceForExpansion = AvailableSpace::MinContent();
     } else {
         axisAvailableSpaceForExpansion = AvailableSpace::MaxContent();
     }
 
-    ExpandFlexibleTracks(tree, axis, axisTracks, nAxisTracks, items, nItems,
-                         axisMinSize, axisMaxSize,
-                         axisAvailableSpaceForExpansion);
+    ExpandFlexibleTracks(tree, axis, axisTracks, nAxisTracks, otherAxisTracks,
+                         items, nItems, axisMinSize, axisMaxSize,
+                         axisAvailableSpaceForExpansion, innerNodeSize,
+                         estimate);
 
     if (axisAlignment.keyword == AlignContentKeyword::Stretch) {
         StretchAutoTracks(axisTracks, nAxisTracks, axisMinSize,
@@ -8748,9 +9402,8 @@ void AlignTracks(float gridContainerContentBoxSize, LineF padding, LineF border,
             : 0.0f;
     float totalOffset = origin + emptyGridOffset;
     bool seenNonCollapsedTrack = false;
-    for (int i = 0; i < n; i++) {
-        GridTrack& track = tracks[i];
 
+    auto positionTrack = [&](int i, GridTrack& track) {
         bool isGutter = (i % 2) == 0;
         bool isNonCollapsedTrack = !isGutter && !track.isCollapsed;
         bool isFirst = isNonCollapsedTrack && !seenNonCollapsedTrack;
@@ -8764,6 +9417,15 @@ void AlignTracks(float gridContainerContentBoxSize, LineF padding, LineF border,
         totalOffset = totalOffset + offset + track.baseSize;
         if (isNonCollapsedTrack) {
             seenNonCollapsedTrack = true;
+        }
+    };
+    if (axisIsReversed) {
+        for (int i = 0; i < n; i++) {
+            positionTrack(i, tracks[n - 1 - i]);
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            positionTrack(i, tracks[i]);
         }
     }
 }
@@ -8825,7 +9487,7 @@ AlignedAxis AlignItemWithinArea(LineF gridArea, AlignSelf alignmentStyle,
     }
 
     float offsetWithinArea = alignmentBasedOffset;
-    if (position == Position::Absolute) {
+    if (IsOutOfFlow(position)) {
         if (IsSome(insetStart) && IsSome(insetEnd)) {
             offsetWithinArea =
                 IsRtl(direction)
@@ -8853,99 +9515,134 @@ AlignedAxis AlignItemWithinArea(LineF gridArea, AlignSelf alignmentStyle,
 }
 
 struct AlignedItem {
-    SizeF contentSizeContribution;
+    RectF overflowContribution;
     float yPosition = 0.0f;
     float height = 0.0f;
+    int oofStart = 0;
+    int oofCount = 0;
 };
 
-AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
-                                 RectF gridArea,
-                                 OptAlignItems containerJustifyItems,
-                                 OptAlignItems containerAlignItems,
-                                 float baselineShim, Direction direction,
-                                 float containerBorderBoxWidth,
-                                 RectF containerBorder) {
+AlignedItem AlignAndPositionItem(
+    TaffyTree* tree, NodeId node, uint32_t order, RectF gridArea,
+    SizeF containingBlock, AlignItems containerJustifyItems,
+    AlignItems containerAlignItems, float baselineShim, Direction direction,
+    float containerBorderBoxWidth, RectF containerBorder,
+    bool containerIsScrollContainer, Vec<OofCandidate>* oofPool) {
     CalcResolver calc = tree->calc;
     SizeF gridAreaSize = {gridArea.right - gridArea.left,
                           gridArea.bottom - gridArea.top};
+    SizeFOpt containingOpt = AsOptional(containingBlock);
 
     const Style& style = tree->GetStyle(node);
     PointOverflow overflow = style.overflow;
+    Contain contain = style.contain;
     float scrollbarWidth = style.scrollbarWidth;
     Optf aspectRatio = style.aspectRatio;
-    OptAlignItems justifySelf = style.justifySelf;
-    if (justifySelf.IsSome()) {
-        justifySelf.val = ResolveSelfRelative(justifySelf.val, style.direction,
-                                              direction, true);
-    }
-    OptAlignItems alignSelf = style.alignSelf;
-    if (alignSelf.IsSome()) {
-        alignSelf.val = ResolveSelfRelative(alignSelf.val, style.direction,
-                                            direction, false);
-    }
-    if (containerJustifyItems.IsSome()) {
-        containerJustifyItems.val = ResolveSelfRelative(
-            containerJustifyItems.val, style.direction, direction, true);
-    }
-    if (containerAlignItems.IsSome()) {
-        containerAlignItems.val = ResolveSelfRelative(
-            containerAlignItems.val, style.direction, direction, false);
-    }
+    bool isReplaced = style.IsReplaced();
+
+    AlignItems justifySelf =
+        ResolveSelfRelative(style.justifySelf.UnwrapOr(containerJustifyItems),
+                            style.direction, direction, true);
+    AlignItems alignSelf =
+        ResolveSelfRelative(style.alignSelf.UnwrapOr(containerAlignItems),
+                            style.direction, direction, false);
     Position position = style.position;
 
-    RectFOpt inset = style.inset
-                         .MaybeResolveZip(AsOptional(gridAreaSize), calc);
-    RectF padding = style.padding.ResolveOrZero(Some(gridAreaSize.w), calc);
-    RectF border = style.border.ResolveOrZero(Some(gridAreaSize.w), calc);
+    RectFOpt inset = style.inset.MaybeResolveZip(containingOpt, calc);
+    RectF padding = style.padding.ResolveOrZero(Some(containingBlock.w), calc);
+    RectF border = style.border.ResolveOrZero(Some(containingBlock.w), calc);
     SizeF paddingBorderSize = (padding + border).SumAxes();
     SizeF boxSizingAdjustment = style.boxSizing == BoxSizing::ContentBox
                                     ? paddingBorderSize
                                     : SizeF::Zero();
 
-    SizeFOpt gridAreaOpt = AsOptional(gridAreaSize);
+    SizeDim sizeStyle = style.size;
     SizeFOpt inherentSize =
         MaybeAdd(MaybeApplyAspectRatio(
-                     style.size.MaybeResolve(gridAreaOpt, calc), aspectRatio),
+                     sizeStyle.MaybeResolve(containingOpt, calc), aspectRatio),
                  boxSizingAdjustment);
     SizeFOpt minSize = MaybeApplyAspectRatio(
-        MaybeMax(Or(MaybeAdd(style.minSize.MaybeResolve(gridAreaOpt, calc),
+        MaybeMax(Or(MaybeAdd(style.minSize.MaybeResolve(containingOpt, calc),
                              boxSizingAdjustment),
                     AsOptional(paddingBorderSize)),
                  paddingBorderSize),
         aspectRatio);
     SizeFOpt maxSize = MaybeAdd(
-        MaybeApplyAspectRatio(style.maxSize.MaybeResolve(gridAreaOpt, calc),
+        MaybeApplyAspectRatio(style.maxSize.MaybeResolve(containingOpt, calc),
                               aspectRatio),
         boxSizingAdjustment);
 
-    AlignItems horizontalAlignment =
-        justifySelf.Or(containerJustifyItems)
-            .UnwrapOr(IsSome(inherentSize.w)
-                          ? AlignItems{AlignItemsKeyword::Start}
-                          : AlignItems{AlignItemsKeyword::Stretch});
-    AlignItems verticalAlignment =
-        alignSelf.Or(containerAlignItems)
-            .UnwrapOr((IsSome(inherentSize.h) || IsSome(aspectRatio))
-                          ? AlignItems{AlignItemsKeyword::Start}
-                          : AlignItems{AlignItemsKeyword::Stretch});
+    AlignItems horizontalAlignment = justifySelf;
+    if (justifySelf.keyword == AlignItemsKeyword::Normal) {
+        horizontalAlignment = (IsSome(inherentSize.w) ||
+                               sizeStyle.width.IsSizingKeyword() || isReplaced)
+                                  ? AlignItems{AlignItemsKeyword::Start}
+                                  : AlignItems{AlignItemsKeyword::Stretch};
+    }
+    AlignItems verticalAlignment = alignSelf;
+    if (alignSelf.keyword == AlignItemsKeyword::Normal) {
+        verticalAlignment =
+            (IsSome(inherentSize.h) || sizeStyle.height.IsSizingKeyword() ||
+             IsSome(aspectRatio) || isReplaced)
+                ? AlignItems{AlignItemsKeyword::Start}
+                : AlignItems{AlignItemsKeyword::Stretch};
+    }
 
-    RectFOpt margin = style.margin.MaybeResolve(Some(gridAreaSize.w), calc);
+    RectFOpt margin = style.margin.MaybeResolve(Some(containingBlock.w), calc);
 
     SizeF gridAreaMinusItemMarginsSize = {
-        MaybeSub(MaybeSub(gridAreaSize.w, margin.left), margin.right),
-        MaybeSub(MaybeSub(gridAreaSize.h, margin.top), margin.bottom) -
-            baselineShim};
+        F32Max(MaybeSub(MaybeSub(gridAreaSize.w, margin.left), margin.right),
+               0.0f),
+        F32Max(MaybeSub(MaybeSub(gridAreaSize.h, margin.top), margin.bottom) -
+                   baselineShim,
+               0.0f)};
+
+    SizingKeywordResolution keywordWidth;
+    if (!IsSome(inherentSize.w)) {
+        keywordWidth = ResolveSizingKeyword(
+            sizeStyle.width, Some(gridAreaMinusItemMarginsSize.w),
+            Some(containingBlock.w), calc);
+    }
+    SizingKeywordResolution keywordHeight;
+    if (!IsSome(inherentSize.h)) {
+        keywordHeight = ResolveSizingKeyword(
+            sizeStyle.height, Some(gridAreaMinusItemMarginsSize.h),
+            Some(containingBlock.h), calc);
+    }
+
+    SizeFOpt keywordMeasured = SizeFOptNone();
+    if (!IsOutOfFlow(position) && keywordWidth.isSome && keywordHeight.isSome &&
+        keywordWidth.kind == SizingKeywordKind::Measure &&
+        keywordHeight.kind == SizingKeywordKind::Measure) {
+        keywordMeasured = AsOptional(tree->MeasureChildSizeBoth(
+            node, SizeFOptNone(), containingOpt,
+            {keywordWidth.measure, keywordHeight.measure},
+            SizingMode::InherentSize, LineBool::False()));
+    }
 
     Optf width = inherentSize.w;
     if (!IsSome(width)) {
-        if (position == Position::Absolute && IsSome(inset.left) &&
+        if (IsOutOfFlow(position) && IsSome(inset.left) &&
             IsSome(inset.right)) {
             width = Some(F32Max(
                 gridAreaMinusItemMarginsSize.w - inset.left - inset.right,
                 0.0f));
+        } else if (keywordWidth.isSome) {
+            if (keywordWidth.kind == SizingKeywordKind::Exact) {
+                width = Some(keywordWidth.exact);
+            } else if (IsSome(keywordMeasured.w)) {
+                width = keywordMeasured.w;
+            } else {
+                width = Some(tree->MeasureChildSize(
+                    node, SizeFOptNone(), containingOpt,
+                    {keywordWidth.measure,
+                     AvailableSpace::Definite(gridAreaMinusItemMarginsSize.h)},
+                    SizingMode::InherentSize, AbsoluteAxis::Horizontal,
+                    LineBool::False()));
+            }
         } else if (IsSome(margin.left) && IsSome(margin.right) &&
                    horizontalAlignment.keyword == AlignItemsKeyword::Stretch &&
-                   position != Position::Absolute) {
+                   !IsOutOfFlow(position)) {
             width = Some(gridAreaMinusItemMarginsSize.w);
         }
     }
@@ -8954,14 +9651,30 @@ AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
 
     Optf height = sized.h;
     if (!IsSome(height)) {
-        if (position == Position::Absolute && IsSome(inset.top) &&
+        if (IsOutOfFlow(position) && IsSome(inset.top) &&
             IsSome(inset.bottom)) {
             height = Some(F32Max(
                 gridAreaMinusItemMarginsSize.h - inset.top - inset.bottom,
                 0.0f));
+        } else if (keywordHeight.isSome) {
+            if (keywordHeight.kind == SizingKeywordKind::Exact) {
+                height = Some(keywordHeight.exact);
+            } else if (IsSome(keywordMeasured.h)) {
+                height = keywordMeasured.h;
+            } else {
+                AvailableSpace widthAvail =
+                    IsSome(width) ? AvailableSpace::Definite(width)
+                                  : AvailableSpace::Definite(
+                                        gridAreaMinusItemMarginsSize.w);
+                height = Some(tree->MeasureChildSize(
+                    node, {width, None()}, containingOpt,
+                    {widthAvail, keywordHeight.measure},
+                    SizingMode::InherentSize, AbsoluteAxis::Vertical,
+                    LineBool::False()));
+            }
         } else if (IsSome(margin.top) && IsSome(margin.bottom) &&
                    verticalAlignment.keyword == AlignItemsKeyword::Stretch &&
-                   position != Position::Absolute) {
+                   !IsOutOfFlow(position)) {
             height = Some(gridAreaMinusItemMarginsSize.h);
         }
     }
@@ -8970,29 +9683,26 @@ AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
 
     SizeAvail avail = SizeAvail::Definite(gridAreaMinusItemMarginsSize);
     SizeFOpt size = sized;
-    if (position == Position::Absolute &&
-        (!IsSome(sized.w) || !IsSome(sized.h))) {
+    if (IsOutOfFlow(position) && (!IsSome(sized.w) || !IsSome(sized.h))) {
         SizeF measured = tree->MeasureChildSizeBoth(
-            node, sized, gridAreaOpt, avail, SizingMode::InherentSize,
+            node, sized, containingOpt, avail, SizingMode::InherentSize,
             LineBool::False());
         size = AsOptional(measured);
     }
 
     LayoutOutput layoutOutput =
-        tree->PerformChildLayout(node, size, gridAreaOpt, avail,
+        tree->PerformChildLayout(node, size, containingOpt, avail,
                                  SizingMode::InherentSize, LineBool::False());
 
     SizeF finalSize =
         MaybeClamp(UnwrapOr(size, layoutOutput.size), minSize, maxSize);
 
     AlignedAxis xr = AlignItemWithinArea(
-        {gridArea.left, gridArea.right},
-        justifySelf.UnwrapOr(horizontalAlignment), finalSize.w, position, inset,
-        false, margin, 0.0f, direction);
-    AlignedAxis yr = AlignItemWithinArea({gridArea.top, gridArea.bottom},
-                                         alignSelf.UnwrapOr(verticalAlignment),
-                                         finalSize.h, position, inset, true,
-                                         margin, baselineShim, Direction::Ltr);
+        {gridArea.left, gridArea.right}, horizontalAlignment, finalSize.w,
+        position, inset, false, margin, 0.0f, direction);
+    AlignedAxis yr = AlignItemWithinArea(
+        {gridArea.top, gridArea.bottom}, verticalAlignment, finalSize.h,
+        position, inset, true, margin, baselineShim, Direction::Ltr);
 
     SizeF scrollbarSize = {
         overflow.y == Overflow::Scroll ? scrollbarWidth : 0.0f,
@@ -9002,7 +9712,7 @@ AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
     layout.order = order;
     layout.location = {xr.start, yr.start};
     layout.size = finalSize;
-    layout.contentSize = layoutOutput.contentSize;
+    layout.scrollableOverflowRect = layoutOutput.scrollableOverflowRect;
     layout.scrollbarSize = scrollbarSize;
     layout.padding = padding;
     layout.border = border;
@@ -9010,62 +9720,61 @@ AlignedItem AlignAndPositionItem(TaffyTree* tree, NodeId node, uint32_t order,
                      yr.margin.end};
     tree->SetUnroundedLayout(node, layout);
 
-    SizeF contribution = ComputeContentSizeContribution(
+    RectF contribution = ComputeScrollableOverflowContribution(
         {IsRtl(direction) ? containerBorderBoxWidth - (xr.start + finalSize.w) -
                                 containerBorder.right
                           : xr.start - containerBorder.left,
          yr.start - containerBorder.top},
-        finalSize, layoutOutput.contentSize, overflow);
-    return {contribution, yr.start, finalSize.h};
+        finalSize, layoutOutput.scrollableOverflowRect, overflow, contain,
+        containerIsScrollContainer);
+    OofCandRange range;
+    OofAppendRange(oofPool, &range, layoutOutput.oofCandidates);
+    if (range.count > 0) {
+        OofTranslateRange(oofPool, range, {xr.start, yr.start});
+    }
+    return {contribution, yr.start, finalSize.h, range.start, range.count};
 }
 
-void ReverseNonGutterTracks(GridTrack* tracks, int n, TrackCounts trackCounts) {
-
-    if (trackCounts.explicitCount <= 1) {
-        const int kMinTrackVecLenToReverseColumns = 5;
-        if (n < kMinTrackVecLenToReverseColumns) {
-            return;
-        }
-        int left = 1;
-        int right = n - 2;
-        while (left < right) {
-            GridTrack tmp = tracks[left];
-            tracks[left] = tracks[right];
-            tracks[right] = tmp;
-            left += 2;
-            right = right >= 2 ? right - 2 : 0;
-        }
+void StoreGridOofSnapshot(TaffyTree* tree, NodeId node, uint16_t colAuto,
+                          uint16_t rowAuto, TrackCounts colCounts,
+                          TrackCounts rowCounts, const Vec<GridTrack>& columns,
+                          const Vec<GridTrack>& rows) {
+    NodeData* d = tree->Get(node);
+    if (!d) {
         return;
     }
-
-    int explicitTrackCount = (int)trackCounts.explicitCount;
-    if (explicitTrackCount < 2) {
-        return;
-    }
-    int left = (int)trackCounts.negativeImplicit;
-    int right = left + explicitTrackCount - 1;
-    while (left < right) {
-        int li = 2 * left + 1;
-        int ri = 2 * right + 1;
-        GridTrack tmp = tracks[li];
-        tracks[li] = tracks[ri];
-        tracks[ri] = tmp;
-        left += 1;
-        right = right >= 1 ? right - 1 : 0;
-    }
-}
-
-int RtlColumnOccupancyIndexForInitialization(int columnIndex,
-                                             TrackCounts trackCounts) {
-    if (trackCounts.explicitCount <= 1) {
-        return trackCounts.Len() - columnIndex - 1;
-    }
-    int explicitStart = (int)trackCounts.negativeImplicit;
-    int explicitEnd = explicitStart + (int)trackCounts.explicitCount;
-    if (columnIndex >= explicitStart && columnIndex < explicitEnd) {
-        return explicitStart + (explicitEnd - columnIndex - 1);
-    }
-    return columnIndex;
+    auto fill = [](GridAxisPositions* axis, uint16_t autoRep,
+                   TrackCounts counts, const Vec<GridTrack>& tracks) {
+        axis->negativeImplicit = counts.negativeImplicit;
+        axis->explicitCount = counts.explicitCount;
+        axis->positiveImplicit = counts.positiveImplicit;
+        axis->autoRepetitions = autoRep;
+        for (int i = 0; i < len(tracks); i++) {
+            if (tracks[i].kind != GridTrackKind::Track) {
+                continue;
+            }
+            if (tracks[i].isCollapsed) {
+                int index = len(axis->spans);
+                if (len(axis->collapsed) > 0 &&
+                    axis->collapsed[len(axis->collapsed) - 1].end == index) {
+                    axis->collapsed[len(axis->collapsed) - 1].end = index + 1;
+                } else {
+                    CollapsedRun run;
+                    run.start = index;
+                    run.end = index + 1;
+                    VecAppend(axis->collapsed, run);
+                }
+            }
+            GridTrackSpan span;
+            span.start = tracks[i].offset;
+            span.end = tracks[i].offset + tracks[i].baseSize;
+            VecAppend(axis->spans, span);
+        }
+    };
+    d->gridOof.Clear();
+    d->gridOof.live = true;
+    fill(&d->gridOof.columns, colAuto, colCounts, columns);
+    fill(&d->gridOof.rows, rowAuto, rowCounts, rows);
 }
 
 }
@@ -9080,6 +9789,7 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
 
     const Style& style = tree->GetStyle(node);
     Direction direction = style.direction;
+    Contain contain = style.contain;
 
     Optf aspectRatio = style.aspectRatio;
     RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
@@ -9107,6 +9817,8 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     }
 
     PointOverflow t = style.overflow.Transpose();
+    bool isScrollContainer = IsScrollContainer(style.overflow.x) ||
+                             IsScrollContainer(style.overflow.y);
     PointF scrollbarGutter = {
         t.x == Overflow::Scroll ? style.scrollbarWidth : 0.0f,
         t.y == Overflow::Scroll ? style.scrollbarWidth : 0.0f};
@@ -9119,12 +9831,15 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     }
 
     AlignContent alignContent =
-        style.alignContent.UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
+        style.alignContent.keyword == AlignContentKeyword::Normal
+            ? AlignContent{AlignContentKeyword::Stretch}
+            : style.alignContent;
     AlignContent justifyContent =
-        style.justifyContent
-            .UnwrapOr(AlignContent{AlignContentKeyword::Stretch});
-    OptAlignItems alignItems = style.alignItems;
-    OptAlignItems justifyItems = style.justifyItems;
+        style.justifyContent.keyword == AlignContentKeyword::Normal
+            ? AlignContent{AlignContentKeyword::Stretch}
+            : style.justifyContent;
+    AlignItems alignItems = style.alignItems;
+    AlignItems justifyItems = style.justifyItems;
 
     SizeFOpt sizeOrPreferred = Or(knownDimensions, preferredSize);
 
@@ -9216,14 +9931,13 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     nameResolver.explicitRowCount = explicitRowCount;
 
     Vec<PlacementChild> children;
-    Vec<ChildPlacementStyles> childPlacements;
     int childCount = tree->ChildCount(node);
 
     for (int i = 0; i < childCount; i++) {
         NodeId child = tree->GetChildId(node, i);
         const Style& cs = tree->GetStyle(child);
         if (cs.BoxGenMode() == BoxGenerationMode::None ||
-            cs.position == Position::Absolute) {
+            IsOutOfFlow(cs.position)) {
             continue;
         }
         PlacementChild pc;
@@ -9234,23 +9948,18 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         pc.vertical = nameResolver.ResolveRowNames(cs.gridRow)
                           .IntoOriginZero(explicitRowCount);
         VecAppend(children, pc);
-        VecAppend(childPlacements, {cs.gridColumn, cs.gridRow});
     }
 
     TrackCounts estColCounts;
     TrackCounts estRowCounts;
-    ComputeGridSizeEstimate(explicitColCount, explicitRowCount, direction,
-                            childPlacements.els, len(childPlacements),
-                            &estColCounts, &estRowCounts);
+    ComputeGridSizeEstimate(explicitColCount, explicitRowCount, children.els,
+                            len(children), &estColCounts, &estRowCounts);
 
     Vec<GridItem> items;
     CellOccupancyMatrix cellOccupancyMatrix;
     cellOccupancyMatrix.Init(estColCounts, estRowCounts);
-    PlaceGridItems(&cellOccupancyMatrix, &items, tree, children, direction,
-                   style.gridAutoFlow,
-                   alignItems.UnwrapOr(AlignItems{AlignItemsKeyword::Stretch}),
-                   justifyItems
-                       .UnwrapOr(AlignItems{AlignItemsKeyword::Stretch}));
+    PlaceGridItems(&cellOccupancyMatrix, &items, tree, children,
+                   style.gridAutoFlow, alignItems, justifyItems);
 
     TrackCounts finalColCounts = cellOccupancyMatrix
                                      .Counts(AbsoluteAxis::Horizontal);
@@ -9259,29 +9968,15 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
 
     Vec<GridTrack> columns;
     Vec<GridTrack> rows;
-    TrackCounts columnTrackCountsForInit = finalColCounts;
-    if (IsRtl(direction) && finalColCounts.explicitCount <= 1) {
-        columnTrackCountsForInit.negativeImplicit = finalColCounts
-                                                        .positiveImplicit;
-        columnTrackCountsForInit.positiveImplicit = finalColCounts
-                                                        .negativeImplicit;
-    }
-    InitializeGridTracks(
-        &columns, columnTrackCountsForInit, style, AbsoluteAxis::Horizontal,
-        [&](int columnIndex) {
-            int occupancyIndex = IsRtl(direction)
-                                     ? RtlColumnOccupancyIndexForInitialization(
-                                           columnIndex, finalColCounts)
-                                     : columnIndex;
-            return cellOccupancyMatrix.ColumnIsOccupied(occupancyIndex);
-        });
+    InitializeGridTracks(&columns, finalColCounts, style,
+                         AbsoluteAxis::Horizontal, [&](int columnIndex) {
+                             return cellOccupancyMatrix
+                                 .ColumnIsOccupied(columnIndex);
+                         });
     InitializeGridTracks(&rows, finalRowCounts, style, AbsoluteAxis::Vertical,
                          [&](int rowIndex) {
                              return cellOccupancyMatrix.RowIsOccupied(rowIndex);
                          });
-    if (IsRtl(direction)) {
-        ReverseNonGutterTracks(columns.els, len(columns), finalColCounts);
-    }
 
     ResolveItemTrackIndexes(items.els, len(items), finalColCounts,
                             finalRowCounts);
@@ -9290,7 +9985,7 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
 
     bool hasBaselineAlignedItem = false;
     for (int i = 0; i < len(items); i++) {
-        if (items[i].alignSelf.keyword == AlignItemsKeyword::Baseline) {
+        if (items[i].ParticipatesInBaselineAlignment()) {
             hasBaselineAlignedItem = true;
             break;
         }
@@ -9310,6 +10005,21 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         innerNodeSize.w = Some(initialColumnSum);
     }
 
+    if (runMode == RunMode::ComputeSize &&
+        inputs.axis == RequestedAxis::Horizontal) {
+        float width = F32Max(
+            MaybeClamp(initialColumnSum + contentBoxInset.HorizontalAxisSum(),
+                       minSize.w, maxSize.w),
+            paddingBorderSize.w);
+        VecReset(items);
+        VecReset(columns);
+        VecReset(rows);
+        VecReset(children);
+        cellOccupancyMatrix.Free();
+        nameResolver.Free();
+        return LayoutOutput::FromOuterSize({width, 0.0f});
+    }
+
     for (int i = 0; i < len(items); i++) {
         items[i].hasGridAreaSizeCache = false;
     }
@@ -9324,9 +10034,6 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
     float initialRowSum = 0.0f;
     for (int i = 0; i < len(rows); i++) {
         initialRowSum += rows[i].baseSize;
-    }
-    if (!IsSome(innerNodeSize.h)) {
-        innerNodeSize.h = Some(initialRowSum);
     }
 
     SizeFOpt resolvedStyleSize = Or(knownDimensions, preferredSize);
@@ -9351,32 +10058,12 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         VecReset(columns);
         VecReset(rows);
         VecReset(children);
-        VecReset(childPlacements);
         cellOccupancyMatrix.Free();
         nameResolver.Free();
         return LayoutOutput::FromOuterSize(containerBorderBox);
     }
 
-    if (!availableGridSpace.width.IsDefinite()) {
-        for (int i = 0; i < len(columns); i++) {
-            GridTrack& c = columns[i];
-            Optf mn = c.minTrackSizingFunction
-                          .ResolvedPercentageSize(containerContentBox.w, calc);
-            Optf mx = c.maxTrackSizingFunction
-                          .ResolvedPercentageSize(containerContentBox.w, calc);
-            c.baseSize = MaybeClamp(c.baseSize, mn, mx);
-        }
-    }
-    if (!availableGridSpace.height.IsDefinite()) {
-        for (int i = 0; i < len(rows); i++) {
-            GridTrack& r = rows[i];
-            Optf mn = r.minTrackSizingFunction
-                          .ResolvedPercentageSize(containerContentBox.h, calc);
-            Optf mx = r.maxTrackSizingFunction
-                          .ResolvedPercentageSize(containerContentBox.h, calc);
-            r.baseSize = MaybeClamp(r.baseSize, mn, mx);
-        }
-    }
+    innerNodeSize = {Some(containerContentBox.w), Some(containerContentBox.h)};
 
     bool hasPercentageColumn = false;
     for (int i = 0; i < len(columns); i++) {
@@ -9392,11 +10079,13 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
             break;
         }
     }
-    bool parentWidthIndefinite = !availableSpace.width.IsDefinite();
+
+    bool parentWidthIndefinite = !IsSome(outerNodeSize.w);
     bool rerunColumnSizing = parentWidthIndefinite && hasPercentageColumn;
     bool intrinsicColumnContributionChanged = false;
 
     if (!rerunColumnSizing) {
+
         for (int i = 0; i < len(items); i++) {
             GridItem* item = &items[i];
             if (!item->crossesIntrinsicColumn) {
@@ -9431,7 +10120,18 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         }
     }
 
+    bool parentHeightIndefinite = !IsSome(outerNodeSize.h);
+    bool rerunRowSizing = parentHeightIndefinite && hasPercentageRow;
     bool intrinsicRowContributionChanged = false;
+    if (rerunRowSizing) {
+        for (int i = 0; i < len(items); i++) {
+            items[i].hasGridAreaSizeCache = false;
+            items[i].minContentContributionCache.h = None();
+            items[i].maxContentContributionCache.h = None();
+            items[i].minimumContributionCache.h = None();
+        }
+    }
+
     if (rerunColumnSizing) {
         TrackSizingAlgorithm(
             tree, AbstractAxis::Inline, Get(innerMinSize, AbstractAxis::Inline),
@@ -9440,13 +10140,11 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
             len(columns), rows.els, len(rows), items.els, len(items),
             TrackSizeEstimate::BaseSize, hasBaselineAlignedItem);
 
-        bool parentHeightIndefinite = !availableSpace.height.IsDefinite();
-        bool rerunRowSizing = parentHeightIndefinite && hasPercentageRow;
-
         if (!rerunRowSizing) {
+
             for (int i = 0; i < len(items); i++) {
                 GridItem* item = &items[i];
-                if (!item->crossesIntrinsicColumn) {
+                if (!item->crossesIntrinsicRow) {
                     continue;
                 }
                 SizeFOpt gridAreaSize = ItemGridAreaSize(
@@ -9469,24 +10167,16 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                 }
             }
             rerunRowSizing = intrinsicRowContributionChanged;
-        } else {
-            for (int i = 0; i < len(items); i++) {
-                items[i].hasGridAreaSizeCache = false;
-                items[i].minContentContributionCache.h = None();
-                items[i].maxContentContributionCache.h = None();
-                items[i].minimumContributionCache.h = None();
-            }
         }
+    }
 
-        if (rerunRowSizing) {
-            TrackSizingAlgorithm(
-                tree, AbstractAxis::Block,
-                Get(innerMinSize, AbstractAxis::Block),
-                Get(innerMaxSize, AbstractAxis::Block), alignContent,
-                justifyContent, availableGridSpace, innerNodeSize, rows.els,
-                len(rows), columns.els, len(columns), items.els, len(items),
-                TrackSizeEstimate::BaseSize, false);
-        }
+    if (rerunRowSizing) {
+        TrackSizingAlgorithm(
+            tree, AbstractAxis::Block, Get(innerMinSize, AbstractAxis::Block),
+            Get(innerMaxSize, AbstractAxis::Block), alignContent,
+            justifyContent, availableGridSpace, innerNodeSize, rows.els,
+            len(rows), columns.els, len(columns), items.els, len(items),
+            TrackSizeEstimate::BaseSize, false);
     }
 
     if ((intrinsicColumnContributionChanged && !hasPercentageColumn) ||
@@ -9539,8 +10229,12 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
                 {padding.top, padding.bottom}, {border.top, border.bottom},
                 rows.els, len(rows), alignContent, false);
 
-    SizeF itemContentSizeContribution = SizeF::Zero();
-    SizeF absoluteContentSize = SizeF::Zero();
+    RectF itemOverflowRect = RectF::Zero();
+    Vec<OofCandidate> oofPool;
+    OofCandidates oofCandidates;
+    StoreGridOofSnapshot(tree, node, colSize.autoRepetitionCount,
+                         rowSize.autoRepetitionCount, finalColCounts,
+                         finalRowCounts, columns, rows);
 
     StableSort(items.els, len(items), [](const GridItem& a, const GridItem& b) {
         return a.sourceOrder < b.sourceOrder;
@@ -9548,25 +10242,71 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
 
     for (int index = 0; index < len(items); index++) {
         GridItem& item = items[index];
-        RectF gridArea = {columns[(int)item.columnIndexes.start + 1].offset,
-                          columns[(int)item.columnIndexes.end].offset,
+
+        float gridLeft = IsRtl(direction)
+                             ? columns[(int)item.columnIndexes.end - 1].offset
+                             : columns[(int)item.columnIndexes.start + 1]
+                                   .offset;
+        float gridRight = IsRtl(direction)
+                              ? columns[(int)item.columnIndexes.start].offset
+                              : columns[(int)item.columnIndexes.end].offset;
+        RectF gridArea = {gridLeft, gridRight,
                           rows[(int)item.rowIndexes.start + 1].offset,
                           rows[(int)item.rowIndexes.end].offset};
-        AlignedItem placed =
-            AlignAndPositionItem(tree, item.node, (uint32_t)index, gridArea,
-                                 justifyItems, alignItems, item.baselineShim,
-                                 direction, containerBorderBox.w, border);
+
+        SizeF containingBlock = {gridArea.right - gridArea.left,
+                                 gridArea.bottom - gridArea.top};
+        AlignedItem placed = AlignAndPositionItem(
+            tree, item.node, (uint32_t)index, gridArea, containingBlock,
+            justifyItems, alignItems, item.baselineShim, direction,
+            containerBorderBox.w, border, isScrollContainer, &oofPool);
         item.yPosition = placed.yPosition;
         item.height = placed.height;
-        itemContentSizeContribution =
-            Max(itemContentSizeContribution, placed.contentSizeContribution);
+        item.oofStart = placed.oofStart;
+        item.oofCount = placed.oofCount;
+        itemOverflowRect = itemOverflowRect.Union(placed.overflowContribution);
     }
 
+    int itemCursor = 0;
     uint32_t order = (uint32_t)len(items);
+    ContainingBlockClaims claims = ContainingBlockFor(style.position);
+    auto lineAsStartEdge = [](const Vec<GridTrack>& tracks, int index) {
+        return index + 1 < len(tracks) ? tracks[index + 1].offset
+                                       : tracks[index].offset;
+    };
+    auto lineAsEndEdge = [](const Vec<GridTrack>& tracks, int index) {
+        if (index == 0) {
+            return len(tracks) > 1 ? tracks[1].offset : tracks[0].offset;
+        }
+        return tracks[index].offset;
+    };
+    auto rtlLineAsStartEdge = [](const Vec<GridTrack>& tracks, int index) {
+        if (index + 1 < len(tracks)) {
+            return tracks[index].offset;
+        }
+        if (index == 0) {
+            return tracks[0].offset;
+        }
+        return tracks[index - 1].offset;
+    };
+    auto rtlLineAsEndEdge = [](const Vec<GridTrack>& tracks, int index) {
+        if (index == 0) {
+            return tracks[0].offset;
+        }
+        return tracks[index - 1].offset;
+    };
     for (int index = 0; index < childCount; index++) {
+        if (itemCursor < len(items) &&
+            items[itemCursor].sourceOrder == (uint16_t)index) {
+            OofCandRange range = {items[itemCursor].oofStart, items[itemCursor]
+                                                                  .oofCount};
+            OofAppendPoolRange(&oofCandidates, oofPool, range);
+            itemCursor += 1;
+            continue;
+        }
+
         NodeId child = tree->GetChildId(node, index);
         const Style& cs = tree->GetStyle(child);
-
         if (cs.BoxGenMode() == BoxGenerationMode::None) {
             tree->SetUnroundedLayout(child, Layout::WithOrder(order));
             tree->PerformChildLayout(
@@ -9575,97 +10315,112 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
             order += 1;
             continue;
         }
-        if (cs.position != Position::Absolute) {
+        if (!IsOutOfFlow(cs.position)) {
             continue;
         }
 
-        LineOptOzl colLines = nameResolver.ResolveColumnNames(cs.gridColumn)
-                                  .IntoOriginZero(finalColCounts.explicitCount)
-                                  .ResolveAbsolutelyPositionedGridTracks();
-        int colStartIdx = -1;
-        int colEndIdx = -1;
-        if (colLines.start.IsSome()) {
-            OriginZeroLine l = colLines.start.val;
+        RectF area;
+        if (claims.ForPosition(cs.position)) {
+            LineOptOzl colLines =
+                nameResolver.ResolveColumnNames(cs.gridColumn)
+                    .IntoOriginZero(finalColCounts.explicitCount)
+                    .ResolveAbsolutelyPositionedGridTracks();
+            int colStartIdx = -1;
+            int colEndIdx = -1;
+            if (colLines.start.IsSome()) {
+                TryIntoTrackVecIndex(colLines.start.val, finalColCounts,
+                                     &colStartIdx);
+            }
+            if (colLines.end.IsSome()) {
+                TryIntoTrackVecIndex(colLines.end.val, finalColCounts,
+                                     &colEndIdx);
+            }
+            LineOptOzl rowLines =
+                nameResolver.ResolveRowNames(cs.gridRow)
+                    .IntoOriginZero(finalRowCounts.explicitCount)
+                    .ResolveAbsolutelyPositionedGridTracks();
+            int rowStartIdx = -1;
+            int rowEndIdx = -1;
+            if (rowLines.start.IsSome()) {
+                TryIntoTrackVecIndex(rowLines.start.val, finalRowCounts,
+                                     &rowStartIdx);
+            }
+            if (rowLines.end.IsSome()) {
+                TryIntoTrackVecIndex(rowLines.end.val, finalRowCounts,
+                                     &rowEndIdx);
+            }
+            area.top = rowStartIdx >= 0 ? lineAsStartEdge(rows, rowStartIdx)
+                                        : border.top;
+            area.bottom =
+                rowEndIdx >= 0
+                    ? lineAsEndEdge(rows, rowEndIdx)
+                    : containerBorderBox.h - border.bottom - scrollbarGutter.y;
             if (IsRtl(direction)) {
-                l = OriginZeroLine{
-                    (int16_t)((int16_t)finalColCounts.explicitCount - l.v)};
+                area.left = colEndIdx >= 0
+                                ? rtlLineAsEndEdge(columns, colEndIdx)
+                                : border.left + scrollbarGutter.x;
+                area.right = colStartIdx >= 0
+                                 ? rtlLineAsStartEdge(columns, colStartIdx)
+                                 : containerBorderBox.w - border.right;
+            } else {
+                area.left = colStartIdx >= 0
+                                ? lineAsStartEdge(columns, colStartIdx)
+                                : border.left;
+                area.right = colEndIdx >= 0
+                                 ? lineAsEndEdge(columns, colEndIdx)
+                                 : containerBorderBox.w - border.right -
+                                       scrollbarGutter.x;
             }
-            TryIntoTrackVecIndex(l, finalColCounts, &colStartIdx);
-        }
-        if (colLines.end.IsSome()) {
-            OriginZeroLine l = colLines.end.val;
-            if (IsRtl(direction)) {
-                l = OriginZeroLine{
-                    (int16_t)((int16_t)finalColCounts.explicitCount - l.v)};
-            }
-            TryIntoTrackVecIndex(l, finalColCounts, &colEndIdx);
-        }
-        if (IsRtl(direction)) {
-            int tmp = colStartIdx;
-            colStartIdx = colEndIdx;
-            colEndIdx = tmp;
+        } else {
+
+            area.left = border.left + padding.left +
+                        (IsRtl(direction) ? scrollbarGutter.x : 0.0f);
+            area.right = containerBorderBox.w - border.right - padding.right -
+                         (IsRtl(direction) ? 0.0f : scrollbarGutter.x);
+            area.top = border.top + padding.top;
+            area.bottom = containerBorderBox.h - border.bottom -
+                          padding.bottom - scrollbarGutter.y;
         }
 
-        LineOptOzl rowLines = nameResolver.ResolveRowNames(cs.gridRow)
-                                  .IntoOriginZero(finalRowCounts.explicitCount)
-                                  .ResolveAbsolutelyPositionedGridTracks();
-        int rowStartIdx = -1;
-        int rowEndIdx = -1;
-        if (rowLines.start.IsSome()) {
-            TryIntoTrackVecIndex(rowLines.start.val, finalRowCounts,
-                                 &rowStartIdx);
-        }
-        if (rowLines.end.IsSome()) {
-            TryIntoTrackVecIndex(rowLines.end.val, finalRowCounts, &rowEndIdx);
-        }
+        AlignItems justifySelf =
+            ResolveSelfRelative(cs.justifySelf.UnwrapOr(justifyItems),
+                                cs.direction, direction, true);
+        AlignItems alignSelf = ResolveSelfRelative(
+            cs.alignSelf.UnwrapOr(alignItems), cs.direction, direction, false);
 
-        auto lineAsStartEdge = [](const Vec<GridTrack>& tracks, int index) {
-            return index + 1 < len(tracks) ? tracks[index + 1].offset
-                                           : tracks[index].offset;
-        };
-        auto lineAsEndEdge = [](const Vec<GridTrack>& tracks, int index) {
-            if (index == 0) {
-                return len(tracks) > 1 ? tracks[1].offset : tracks[0].offset;
-            }
-            return tracks[index].offset;
-        };
-
-        RectF gridArea;
-        gridArea.top =
-            rowStartIdx >= 0 ? lineAsStartEdge(rows, rowStartIdx) : border.top;
-        gridArea.bottom =
-            rowEndIdx >= 0
-                ? lineAsEndEdge(rows, rowEndIdx)
-                : containerBorderBox.h - border.bottom - scrollbarGutter.y;
-        gridArea
-            .left = colStartIdx >= 0
-                        ? lineAsStartEdge(columns, colStartIdx)
-                        : (IsRtl(direction) ? border.left + scrollbarGutter.x
-                                            : border.left);
-        gridArea.right =
-            colEndIdx >= 0
-                ? lineAsEndEdge(columns, colEndIdx)
-                : (IsRtl(direction) ? containerBorderBox.w - border.right
-                                    : containerBorderBox.w - border.right -
-                                          scrollbarGutter.x);
-
-        AlignedItem placed = AlignAndPositionItem(
-            tree, child, order, gridArea, justifyItems, alignItems, 0.0f,
-            direction, containerBorderBox.w, border);
-        absoluteContentSize =
-            Max(absoluteContentSize, placed.contentSizeContribution);
+        OofCandidate candidate;
+        candidate.node = child;
+        candidate.order = order;
+        candidate.position = cs.position;
+        candidate.staticX = AxisStaticPosition::FromAlignment(
+            justifySelf, area.left, area.right, IsRtl(direction));
+        candidate.staticY = AxisStaticPosition::FromAlignment(
+            alignSelf, area.top, area.bottom, false);
+        oofCandidates.Push(candidate);
         order += 1;
     }
 
-    itemContentSizeContribution
-        .w += IsRtl(direction) ? padding.left : padding.right;
-    itemContentSizeContribution.h += padding.bottom;
-    SizeF finalContentSize =
-        Max(itemContentSizeContribution, absoluteContentSize);
+    RectF absolutePositionInset = border;
+    if (IsRtl(direction)) {
+        absolutePositionInset.left += scrollbarGutter.x;
+    } else {
+        absolutePositionInset.right += scrollbarGutter.x;
+    }
+    absolutePositionInset.bottom += scrollbarGutter.y;
+
+    auto withEndPadding = [&](RectF overflowRect) {
+        if (isScrollContainer) {
+            overflowRect
+                .right += IsRtl(direction) ? padding.left : padding.right;
+            overflowRect.bottom += padding.bottom;
+        }
+        return overflowRect;
+    };
 
     LayoutOutput out;
     if (len(items) == 0) {
-        out = LayoutOutput::FromOuterSize(containerBorderBox);
+        out = LayoutOutput::FromSizes(containerBorderBox,
+                                      withEndPadding(itemOverflowRect));
     } else {
 
         StableSort(items.els, len(items),
@@ -9679,26 +10434,142 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
         }
         const GridItem* chosen = &items[0];
         for (int i = 0; i < rowEnd; i++) {
-            if (items[i].alignSelf.keyword == AlignItemsKeyword::Baseline) {
+            if (items[i].ParticipatesInBaselineAlignment()) {
                 chosen = &items[i];
                 break;
             }
         }
-        float gridContainerBaseline =
-            chosen->yPosition + UnwrapOr(chosen->baseline, chosen->height);
+
+        Optf gridContainerBaseline = None();
+        if (!contain.SuppressesBaseline()) {
+            gridContainerBaseline = Some(
+                chosen->yPosition + UnwrapOr(chosen->baseline, chosen->height));
+        }
         out = LayoutOutput::FromSizesAndBaselines(
-            containerBorderBox, finalContentSize,
-            PointFOpt{None(), Some(gridContainerBaseline)});
+            containerBorderBox, withEndPadding(itemOverflowRect),
+            BaselinesFromFirst(gridContainerBaseline));
     }
+
+    out.oofCandidates = oofCandidates;
+    out.hasOofPositioningArea = true;
+    out.oofPositioningArea.size = containerBorderBox - absolutePositionInset
+                                                           .SumAxes();
+    out.oofPositioningArea
+        .offset = {absolutePositionInset.left, absolutePositionInset.top};
 
     VecReset(items);
     VecReset(columns);
     VecReset(rows);
     VecReset(children);
-    VecReset(childPlacements);
+    VecReset(oofPool);
     cellOccupancyMatrix.Free();
     nameResolver.Free();
     return out;
+}
+
+bool GridOofArea(TaffyTree* tree, NodeId grid, NodeId child, RectF paddingBox,
+                 RectF* out) {
+    NodeData* d = tree->Get(grid);
+    if (!d || !d->gridOof.live) {
+        return false;
+    }
+    const Style& gridStyle = tree->GetStyle(grid);
+    const Style& childStyle = tree->GetStyle(child);
+    const GridOofSnapshot& snap = d->gridOof;
+    NamedLineResolver resolver;
+    resolver.Init(gridStyle, snap.columns.autoRepetitions,
+                  snap.rows.autoRepetitions);
+    resolver.explicitColumnCount = snap.columns.explicitCount;
+    resolver.explicitRowCount = snap.rows.explicitCount;
+
+    auto spanIndex = [](OptOriginZeroLine line, TrackCounts counts) {
+        if (!line.IsSome()) {
+            return -1;
+        }
+        int16_t minLine = -(int16_t)counts.negativeImplicit;
+        int16_t maxLine =
+            (int16_t)(counts.explicitCount + counts.positiveImplicit);
+        if (line.val.v < minLine || line.val.v > maxLine) {
+            return -1;
+        }
+        int trackVec = 0;
+        if (!TryIntoTrackVecIndex(line.val, counts, &trackVec)) {
+            return -1;
+        }
+        return trackVec / 2;
+    };
+    auto resolveAxis = [&](LinePlacement placement,
+                           const GridAxisPositions& axis, float padStart,
+                           float padEnd, bool rows, bool reversed) {
+        TrackCounts counts;
+        counts.negativeImplicit = axis.negativeImplicit;
+        counts.explicitCount = axis.explicitCount;
+        counts.positiveImplicit = axis.positiveImplicit;
+        LinePlain plain = rows ? resolver.ResolveRowNames(placement)
+                               : resolver.ResolveColumnNames(placement);
+        LineOptOzl lines = plain.IntoOriginZero(axis.explicitCount)
+                               .ResolveAbsolutelyPositionedGridTracks();
+        int startIdx = spanIndex(lines.start, counts);
+        int endIdx = spanIndex(lines.end, counts);
+
+        auto trackEdge = [&](int index, bool isStart) {
+            int nRuns = len(axis.collapsed);
+            int rangeIndex = 0;
+            while (rangeIndex < nRuns && axis.collapsed[rangeIndex]
+                                                 .end <= index) {
+                rangeIndex++;
+            }
+            int use = index;
+            if (rangeIndex < nRuns &&
+                index >= axis.collapsed[rangeIndex].start &&
+                index < axis.collapsed[rangeIndex].end) {
+                const CollapsedRun& range = axis.collapsed[rangeIndex];
+                int adjacent = isStart ? range.end : range.start - 1;
+                if (adjacent >= 0 && adjacent < len(axis.spans)) {
+                    use = adjacent;
+                }
+            }
+            const GridTrackSpan& track = axis.spans[use];
+            return (isStart != reversed) ? track.start : track.end;
+        };
+        float startPos;
+        float endPos;
+        if (startIdx >= 0 && startIdx < len(axis.spans)) {
+            startPos = trackEdge(startIdx, true);
+        } else if (startIdx >= 0 && len(axis.spans) > 0) {
+            const GridTrackSpan& last = axis.spans[len(axis.spans) - 1];
+            startPos = reversed ? last.start : last.end;
+        } else {
+            startPos = reversed ? padEnd : padStart;
+        }
+        if (endIdx > 0 && endIdx - 1 < len(axis.spans)) {
+            endPos = trackEdge(endIdx - 1, false);
+        } else if (endIdx >= 0 && len(axis.spans) > 0) {
+            endPos = reversed ? axis.spans[0].end : axis.spans[0].start;
+        } else {
+            endPos = reversed ? padStart : padEnd;
+        }
+
+        float left;
+        float right;
+        if (reversed) {
+            left = F32Min(startPos, endPos);
+            right = startPos;
+        } else {
+            left = startPos;
+            right = F32Max(startPos, endPos);
+        }
+        return RectF{left, right, 0.0f, 0.0f};
+    };
+
+    RectF cols =
+        resolveAxis(childStyle.gridColumn, snap.columns, paddingBox.left,
+                    paddingBox.right, false, IsRtl(gridStyle.direction));
+    RectF row = resolveAxis(childStyle.gridRow, snap.rows, paddingBox.top,
+                            paddingBox.bottom, true, false);
+    resolver.Free();
+    *out = {cols.left, cols.right, row.left, row.right};
+    return true;
 }
 
 void GridExplicitSizeForTest(const Style& style, Optf autoFitContainerSize,
@@ -9717,25 +10588,30 @@ void GridExplicitSizeForTest(const Style& style, Optf autoFitContainerSize,
 void GridChildMinMaxSpanForTest(LinePlacement line, uint16_t explicitTrackCount,
                                 int16_t* outMinLine, int16_t* outMaxLine,
                                 uint16_t* outSpan) {
-    MinMaxSpan r = ChildMinLineMaxLineSpan(line, explicitTrackCount);
+    MinMaxSpan r = ChildMinLineMaxLineSpan(
+        line.IntoOriginZeroIgnoringNamed(explicitTrackCount));
     *outMinLine = r.minLine.v;
     *outMaxLine = r.maxLine.v;
     *outSpan = r.span;
 }
 
 void GridSizeEstimateForTest(uint16_t explicitColCount,
-                             uint16_t explicitRowCount, Direction direction,
+                             uint16_t explicitRowCount,
                              const LinePlacement* columns,
                              const LinePlacement* rows, int n,
                              uint16_t* outColCounts, uint16_t* outRowCounts) {
-    Vec<ChildPlacementStyles> children;
+    Vec<PlacementChild> children;
     for (int i = 0; i < n; i++) {
-        VecAppend(children, {columns[i], rows[i]});
+        PlacementChild pc;
+        pc.horizontal = columns[i]
+                            .IntoOriginZeroIgnoringNamed(explicitColCount);
+        pc.vertical = rows[i].IntoOriginZeroIgnoringNamed(explicitRowCount);
+        VecAppend(children, pc);
     }
     TrackCounts cols;
     TrackCounts rws;
-    ComputeGridSizeEstimate(explicitColCount, explicitRowCount, direction,
-                            children.els, len(children), &cols, &rws);
+    ComputeGridSizeEstimate(explicitColCount, explicitRowCount, children.els,
+                            len(children), &cols, &rws);
     VecReset(children);
     outColCounts[0] = cols.negativeImplicit;
     outColCounts[1] = cols.explicitCount;
@@ -9775,13 +10651,12 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
     nameResolver.explicitRowCount = explicitRowCount;
 
     Vec<PlacementChild> children;
-    Vec<ChildPlacementStyles> childPlacements;
     int childCount = tree->ChildCount(parent);
     for (int i = 0; i < childCount; i++) {
         NodeId child = tree->GetChildId(parent, i);
         const Style& cs = tree->GetStyle(child);
         if (cs.BoxGenMode() == BoxGenerationMode::None ||
-            cs.position == Position::Absolute) {
+            IsOutOfFlow(cs.position)) {
             continue;
         }
         PlacementChild pc;
@@ -9792,19 +10667,17 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
         pc.vertical = nameResolver.ResolveRowNames(cs.gridRow)
                           .IntoOriginZero(explicitRowCount);
         VecAppend(children, pc);
-        VecAppend(childPlacements, {cs.gridColumn, cs.gridRow});
     }
 
     TrackCounts estCols;
     TrackCounts estRows;
-    ComputeGridSizeEstimate(explicitColCount, explicitRowCount, Direction::Ltr,
-                            childPlacements.els, len(childPlacements), &estCols,
-                            &estRows);
+    ComputeGridSizeEstimate(explicitColCount, explicitRowCount, children.els,
+                            len(children), &estCols, &estRows);
 
     Vec<GridItem> items;
     CellOccupancyMatrix matrix;
     matrix.Init(estCols, estRows);
-    PlaceGridItems(&matrix, &items, tree, children, Direction::Ltr, flow,
+    PlaceGridItems(&matrix, &items, tree, children, flow,
                    AlignItems{AlignItemsKeyword::Start},
                    AlignItems{AlignItemsKeyword::Start});
 
@@ -9826,10 +10699,576 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
 
     VecReset(items);
     VecReset(children);
-    VecReset(childPlacements);
     matrix.Free();
     nameResolver.Free();
     return n;
+}
+
+}
+
+#line 1 "src/taffy/compute_oof.cpp"
+
+namespace taffy {
+
+static float AlignInLine(float start, float end, float size,
+                         AxisStaticEdge edge) {
+    if (edge == AxisStaticEdge::End) {
+        return end - size;
+    }
+    if (edge == AxisStaticEdge::Center) {
+        return (start + end - size) / 2.0f;
+    }
+    return start;
+}
+
+float ResolveStaticOffsetAxis(AxisStaticPosition position, float size,
+                              float marginStart, float marginEnd) {
+    float marginBox = size + marginStart + marginEnd;
+    bool overflows = position.align.safety == AlignmentSafety::Safe &&
+                     marginBox > position.end - position.start;
+    AxisStaticEdge keyword =
+        overflows ? position.align.fallback : position.align.keyword;
+    return AlignInLine(position.start, position.end, marginBox, keyword) +
+           marginStart;
+}
+
+enum class OofAlignment : uint8_t {
+    Normal,
+    Stretch,
+    Start,
+    Center,
+    End
+};
+
+static OofAlignment OofAlignmentFromResolved(AlignItems alignment) {
+    switch (alignment.keyword) {
+        case AlignItemsKeyword::Normal:
+            return OofAlignment::Normal;
+        case AlignItemsKeyword::Stretch:
+            return OofAlignment::Stretch;
+        case AlignItemsKeyword::Center:
+            return OofAlignment::Center;
+        case AlignItemsKeyword::End:
+        case AlignItemsKeyword::FlexEnd:
+        case AlignItemsKeyword::SelfEnd:
+            return OofAlignment::End;
+        case AlignItemsKeyword::Start:
+        case AlignItemsKeyword::FlexStart:
+        case AlignItemsKeyword::SelfStart:
+        case AlignItemsKeyword::Baseline:
+        default:
+            return OofAlignment::Start;
+    }
+}
+
+static AxisStaticEdge OofPhysicalEdge(OofAlignment alignment, bool reversed) {
+    if (alignment == OofAlignment::Center) {
+        return AxisStaticEdge::Center;
+    }
+    bool isEnd = alignment == OofAlignment::End;
+    return (isEnd != reversed) ? AxisStaticEdge::End : AxisStaticEdge::Start;
+}
+
+struct OofAxis {
+    float cbSize = 0.0f;
+    Optf insetStart = None();
+    Optf insetEnd = None();
+    Optf marginStart = None();
+    Optf marginEnd = None();
+    AxisStaticPosition staticPosition;
+    OofAlignment alignment = OofAlignment::Normal;
+    AlignmentSafety safety = AlignmentSafety::Default;
+    bool isInline = false;
+    bool reversed = false;
+    bool isScrollAxis = false;
+
+    AxisStaticEdge StartEdge() const {
+        return reversed ? AxisStaticEdge::End : AxisStaticEdge::Start;
+    }
+    AxisStaticEdge EndEdge() const {
+        return reversed ? AxisStaticEdge::Start : AxisStaticEdge::End;
+    }
+
+    void InsetModifiedContainingBlock(float* start, float* end) const {
+        AxisStaticEdge weaker;
+        if (IsSome(insetStart) && IsSome(insetEnd)) {
+            *start = insetStart;
+            *end = cbSize - insetEnd;
+            weaker = EndEdge();
+        } else if (IsSome(insetStart)) {
+            *start = insetStart;
+            *end = cbSize;
+            weaker = AxisStaticEdge::End;
+        } else if (IsSome(insetEnd)) {
+            *start = 0.0f;
+            *end = cbSize - insetEnd;
+            weaker = AxisStaticEdge::Start;
+        } else {
+            AxisStaticEdge keyword = staticPosition.align.keyword;
+            if (keyword == AxisStaticEdge::End) {
+                *start = 0.0f;
+                *end = staticPosition.end;
+            } else if (keyword == AxisStaticEdge::Center) {
+                float center =
+                    (staticPosition.start + staticPosition.end) / 2.0f;
+                float startDistance = center;
+                float endDistance = cbSize - center;
+                float startAbs =
+                    startDistance < 0.0f ? -startDistance : startDistance;
+                float endAbs = endDistance < 0.0f ? -endDistance : endDistance;
+                if (startAbs <= endAbs) {
+                    *start = 0.0f;
+                    *end = 2.0f * startDistance;
+                } else {
+                    *start = cbSize - 2.0f * endDistance;
+                    *end = cbSize;
+                }
+            } else {
+                *start = staticPosition.start;
+                *end = cbSize;
+            }
+            weaker = EndEdge();
+        }
+        if (*end < *start) {
+            if (weaker == AxisStaticEdge::Start) {
+                *start = *end;
+            } else {
+                *end = *start;
+            }
+        }
+    }
+
+    float InsetModifiedContainingBlockSize() const {
+        float start = 0.0f;
+        float end = 0.0f;
+        InsetModifiedContainingBlock(&start, &end);
+        return end - start;
+    }
+
+    float StretchFitSize() const {
+        float margins = UnwrapOr(marginStart, 0.0f) + UnwrapOr(marginEnd, 0.0f);
+        return F32Max(InsetModifiedContainingBlockSize() - margins, 0.0f);
+    }
+
+    bool IsStretchSized(bool isReplaced, bool isTable) const {
+        if (!(IsSome(insetStart) && IsSome(insetEnd))) {
+            return false;
+        }
+        if (alignment == OofAlignment::Stretch) {
+            return true;
+        }
+        if (alignment == OofAlignment::Normal) {
+            return !isReplaced && !isTable;
+        }
+        return false;
+    }
+
+    void ResolveMargins(float size, float* start, float* end) const {
+        bool bothInsets = IsSome(insetStart) && IsSome(insetEnd);
+        float imcbStart = 0.0f;
+        float imcbEnd = 0.0f;
+        InsetModifiedContainingBlock(&imcbStart, &imcbEnd);
+        float freeSpace = imcbEnd - imcbStart - size;
+        if (IsSome(marginStart) && IsSome(marginEnd)) {
+            *start = marginStart;
+            *end = marginEnd;
+            return;
+        }
+        if (!bothInsets) {
+            *start = UnwrapOr(marginStart, 0.0f);
+            *end = UnwrapOr(marginEnd, 0.0f);
+            return;
+        }
+        if (IsSome(marginStart)) {
+            *start = marginStart;
+            *end = freeSpace - marginStart;
+            return;
+        }
+        if (IsSome(marginEnd)) {
+            *end = marginEnd;
+            *start = freeSpace - marginEnd;
+            return;
+        }
+
+        if (freeSpace < 0.0f && isInline) {
+            if (reversed) {
+                *start = freeSpace;
+                *end = 0.0f;
+            } else {
+                *start = 0.0f;
+                *end = freeSpace;
+            }
+            return;
+        }
+        *start = freeSpace / 2.0f;
+        *end = freeSpace / 2.0f;
+    }
+
+    float Position(float size, float marginStartResolved,
+                   float marginEndResolved) const {
+        float imcbStart = 0.0f;
+        float imcbEnd = 0.0f;
+        InsetModifiedContainingBlock(&imcbStart, &imcbEnd);
+        if (!IsSome(insetStart) && !IsSome(insetEnd)) {
+
+            float marginBox = size + marginStartResolved + marginEndResolved;
+            float imcbSize = imcbEnd - imcbStart;
+            bool safeOverflow = staticPosition.align
+                                        .safety == AlignmentSafety::Safe &&
+                                marginBox > imcbSize;
+            float offset;
+            if (safeOverflow) {
+                offset =
+                    AlignInLine(imcbStart, imcbEnd, marginBox, StartEdge());
+            } else {
+                offset = AlignInLine(staticPosition.start, staticPosition.end,
+                                     marginBox, staticPosition.align.keyword);
+            }
+            return offset + marginStartResolved;
+        }
+        if (IsSome(insetStart) && !IsSome(insetEnd)) {
+            return imcbStart + marginStartResolved;
+        }
+        if (!IsSome(insetStart) && IsSome(insetEnd)) {
+            return imcbEnd - size - marginEndResolved;
+        }
+        if (!IsSome(marginStart) || !IsSome(marginEnd)) {
+            return imcbStart + marginStartResolved;
+        }
+        float marginBox = size + marginStartResolved + marginEndResolved;
+        float imcbSize = imcbEnd - imcbStart;
+        AxisStaticEdge edge = OofPhysicalEdge(alignment, reversed);
+        float marginBoxStart;
+        if (safety == AlignmentSafety::Unsafe) {
+            marginBoxStart = AlignInLine(imcbStart, imcbEnd, marginBox, edge);
+        } else if (safety == AlignmentSafety::Safe) {
+            AxisStaticEdge used = marginBox > imcbSize ? StartEdge() : edge;
+            marginBoxStart = AlignInLine(imcbStart, imcbEnd, marginBox, used);
+        } else if (marginBox <= imcbSize || alignment == OofAlignment::Normal) {
+            marginBoxStart = AlignInLine(imcbStart, imcbEnd, marginBox, edge);
+        } else {
+
+            float limitStart = F32Min(imcbStart, 0.0f);
+            float limitEnd = F32Max(imcbEnd, cbSize);
+            if (isScrollAxis) {
+                if (reversed) {
+                    limitStart = -INFINITY;
+                } else {
+                    limitEnd = INFINITY;
+                }
+            }
+            if (marginBox <= limitEnd - limitStart) {
+                float aligned =
+                    AlignInLine(imcbStart, imcbEnd, marginBox, edge);
+                marginBoxStart =
+                    F32Max(F32Min(aligned, limitEnd - marginBox), limitStart);
+            } else {
+                marginBoxStart =
+                    AlignInLine(limitStart, limitEnd, marginBox, StartEdge());
+            }
+        }
+        return marginBoxStart + marginStartResolved;
+    }
+};
+
+OofBoxLayout LayoutOofBox(TaffyTree* tree, const OofCandidate& candidate,
+                          SizeF areaSize, PointF areaOffset,
+                          Direction direction, bool resolveGridArea,
+                          NodeId gridOwner, PointOverflow containerOverflow,
+                          bool* cacheHit) {
+    OofBoxLayout result;
+    SizeF usedArea = areaSize;
+    PointF usedOffset = areaOffset;
+    if (resolveGridArea) {
+        RectF paddingBox = {areaOffset.x, areaOffset.x + areaSize.w,
+                            areaOffset.y, areaOffset.y + areaSize.h};
+        RectF gridArea;
+        if (GridOofArea(tree, gridOwner, candidate.node, paddingBox,
+                        &gridArea)) {
+            usedArea = {gridArea.right - gridArea.left,
+                        gridArea.bottom - gridArea.top};
+            usedOffset = {gridArea.left, gridArea.top};
+        }
+    }
+    float areaWidth = usedArea.w;
+    float areaHeight = usedArea.h;
+
+    CalcResolver calc = tree->calc;
+    const Style& cs = tree->GetStyle(candidate.node);
+    Optf aspectRatio = cs.aspectRatio;
+    RectFOpt margin = cs.margin.MaybeResolve(Some(areaWidth), calc);
+    RectF padding = cs.padding.ResolveOrZero(Some(areaWidth), calc);
+    RectF border = cs.border.ResolveOrZero(Some(areaWidth), calc);
+    SizeF paddingBorderSum = (padding + border).SumAxes();
+    SizeF boxSizingAdjustment = cs.boxSizing == BoxSizing::ContentBox
+                                    ? paddingBorderSum
+                                    : SizeF::Zero();
+    RectFOpt inset = cs.inset.MaybeResolveZip(AsOptional(usedArea), calc);
+    Optf left = inset.left;
+    Optf right = inset.right;
+    Optf top = inset.top;
+    Optf bottom = inset.bottom;
+    SizeDim sizeStyle = cs.size;
+    PointOverflow overflow = cs.overflow;
+    Contain contain = cs.contain;
+    float scrollbarWidth = cs.scrollbarWidth;
+
+    SizeFOpt styleSize = MaybeAdd(
+        MaybeApplyAspectRatio(
+            sizeStyle.MaybeResolve(AsOptional(usedArea), calc), aspectRatio),
+        boxSizingAdjustment);
+    SizeFOpt minSize = MaybeMax(
+        Or(MaybeAdd(MaybeApplyAspectRatio(
+                        cs.minSize.MaybeResolve(AsOptional(usedArea), calc),
+                        aspectRatio),
+                    boxSizingAdjustment),
+           AsOptional(paddingBorderSum)),
+        paddingBorderSum);
+    SizeFOpt maxSize = MaybeAdd(
+        MaybeApplyAspectRatio(
+            cs.maxSize.MaybeResolve(AsOptional(usedArea), calc), aspectRatio),
+        boxSizingAdjustment);
+    SizeFOpt knownDimensions = MaybeClamp(styleSize, minSize, maxSize);
+
+    bool isReplaced = cs.IsReplaced();
+    bool isTable = cs.itemIsTable;
+    Direction itemDirection = cs.direction;
+
+    AlignItems justifySelf = ResolveSelfRelative(
+        cs.justifySelf.UnwrapOr(AlignItems{AlignItemsKeyword::Normal}),
+        itemDirection, direction, true);
+    AlignItems alignSelf = ResolveSelfRelative(
+        cs.alignSelf.UnwrapOr(AlignItems{AlignItemsKeyword::Normal}),
+        itemDirection, direction, false);
+
+    AxisStaticPosition staticX = candidate.staticX;
+    staticX.start -= usedOffset.x;
+    staticX.end -= usedOffset.x;
+    AxisStaticPosition staticY = candidate.staticY;
+    staticY.start -= usedOffset.y;
+    staticY.end -= usedOffset.y;
+
+    OofAxis horizontal;
+    horizontal.cbSize = areaWidth;
+    horizontal.insetStart = left;
+    horizontal.insetEnd = right;
+    horizontal.marginStart = margin.left;
+    horizontal.marginEnd = margin.right;
+    horizontal.staticPosition = staticX;
+    horizontal.alignment = OofAlignmentFromResolved(justifySelf);
+    horizontal.safety = justifySelf.safety;
+    horizontal.isInline = true;
+    horizontal.reversed = IsRtl(direction);
+    horizontal.isScrollAxis = IsScrollContainer(containerOverflow.x);
+
+    OofAxis vertical;
+    vertical.cbSize = areaHeight;
+    vertical.insetStart = top;
+    vertical.insetEnd = bottom;
+    vertical.marginStart = margin.top;
+    vertical.marginEnd = margin.bottom;
+    vertical.staticPosition = staticY;
+    vertical.alignment = OofAlignmentFromResolved(alignSelf);
+    vertical.safety = alignSelf.safety;
+    vertical.isInline = false;
+    vertical.reversed = false;
+    vertical.isScrollAxis = IsScrollContainer(containerOverflow.y);
+
+    float stretchWidth = horizontal.StretchFitSize();
+    float stretchHeight = vertical.StretchFitSize();
+
+    float availWidth = stretchWidth;
+    float availHeight = stretchHeight;
+    if (isTable) {
+        float nonAutoW =
+            UnwrapOr(margin.left, 0.0f) + UnwrapOr(margin.right, 0.0f);
+        float nonAutoH =
+            UnwrapOr(margin.top, 0.0f) + UnwrapOr(margin.bottom, 0.0f);
+        availWidth = F32Min(availWidth, F32Max(areaWidth - nonAutoW, 0.0f));
+        availHeight = F32Min(availHeight, F32Max(areaHeight - nonAutoH, 0.0f));
+    }
+    SizeFOpt availClamped =
+        MaybeClamp(SizeFOpt{availWidth, availHeight}, minSize, maxSize);
+    SizeAvail childAvail =
+        SizeAvail::Definite({availClamped.w, availClamped.h});
+
+    if (sizeStyle.width.IsSizingKeyword() || sizeStyle.height
+                                                 .IsSizingKeyword()) {
+        ResolveAbsoluteSizingKeywords(tree, candidate.node, &knownDimensions,
+                                      sizeStyle, usedArea, inset, margin,
+                                      SizingMode::ContentSize);
+        knownDimensions =
+            MaybeClamp(MaybeApplyAspectRatio(knownDimensions, aspectRatio),
+                       minSize, maxSize);
+    }
+
+    bool stretchW = !IsSome(knownDimensions.w) &&
+                    horizontal.IsStretchSized(isReplaced, isTable);
+    bool stretchH = !IsSome(knownDimensions.h) &&
+                    vertical.IsStretchSized(isReplaced, isTable);
+    bool bothExplicitStretch = horizontal.alignment == OofAlignment::Stretch &&
+                               vertical.alignment == OofAlignment::Stretch;
+    Optf stretchAspect =
+        (stretchW && stretchH && bothExplicitStretch) ? None() : aspectRatio;
+    if (stretchW) {
+        if (isTable) {
+            minSize.w = Some(F32Max(UnwrapOr(minSize.w, 0.0f), stretchWidth));
+        } else {
+            knownDimensions.w = Some(stretchWidth);
+            knownDimensions = MaybeClamp(
+                MaybeApplyAspectRatio(knownDimensions, stretchAspect), minSize,
+                maxSize);
+        }
+    }
+    if (!IsSome(knownDimensions.h) && stretchH) {
+        if (isTable) {
+            minSize.h = Some(F32Max(UnwrapOr(minSize.h, 0.0f), stretchHeight));
+        } else {
+            knownDimensions.h = Some(stretchHeight);
+            knownDimensions = MaybeClamp(
+                MaybeApplyAspectRatio(knownDimensions, stretchAspect), minSize,
+                maxSize);
+        }
+    }
+
+    SizeF finalSize;
+    if (IsSome(knownDimensions.w) && IsSome(knownDimensions.h)) {
+        finalSize = {knownDimensions.w, knownDimensions.h};
+    } else {
+        SizeF measured = tree->MeasureChildSizeBoth(
+            candidate.node, knownDimensions, AsOptional(usedArea), childAvail,
+            SizingMode::ContentSize, LineBool::False());
+        finalSize = UnwrapOr(knownDimensions, measured);
+    }
+    finalSize = MaybeClamp(finalSize, minSize, maxSize);
+
+    LayoutInput layoutInput;
+    layoutInput.knownDimensions = AsOptional(finalSize);
+    layoutInput.parentSize = AsOptional(usedArea);
+    layoutInput.availableSpace = childAvail;
+    layoutInput.sizingMode = SizingMode::ContentSize;
+    layoutInput.axis = RequestedAxis::Both;
+    layoutInput.runMode = RunMode::PerformLayout;
+    layoutInput.verticalMarginsAreCollapsible = LineBool::False();
+    if (cacheHit) {
+        LayoutOutput probe;
+        *cacheHit = tree->CacheGet(candidate.node, layoutInput, &probe);
+    }
+    LayoutOutput layoutOutput =
+        tree->ComputeChildLayout(candidate.node, layoutInput);
+
+    float marginLeft = 0.0f;
+    float marginRight = 0.0f;
+    float marginTop = 0.0f;
+    float marginBottom = 0.0f;
+    horizontal.ResolveMargins(finalSize.w, &marginLeft, &marginRight);
+    vertical.ResolveMargins(finalSize.h, &marginTop, &marginBottom);
+    RectF resolvedMargin = {marginLeft, marginRight, marginTop, marginBottom};
+    PointF location = {
+        horizontal.Position(finalSize.w, marginLeft, marginRight) + usedOffset
+                                                                        .x,
+        vertical.Position(finalSize.h, marginTop, marginBottom) + usedOffset.y};
+
+    SizeF scrollbarSize = {
+        overflow.y == Overflow::Scroll ? scrollbarWidth : 0.0f,
+        overflow.x == Overflow::Scroll ? scrollbarWidth : 0.0f};
+
+    Layout layout;
+    layout.order = candidate.order;
+    layout.size = finalSize;
+    layout.scrollableOverflowRect = layoutOutput.scrollableOverflowRect;
+    layout.scrollbarSize = scrollbarSize;
+    layout.location = location;
+    layout.padding = padding;
+    layout.border = border;
+    layout.margin = resolvedMargin;
+    tree->SetUnroundedLayout(candidate.node, layout);
+
+    if (!layoutOutput.oofCandidates.IsEmpty()) {
+        result.surfaced = layoutOutput.oofCandidates;
+    }
+
+    float relX = location.x - usedOffset.x;
+    PointF relativeLocation = {
+        IsRtl(direction) ? usedArea.w - relX - finalSize.w : relX,
+        location.y - usedOffset.y};
+    result.layout = layout;
+    bool isScrollContainer = IsScrollContainer(containerOverflow.x) ||
+                             IsScrollContainer(containerOverflow.y);
+    result.overflowContribution = ComputeScrollableOverflowContribution(
+        relativeLocation, finalSize, layoutOutput.scrollableOverflowRect,
+        overflow, contain, isScrollContainer);
+    return result;
+}
+
+void PerformOofLayout(TaffyTree* tree, NodeId nodeId, OofCandidates candidates,
+                      SizeF areaSize, PointF areaOffset, Direction direction,
+                      ContainingBlockClaims claims,
+                      PointOverflow containerOverflow, Vec<NodeId>* hoisted,
+                      OofCandidates* unclaimed, RectF* overflowOut) {
+    RectF absoluteOverflowRect = RectF::Zero();
+    if (candidates.IsEmpty()) {
+        *overflowOut = absoluteOverflowRect;
+        return;
+    }
+
+    Vec<OofCandidate> work;
+    for (int i = 0; i < len(candidates.inner); i++) {
+        const OofCandidate& candidate = candidates.inner[i];
+        if (claims.ForPosition(candidate.position)) {
+            VecAppend(work, candidate);
+        } else {
+            unclaimed->Push(candidate);
+        }
+    }
+
+    int index = 0;
+    while (index < len(work)) {
+        OofCandidate candidate = work[index];
+        index += 1;
+        VecAppend(*hoisted, candidate.node);
+        OofBoxLayout box =
+            LayoutOofBox(tree, candidate, areaSize, areaOffset, direction, true,
+                         nodeId, containerOverflow, nullptr);
+        if (!box.surfaced.IsEmpty()) {
+            box.surfaced.Translate(box.layout.location);
+        }
+        for (int s = 0; s < len(box.surfaced.inner); s++) {
+            const OofCandidate& surfaced = box.surfaced.inner[s];
+            if (claims.ForPosition(surfaced.position)) {
+                VecAppend(work, surfaced);
+            } else {
+                unclaimed->Push(surfaced);
+            }
+        }
+        absoluteOverflowRect = absoluteOverflowRect
+                                   .Union(box.overflowContribution);
+    }
+
+    *overflowOut = absoluteOverflowRect;
+}
+
+void ComputeOofLayout(TaffyTree* tree, NodeId node, LayoutOutput* output) {
+    if (!output->hasOofPositioningArea) {
+        return;
+    }
+    const Style& style = tree->GetStyle(node);
+    Direction direction = style.direction;
+    ContainingBlockClaims claims = ContainingBlockFor(style.position);
+    OofCandidates candidates = output->oofCandidates;
+    output->oofCandidates.Clear();
+
+    Vec<NodeId> hoisted;
+    OofCandidates unclaimed;
+    RectF overflow = RectF::Zero();
+    PerformOofLayout(tree, node, candidates, output->oofPositioningArea.size,
+                     output->oofPositioningArea.offset, direction, claims,
+                     style.overflow, &hoisted, &unclaimed, &overflow);
+    tree->ClearHoistedChildren(node);
+    tree->AddHoistedChildren(node, hoisted);
+    output->oofCandidates = unclaimed;
+    output->scrollableOverflowRect = output->scrollableOverflowRect
+                                         .Union(overflow);
 }
 
 }
@@ -9839,88 +11278,186 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
 namespace taffy {
 
 void ComputeRootLayout(TaffyTree* tree, NodeId root, SizeAvail availableSpace) {
-    SizeFOpt knownDimensions = SizeFOptNone();
     CalcResolver calc = tree->calc;
+    Position rootPosition = tree->GetStyle(root).position;
+    Direction rootDirection = tree->GetStyle(root).direction;
+    SizeFOpt icbSize = availableSpace.IntoOptions();
 
-    {
-        SizeFOpt parentSize = availableSpace.IntoOptions();
+    bool oofRoot =
+        IsOutOfFlow(rootPosition) && IsSome(icbSize.w) && IsSome(icbSize.h);
+
+    bool rootIsCached = false;
+    Layout layout;
+    OofCandidates candidates;
+
+    if (oofRoot) {
+        OofCandidate self;
+        self.node = root;
+        self.order = 0;
+        self.position = rootPosition;
+        float xAnchor = IsRtl(rootDirection) ? icbSize.w : 0.0f;
+        self.staticX = AxisStaticPosition::FromEdge(
+            xAnchor,
+            IsRtl(rootDirection) ? AxisStaticEdge::End : AxisStaticEdge::Start);
+        self.staticY =
+            AxisStaticPosition::FromEdge(0.0f, AxisStaticEdge::Start);
+
+        PointOverflow icbOverflow = {Overflow::Visible, Overflow::Visible};
+        OofBoxLayout box = LayoutOofBox(tree, self, {icbSize.w, icbSize.h},
+                                        {0.0f, 0.0f}, rootDirection, false,
+                                        root, icbOverflow, &rootIsCached);
+        layout = box.layout;
+        candidates = box.surfaced;
+    } else {
+        SizeFOpt knownDimensions = SizeFOptNone();
+
+        const Style& rootStyle = tree->GetStyle(root);
+        RectF rootMargin = rootStyle.margin.ResolveOrZero(
+            availableSpace.width.IntoOption(), calc);
+        SizeF rootMarginSum = rootMargin.SumAxes();
+        SizeAvail rootAvailableSpace = {
+            MaybeMax(MaybeSub(availableSpace.width, Some(rootMarginSum.w)),
+                     Some(0.0f)),
+            MaybeMax(MaybeSub(availableSpace.height, Some(rootMarginSum.h)),
+                     Some(0.0f))};
+
+        {
+            SizeFOpt parentSize = availableSpace.IntoOptions();
+            const Style& style = tree->GetStyle(root);
+
+            if (style.IsBlock()) {
+                Optf aspectRatio = style.aspectRatio;
+                RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
+                RectF border = style.border.ResolveOrZero(parentSize.w, calc);
+                SizeF paddingBorderSize = (padding + border).SumAxes();
+                SizeF boxSizingAdjustment =
+                    style.boxSizing == BoxSizing::ContentBox ? paddingBorderSize
+                                                             : SizeF::Zero();
+
+                SizeFOpt minSize =
+                    MaybeAdd(MaybeApplyAspectRatio(
+                                 style.minSize.MaybeResolve(parentSize, calc),
+                                 aspectRatio),
+                             boxSizingAdjustment);
+                SizeFOpt maxSize =
+                    MaybeAdd(MaybeApplyAspectRatio(
+                                 style.maxSize.MaybeResolve(parentSize, calc),
+                                 aspectRatio),
+                             boxSizingAdjustment);
+                SizeFOpt clampedStyleSize = MaybeClamp(
+                    MaybeAdd(MaybeApplyAspectRatio(
+                                 style.size.MaybeResolve(parentSize, calc),
+                                 aspectRatio),
+                             boxSizingAdjustment),
+                    minSize, maxSize);
+
+                SizeFOpt minMaxDefiniteSize = SizeFOptNone();
+                if (IsSome(minSize.w) && IsSome(maxSize.w) &&
+                    maxSize.w <= minSize.w) {
+                    minMaxDefiniteSize.w = minSize.w;
+                }
+                if (IsSome(minSize.h) && IsSome(maxSize.h) &&
+                    maxSize.h <= minSize.h) {
+                    minMaxDefiniteSize.h = minSize.h;
+                }
+
+                SizeFOpt availableSpaceBasedSize = SizeFOptNone();
+                availableSpaceBasedSize.w = rootAvailableSpace.width
+                                                .IntoOption();
+
+                SizeFOpt known = Or(knownDimensions, minMaxDefiniteSize);
+                known = Or(known, clampedStyleSize);
+                known = Or(known, availableSpaceBasedSize);
+                knownDimensions = MaybeMax(known, paddingBorderSize);
+            }
+        }
+
+        LayoutInput rootInput;
+        rootInput.knownDimensions = knownDimensions;
+        rootInput.parentSize = availableSpace.IntoOptions();
+        rootInput.availableSpace = rootAvailableSpace;
+        rootInput.sizingMode = SizingMode::InherentSize;
+        rootInput.axis = RequestedAxis::Both;
+        rootInput.runMode = RunMode::PerformLayout;
+        rootInput.verticalMarginsAreCollapsible = LineBool::False();
+        LayoutOutput cachedProbe;
+
+        rootIsCached = tree->CacheGet(root, rootInput, &cachedProbe);
+
+        LayoutOutput output = tree->PerformChildLayout(
+            root, knownDimensions, availableSpace.IntoOptions(),
+            rootAvailableSpace, SizingMode::InherentSize, LineBool::False());
+
         const Style& style = tree->GetStyle(root);
+        Optf widthOpt = availableSpace.width.IntoOption();
+        RectF padding = style.padding.ResolveOrZero(widthOpt, calc);
+        RectF border = style.border.ResolveOrZero(widthOpt, calc);
+        RectF margin = style.margin.ResolveOrZero(widthOpt, calc);
 
-        if (style.IsBlock()) {
-            Optf aspectRatio = style.aspectRatio;
-            RectF margin = style.margin.ResolveOrZero(parentSize.w, calc);
-            RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
-            RectF border = style.border.ResolveOrZero(parentSize.w, calc);
-            SizeF paddingBorderSize = (padding + border).SumAxes();
-            SizeF boxSizingAdjustment = style.boxSizing == BoxSizing::ContentBox
-                                            ? paddingBorderSize
-                                            : SizeF::Zero();
+        SizeF scrollbarSize = {
+            style.overflow.y == Overflow::Scroll ? style.scrollbarWidth : 0.0f,
+            style.overflow.x == Overflow::Scroll ? style.scrollbarWidth : 0.0f};
 
-            SizeFOpt minSize = MaybeAdd(
-                MaybeApplyAspectRatio(
-                    style.minSize.MaybeResolve(parentSize, calc), aspectRatio),
-                boxSizingAdjustment);
-            SizeFOpt maxSize = MaybeAdd(
-                MaybeApplyAspectRatio(
-                    style.maxSize.MaybeResolve(parentSize, calc), aspectRatio),
-                boxSizingAdjustment);
-            SizeFOpt clampedStyleSize = MaybeClamp(
-                MaybeAdd(
-                    MaybeApplyAspectRatio(
-                        style.size.MaybeResolve(parentSize, calc), aspectRatio),
-                    boxSizingAdjustment),
-                minSize, maxSize);
+        PointF location = {margin.left, margin.top};
+        if (IsRtl(style.direction) && IsSome(widthOpt)) {
+            location.x = widthOpt - output.size.w - margin.right;
+        }
 
-            SizeFOpt minMaxDefiniteSize = SizeFOptNone();
-            if (IsSome(minSize.w) && IsSome(maxSize.w) &&
-                maxSize.w <= minSize.w) {
-                minMaxDefiniteSize.w = minSize.w;
+        if (style.position == Position::Relative) {
+            RectFOpt inset = style.inset.MaybeResolveZip(icbSize, calc);
+            Optf negRight = inset.right;
+            if (IsSome(negRight)) {
+                negRight = -negRight;
             }
-            if (IsSome(minSize.h) && IsSome(maxSize.h) &&
-                maxSize.h <= minSize.h) {
-                minMaxDefiniteSize.h = minSize.h;
+            Optf negBottom = inset.bottom;
+            if (IsSome(negBottom)) {
+                negBottom = -negBottom;
             }
+            Optf dx = IsRtl(style.direction) ? Or(negRight, inset.left)
+                                             : Or(inset.left, negRight);
+            location.x += UnwrapOr(dx, 0.0f);
+            location.y += UnwrapOr(Or(inset.top, negBottom), 0.0f);
+        }
 
-            SizeFOpt availableSpaceBasedSize = SizeFOptNone();
-            availableSpaceBasedSize.w = MaybeSub(
-                availableSpace.width.IntoOption(), margin.HorizontalAxisSum());
+        layout.order = 0;
+        layout.location = location;
+        layout.size = output.size;
+        layout.scrollableOverflowRect = output.scrollableOverflowRect;
+        layout.scrollbarSize = scrollbarSize;
+        layout.padding = padding;
+        layout.border = border;
 
-            SizeFOpt known = Or(knownDimensions, minMaxDefiniteSize);
-            known = Or(known, clampedStyleSize);
-            known = Or(known, availableSpaceBasedSize);
-            knownDimensions = MaybeMax(known, paddingBorderSize);
+        layout.margin = margin;
+        tree->SetUnroundedLayout(root, layout);
+        candidates = output.oofCandidates;
+    }
+
+    if (!candidates.IsEmpty()) {
+        RectF areaInset = layout.border;
+        areaInset.right += layout.scrollbarSize.w;
+        areaInset.bottom += layout.scrollbarSize.h;
+        SizeF rootPaddingBox = layout.size - areaInset.SumAxes();
+        SizeF areaSize = rootPaddingBox;
+        PointF areaOffset = {areaInset.left, areaInset.top};
+        if (IsSome(icbSize.w)) {
+            areaSize.w = F32Max(icbSize.w - layout.scrollbarSize.w, 0.0f);
+            areaOffset.x = -layout.location.x;
+        }
+        if (IsSome(icbSize.h)) {
+            areaSize.h = F32Max(icbSize.h - layout.scrollbarSize.h, 0.0f);
+            areaOffset.y = -layout.location.y;
+        }
+        const Style& tailStyle = tree->GetStyle(root);
+        Vec<NodeId> hoisted;
+        OofCandidates unclaimed;
+        RectF overflow = RectF::Zero();
+        PerformOofLayout(tree, root, candidates, areaSize, areaOffset,
+                         rootDirection, ContainingBlockClaims::All(),
+                         tailStyle.overflow, &hoisted, &unclaimed, &overflow);
+        if (!rootIsCached) {
+            tree->AddHoistedChildren(root, hoisted);
         }
     }
-
-    LayoutOutput output = tree->PerformChildLayout(
-        root, knownDimensions, availableSpace.IntoOptions(), availableSpace,
-        SizingMode::InherentSize, LineBool::False());
-
-    const Style& style = tree->GetStyle(root);
-    Optf widthOpt = availableSpace.width.IntoOption();
-    RectF padding = style.padding.ResolveOrZero(widthOpt, calc);
-    RectF border = style.border.ResolveOrZero(widthOpt, calc);
-    RectF margin = style.margin.ResolveOrZero(widthOpt, calc);
-
-    SizeF scrollbarSize = {
-        style.overflow.y == Overflow::Scroll ? style.scrollbarWidth : 0.0f,
-        style.overflow.x == Overflow::Scroll ? style.scrollbarWidth : 0.0f};
-    PointF location;
-    if (IsRtl(style.direction) && IsSome(widthOpt)) {
-        location.x = widthOpt - output.size.w;
-    }
-
-    Layout layout;
-    layout.order = 0;
-    layout.location = location;
-    layout.size = output.size;
-    layout.contentSize = output.contentSize;
-    layout.scrollbarSize = scrollbarSize;
-    layout.padding = padding;
-    layout.border = border;
-
-    layout.margin = margin;
-    tree->SetUnroundedLayout(root, layout);
 }
 
 LayoutOutput ComputeHiddenLayout(TaffyTree* tree, NodeId node) {
@@ -9940,11 +11477,13 @@ static void RoundLayoutInner(TaffyTree* tree, NodeId nodeId, float cumulativeX,
     Layout unrounded = tree->GetUnroundedLayout(nodeId);
     Layout layout = unrounded;
 
+    float parentX = cumulativeX;
+    float parentY = cumulativeY;
     cumulativeX += unrounded.location.x;
     cumulativeY += unrounded.location.y;
 
-    layout.location.x = F32Round(unrounded.location.x);
-    layout.location.y = F32Round(unrounded.location.y);
+    layout.location.x = F32Round(cumulativeX) - F32Round(parentX);
+    layout.location.y = F32Round(cumulativeY) - F32Round(parentY);
     layout.size
         .w = F32Round(cumulativeX + unrounded.size.w) - F32Round(cumulativeX);
     layout.size
@@ -9971,16 +11510,31 @@ static void RoundLayoutInner(TaffyTree* tree, NodeId nodeId, float cumulativeX,
     layout.padding.bottom =
         F32Round(cumulativeY + unrounded.size.h) -
         F32Round(cumulativeY + unrounded.size.h - unrounded.padding.bottom);
-    layout.contentSize.w =
-        F32Round(cumulativeX + unrounded.contentSize.w) - F32Round(cumulativeX);
-    layout.contentSize.h =
-        F32Round(cumulativeY + unrounded.contentSize.h) - F32Round(cumulativeY);
+    layout.scrollableOverflowRect
+        .left = F32Round(cumulativeX + unrounded.scrollableOverflowRect.left) -
+                F32Round(cumulativeX);
+    layout.scrollableOverflowRect.right =
+        F32Round(cumulativeX + unrounded.scrollableOverflowRect.right) -
+        F32Round(cumulativeX);
+    layout.scrollableOverflowRect
+        .top = F32Round(cumulativeY + unrounded.scrollableOverflowRect.top) -
+               F32Round(cumulativeY);
+    layout.scrollableOverflowRect.bottom =
+        F32Round(cumulativeY + unrounded.scrollableOverflowRect.bottom) -
+        F32Round(cumulativeY);
 
     tree->SetFinalLayout(nodeId, layout);
 
     int n = tree->ChildCount(nodeId);
     for (int i = 0; i < n; i++) {
-        RoundLayoutInner(tree, tree->GetChildId(nodeId, i), cumulativeX,
+        NodeId child = tree->GetChildId(nodeId, i);
+        if (!IsOutOfFlow(tree->GetStyle(child).position)) {
+            RoundLayoutInner(tree, child, cumulativeX, cumulativeY);
+        }
+    }
+    int hoisted = tree->HoistedChildCount(nodeId);
+    for (int i = 0; i < hoisted; i++) {
+        RoundLayoutInner(tree, tree->HoistedChildAt(nodeId, i), cumulativeX,
                          cumulativeY);
     }
 }
@@ -9996,7 +11550,6 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
     SizeFOpt parentSize = inputs.parentSize;
     SizeAvail availableSpaceIn = inputs.availableSpace;
 
-    RectF margin = style.margin.ResolveOrZero(parentSize.w, calc);
     RectF padding = style.padding.ResolveOrZero(parentSize.w, calc);
     RectF border = style.border.ResolveOrZero(parentSize.w, calc);
     RectF paddingBorder = padding + border;
@@ -10038,10 +11591,10 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
 
     bool hasStylesPreventingBeingCollapsedThrough =
         !style.IsBlock() || IsScrollContainer(style.overflow.x) ||
-        IsScrollContainer(style.overflow.y) ||
-        style.position == Position::Absolute || padding.top > 0.0f ||
-        padding.bottom > 0.0f || border.top > 0.0f || border.bottom > 0.0f ||
-        (IsSome(nodeSize.h) && nodeSize.h > 0.0f) ||
+        IsScrollContainer(style.overflow.y) || IsOutOfFlow(style.position) ||
+        style.contain.EstablishesIndependentFormattingContext() ||
+        padding.top > 0.0f || padding.bottom > 0.0f || border.top > 0.0f ||
+        border.bottom > 0.0f || (IsSome(nodeSize.h) && nodeSize.h > 0.0f) ||
         (IsSome(nodeMinSize.h) && nodeMinSize.h > 0.0f);
 
     if (inputs.runMode == RunMode::ComputeSize &&
@@ -10058,8 +11611,7 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
     AvailableSpace availWidth =
         IsSome(knownDimensions.w) ? AvailableSpace::Definite(knownDimensions.w)
                                   : availableSpaceIn.width;
-    availableSpace.width = MaybeSub(availWidth, margin.HorizontalAxisSum())
-                               .MaybeSet(knownDimensions.w)
+    availableSpace.width = availWidth.MaybeSet(knownDimensions.w)
                                .MaybeSet(nodeSize.w);
     if (availableSpace.width.IsDefinite()) {
         availableSpace.width =
@@ -10070,8 +11622,7 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
     AvailableSpace availHeight =
         IsSome(knownDimensions.h) ? AvailableSpace::Definite(knownDimensions.h)
                                   : availableSpaceIn.height;
-    availableSpace.height = MaybeSub(availHeight, margin.VerticalAxisSum())
-                                .MaybeSet(knownDimensions.h)
+    availableSpace.height = availHeight.MaybeSet(knownDimensions.h)
                                 .MaybeSet(nodeSize.h);
     if (availableSpace.height.IsDefinite()) {
         availableSpace.height =
@@ -10099,7 +11650,18 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
 
     LayoutOutput out;
     out.size = size;
-    out.contentSize = measuredSize + padding.SumAxes();
+
+    bool isScrollContainer = IsScrollContainer(style.overflow.x) ||
+                             IsScrollContainer(style.overflow.y);
+    bool isRtl = IsRtl(style.direction);
+    float startPadding = isRtl ? padding.right : padding.left;
+    float endPadding = isRtl ? padding.left : padding.right;
+    out.scrollableOverflowRect = {
+        0.0f,
+        startPadding + measuredSize.w + (isScrollContainer ? endPadding : 0.0f),
+        0.0f,
+        padding.top + measuredSize.h +
+            (isScrollContainer ? padding.bottom : 0.0f)};
     out.marginsCanCollapseThrough = !hasStylesPreventingBeingCollapsedThrough &&
                                     size.h == 0.0f && measuredSize.h == 0.0f;
     return out;
@@ -10107,7 +11669,11 @@ LayoutOutput ComputeLeafLayout(const LayoutInput& inputs, const Style& style,
 
 AlignContentKeyword ApplyAlignmentFallback(float freeSpace, int numItems,
                                            AlignContent alignmentMode) {
-    AlignContentKeyword keyword = alignmentMode.keyword;
+
+    AlignContentKeyword keyword =
+        alignmentMode.keyword == AlignContentKeyword::Normal
+            ? AlignContentKeyword::Stretch
+            : alignmentMode.keyword;
     bool isSafe = alignmentMode.safety == AlignmentSafety::Safe;
 
     if (numItems <= 1 || freeSpace <= 0.0f) {
@@ -10148,6 +11714,7 @@ float ComputeAlignmentOffset(float freeSpace, int numItems, float gap,
                 return layoutIsFlexReversed ? 0.0f : freeSpace;
             case AlignContentKeyword::Center:
                 return freeSpace / 2.0f;
+            case AlignContentKeyword::Normal:
             case AlignContentKeyword::Stretch:
             case AlignContentKeyword::SpaceBetween:
                 return 0.0f;
@@ -10177,22 +11744,37 @@ float ComputeAlignmentOffset(float freeSpace, int numItems, float gap,
     }
 }
 
-SizeF ComputeContentSizeContribution(PointF location, SizeF size,
-                                     SizeF contentSize,
-                                     PointOverflow overflow) {
-    SizeF contribution = {
-        overflow.x == Overflow::Visible ? F32Max(size.w, contentSize.w)
-                                        : size.w,
-        overflow.y == Overflow::Visible ? F32Max(size.h, contentSize.h)
-                                        : size.h};
-    if (contribution.w > 0.0f && contribution.h > 0.0f) {
-        float maxX = F32Max(location.x + contribution.w, 0.0f);
-        float minX = F32Min(location.x, 0.0f);
-        float maxY = F32Max(location.y + contribution.h, 0.0f);
-        float minY = F32Min(location.y, 0.0f);
-        return {maxX - minX, maxY - minY};
+RectF ComputeScrollableOverflowContribution(PointF location, SizeF size,
+                                            RectF scrollableOverflowRect,
+                                            PointOverflow overflow,
+                                            Contain contain,
+                                            bool parentIsScrollContainer) {
+    bool isScrollContainer =
+        IsScrollContainer(overflow.x) || IsScrollContainer(overflow.y);
+
+    bool overflowIsContained = contain.ContainsScrollableOverflow();
+
+    bool propagatesX = !isScrollContainer && !overflowIsContained &&
+                       overflow.x == Overflow::Visible;
+    bool propagatesY = !isScrollContainer && !overflowIsContained &&
+                       overflow.y == Overflow::Visible;
+    SizeF endExtent = {
+        propagatesX ? F32Max(size.w, scrollableOverflowRect.right) : size.w,
+        propagatesY ? F32Max(size.h, scrollableOverflowRect.bottom) : size.h};
+    if (endExtent.w <= 0.0f || endExtent.h <= 0.0f) {
+        return RectF::Zero();
     }
-    return SizeF::Zero();
+    PointF startExtent = {
+        propagatesX ? F32Min(0.0f, scrollableOverflowRect.left) : 0.0f,
+        propagatesY ? F32Min(0.0f, scrollableOverflowRect.top) : 0.0f};
+    RectF contribution = {location.x + startExtent.x, location.x + endExtent.w,
+                          location.y + startExtent.y, location.y + endExtent.h};
+    bool whollyUnreachable =
+        contribution.right <= 0.0f || contribution.bottom <= 0.0f;
+    if (parentIsScrollContainer && whollyUnreachable) {
+        return RectF::Zero();
+    }
+    return contribution;
 }
 
 }
@@ -10210,6 +11792,15 @@ static Optf MaybeResolveRaw(CompactLength raw, Optf context,
             return Some(raw.Value());
         case CompactLength::kPercentTag:
             return IsSome(context) ? Some(context * raw.Value()) : None();
+
+        case CompactLength::kMinContentTag:
+        case CompactLength::kMaxContentTag:
+        case CompactLength::kFitContentPxTag:
+        case CompactLength::kFitContentPercentTag:
+        case CompactLength::kFitContentKeywordTag:
+        case CompactLength::kStretchTag:
+        case CompactLength::kContentTag:
+            return None();
         default:
             break;
     }
@@ -10313,11 +11904,18 @@ OriginZeroLine IntoOriginZeroLine(GridLine line, uint16_t explicitTrackCount) {
     return OriginZeroLine{(int16_t)value};
 }
 
+static uint16_t ClampGridSpan(uint16_t span) {
+    if (span < 1) {
+        return 1;
+    }
+    return span > kMaxGridTracks ? kMaxGridTracks : span;
+}
+
 static PlainPlacement IntoOriginZeroIgnoringNamed(const GridPlacement& p,
                                                   uint16_t explicitTrackCount) {
     switch (p.kind) {
         case GridPlacementKind::Span:
-            return PlainPlacement::Spanning(p.span);
+            return PlainPlacement::Spanning(ClampGridSpan(p.span));
         case GridPlacementKind::Line:
 
             if (p.line == 0) {
@@ -10360,7 +11958,7 @@ bool LinePlain::IsDefiniteGridLine() const {
 static PlainPlacement PlainIntoOriginZero(PlainPlacement p,
                                           uint16_t explicitTrackCount) {
     if (p.IsSpan()) {
-        return p;
+        return PlainPlacement::Spanning(ClampGridSpan(p.span));
     }
     if (p.IsLine()) {
         if (p.line == 0) {
@@ -10482,8 +12080,14 @@ Optf MaxTrackSizingFunction::DefiniteLimit(Optf parentSize,
         case CompactLength::kFitContentPercentTag:
             return IsSome(parentSize) ? Some(raw.Value() * parentSize) : None();
         default:
-            return DefiniteValue(parentSize, calc);
+            break;
     }
+    if (raw.IsFitContentCalc()) {
+        return IsSome(parentSize)
+                   ? Some(calc.Resolve(raw.CalcValue(), parentSize))
+                   : None();
+    }
+    return DefiniteValue(parentSize, calc);
 }
 
 Optf MinTrackSizingFunction::DefiniteValue(Optf parentSize,
@@ -10504,11 +12108,13 @@ Optf MinTrackSizingFunction::DefiniteValue(Optf parentSize,
 
 bool operator==(const Style& a, const Style& b) {
     return a.display == b.display && a.itemIsTable == b.itemIsTable &&
-           a.itemIsReplaced == b.itemIsReplaced && a.boxSizing == b.boxSizing &&
-           a.direction == b.direction &&
+           a.itemIsReplaced == b.itemIsReplaced &&
+           a.itemIsCompressibleReplaced == b.itemIsCompressibleReplaced &&
+           a.boxSizing == b.boxSizing && a.direction == b.direction &&
 
            a.overflow == b.overflow &&
            SameFloatBits(a.scrollbarWidth, b.scrollbarWidth) &&
+           a.contain == b.contain &&
 
            a.floatMode == b.floatMode && a.clear == b.clear &&
 
@@ -10528,6 +12134,7 @@ bool operator==(const Style& a, const Style& b) {
            a.textAlign == b.textAlign &&
 
            a.flexDirection == b.flexDirection && a.flexWrap == b.flexWrap &&
+           a.flexLineCount == b.flexLineCount &&
 
            a.flexBasis == b.flexBasis &&
            SameFloatBits(a.flexGrow, b.flexGrow) &&
@@ -10638,6 +12245,8 @@ static NodeId InsertNode(TaffyTree* tree, const Style& style) {
     d->generation = generation;
     d->alive = true;
     d->children.len = 0;
+    d->hoisted.len = 0;
+    d->gridOof.Clear();
     d->parent = NodeId{};
     d->hasParent = false;
 
@@ -10706,6 +12315,8 @@ void TaffyTree::Remove(NodeId node) {
             }
             p->children.len = w;
         }
+
+        MarkDirty(d->parent);
     }
 
     for (int i = 0; i < d->children.len; i++) {
@@ -11077,22 +12688,34 @@ void TaffyTree::CacheClear(NodeId node) {
     }
 }
 
-struct LeafMeasureCtx {
-    TaffyTree* tree;
-    NodeId node;
-    void* nodeContext;
-    const Style* style;
-};
-
-static SizeF LeafMeasureThunk(SizeFOpt knownDimensions,
-                              SizeAvail availableSpace, void* ctx) {
-    LeafMeasureCtx* c = (LeafMeasureCtx*)ctx;
-    if (!c->tree->measureFn) {
-        return SizeF::Zero();
+void TaffyTree::ClearHoistedChildren(NodeId node) {
+    NodeData* d = Get(node);
+    if (d) {
+        VecReset(d->hoisted);
     }
-    return c->tree
-        ->measureFn(knownDimensions, availableSpace, c->node, c->nodeContext,
-                    c->style, c->tree->measureUserData);
+}
+
+void TaffyTree::AddHoistedChildren(NodeId node, const Vec<NodeId>& ids) {
+    NodeData* d = Get(node);
+    if (!d) {
+        return;
+    }
+    for (int i = 0; i < len(ids); i++) {
+        VecAppend(d->hoisted, ids[i]);
+    }
+}
+
+int TaffyTree::HoistedChildCount(NodeId node) const {
+    NodeData* d = Get(node);
+    return d ? len(d->hoisted) : 0;
+}
+
+NodeId TaffyTree::HoistedChildAt(NodeId node, int index) const {
+    NodeData* d = Get(node);
+    if (!d || index < 0 || index >= len(d->hoisted)) {
+        return NodeId{};
+    }
+    return d->hoisted[index];
 }
 
 LayoutOutput TaffyTree::ComputeBlockChildLayout(NodeId node, LayoutInput inputs,
@@ -11108,20 +12731,27 @@ LayoutOutput TaffyTree::ComputeBlockChildLayout(NodeId node, LayoutInput inputs,
     }
     CacheKey key = CacheKey::From(inputs);
     LayoutOutput cached;
-    if (d->cache.GetWithKey(key, inputs.runMode, &cached)) {
+    if (d->cache.ModeMatches(inputs) &&
+        d->cache.GetWithKey(key, inputs.runMode, &cached)) {
         return cached;
     }
 
     Display displayMode = d->style.display;
     bool hasChildren = d->children.len > 0;
 
+    d->gridOof.Clear();
+
     LayoutOutput out;
     if (displayMode == Display::None) {
         out = ComputeHiddenLayout(this, node);
     } else if (!hasChildren) {
-        LeafMeasureCtx ctx = {this, node, d->hasContext ? d->context : nullptr,
-                              &d->style};
-        out = ComputeLeafLayout(inputs, d->style, calc, LeafMeasureThunk, &ctx);
+
+        if (measureFn) {
+            out = measureFn(inputs, node, d->hasContext ? d->context : nullptr,
+                            &d->style, measureUserData);
+        } else {
+            out = ComputeLeafLayout(inputs, d->style, calc, nullptr, nullptr);
+        }
     } else {
         switch (displayMode) {
             case Display::Block:
@@ -11137,6 +12767,10 @@ LayoutOutput TaffyTree::ComputeBlockChildLayout(NodeId node, LayoutInput inputs,
                 out = ComputeFlexboxLayout(this, node, inputs);
                 break;
         }
+    }
+
+    if (inputs.runMode == RunMode::PerformLayout) {
+        ComputeOofLayout(this, node, &out);
     }
 
     d->cache.StoreWithKey(key, inputs, out);
@@ -11217,10 +12851,13 @@ static void PrintNode(TaffyTree* tree, NodeId node, bool hasSibling,
 
     base::log(base::fmt(
         "%s%s%s [x: %-4g y: %-4g w: %-4g h: %-4g "
-        "content_w: %-4g content_h: %-4g",
+        "overflow: l:%g r:%g t:%g b:%g",
         Str(linesString), Str(fork), Str(displayStr), (double)layout.location.x,
         (double)layout.location.y, (double)layout.size.w, (double)layout.size.h,
-        (double)layout.contentSize.w, (double)layout.contentSize.h));
+        (double)layout.scrollableOverflowRect.left,
+        (double)layout.scrollableOverflowRect.right,
+        (double)layout.scrollableOverflowRect.top,
+        (double)layout.scrollableOverflowRect.bottom));
     base::log(
         base::fmt(" border: l:%g r:%g t:%g b:%g, "
                   "padding: l:%g r:%g t:%g b:%g] (%llu)\n",
@@ -11318,6 +12955,11 @@ CacheKey CacheKey::From(const LayoutInput& input) {
         SizeMixedCacheKey(input.knownDimensions, input.availableSpace);
     key.parentSize =
         (SizeOptionCacheKey(input.parentSize) & kNonSignBitsMask) | extraBits;
+
+    key.knownDimensionsAreDefiniteW =
+        input.knownDimensionsAreDefiniteW || !IsSome(input.knownDimensions.w);
+    key.knownDimensionsAreDefiniteH =
+        input.knownDimensionsAreDefiniteH || !IsSome(input.knownDimensions.h);
     return key;
 }
 
@@ -11325,31 +12967,16 @@ uint64_t CacheKey::XAxisParentSize() const {
     return parentSize & (kXAxisValueMask & kNonSignBitsMask);
 }
 
-static int ComputeCacheSlot(SizeFOpt knownDimensions,
-                            SizeAvail availableSpace) {
-    bool hasKnownWidth = IsSome(knownDimensions.w);
-    bool hasKnownHeight = IsSome(knownDimensions.h);
-
-    if (hasKnownWidth && hasKnownHeight) {
-        return 0;
-    }
-    bool heightIsMin = availableSpace.height
-                           .kind == AvailableSpace::Kind::MinContent;
-    bool widthIsMin = availableSpace.width
-                          .kind == AvailableSpace::Kind::MinContent;
-    if (hasKnownWidth && !hasKnownHeight) {
-        return 1 + (heightIsMin ? 1 : 0);
-    }
-    if (hasKnownHeight && !hasKnownWidth) {
-        return 3 + (widthIsMin ? 1 : 0);
-    }
-    if (!widthIsMin) {
-        return heightIsMin ? 6 : 5;
-    }
-    return heightIsMin ? 8 : 7;
+bool CacheKey::SizeIsValidFor(CacheKey other) const {
+    uint64_t entryAxis = parentSize & kBothSignBitsMask;
+    return entryAxis == kBothSignBitsMask ||
+           entryAxis == (other.parentSize & kBothSignBitsMask);
 }
 
-bool Cache::Get(const LayoutInput& input, LayoutOutput* out) const {
+bool Cache::Get(const LayoutInput& input, LayoutOutput* out) {
+    if (!ModeMatches(input)) {
+        return false;
+    }
     return GetWithKey(CacheKey::From(input), input.runMode, out);
 }
 
@@ -11357,7 +12984,7 @@ void Cache::Store(const LayoutInput& input, const LayoutOutput& output) {
     StoreWithKey(CacheKey::From(input), input, output);
 }
 
-bool Cache::GetWithKey(CacheKey key, RunMode runMode, LayoutOutput* out) const {
+bool Cache::GetWithKey(CacheKey key, RunMode runMode, LayoutOutput* out) {
     switch (runMode) {
         case RunMode::PerformLayout:
             if ((presentMask & kFinalBit) && finalLayoutEntry.key == key) {
@@ -11374,7 +13001,13 @@ bool Cache::GetWithKey(CacheKey key, RunMode runMode, LayoutOutput* out) const {
                 }
                 const CacheEntry<SizeF>& e = measureEntries[i];
                 if (e.key.kdAvailableSpace == key.kdAvailableSpace &&
-                    e.key.XAxisParentSize() == xAxis) {
+                    e.key.knownDimensionsAreDefiniteW ==
+                        key.knownDimensionsAreDefiniteW &&
+                    e.key.knownDimensionsAreDefiniteH ==
+                        key.knownDimensionsAreDefiniteH &&
+                    e.key.XAxisParentSize() == xAxis &&
+                    e.key.SizeIsValidFor(key)) {
+                    recentlyUsedEntries |= (uint16_t)(1u << i);
                     *out = LayoutOutput::FromOuterSize(e.content);
                     return true;
                 }
@@ -11388,6 +13021,15 @@ bool Cache::GetWithKey(CacheKey key, RunMode runMode, LayoutOutput* out) const {
 
 void Cache::StoreWithKey(CacheKey key, const LayoutInput& input,
                          const LayoutOutput& output) {
+
+    if (input.runMode == RunMode::PerformHiddenLayout) {
+        return;
+    }
+    uint8_t nextMode = CacheModeOf(input);
+    if (mode != nextMode) {
+        Clear();
+        mode = nextMode;
+    }
     switch (input.runMode) {
         case RunMode::PerformLayout:
             isEmpty = false;
@@ -11395,11 +13037,41 @@ void Cache::StoreWithKey(CacheKey key, const LayoutInput& input,
             finalLayoutEntry = {key, output};
             break;
         case RunMode::ComputeSize: {
+
+            if (output.marginsCanCollapseThrough ||
+                output.topMargin.positive != 0.0f ||
+                output.topMargin.negative != 0.0f ||
+                output.bottomMargin.positive != 0.0f ||
+                output.bottomMargin.negative != 0.0f) {
+                return;
+            }
             isEmpty = false;
-            int slot =
-                ComputeCacheSlot(input.knownDimensions, input.availableSpace);
-            presentMask |= MeasureBit(slot);
-            measureEntries[slot] = {key, output.size};
+            for (int i = 0; i < kCacheSize; i++) {
+                if ((presentMask & MeasureBit(i)) == 0) {
+                    continue;
+                }
+                if (measureEntries[i].key == key) {
+                    measureEntries[i].content = output.size;
+                    recentlyUsedEntries |= (uint16_t)(1u << i);
+                    return;
+                }
+            }
+            while ((recentlyUsedEntries & (uint16_t)(1u << nextMeasureEntry)) !=
+                   0) {
+                recentlyUsedEntries &= (uint16_t)~(1u << nextMeasureEntry);
+                nextMeasureEntry = (uint8_t)(nextMeasureEntry + 1);
+                if (nextMeasureEntry == (uint8_t)kCacheSize) {
+                    nextMeasureEntry = 0;
+                }
+            }
+            int entryIndex = nextMeasureEntry;
+            presentMask |= MeasureBit(entryIndex);
+            measureEntries[entryIndex] = {key, output.size};
+            recentlyUsedEntries |= (uint16_t)(1u << entryIndex);
+            nextMeasureEntry = (uint8_t)(nextMeasureEntry + 1);
+            if (nextMeasureEntry == (uint8_t)kCacheSize) {
+                nextMeasureEntry = 0;
+            }
             break;
         }
         default:
@@ -11414,6 +13086,8 @@ bool Cache::Clear() {
     isEmpty = true;
 
     presentMask = 0;
+    recentlyUsedEntries = 0;
+    nextMeasureEntry = 0;
     return true;
 }
 
@@ -11460,11 +13134,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
+bool PlatCleanOnEscape() {
+    return false;
+}
 bool PlatScrollBounceTouch() {
     return true;
-}
-bool PlatWebViewPartialClipHides() {
-    return false;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -11524,11 +13198,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
-bool PlatScrollBounceTouch() {
+bool PlatCleanOnEscape() {
     return true;
 }
-bool PlatWebViewPartialClipHides() {
-    return false;
+bool PlatScrollBounceTouch() {
+    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -11631,11 +13305,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
+bool PlatCleanOnEscape() {
+    return true;
+}
 bool PlatScrollBounceTouch() {
     return false;
-}
-bool PlatWebViewPartialClipHides() {
-    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -11738,11 +13412,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
+bool PlatCleanOnEscape() {
+    return true;
+}
 bool PlatScrollBounceTouch() {
     return false;
-}
-bool PlatWebViewPartialClipHides() {
-    return true;
 }
 const char* PlatMonoFontName() {
     return "Menlo";
@@ -12188,10 +13862,10 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
-bool PlatScrollBounceTouch() {
-    return false;
+bool PlatCleanOnEscape() {
+    return true;
 }
-bool PlatWebViewPartialClipHides() {
+bool PlatScrollBounceTouch() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -12585,10 +14259,10 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
-bool PlatScrollBounceTouch() {
-    return false;
+bool PlatCleanOnEscape() {
+    return true;
 }
-bool PlatWebViewPartialClipHides() {
+bool PlatScrollBounceTouch() {
     return false;
 }
 const char* PlatMonoFontName() {

@@ -189,9 +189,9 @@ bool PlatTitleBarCloseIsElement();
 float PlatCaretWidth();
 bool PlatScrollBounce();
 
-bool PlatScrollBounceTouch();
+bool PlatCleanOnEscape();
 
-bool PlatWebViewPartialClipHides();
+bool PlatScrollBounceTouch();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
 const char* PlatShellPlatformName();
@@ -1078,6 +1078,13 @@ struct RectF {
     constexpr float HorizontalAxisSum() const { return left + right; }
     constexpr float VerticalAxisSum() const { return top + bottom; }
     constexpr SizeF SumAxes() const { return {left + right, top + bottom}; }
+
+    constexpr RectF Union(RectF other) const {
+        return {left < other.left ? left : other.left,
+                right > other.right ? right : other.right,
+                top < other.top ? top : other.top,
+                bottom > other.bottom ? bottom : other.bottom};
+    }
 };
 
 constexpr bool operator==(RectF a, RectF b) {
@@ -1633,17 +1640,37 @@ struct CompactLength {
     static constexpr uint64_t kFitContentPxTag = 0x17;
     static constexpr uint64_t kFitContentPercentTag = 0x1f;
 
+    static constexpr uint64_t kFitContentCalcTag = 0x06;
+
+    static constexpr uint64_t kFitContentKeywordTag = 0x27;
+    static constexpr uint64_t kStretchTag = 0x2f;
+
+    static constexpr uint64_t kContentTag = 0x37;
+
     static constexpr uint64_t kTagMask = 0xff;
     static constexpr uint64_t kCalcTagMask = 0x07;
 
-    uint64_t Tag() const { return bits & kTagMask; }
+    uint64_t Tag() const {
+        uint64_t low3 = bits & kCalcTagMask;
+        if (low3 == 0 || low3 == kFitContentCalcTag) {
+            return low3;
+        }
+        return bits & kTagMask;
+    }
 
     float Value() const {
         return __builtin_bit_cast(float, (uint32_t)(bits >> 32));
     }
-    const void* CalcValue() const { return (const void*)(uintptr_t)bits; }
+
+    const void* CalcValue() const {
+        return (const void*)(uintptr_t)(bits & ~kCalcTagMask);
+    }
 
     bool IsCalc() const { return (bits & kCalcTagMask) == 0; }
+    bool IsFitContentCalc() const {
+        return (bits & kCalcTagMask) == kFitContentCalcTag;
+    }
+    bool HasCalc() const { return IsCalc() || IsFitContentCalc(); }
     bool IsZero() const { return bits == FromVal(0.0f, kLengthTag).bits; }
     bool IsLengthOrPercentage() const {
         uint64_t t = Tag();
@@ -1654,18 +1681,29 @@ struct CompactLength {
     bool IsMaxContent() const { return Tag() == kMaxContentTag; }
     bool IsFitContent() const {
         uint64_t t = Tag();
-        return t == kFitContentPxTag || t == kFitContentPercentTag;
+        return t == kFitContentPxTag || t == kFitContentPercentTag ||
+               IsFitContentCalc();
     }
+
+    bool IsSizingKeyword() const {
+        uint64_t t = Tag();
+        return t == kMinContentTag || t == kMaxContentTag ||
+               t == kFitContentKeywordTag || t == kFitContentPxTag ||
+               t == kFitContentPercentTag || t == kStretchTag ||
+               IsFitContentCalc();
+    }
+    bool IsStretch() const { return Tag() == kStretchTag; }
+    bool IsContent() const { return Tag() == kContentTag; }
     bool IsMaxOrFitContent() const {
         uint64_t t = Tag();
         return t == kMaxContentTag || t == kFitContentPxTag ||
-               t == kFitContentPercentTag;
+               t == kFitContentPercentTag || IsFitContentCalc();
     }
 
     bool IsMaxContentAlike() const {
         uint64_t t = Tag();
         return t == kAutoTag || t == kMaxContentTag || t == kFitContentPxTag ||
-               t == kFitContentPercentTag;
+               t == kFitContentPercentTag || IsFitContentCalc();
     }
     bool IsMinOrMaxContent() const {
         uint64_t t = Tag();
@@ -1674,13 +1712,14 @@ struct CompactLength {
     bool IsIntrinsic() const {
         uint64_t t = Tag();
         return t == kAutoTag || t == kMinContentTag || t == kMaxContentTag ||
-               t == kFitContentPxTag || t == kFitContentPercentTag;
+               t == kFitContentPxTag || t == kFitContentPercentTag ||
+               IsFitContentCalc();
     }
     bool IsFr() const { return Tag() == kFrTag; }
 
     bool UsesPercentage() const {
         uint64_t t = Tag();
-        return t == kPercentTag || t == kFitContentPercentTag || IsCalc();
+        return t == kPercentTag || t == kFitContentPercentTag || HasCalc();
     }
 
     static CompactLength FromVal(float v, uint64_t tag) {
@@ -1705,9 +1744,21 @@ struct CompactLength {
     static CompactLength FitContentPercent(float limit) {
         return FromVal(limit, kFitContentPercentTag);
     }
+
+    static CompactLength FitContentKeyword() {
+        return FromTag(kFitContentKeywordTag);
+    }
+
+    static CompactLength Stretch() { return FromTag(kStretchTag); }
+
+    static CompactLength Content() { return FromTag(kContentTag); }
     static CompactLength Zero() { return Length(0.0f); }
 
     static CompactLength Calc(const void* p) { return FromPtr(p); }
+
+    static CompactLength FitContentCalc(const void* p) {
+        return CompactLength{(uint64_t)(uintptr_t)p | kFitContentCalcTag};
+    }
 };
 
 inline bool operator==(CompactLength a, CompactLength b) {
@@ -1785,12 +1836,34 @@ struct Dimension {
     static Dimension Length(float v) { return {CompactLength::Length(v)}; }
     static Dimension Percent(float v) { return {CompactLength::Percent(v)}; }
     static Dimension Auto() { return {CompactLength::Auto()}; }
+    static Dimension MinContent() { return {CompactLength::MinContent()}; }
+    static Dimension MaxContent() { return {CompactLength::MaxContent()}; }
+
+    static Dimension FitContent() {
+        return {CompactLength::FitContentKeyword()};
+    }
+    static Dimension FitContentPx(float limit) {
+        return {CompactLength::FitContentPx(limit)};
+    }
+    static Dimension FitContentPercent(float limit) {
+        return {CompactLength::FitContentPercent(limit)};
+    }
+    static Dimension FitContentCalc(const void* p) {
+        return {CompactLength::FitContentCalc(p)};
+    }
+    static Dimension Stretch() { return {CompactLength::Stretch()}; }
+
+    static Dimension Content() { return {CompactLength::Content()}; }
     static Dimension Calc(const void* p) { return {CompactLength::Calc(p)}; }
     static Dimension Zero() { return {CompactLength::Zero()}; }
     static Dimension From(LengthPercentage lp) { return {lp.raw}; }
     static Dimension From(LengthPercentageAuto lp) { return {lp.raw}; }
 
     bool IsAuto() const { return raw.IsAuto(); }
+    bool IsFitContentCalc() const { return raw.IsFitContentCalc(); }
+    bool IsSizingKeyword() const { return raw.IsSizingKeyword(); }
+    bool IsStretch() const { return raw.IsStretch(); }
+    bool IsContent() const { return raw.IsContent(); }
     uint64_t Tag() const { return raw.Tag(); }
     float Value() const { return raw.Value(); }
 
@@ -1887,6 +1960,8 @@ inline bool operator!=(AvailableSpace a, AvailableSpace b) {
 }
 
 enum class AlignItemsKeyword : uint8_t {
+
+    Normal,
     Start,
     End,
     FlexStart,
@@ -1899,6 +1974,8 @@ enum class AlignItemsKeyword : uint8_t {
 };
 
 enum class AlignContentKeyword : uint8_t {
+
+    Normal,
     Start,
     End,
     FlexStart,
@@ -1922,27 +1999,34 @@ constexpr AlignContentKeyword Reversed(AlignContentKeyword k) {
             return AlignContentKeyword::FlexStart;
         case AlignContentKeyword::Stretch:
             return AlignContentKeyword::End;
+        case AlignContentKeyword::Normal:
         default:
             return k;
     }
 }
 
 enum class AlignmentSafety : uint8_t {
+    Default,
     Unsafe,
     Safe
 };
 
 struct AlignItems {
     AlignItemsKeyword keyword = AlignItemsKeyword::Start;
-    AlignmentSafety safety = AlignmentSafety::Unsafe;
+    AlignmentSafety safety = AlignmentSafety::Default;
 
     constexpr bool IsSafe() const { return safety == AlignmentSafety::Safe; }
     constexpr AlignItemsKeyword Keyword() const { return keyword; }
+
+    constexpr bool IsStretchOrNormal() const {
+        return keyword == AlignItemsKeyword::Stretch ||
+               keyword == AlignItemsKeyword::Normal;
+    }
 };
 
 struct AlignContent {
     AlignContentKeyword keyword = AlignContentKeyword::Start;
-    AlignmentSafety safety = AlignmentSafety::Unsafe;
+    AlignmentSafety safety = AlignmentSafety::Default;
 
     constexpr bool IsSafe() const { return safety == AlignmentSafety::Safe; }
     constexpr AlignContentKeyword Keyword() const { return keyword; }
@@ -2026,9 +2110,48 @@ enum class BoxGenerationMode : uint8_t {
 };
 
 enum class Position : uint8_t {
+    Static,
     Relative,
-    Absolute
+    Absolute,
+    Fixed,
+    Sticky
 };
+
+inline bool IsOutOfFlow(Position p) {
+    return p == Position::Absolute || p == Position::Fixed;
+}
+
+inline bool IsPositioned(Position p) {
+    return p != Position::Static;
+}
+
+struct ContainingBlockClaims {
+    bool absolute = false;
+    bool fixed = false;
+
+    static ContainingBlockClaims None() { return {}; }
+    static ContainingBlockClaims All() {
+        ContainingBlockClaims c;
+        c.absolute = true;
+        c.fixed = true;
+        return c;
+    }
+    bool ForPosition(Position p) const {
+        if (p == Position::Absolute) {
+            return absolute;
+        }
+        if (p == Position::Fixed) {
+            return fixed;
+        }
+        return false;
+    }
+};
+
+inline ContainingBlockClaims ContainingBlockFor(Position p) {
+    ContainingBlockClaims c;
+    c.absolute = IsPositioned(p);
+    return c;
+}
 
 enum class BoxSizing : uint8_t {
     BorderBox,
@@ -2048,6 +2171,47 @@ constexpr bool IsScrollContainer(Overflow o) {
 
 constexpr Optf MaybeIntoAutomaticMinSize(Overflow o) {
     return IsScrollContainer(o) ? Some(0.0f) : None();
+}
+
+struct Contain {
+    uint8_t bits = 0;
+
+    static constexpr Contain None() { return {}; }
+
+    static constexpr Contain Layout() { return {1u << 0}; }
+
+    static constexpr Contain Paint() { return {1u << 1}; }
+
+    static constexpr Contain Content() {
+        return {uint8_t((1u << 0) | (1u << 1))};
+    }
+
+    constexpr bool Contains(Contain other) const {
+        return (bits & other.bits) == other.bits;
+    }
+    constexpr bool Intersects(Contain other) const {
+        return (bits & other.bits) != 0;
+    }
+    constexpr Contain Union(Contain other) const {
+        return Contain{uint8_t(bits | other.bits)};
+    }
+
+    constexpr bool EstablishesIndependentFormattingContext() const {
+        return Intersects(Layout().Union(Paint()));
+    }
+
+    constexpr bool SuppressesBaseline() const { return Contains(Layout()); }
+
+    constexpr bool ContainsScrollableOverflow() const {
+        return Intersects(Layout().Union(Paint()));
+    }
+};
+
+constexpr bool operator==(Contain a, Contain b) {
+    return a.bits == b.bits;
+}
+constexpr bool operator!=(Contain a, Contain b) {
+    return !(a == b);
 }
 
 enum class Direction : uint8_t {
@@ -2084,8 +2248,22 @@ enum class TextAlign : uint8_t {
 enum class FlexWrap : uint8_t {
     NoWrap,
     Wrap,
-    WrapReverse
+    WrapReverse,
+
+    Balance,
+
+    BalanceReverse
 };
+
+inline bool FlexWrapIsMultiLine(FlexWrap w) {
+    return w != FlexWrap::NoWrap;
+}
+inline bool FlexWrapIsReverse(FlexWrap w) {
+    return w == FlexWrap::WrapReverse || w == FlexWrap::BalanceReverse;
+}
+inline bool FlexWrapIsBalance(FlexWrap w) {
+    return w == FlexWrap::Balance || w == FlexWrap::BalanceReverse;
+}
 
 enum class Float : uint8_t {
     Left,
@@ -2560,10 +2738,17 @@ struct MaxTrackSizingFunction {
     static MaxTrackSizingFunction FitContentPercent(float v) {
         return {CompactLength::FitContentPercent(v)};
     }
+    static MaxTrackSizingFunction FitContentCalc(const void* p) {
+        return {CompactLength::FitContentCalc(p)};
+    }
     static MaxTrackSizingFunction FitContent(LengthPercentage lp) {
-        return lp.raw.Tag() == CompactLength::kPercentTag
-                   ? FitContentPercent(lp.raw.Value())
-                   : FitContentPx(lp.raw.Value());
+        if (lp.raw.Tag() == CompactLength::kPercentTag) {
+            return FitContentPercent(lp.raw.Value());
+        }
+        if (lp.raw.IsCalc()) {
+            return FitContentCalc(lp.raw.CalcValue());
+        }
+        return FitContentPx(lp.raw.Value());
     }
     static MaxTrackSizingFunction Fr(float v) { return {CompactLength::Fr(v)}; }
     static MaxTrackSizingFunction Zero() { return {CompactLength::Zero()}; }
@@ -2571,7 +2756,14 @@ struct MaxTrackSizingFunction {
     static MaxTrackSizingFunction From(LengthPercentageAuto v) {
         return {v.raw};
     }
-    static MaxTrackSizingFunction From(Dimension v) { return {v.raw}; }
+
+    static MaxTrackSizingFunction From(Dimension v) {
+        if (v.raw.Tag() == CompactLength::kFitContentKeywordTag ||
+            v.raw.IsStretch() || v.raw.IsContent()) {
+            return Auto();
+        }
+        return {v.raw};
+    }
 
     bool IsIntrinsic() const { return raw.IsIntrinsic(); }
     bool IsMaxContentAlike() const { return raw.IsMaxContentAlike(); }
@@ -2585,6 +2777,22 @@ struct MaxTrackSizingFunction {
 
     bool HasDefiniteValue(Optf parentSize) const;
     Optf DefiniteValue(Optf parentSize, CalcResolver calc) const;
+
+    Optf FitContentLimit(Optf parentSize, CalcResolver calc) const {
+        switch (raw.Tag()) {
+            case CompactLength::kFitContentPxTag:
+                return Some(raw.Value());
+            case CompactLength::kFitContentPercentTag:
+                return IsSome(parentSize) ? Some(raw.Value() * parentSize)
+                                          : None();
+            default:
+                break;
+        }
+        if (raw.IsFitContentCalc() && IsSome(parentSize)) {
+            return Some(calc.Resolve(raw.CalcValue(), parentSize));
+        }
+        return None();
+    }
 
     Optf DefiniteLimit(Optf parentSize, CalcResolver calc) const;
     Optf ResolvedPercentageSize(float parentSize, CalcResolver calc) const {
@@ -2613,7 +2821,18 @@ struct MinTrackSizingFunction {
     static MinTrackSizingFunction From(LengthPercentageAuto v) {
         return {v.raw};
     }
-    static MinTrackSizingFunction From(Dimension v) { return {v.raw}; }
+
+    static MinTrackSizingFunction From(Dimension v) {
+        uint64_t t = v.raw.Tag();
+        if (t == CompactLength::kFitContentPxTag ||
+            t == CompactLength::kFitContentPercentTag ||
+            t == CompactLength::kFitContentKeywordTag ||
+            v.raw.IsFitContentCalc() || v.raw.IsStretch() ||
+            v.raw.IsContent()) {
+            return Auto();
+        }
+        return {v.raw};
+    }
 
     static MinTrackSizingFunction From(MaxTrackSizingFunction v) {
         if (v.raw.IsFr() || v.raw.IsFitContent()) {
@@ -2623,12 +2842,15 @@ struct MinTrackSizingFunction {
     }
 
     bool IsAuto() const { return raw.IsAuto(); }
+
+    bool BehavesAsAuto(Optf parentSize) const {
+        return raw.IsAuto() || (!IsSome(parentSize) && raw.UsesPercentage());
+    }
     bool IsMinContent() const { return raw.IsMinContent(); }
     bool IsMaxContent() const { return raw.IsMaxContent(); }
     bool IsMinOrMaxContent() const { return raw.IsMinOrMaxContent(); }
-    bool UsesPercentage() const {
-        return raw.Tag() == CompactLength::kPercentTag || raw.IsCalc();
-    }
+
+    bool UsesPercentage() const { return raw.UsesPercentage(); }
 
     Optf DefiniteValue(Optf parentSize, CalcResolver calc) const;
     Optf ResolvedPercentageSize(float parentSize, CalcResolver calc) const {
@@ -2714,6 +2936,7 @@ struct LineNameSet {
 struct GridTemplateRepetition {
     RepetitionCount count;
     Slice<TrackSizingFunction> tracks;
+
     Slice<LineNameSet> lineNames;
 
     uint16_t TrackCount() const { return (uint16_t)tracks.len; }
@@ -2769,16 +2992,20 @@ struct Style {
     bool itemIsTable = false;
 
     bool itemIsReplaced = false;
+
+    bool itemIsCompressibleReplaced = false;
     BoxSizing boxSizing = BoxSizing::BorderBox;
     Direction direction = Direction::Ltr;
 
     PointOverflow overflow;
     float scrollbarWidth = 0.0f;
 
+    Contain contain;
+
     Float floatMode = Float::None;
     Clear clear = Clear::None;
 
-    Position position = Position::Relative;
+    Position position = Position::Static;
     RectLpa inset = RectLpa::Auto();
 
     SizeDim size;
@@ -2790,18 +3017,21 @@ struct Style {
     RectLp padding;
     RectLp border;
 
-    OptAlignItems alignItems;
+    AlignItems alignItems = AlignItems{AlignItemsKeyword::Normal};
     OptAlignSelf alignSelf;
-    OptAlignItems justifyItems;
+    AlignItems justifyItems = AlignItems{AlignItemsKeyword::Normal};
     OptAlignSelf justifySelf;
-    OptAlignContent alignContent;
-    OptJustifyContent justifyContent;
+
+    AlignContent alignContent = AlignContent{AlignContentKeyword::Normal};
+    AlignContent justifyContent = AlignContent{AlignContentKeyword::Normal};
     SizeLp gap;
 
     TextAlign textAlign = TextAlign::Auto;
 
     FlexDirection flexDirection = FlexDirection::Row;
     FlexWrap flexWrap = FlexWrap::NoWrap;
+
+    uint16_t flexLineCount = 1;
 
     Dimension flexBasis = Dimension::Auto();
     float flexGrow = 0.0f;
@@ -2825,7 +3055,11 @@ struct Style {
                                         : BoxGenerationMode::Normal;
     }
     bool IsBlock() const { return display == Display::Block; }
-    bool IsCompressibleReplaced() const { return itemIsReplaced; }
+
+    bool IsCompressibleReplaced() const {
+        return itemIsReplaced || itemIsCompressibleReplaced;
+    }
+    bool IsReplaced() const { return itemIsReplaced; }
 };
 
 bool operator==(const Style& a, const Style& b);
@@ -3146,6 +3380,9 @@ struct LayoutInput {
 
     SizeFOpt knownDimensions = SizeFOptNone();
 
+    bool knownDimensionsAreDefiniteW = true;
+    bool knownDimensionsAreDefiniteH = true;
+
     SizeFOpt parentSize = SizeFOptNone();
 
     SizeAvail availableSpace = SizeAvail::MaxContent();
@@ -3159,33 +3396,188 @@ struct LayoutInput {
     }
 };
 
+struct Baselines {
+    Optf first = None();
+    Optf last = None();
+};
+
+inline Baselines BaselinesNone() {
+    return {};
+}
+
+inline Baselines BaselinesFromFirst(Optf first) {
+    Baselines b;
+    b.first = first;
+    return b;
+}
+
+enum class AxisStaticEdge : uint8_t {
+    Start,
+    Center,
+    End
+};
+
+struct AxisStaticAlign {
+    AxisStaticEdge keyword = AxisStaticEdge::Start;
+    AlignmentSafety safety = AlignmentSafety::Default;
+    AxisStaticEdge fallback = AxisStaticEdge::Start;
+
+    static AxisStaticAlign FromKeyword(AxisStaticEdge keyword) {
+        AxisStaticAlign a;
+        a.keyword = keyword;
+        a.safety = AlignmentSafety::Default;
+        a.fallback = keyword;
+        return a;
+    }
+};
+
+struct AxisStaticPosition {
+    float start = 0.0f;
+    float end = 0.0f;
+    AxisStaticAlign align;
+
+    static AxisStaticPosition FromEdge(float anchor, AxisStaticEdge edge) {
+        AxisStaticPosition p;
+        p.start = anchor;
+        p.end = anchor;
+        p.align = AxisStaticAlign::FromKeyword(edge);
+        return p;
+    }
+
+    static AxisStaticPosition FromAlignment(AlignItems alignment,
+                                            float areaStart, float areaEnd,
+                                            bool axisIsRtl) {
+        auto edgeFor = [](AlignItemsKeyword keyword, bool rtl) {
+            if (keyword == AlignItemsKeyword::Center) {
+                return AxisStaticEdge::Center;
+            }
+            bool endish = keyword == AlignItemsKeyword::End ||
+                          keyword == AlignItemsKeyword::FlexEnd;
+            bool startPosition = (!endish) != rtl;
+            return startPosition ? AxisStaticEdge::Start : AxisStaticEdge::End;
+        };
+        AlignItems resolved = alignment;
+        AlignItemsKeyword fallbackKw = resolved.safety == AlignmentSafety::Safe
+                                           ? AlignItemsKeyword::Start
+                                           : resolved.keyword;
+        AxisStaticPosition p;
+        p.start = areaStart;
+        p.end = areaEnd;
+        p.align.keyword = edgeFor(resolved.keyword, axisIsRtl);
+        p.align.safety = resolved.safety;
+        p.align.fallback = edgeFor(fallbackKw, axisIsRtl);
+        return p;
+    }
+};
+
+struct OofCandidate {
+    NodeId node;
+    uint32_t order = 0;
+    Position position = Position::Absolute;
+    AxisStaticPosition staticX;
+    AxisStaticPosition staticY;
+};
+
+struct OofCandidates {
+    Vec<OofCandidate> inner;
+
+    bool IsEmpty() const { return len(inner) == 0; }
+    void Push(OofCandidate candidate) { VecAppend(inner, candidate); }
+    void Append(OofCandidates* other) {
+        if (!other || other->IsEmpty()) {
+            return;
+        }
+        for (int i = 0; i < len(other->inner); i++) {
+            VecAppend(inner, other->inner[i]);
+        }
+        VecReset(other->inner);
+    }
+    void Translate(PointF offset) {
+        for (int i = 0; i < len(inner); i++) {
+            inner[i].staticX.start += offset.x;
+            inner[i].staticX.end += offset.x;
+            inner[i].staticY.start += offset.y;
+            inner[i].staticY.end += offset.y;
+        }
+    }
+    void Clear() { VecReset(inner); }
+};
+
+struct OofCandRange {
+    int start = 0;
+    int count = 0;
+};
+
+inline void OofAppendRange(Vec<OofCandidate>* pool, OofCandRange* range,
+                           const OofCandidates& src) {
+    range->start = len(*pool);
+    range->count = len(src.inner);
+    for (int i = 0; i < range->count; i++) {
+        VecAppend(*pool, src.inner[i]);
+    }
+}
+
+inline void OofTranslateRange(Vec<OofCandidate>* pool, OofCandRange range,
+                              PointF offset) {
+    for (int i = 0; i < range.count; i++) {
+        OofCandidate& c = (*pool)[range.start + i];
+        c.staticX.start += offset.x;
+        c.staticX.end += offset.x;
+        c.staticY.start += offset.y;
+        c.staticY.end += offset.y;
+    }
+}
+
+inline void OofAppendPoolRange(OofCandidates* dst,
+                               const Vec<OofCandidate>& pool,
+                               OofCandRange range) {
+    for (int i = 0; i < range.count; i++) {
+        dst->Push(pool[range.start + i]);
+    }
+}
+
+struct OofPositioningArea {
+    SizeF size;
+    PointF offset;
+};
+
 struct LayoutOutput {
+
+    LayoutOutput() = default;
+
     SizeF size;
 
-    SizeF contentSize;
+    RectF scrollableOverflowRect;
 
-    PointFOpt firstBaselines = PointFOptNone();
+    Baselines baselines;
 
     CollapsibleMarginSet topMargin;
     CollapsibleMarginSet bottomMargin;
 
     bool marginsCanCollapseThrough = false;
 
+    OofCandidates oofCandidates;
+
+    bool hasOofPositioningArea = false;
+    OofPositioningArea oofPositioningArea;
+
     static LayoutOutput Hidden() { return {}; }
 
-    static LayoutOutput FromSizesAndBaselines(SizeF size, SizeF contentSize,
-                                              PointFOpt firstBaselines) {
+    static LayoutOutput FromSizesAndBaselines(SizeF size,
+                                              RectF scrollableOverflowRect,
+                                              Baselines baselines) {
         LayoutOutput out;
         out.size = size;
-        out.contentSize = contentSize;
-        out.firstBaselines = firstBaselines;
+        out.scrollableOverflowRect = scrollableOverflowRect;
+        out.baselines = baselines;
         return out;
     }
-    static LayoutOutput FromSizes(SizeF size, SizeF contentSize) {
-        return FromSizesAndBaselines(size, contentSize, PointFOptNone());
+    static LayoutOutput FromSizes(SizeF size, RectF scrollableOverflowRect) {
+        return FromSizesAndBaselines(size, scrollableOverflowRect,
+                                     BaselinesNone());
     }
     static LayoutOutput FromOuterSize(SizeF size) {
-        return FromSizes(size, SizeF::Zero());
+        return FromSizes(size, RectF::Zero());
     }
 };
 
@@ -3196,7 +3588,7 @@ struct Layout {
     PointF location;
     SizeF size;
 
-    SizeF contentSize;
+    RectF scrollableOverflowRect;
 
     SizeF scrollbarSize;
     RectF border;
@@ -3228,12 +3620,14 @@ struct Layout {
     float ContentBoxY() const { return location.y + border.top + padding.top; }
 
     float ScrollWidth() const {
-        return F32Max(0.0f, contentSize.w + F32Min(scrollbarSize.w, size.w) -
-                                size.w + border.left + border.right);
+        return F32Max(0.0f, scrollableOverflowRect.right +
+                                F32Min(scrollbarSize.w, size.w) - size.w +
+                                border.left + border.right);
     }
     float ScrollHeight() const {
-        return F32Max(0.0f, contentSize.h + F32Min(scrollbarSize.h, size.h) -
-                                size.h + border.top + border.bottom);
+        return F32Max(0.0f, scrollableOverflowRect.bottom +
+                                F32Min(scrollbarSize.h, size.h) - size.h +
+                                border.top + border.bottom);
     }
 };
 
@@ -3243,14 +3637,21 @@ struct CacheKey {
     uint64_t kdAvailableSpace = 0;
     uint64_t parentSize = 0;
 
+    bool knownDimensionsAreDefiniteW = true;
+    bool knownDimensionsAreDefiniteH = true;
+
     static CacheKey From(const LayoutInput& input);
 
     uint64_t XAxisParentSize() const;
+
+    bool SizeIsValidFor(CacheKey other) const;
 };
 
 constexpr bool operator==(CacheKey a, CacheKey b) {
     return a.kdAvailableSpace == b.kdAvailableSpace &&
-           a.parentSize == b.parentSize;
+           a.parentSize == b.parentSize &&
+           a.knownDimensionsAreDefiniteW == b.knownDimensionsAreDefiniteW &&
+           a.knownDimensionsAreDefiniteH == b.knownDimensionsAreDefiniteH;
 }
 
 template <typename T>
@@ -3265,17 +3666,39 @@ struct Cache {
 
     uint16_t presentMask = 0;
 
+    uint16_t recentlyUsedEntries = 0;
+    uint8_t nextMeasureEntry = 0;
+
     bool isEmpty = true;
+
+    uint8_t mode = 0;
+
+    static uint8_t CacheModeOf(const LayoutInput& input) {
+        uint8_t bits = 0;
+        if (input.sizingMode == SizingMode::InherentSize) {
+            bits = (uint8_t)(bits | 1u);
+        }
+        if (input.verticalMarginsAreCollapsible.start) {
+            bits = (uint8_t)(bits | 2u);
+        }
+        if (input.verticalMarginsAreCollapsible.end) {
+            bits = (uint8_t)(bits | 4u);
+        }
+        return bits;
+    }
+    bool ModeMatches(const LayoutInput& input) const {
+        return mode == CacheModeOf(input);
+    }
 
     static constexpr uint16_t kFinalBit = 1;
     static constexpr uint16_t MeasureBit(int i) {
         return (uint16_t)(1u << (i + 1));
     }
 
-    bool Get(const LayoutInput& input, LayoutOutput* out) const;
+    bool Get(const LayoutInput& input, LayoutOutput* out);
     void Store(const LayoutInput& input, const LayoutOutput& output);
 
-    bool GetWithKey(CacheKey key, RunMode runMode, LayoutOutput* out) const;
+    bool GetWithKey(CacheKey key, RunMode runMode, LayoutOutput* out);
     void StoreWithKey(CacheKey key, const LayoutInput& input,
                       const LayoutOutput& output);
 
@@ -3291,9 +3714,45 @@ namespace taffy {
 
 struct BlockContext;
 
-using MeasureFn = SizeF (*)(SizeFOpt knownDimensions, SizeAvail availableSpace,
-                            NodeId node, void* nodeContext, const Style* style,
-                            void* userData);
+struct GridTrackSpan {
+    float start = 0.0f;
+    float end = 0.0f;
+};
+
+struct CollapsedRun {
+    int start = 0;
+    int end = 0;
+};
+
+struct GridAxisPositions {
+    uint16_t negativeImplicit = 0;
+    uint16_t explicitCount = 0;
+    uint16_t positiveImplicit = 0;
+    uint16_t autoRepetitions = 0;
+    Vec<GridTrackSpan> spans;
+    Vec<CollapsedRun> collapsed;
+
+    void Clear() {
+        VecReset(spans);
+        VecReset(collapsed);
+    }
+};
+
+struct GridOofSnapshot {
+    bool live = false;
+    GridAxisPositions columns;
+    GridAxisPositions rows;
+
+    void Clear() {
+        live = false;
+        columns.Clear();
+        rows.Clear();
+    }
+};
+
+using MeasureFn = LayoutOutput (*)(const LayoutInput& inputs, NodeId node,
+                                   void* nodeContext, const Style* style,
+                                   void* userData);
 
 struct NodeData {
     Style style;
@@ -3311,6 +3770,9 @@ struct NodeData {
     bool alive = false;
 
     Vec<NodeId> children;
+
+    Vec<NodeId> hoisted;
+    GridOofSnapshot gridOof;
     NodeId parent;
     bool hasParent = false;
 };
@@ -3409,6 +3871,11 @@ struct TaffyTree {
     LayoutOutput ComputeBlockChildLayout(NodeId node, LayoutInput inputs,
                                          BlockContext* blockCtx);
 
+    void ClearHoistedChildren(NodeId node);
+    void AddHoistedChildren(NodeId node, const Vec<NodeId>& ids);
+    int HoistedChildCount(NodeId node) const;
+    NodeId HoistedChildAt(NodeId node, int index) const;
+
     float MeasureChildSize(NodeId node, SizeFOpt knownDimensions,
                            SizeFOpt parentSize, SizeAvail availableSpace,
                            SizingMode sizingMode, AbsoluteAxis axis,
@@ -3429,6 +3896,393 @@ struct TaffyTree {
 }
 
 #if GPUI_INCLUDE_PRIVATE_API
+#line 1 "src/taffy/flex_balance.h"
+
+namespace taffy {
+
+constexpr double kFlexBalanceInfeasible = (double)INFINITY;
+
+struct FlexBalancePrefix {
+    double sum = 0.0;
+    bool zero = false;
+};
+
+struct FlexBalanceSizes {
+    Vec<FlexBalancePrefix> sums;
+    double gap = 0.0;
+    double limit = 0.0;
+
+    int ItemCount() const { return len(sums); }
+
+    bool IsZeroItem(int index) const { return sums[index].zero; }
+
+    double LineSize(int start, int end) const {
+        double startSum = start == 0 ? 0.0 : sums[start - 1].sum;
+        return sums[end].sum - startSum - gap;
+    }
+
+    double LineCost(int start, int end) const {
+        double size = LineSize(start, end);
+        if (end > start && size > limit) {
+            return kFlexBalanceInfeasible;
+        }
+        return size * size;
+    }
+};
+
+inline double FlexBalanceToSize(float value) {
+    double v = (double)value;
+    if (v < 0.0) {
+        return 0.0;
+    }
+
+    constexpr double kF32Max = 3.4028234663852886e+38;
+    double cap = kF32Max;
+    if (v > cap) {
+        return cap;
+    }
+    return v;
+}
+
+inline bool FlexBalanceFillSizes(FlexBalanceSizes* sizes,
+                                 const float* itemSizes, int itemCount,
+                                 float lineLimit, float gap) {
+    sizes->gap = FlexBalanceToSize(gap);
+    sizes->limit = (double)lineLimit;
+    for (int i = 0; i < itemCount; i++) {
+        double size = FlexBalanceToSize(itemSizes[i]);
+        double sum = size + sizes->gap;
+        if (i > 0) {
+            sum += sizes->sums[i - 1].sum;
+        }
+        FlexBalancePrefix p;
+        p.sum = sum;
+        p.zero = size == 0.0;
+        if (!VecAppend(sizes->sums, p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline int FlexBalancePartitionGe(const uint32_t* a, int n, uint32_t bound) {
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] < bound) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+inline int FlexBalancePartitionGt(const uint32_t* a, int n, uint32_t bound) {
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (a[mid] <= bound) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+struct FlexBalanceRow {
+    const FlexBalanceSizes* sizes;
+    const uint32_t* fitEnds;
+    const double* prev;
+    const uint32_t* nonzeroEnds;
+    int maxEnd;
+};
+
+inline void FlexBalanceFillRow(const FlexBalanceRow* row, double* cur,
+                               uint32_t* opts, int startLo, int startHi,
+                               int colLo, int colHi) {
+    if (startLo > startHi) {
+        return;
+    }
+    int start = startLo + (startHi - startLo) / 2;
+    int sliceN = colHi - colLo;
+    int firstCol = colLo + FlexBalancePartitionGe(row->nonzeroEnds + colLo,
+                                                  sliceN, (uint32_t)start);
+    double minCost = kFlexBalanceInfeasible;
+    int minCol = -1;
+    for (int col = firstCol; col < colHi; col++) {
+        int end = (int)row->nonzeroEnds[col];
+        double lineCost = row->sizes->LineCost(start, end);
+        if (lineCost == kFlexBalanceInfeasible) {
+            break;
+        }
+        double cost = lineCost + row->prev[end + 1];
+
+        if (cost <= minCost) {
+            minCost = cost;
+            minCol = col;
+        }
+    }
+
+    int minEnd = minCol < 0 ? -1 : (int)row->nonzeroEnds[minCol];
+    int zeroEnd = (int)row->fitEnds[start];
+    if (zeroEnd > row->maxEnd) {
+        zeroEnd = row->maxEnd;
+    }
+    if (row->sizes->IsZeroItem(zeroEnd + 1)) {
+        double cost =
+            row->sizes->LineCost(start, zeroEnd) + row->prev[zeroEnd + 1];
+        if (cost < minCost || (cost == minCost && minEnd < zeroEnd)) {
+            minCost = cost;
+            minEnd = zeroEnd;
+        }
+    }
+
+    cur[start] = minCost;
+    opts[start] = (uint32_t)(minEnd < 0 ? start : minEnd);
+
+    if (start > startLo) {
+        int nextHi = minCol < 0 ? colHi : minCol + 1;
+        FlexBalanceFillRow(row, cur, opts, startLo, start - 1, colLo, nextHi);
+    }
+    if (start < startHi) {
+        int nextLo = minCol < 0 ? firstCol : minCol;
+        FlexBalanceFillRow(row, cur, opts, start + 1, startHi, nextLo, colHi);
+    }
+}
+
+inline int FlexBalanceGreedyCount(const FlexBalanceSizes* sizes) {
+    int itemCount = sizes->ItemCount();
+    int lineCount = 1;
+    int index = 0;
+    while (index < itemCount) {
+        int next = index;
+        while (next < itemCount &&
+               sizes->LineSize(index, next) <= sizes->limit) {
+            next++;
+        }
+        if (next == index) {
+            next = index + 1;
+        }
+        index = next;
+        if (index < itemCount) {
+            lineCount++;
+        }
+    }
+    return lineCount;
+}
+
+inline bool FlexBalanceZeroBoundaryValid(const FlexBalanceSizes* sizes,
+                                         const double* minErrors, int lines,
+                                         int start, int end) {
+    int itemCount = sizes->ItemCount();
+    if (!sizes->IsZeroItem(end + 1)) {
+        return true;
+    }
+    int last = itemCount - lines;
+    for (int glued = end + 1; glued <= last; glued++) {
+        if (sizes->LineSize(start, glued) > sizes->limit) {
+            break;
+        }
+        double rest = minErrors[(lines - 2) * itemCount + glued + 1];
+        if (rest != kFlexBalanceInfeasible && rest == rest) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline int BalancedLineItemCounts(const float* itemSizes, int itemCount,
+                                  float lineLimit, float gapBetweenItems,
+                                  int minLineCount, int* out) {
+    FlexBalanceSizes sizes;
+    if (!FlexBalanceFillSizes(&sizes, itemSizes, itemCount, lineLimit,
+                              gapBetweenItems)) {
+        return 0;
+    }
+
+    Vec<uint32_t> suffixGreedy;
+    for (int i = 0; i < itemCount + 1; i++) {
+        VecAppend(suffixGreedy, (uint32_t)0);
+    }
+    int lineEnd = itemCount;
+    for (int start = itemCount - 1; start >= 0; start--) {
+        while (lineEnd > start + 1 &&
+               sizes.LineSize(start, lineEnd - 1) > sizes.limit) {
+            lineEnd--;
+        }
+        suffixGreedy[start] = 1 + suffixGreedy[lineEnd];
+    }
+
+    int minLines = minLineCount;
+    if (minLines < 1) {
+        minLines = 1;
+    }
+    if (minLines > itemCount) {
+        minLines = itemCount;
+    }
+    int lineCount = (int)suffixGreedy[0];
+    if (lineCount < minLines) {
+        lineCount = minLines;
+    }
+
+    if (lineCount == itemCount) {
+        for (int i = 0; i < itemCount; i++) {
+            out[i] = 1;
+        }
+        return itemCount;
+    }
+
+    Vec<uint32_t> fitEnds;
+    int fitEnd = 0;
+    for (int start = 0; start < itemCount; start++) {
+        if (fitEnd < start) {
+            fitEnd = start;
+        }
+        while (fitEnd + 1 < itemCount &&
+               sizes.LineSize(start, fitEnd + 1) <= sizes.limit) {
+            fitEnd++;
+        }
+        VecAppend(fitEnds, (uint32_t)fitEnd);
+    }
+
+    Vec<uint32_t> nonzeroEnds;
+    for (int end = 0; end < itemCount - 1; end++) {
+        if (!sizes.IsZeroItem(end + 1)) {
+            VecAppend(nonzeroEnds, (uint32_t)end);
+        }
+    }
+
+    Vec<double> prev;
+    for (int start = 0; start < itemCount; start++) {
+        VecAppend(prev, sizes.LineCost(start, itemCount - 1));
+    }
+    Vec<double> cur;
+    for (int start = 0; start < itemCount; start++) {
+        VecAppend(cur, kFlexBalanceInfeasible);
+    }
+    Vec<uint32_t> opts;
+    int optCount = (lineCount - 1) * itemCount;
+    for (int i = 0; i < optCount; i++) {
+        VecAppend(opts, (uint32_t)0);
+    }
+
+    for (int lines = 2; lines <= lineCount; lines++) {
+        int maxEnd = itemCount - lines;
+        int firstStart = 0;
+        while (firstStart < maxEnd && (int)suffixGreedy[firstStart] > lines) {
+            cur[firstStart] = kFlexBalanceInfeasible;
+            firstStart++;
+        }
+        int colHi = FlexBalancePartitionGt(nonzeroEnds.els, len(nonzeroEnds),
+                                           (uint32_t)maxEnd);
+        FlexBalanceRow row;
+        row.sizes = &sizes;
+        row.fitEnds = fitEnds.els;
+        row.prev = prev.els;
+        row.nonzeroEnds = nonzeroEnds.els;
+        row.maxEnd = maxEnd;
+        FlexBalanceFillRow(&row, cur.els, opts.els + (lines - 2) * itemCount,
+                           firstStart, maxEnd, 0, colHi);
+        prev = cur;
+    }
+
+    int start = 0;
+    int written = 0;
+    for (int lines = lineCount; lines >= 2; lines--) {
+        int end = (int)opts[(lines - 2) * itemCount + start];
+        out[written++] = end - start + 1;
+        start = end + 1;
+    }
+    out[written++] = itemCount - start;
+    return written;
+}
+
+inline int NaiveBalancedLineItemCounts(const float* itemSizes, int itemCount,
+                                       float lineLimit, float gapBetweenItems,
+                                       int minLineCount, int* out) {
+    FlexBalanceSizes sizes;
+    if (!FlexBalanceFillSizes(&sizes, itemSizes, itemCount, lineLimit,
+                              gapBetweenItems)) {
+        return 0;
+    }
+    int minLines = minLineCount;
+    if (minLines < 1) {
+        minLines = 1;
+    }
+    if (minLines > itemCount) {
+        minLines = itemCount;
+    }
+    int lineCount = FlexBalanceGreedyCount(&sizes);
+    if (lineCount < minLines) {
+        lineCount = minLines;
+    }
+
+    Vec<double> minErrors;
+    for (int start = 0; start < itemCount; start++) {
+        VecAppend(minErrors, sizes.LineCost(start, itemCount - 1));
+    }
+    for (int lines = 2; lines <= lineCount; lines++) {
+        int row = (lines - 1) * itemCount;
+        for (int start = 0; start < itemCount; start++) {
+            double minError = kFlexBalanceInfeasible;
+            int end = start;
+            while (end + lines <= itemCount) {
+                double lineCost = sizes.LineCost(start, end);
+                if (lineCost == kFlexBalanceInfeasible) {
+                    break;
+                }
+                if (FlexBalanceZeroBoundaryValid(&sizes, minErrors.els, lines,
+                                                 start, end)) {
+                    double error =
+                        lineCost + minErrors[row - itemCount + end + 1];
+                    if (error < minError) {
+                        minError = error;
+                    }
+                }
+                end++;
+            }
+            VecAppend(minErrors, minError);
+        }
+    }
+
+    int start = 0;
+    int written = 0;
+    for (int linesAfter = lineCount - 1; linesAfter >= 0; linesAfter--) {
+        double target = minErrors[linesAfter * itemCount + start];
+        int end = itemCount - 1 - linesAfter;
+        for (;;) {
+            bool fits = sizes.LineCost(start, end) != kFlexBalanceInfeasible;
+            if (fits && linesAfter != 0) {
+                fits = FlexBalanceZeroBoundaryValid(&sizes, minErrors.els,
+                                                    linesAfter + 1, start, end);
+            }
+            if (fits) {
+                double remaining = 0.0;
+                if (linesAfter != 0) {
+                    remaining =
+                        minErrors[(linesAfter - 1) * itemCount + end + 1];
+                }
+                if (sizes.LineCost(start, end) + remaining == target) {
+                    break;
+                }
+            }
+            end--;
+        }
+        out[written++] = end - start + 1;
+        start = end + 1;
+    }
+    return written;
+}
+
+}
+
+#endif
+
+#if GPUI_INCLUDE_PRIVATE_API
 #line 1 "src/taffy/compute.h"
 
 namespace taffy {
@@ -3438,6 +4292,32 @@ void ComputeRootLayout(TaffyTree* tree, NodeId root, SizeAvail availableSpace);
 LayoutOutput ComputeHiddenLayout(TaffyTree* tree, NodeId node);
 
 void RoundLayout(TaffyTree* tree, NodeId node);
+
+void ComputeOofLayout(TaffyTree* tree, NodeId node, LayoutOutput* output);
+
+struct OofBoxLayout {
+    Layout layout;
+    OofCandidates surfaced;
+    RectF overflowContribution = RectF::Zero();
+};
+
+OofBoxLayout LayoutOofBox(TaffyTree* tree, const OofCandidate& candidate,
+                          SizeF areaSize, PointF areaOffset,
+                          Direction direction, bool resolveGridArea,
+                          NodeId gridOwner, PointOverflow containerOverflow,
+                          bool* cacheHit);
+
+void PerformOofLayout(TaffyTree* tree, NodeId nodeId, OofCandidates candidates,
+                      SizeF areaSize, PointF areaOffset, Direction direction,
+                      ContainingBlockClaims claims,
+                      PointOverflow containerOverflow, Vec<NodeId>* hoisted,
+                      OofCandidates* unclaimed, RectF* overflowOut);
+
+float ResolveStaticOffsetAxis(AxisStaticPosition position, float size,
+                              float marginStart, float marginEnd);
+
+bool GridOofArea(TaffyTree* tree, NodeId grid, NodeId child, RectF paddingBox,
+                 RectF* out);
 
 using LeafMeasureFn = SizeF (*)(SizeFOpt knownDimensions,
                                 SizeAvail availableSpace, void* ctx);
@@ -3481,7 +4361,7 @@ void GridChildMinMaxSpanForTest(LinePlacement line, uint16_t explicitTrackCount,
                                 uint16_t* outSpan);
 
 void GridSizeEstimateForTest(uint16_t explicitColCount,
-                             uint16_t explicitRowCount, Direction direction,
+                             uint16_t explicitRowCount,
                              const LinePlacement* columns,
                              const LinePlacement* rows, int n,
                              uint16_t* outColCounts, uint16_t* outRowCounts);
@@ -3510,8 +4390,152 @@ int GridPlaceForTest(TaffyTree* tree, NodeId parent, uint16_t explicitColCount,
                      GridPlacementForTest* out, int cap, uint16_t* outColCounts,
                      uint16_t* outRowCounts);
 
-SizeF ComputeContentSizeContribution(PointF location, SizeF size,
-                                     SizeF contentSize, PointOverflow overflow);
+RectF ComputeScrollableOverflowContribution(PointF location, SizeF size,
+                                            RectF scrollableOverflowRect,
+                                            PointOverflow overflow,
+                                            Contain contain,
+                                            bool parentIsScrollContainer);
+
+}
+
+#endif
+
+#if GPUI_INCLUDE_PRIVATE_API
+#line 1 "src/taffy/sizing_keyword.h"
+
+namespace taffy {
+
+enum class SizingKeywordKind : uint8_t {
+    Measure,
+    Exact
+};
+
+struct SizingKeywordResolution {
+    bool isSome = false;
+    SizingKeywordKind kind = SizingKeywordKind::Measure;
+    AvailableSpace measure = AvailableSpace::MaxContent();
+    float exact = 0.0f;
+};
+
+inline SizingKeywordResolution ResolveSizingKeyword(Dimension style,
+                                                    Optf stretchSize,
+                                                    Optf percentBasis,
+                                                    CalcResolver calc) {
+    SizingKeywordResolution out;
+    switch (style.raw.Tag()) {
+        case CompactLength::kMinContentTag:
+            out.isSome = true;
+            out.kind = SizingKeywordKind::Measure;
+            out.measure = AvailableSpace::MinContent();
+            break;
+        case CompactLength::kMaxContentTag:
+            out.isSome = true;
+            out.kind = SizingKeywordKind::Measure;
+            out.measure = AvailableSpace::MaxContent();
+            break;
+        case CompactLength::kFitContentPxTag:
+            out.isSome = true;
+            out.kind = SizingKeywordKind::Measure;
+            out.measure = AvailableSpace::Definite(style.Value());
+            break;
+        case CompactLength::kFitContentPercentTag:
+            if (IsSome(percentBasis)) {
+                out.isSome = true;
+                out.kind = SizingKeywordKind::Measure;
+                out.measure =
+                    AvailableSpace::Definite(percentBasis * style.Value());
+            }
+            break;
+        case CompactLength::kFitContentCalcTag:
+            if (IsSome(percentBasis)) {
+                out.isSome = true;
+                out.kind = SizingKeywordKind::Measure;
+                out.measure = AvailableSpace::Definite(
+                    calc.Resolve(style.raw.CalcValue(), percentBasis));
+            }
+            break;
+        case CompactLength::kFitContentKeywordTag:
+            if (IsSome(stretchSize)) {
+                out.isSome = true;
+                out.kind = SizingKeywordKind::Measure;
+                out.measure = AvailableSpace::Definite(stretchSize);
+            }
+            break;
+        case CompactLength::kStretchTag:
+            if (IsSome(stretchSize)) {
+                out.isSome = true;
+                out.kind = SizingKeywordKind::Exact;
+                out.exact = stretchSize;
+            }
+            break;
+        default:
+            break;
+    }
+    return out;
+}
+
+inline void ResolveAbsoluteSizingKeywords(TaffyTree* tree, NodeId node,
+                                          SizeFOpt* knownDimensions,
+                                          SizeDim sizeStyle, SizeF areaSize,
+                                          RectFOpt inset, RectFOpt margin,
+                                          SizingMode sizingMode) {
+    float stretchW = F32Max(
+        areaSize.w - UnwrapOr(inset.left, 0.0f) - UnwrapOr(inset.right, 0.0f) -
+            UnwrapOr(margin.left, 0.0f) - UnwrapOr(margin.right, 0.0f),
+        0.0f);
+    float stretchH = F32Max(
+        areaSize.h - UnwrapOr(inset.top, 0.0f) - UnwrapOr(inset.bottom, 0.0f) -
+            UnwrapOr(margin.top, 0.0f) - UnwrapOr(margin.bottom, 0.0f),
+        0.0f);
+
+    SizingKeywordResolution keywordWidth;
+    if (!IsSome(knownDimensions->w)) {
+        keywordWidth = ResolveSizingKeyword(sizeStyle.width, Some(stretchW),
+                                            Some(areaSize.w), tree->calc);
+    }
+    SizingKeywordResolution keywordHeight;
+    if (!IsSome(knownDimensions->h)) {
+        keywordHeight = ResolveSizingKeyword(sizeStyle.height, Some(stretchH),
+                                             Some(areaSize.h), tree->calc);
+    }
+
+    bool bothMeasure = keywordWidth.isSome && keywordHeight.isSome &&
+                       keywordWidth.kind == SizingKeywordKind::Measure &&
+                       keywordHeight.kind == SizingKeywordKind::Measure;
+    if (bothMeasure) {
+        SizeF measured = tree->MeasureChildSizeBoth(
+            node, SizeFOptNone(), AsOptional(areaSize),
+            {keywordWidth.measure, keywordHeight.measure}, sizingMode,
+            LineBool::False());
+        *knownDimensions = AsOptional(measured);
+        return;
+    }
+
+    if (keywordWidth.isSome) {
+        if (keywordWidth.kind == SizingKeywordKind::Exact) {
+            knownDimensions->w = Some(keywordWidth.exact);
+        } else {
+            knownDimensions->w = Some(tree->MeasureChildSize(
+                node, *knownDimensions, AsOptional(areaSize),
+                {keywordWidth.measure, AvailableSpace::Definite(stretchH)},
+                sizingMode, AbsoluteAxis::Horizontal, LineBool::False()));
+        }
+    }
+    if (keywordHeight.isSome) {
+        if (keywordHeight.kind == SizingKeywordKind::Exact) {
+            knownDimensions->h = Some(keywordHeight.exact);
+        } else {
+            AvailableSpace widthAvail =
+                IsSome(knownDimensions->w)
+                    ? AvailableSpace::Definite(knownDimensions->w)
+                    : AvailableSpace::Definite(stretchW);
+            knownDimensions->h = Some(tree->MeasureChildSize(
+                node, *knownDimensions, AsOptional(areaSize),
+                {widthAvail, keywordHeight.measure}, sizingMode,
+                AbsoluteAxis::Vertical, LineBool::False()));
+        }
+    }
+}
 
 }
 

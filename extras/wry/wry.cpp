@@ -2195,6 +2195,16 @@ Str SyntheticMouseEventJsTemp(const SyntheticMouseEvent* ev) {
     return b.TakeStr();
 }
 
+static const char* gWebViewLastError = nullptr;
+
+Str WebViewLastError() {
+    return gWebViewLastError ? Str(gWebViewLastError) : Str();
+}
+
+void WebViewSetLastError(const char* message) {
+    gWebViewLastError = message;
+}
+
 }
 
 #if GPUI_OS_ANDROID
@@ -2234,11 +2244,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
+bool PlatCleanOnEscape() {
+    return false;
+}
 bool PlatScrollBounceTouch() {
     return true;
-}
-bool PlatWebViewPartialClipHides() {
-    return false;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2298,11 +2308,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
-bool PlatScrollBounceTouch() {
+bool PlatCleanOnEscape() {
     return true;
 }
-bool PlatWebViewPartialClipHides() {
-    return false;
+bool PlatScrollBounceTouch() {
+    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2405,11 +2415,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
+bool PlatCleanOnEscape() {
+    return true;
+}
 bool PlatScrollBounceTouch() {
     return false;
-}
-bool PlatWebViewPartialClipHides() {
-    return true;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -2512,11 +2522,11 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return true;
 }
+bool PlatCleanOnEscape() {
+    return true;
+}
 bool PlatScrollBounceTouch() {
     return false;
-}
-bool PlatWebViewPartialClipHides() {
-    return true;
 }
 const char* PlatMonoFontName() {
     return "Menlo";
@@ -2962,10 +2972,10 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
-bool PlatScrollBounceTouch() {
-    return false;
+bool PlatCleanOnEscape() {
+    return true;
 }
-bool PlatWebViewPartialClipHides() {
+bool PlatScrollBounceTouch() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -3359,10 +3369,10 @@ float PlatCaretWidth() {
 bool PlatScrollBounce() {
     return false;
 }
-bool PlatScrollBounceTouch() {
-    return false;
+bool PlatCleanOnEscape() {
+    return true;
 }
-bool PlatWebViewPartialClipHides() {
+bool PlatScrollBounceTouch() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -3454,11 +3464,14 @@ static bool EnsureGtk() {
 
     gtk_disable_setlocale();
     if (!gtk_init_check(nullptr, nullptr)) {
+
+        WebViewSetLastError("GTK could not open an X11 display");
         logf("wry: GTK could not open the X display\n");
         return false;
     }
     GdkDisplay* display = gdk_display_get_default();
     if (!display || !GDK_IS_X11_DISPLAY(display)) {
+        WebViewSetLastError("GTK did not open an X11 display");
         logf("wry: GTK did not open an X11 display\n");
         return false;
     }
@@ -3574,6 +3587,9 @@ struct WebView {
     bool followsParent = false;
 
     bool inspectorOpen = false;
+
+    double userZoom = 1;
+    float matchedScale = 1;
 
     Vec<Str> pendingScripts;
     bool pendingOpen = true;
@@ -4556,6 +4572,7 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
     ::Window parent = (::Window)(uintptr_t)parentWindow;
     if (!parent) {
 
+        WebViewSetLastError("a webview needs an X11 window to go in");
         logf("wry: a webview needs an X11 window to go in\n");
         return nullptr;
     }
@@ -4567,6 +4584,7 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
 
     ::Window container = CreateContainer(xdpy, parent, attrs, asChild);
     if (!container) {
+        WebViewSetLastError("could not make the webview's X11 window");
         logf("wry: could not make the webview's X11 window\n");
         return nullptr;
     }
@@ -4589,6 +4607,7 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
         WebViewSetVisible(wv, false);
     }
     wv->hasX11 = true;
+    WebViewSetLastError(nullptr);
     if (!asChild) {
         XTrap trap(display);
         XSelectInput(xdpy, parent, StructureNotifyMask);
@@ -4832,6 +4851,14 @@ bool WebViewZoom(WebView* wv, double scaleFactor) {
     return true;
 }
 
+bool WebViewSetUserZoom(WebView* wv, double zoom) {
+    if (!wv || !(zoom > 0)) {
+        return false;
+    }
+    wv->userZoom = zoom;
+    return WebViewMatchPageScale(wv, wv->matchedScale);
+}
+
 bool WebViewMatchPageScale(WebView* wv, float gpuiScale) {
     if (!wv || !wv->webview) {
         return false;
@@ -4843,7 +4870,9 @@ bool WebViewMatchPageScale(WebView* wv, float gpuiScale) {
     if (gpuiScale <= 0) {
         gpuiScale = 1;
     }
-    return WebViewZoom(wv, (double)gpuiScale / (double)gdk);
+    wv->matchedScale = gpuiScale;
+
+    return WebViewZoom(wv, (double)gpuiScale / (double)gdk * wv->userZoom);
 }
 
 void WebViewSetPageClick(WebView* wv, WebViewPageClick fn, void* user) {
@@ -4864,8 +4893,13 @@ bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
     return true;
 }
 
-bool WebViewSetTheme(WebView*, Theme) {
-    return false;
+bool WebViewSetTheme(WebView*, Theme theme) {
+    GtkSettings* settings = gtk_settings_get_default();
+    if (settings) {
+        g_object_set(settings, "gtk-application-prefer-dark-theme",
+                     theme == Theme::Dark, nullptr);
+    }
+    return true;
 }
 bool WebViewSetMemoryUsageLevel(WebView*, MemoryUsageLevel) {
     return false;
@@ -5144,6 +5178,7 @@ static void Unsupported() {
 }
 
 WebView* WebViewNew(void*, const WebViewAttributes*, bool) {
+    WebViewSetLastError("built without WebKitGTK, so there is no webview here");
     Unsupported();
     return nullptr;
 }
@@ -5188,6 +5223,9 @@ bool WebViewFocusParent(WebView*) {
     return false;
 }
 bool WebViewZoom(WebView*, double) {
+    return false;
+}
+bool WebViewSetUserZoom(WebView*, double) {
     return false;
 }
 bool WebViewMatchPageScale(WebView*, float) {
@@ -6606,6 +6644,10 @@ bool WebViewZoom(WebView* wv, double scaleFactor) {
     return true;
 }
 
+bool WebViewSetUserZoom(WebView* wv, double zoom) {
+    return WebViewZoom(wv, zoom);
+}
+
 bool WebViewMatchPageScale(WebView*, float) {
     return true;
 }
@@ -6617,8 +6659,18 @@ bool WebViewSetBackgroundColor(WebView*, Rgba) {
     return true;
 }
 
-bool WebViewSetTheme(WebView*, Theme) {
-    return false;
+bool WebViewSetTheme(WebView* wv, Theme theme) {
+    if (!wv || !wv->webview) {
+        return false;
+    }
+    NSAppearanceName name = nil;
+    if (theme == Theme::Dark) {
+        name = NSAppearanceNameDarkAqua;
+    } else if (theme == Theme::Light) {
+        name = NSAppearanceNameAqua;
+    }
+    wv->webview.appearance = name ? [NSAppearance appearanceNamed:name] : nil;
+    return true;
 }
 
 bool WebViewSetMemoryUsageLevel(WebView*, MemoryUsageLevel) {
@@ -6990,6 +7042,9 @@ bool WebViewFocusParent(WebView*) {
     return false;
 }
 bool WebViewZoom(WebView*, double) {
+    return false;
+}
+bool WebViewSetUserZoom(WebView*, double) {
     return false;
 }
 bool WebViewMatchPageScale(WebView*, float) {
@@ -11960,6 +12015,10 @@ bool WebViewZoom(WebView* wv, double scaleFactor) {
         return false;
     }
     return SUCCEEDED(wv->controller->put_ZoomFactor(scaleFactor));
+}
+
+bool WebViewSetUserZoom(WebView* wv, double zoom) {
+    return WebViewZoom(wv, zoom);
 }
 
 bool WebViewMatchPageScale(WebView*, float) {

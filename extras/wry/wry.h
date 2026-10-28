@@ -189,9 +189,9 @@ bool PlatTitleBarCloseIsElement();
 float PlatCaretWidth();
 bool PlatScrollBounce();
 
-bool PlatScrollBounceTouch();
+bool PlatCleanOnEscape();
 
-bool PlatWebViewPartialClipHides();
+bool PlatScrollBounceTouch();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
 const char* PlatShellPlatformName();
@@ -1078,6 +1078,13 @@ struct RectF {
     constexpr float HorizontalAxisSum() const { return left + right; }
     constexpr float VerticalAxisSum() const { return top + bottom; }
     constexpr SizeF SumAxes() const { return {left + right, top + bottom}; }
+
+    constexpr RectF Union(RectF other) const {
+        return {left < other.left ? left : other.left,
+                right > other.right ? right : other.right,
+                top < other.top ? top : other.top,
+                bottom > other.bottom ? bottom : other.bottom};
+    }
 };
 
 constexpr bool operator==(RectF a, RectF b) {
@@ -1600,7 +1607,13 @@ bool WebViewFocusParent(WebView* webview);
 
 bool WebViewZoom(WebView* webview, double scaleFactor);
 
+bool WebViewSetUserZoom(WebView* webview, double zoom);
+
 bool WebViewMatchPageScale(WebView* webview, float gpuiScale);
+
+Str WebViewLastError();
+
+void WebViewSetLastError(const char* message);
 
 typedef void (*WebViewPageClick)(void* user, int button, float x, float y,
                                  float gdkScale);
