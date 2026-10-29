@@ -95091,7 +95091,7 @@ El* PopupMenu::IntoEl() {
             rows->Child(Div(a)
                             ->W(kFill)
                             ->PadY(Rems(cx, 0.125f))
-                            ->Child(Div(a)->W(kFill)->H(2)->Bg(th.border)));
+                            ->Child(Div(a)->W(kFill)->H(1)->Bg(th.border)));
             continue;
         }
         bool lit =
