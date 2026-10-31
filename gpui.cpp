@@ -37543,7 +37543,19 @@ struct WrapLineUser {
     int nSpans = 0;
 
     WidthRange* valid = nullptr;
+    bool byChars = false;
 };
+
+static const int kWrapShapedMaxBytes = 128 * 1024;
+
+static float WrapCharOrTabWidth(void* user, uint32_t c) {
+    WrapMeasure* wm = (WrapMeasure*)user;
+    const InputWrapMap* m = wm->map;
+    if (c == '\t' && m->tabSize > 0 && m->spaceWidth > 0) {
+        return m->spaceWidth * (float)m->tabSize;
+    }
+    return WrapCharWidthOf(user, c);
+}
 
 static float WrapTokenWidth(WrapLineUser* u, int i) {
     if (u->widths) {
@@ -37972,6 +37984,16 @@ static int TabSourceAtX(PaintCtx* ctx, const InputState* s, Str text, float x) {
 static void WrapLineFragments(void* user, Str slice, int base,
                               Vec<WrapBoundary>* out) {
     WrapLineUser* u = (WrapLineUser*)user;
+    if (u->nSpans == 0 && u->byChars) {
+
+        LineFragment frag = LineFragment::Text(slice);
+        LineWrapperWrapLine(&frag, 1, u->width, &WrapCharOrTabWidth, u->measure,
+                            out);
+        if (u->valid) {
+            u->valid->Intersect(WidthRange::Empty());
+        }
+        return;
+    }
     if (u->nSpans == 0) {
 
         WidthRange range;
@@ -38026,6 +38048,7 @@ static WidthRange WrapOneLine(InputState* s, WrapMeasure* wm, int line,
     u.measure = wm;
     u.width = m->width;
     u.lineStart = start;
+    u.byChars = len(text) > kWrapShapedMaxBytes;
     const Vec<InlineTokenSpan>* spans =
         InputTokensVisible(s) ? InputTokens(s) : nullptr;
     int nSpans = spans ? len(*spans) : 0;
