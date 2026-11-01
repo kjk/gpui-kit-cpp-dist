@@ -19938,7 +19938,8 @@ float VirtualListItemOrigin(const float* sizes, int count, int ix);
 enum class ScrollStrategy : uint8_t {
     Top,
     Center,
-    Bottom
+    Bottom,
+    Start
 };
 
 float VirtualListScrollTo(float origin, float size, float offset,

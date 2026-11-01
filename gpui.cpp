@@ -71329,6 +71329,8 @@ float VirtualListScrollTo(float origin, float size, float offset,
     float want = offset;
     if (strategy == ScrollStrategy::Center) {
         want = origin + size * 0.5f - viewport * 0.5f;
+    } else if (strategy == ScrollStrategy::Start) {
+        want = origin;
     } else if (origin < offset) {
         want = origin;
     } else if (origin + size > offset + viewport) {
@@ -84598,102 +84600,46 @@ void DiffFile::PrepareInline(DiffInlineUnit unit, int maxLineLength) {
     VecReset(inlineRuns[1]);
     VecReset(inlineStarts[0]);
     VecReset(inlineStarts[1]);
-    VecResize(inlineStarts[0], len(original.lines) + 1);
-    VecResize(inlineStarts[1], len(modified.lines) + 1);
-    inlineStarts[0][0] = 0;
-    inlineStarts[1][0] = 0;
-    Vec<Vec<DiffRun>*> scratch;
+    int nOld = len(original.lines);
+    int nNew = len(modified.lines);
+    VecResize(inlineStarts[0], nOld + 1);
+    VecResize(inlineStarts[1], nNew + 1);
 
-    Vec<DiffRun> oldLine;
-    Vec<DiffRun> newLine;
-    Vec<int> oldCount;
-    Vec<int> newCount;
-    VecResize(oldCount, len(original.lines));
-    VecResize(newCount, len(modified.lines));
-    Vec<DiffRun> oldAll;
-    Vec<DiffRun> newAll;
+    Vec<int> pairOfOld;
+    Vec<int> pairOfNew;
+    VecResize(pairOfOld, nOld);
+    VecResize(pairOfNew, nNew);
+    for (int i = 0; i < nOld; i++) pairOfOld[i] = -1;
+    for (int i = 0; i < nNew; i++) pairOfNew[i] = -1;
     for (int p = 0; p < len(pairs); p++) {
-        if (!pairs[p].changed || pairs[p].original < 0 || pairs[p].modified < 0)
-            continue;
-        Str oldText = original.lines[pairs[p].original].text;
-        Str newText = modified.lines[pairs[p].modified].text;
-        if (oldText.len > maxLineLength || newText.len > maxLineLength)
-            continue;
-        if (oldText.len == newText.len &&
-            memcmp(oldText.s ? oldText.s : "", newText.s ? newText.s : "",
-                   (size_t)oldText.len) == 0)
-            continue;
-        VecClear(oldLine);
-        VecClear(newLine);
-        DiffChangedRuns(oldText, newText, unit, &oldLine, &newLine);
-        for (int i = 0; i < len(oldLine); i++) VecAppend(oldAll, oldLine[i]);
-        for (int i = 0; i < len(newLine); i++) VecAppend(newAll, newLine[i]);
-        oldCount[pairs[p].original] = len(oldLine);
-        newCount[pairs[p].modified] = len(newLine);
+        const DiffLinePair& pair = pairs[p];
+        if (!pair.changed || pair.original < 0 || pair.modified < 0) continue;
+        if (pairOfOld[pair.original] < 0) pairOfOld[pair.original] = p;
+        if (pairOfNew[pair.modified] < 0) pairOfNew[pair.modified] = p;
     }
-    int at = 0;
-    for (int i = 0; i < len(original.lines); i++) {
-        inlineStarts[0][i] = at;
-        at += oldCount[i];
-    }
-    inlineStarts[0][len(original.lines)] = at;
-    at = 0;
-    for (int i = 0; i < len(modified.lines); i++) {
-        inlineStarts[1][i] = at;
-        at += newCount[i];
-    }
-    inlineStarts[1][len(modified.lines)] = at;
-
-    VecClear(oldAll);
-    VecClear(newAll);
-    Vec<DiffRun>* bags[2] = {&oldAll, &newAll};
-    (void)bags;
     Vec<DiffRun> perOld;
     Vec<DiffRun> perNew;
-
-    for (int line = 0; line < len(original.lines); line++) {
-        inlineStarts[0][line] = len(inlineRuns[0]);
-        for (int p = 0; p < len(pairs); p++) {
-            if (pairs[p].original != line || pairs[p].modified < 0 ||
-                !pairs[p].changed)
-                continue;
-            Str oldText = original.lines[line].text;
-            Str newText = modified.lines[pairs[p].modified].text;
+    for (int which = 0; which < 2; which++) {
+        const Vec<int>& pairOf = which == 0 ? pairOfOld : pairOfNew;
+        for (int line = 0; line < len(pairOf); line++) {
+            inlineStarts[which][line] = len(inlineRuns[which]);
+            if (pairOf[line] < 0) continue;
+            const DiffLinePair& pair = pairs[pairOf[line]];
+            Str oldText = original.lines[pair.original].text;
+            Str newText = modified.lines[pair.modified].text;
             if (oldText.len > maxLineLength || newText.len > maxLineLength)
-                break;
-            VecClear(perOld);
-            VecClear(perNew);
-            DiffChangedRuns(oldText, newText, unit, &perOld, &perNew);
-            for (int i = 0; i < len(perOld); i++)
-                VecAppend(inlineRuns[0], perOld[i]);
-            break;
-        }
-    }
-    inlineStarts[0][len(original.lines)] = len(inlineRuns[0]);
-    for (int line = 0; line < len(modified.lines); line++) {
-        inlineStarts[1][line] = len(inlineRuns[1]);
-        for (int p = 0; p < len(pairs); p++) {
-            if (pairs[p].modified != line || pairs[p].original < 0 ||
-                !pairs[p].changed)
                 continue;
-            Str oldText = original.lines[pairs[p].original].text;
-            Str newText = modified.lines[line].text;
-            if (oldText.len > maxLineLength || newText.len > maxLineLength)
-                break;
-            VecClear(perOld);
-            VecClear(perNew);
             DiffChangedRuns(oldText, newText, unit, &perOld, &perNew);
-            for (int i = 0; i < len(perNew); i++)
-                VecAppend(inlineRuns[1], perNew[i]);
-            break;
+            const Vec<DiffRun>& runs = which == 0 ? perOld : perNew;
+            for (int i = 0; i < len(runs); i++)
+                VecAppend(inlineRuns[which], runs[i]);
         }
+        inlineStarts[which][len(pairOf)] = len(inlineRuns[which]);
     }
-    inlineStarts[1][len(modified.lines)] = len(inlineRuns[1]);
-    (void)oldCount;
-    (void)newCount;
-    (void)oldAll;
-    (void)newAll;
-    (void)scratch;
+    VecReset(pairOfOld);
+    VecReset(pairOfNew);
+    VecReset(perOld);
+    VecReset(perNew);
 }
 
 int DiffFile::InlineCount(DiffSide side, int line) const {
@@ -85838,8 +85784,9 @@ static void MoveChange(DiffState* self, bool forward, Ctx* cx) {
         target = i > 0 ? self->changeRows[i - 1] : self->changeRows[n - 1];
     }
     self->scrollItem = target;
+
     VirtualListScrollToItemDeferred(&self->listScroll, target,
-                                    ScrollStrategy::Top);
+                                    ScrollStrategy::Start);
     if (cx) Notify(cx);
 }
 
