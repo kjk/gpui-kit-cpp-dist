@@ -159,6 +159,8 @@ void PlatGetExeDir(char* out, int cap);
 
 bool PlatGetExePath(char* out, int cap);
 
+bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status);
+
 bool PlatFileIsExecutable(const char* path);
 
 bool PlatMakeExecutable(const char* path);
@@ -192,6 +194,8 @@ bool PlatScrollBounce();
 bool PlatCleanOnEscape();
 
 bool PlatScrollBounceTouch();
+
+bool PlatOverscrollPhaselessStops();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
 const char* PlatShellPlatformName();

@@ -3490,6 +3490,10 @@ UnistPosition GetUnistPosition(Str md, uint32_t start, uint32_t end) {
 
 namespace base {
 
+bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
+    return true;
+}
+
 bool PlatGetExePath(char* out, int cap) {
     if (!out || cap <= 0) return false;
     out[0] = 0;
@@ -3525,6 +3529,9 @@ bool PlatCleanOnEscape() {
 bool PlatScrollBounceTouch() {
     return true;
 }
+bool PlatOverscrollPhaselessStops() {
+    return false;
+}
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
 }
@@ -3558,6 +3565,10 @@ float PlatWindowShadowSize() {
 
 namespace base {
 
+bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
+    return true;
+}
+
 bool PlatGetExePath(char* out, int cap) {
     if (out && cap > 0) out[0] = 0;
     return false;
@@ -3588,6 +3599,9 @@ bool PlatCleanOnEscape() {
 }
 bool PlatScrollBounceTouch() {
     return true;
+}
+bool PlatOverscrollPhaselessStops() {
+    return false;
 }
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
@@ -3626,6 +3640,10 @@ float PlatWindowShadowSize() {
 namespace base {
 
 void PlatDirNameInPlace(char* path);
+
+bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
+    return true;
+}
 
 bool PlatGetExePath(char* out, int cap) {
     if (!out || cap <= 0) return false;
@@ -3696,6 +3714,9 @@ bool PlatCleanOnEscape() {
 bool PlatScrollBounceTouch() {
     return false;
 }
+bool PlatOverscrollPhaselessStops() {
+    return false;
+}
 const char* PlatMonoFontName() {
     return "DejaVu Sans Mono";
 }
@@ -3725,9 +3746,20 @@ float PlatWindowShadowSize() {
 #if GPUI_OS_MAC
 #line 1 "src/base_mac.cpp"
 
+#include <errno.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+
+extern "C" int responsibility_spawnattrs_setdisclaim(posix_spawnattr_t* attrs,
+                                                     int disclaim);
+
+extern "C" char** environ;
 
 namespace base {
 
@@ -3740,6 +3772,79 @@ bool PlatGetExePath(char* out, int cap) {
     if (_NSGetExecutablePath(out, &n) != 0) return false;
     out[cap - 1] = 0;
     return out[0] != 0;
+}
+
+bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status) {
+    if (getenv("SPEECH_RESPONSIBILITY_DISCLAIMED")) {
+        return true;
+    }
+    char path[kMaxPath];
+    if (!PlatGetExePath(path, kMaxPath)) {
+        fprintf(stderr,
+                "Speech could not disclaim the terminal's responsibility: "
+                "current executable path is unknown\n");
+        return true;
+    }
+    if (argc < 0) {
+        argc = 0;
+    }
+    char** childArgv = new char*[argc + 1];
+    for (int i = 0; i < argc; i++) {
+        childArgv[i] = argv ? argv[i] : nullptr;
+    }
+    childArgv[argc] = nullptr;
+
+    int nenv = 0;
+    if (environ) {
+        while (environ[nenv]) {
+            nenv++;
+        }
+    }
+    char** envp = new char*[nenv + 2];
+    for (int i = 0; i < nenv; i++) {
+        envp[i] = environ[i];
+    }
+    envp[nenv] = const_cast<char*>("SPEECH_RESPONSIBILITY_DISCLAIMED=1");
+    envp[nenv + 1] = nullptr;
+
+    posix_spawnattr_t attrs = nullptr;
+    pid_t pid = 0;
+    int err = posix_spawnattr_init(&attrs);
+    if (err == 0) {
+        err = responsibility_spawnattrs_setdisclaim(&attrs, 1);
+        if (err == 0) {
+            err = posix_spawn(&pid, path, nullptr, &attrs, childArgv, envp);
+        }
+        posix_spawnattr_destroy(&attrs);
+    }
+    delete[] childArgv;
+    delete[] envp;
+    if (err != 0) {
+        fprintf(stderr,
+                "Speech could not disclaim the terminal's responsibility: "
+                "%s\n",
+                strerror(err));
+        return true;
+    }
+
+    int raw = 0;
+    for (;;) {
+        if (waitpid(pid, &raw, 0) != -1) {
+            break;
+        }
+        if (errno != EINTR) {
+            fprintf(stderr,
+                    "Speech could not disclaim the terminal's responsibility: "
+                    "%s\n",
+                    strerror(errno));
+            return true;
+        }
+    }
+    int code = WIFEXITED(raw) ? WEXITSTATUS(raw) : 128 + WTERMSIG(raw);
+    if (status) {
+        *status = code;
+    }
+    return false;
 }
 
 void PlatGetExeDir(char* out, int cap) {
@@ -3802,6 +3907,9 @@ bool PlatCleanOnEscape() {
 }
 bool PlatScrollBounceTouch() {
     return false;
+}
+bool PlatOverscrollPhaselessStops() {
+    return true;
 }
 const char* PlatMonoFontName() {
     return "Menlo";
@@ -4203,6 +4311,10 @@ uint64_t PlatArenaReserveSize() {
     return 4ull * 1024ull * 1024ull;
 }
 
+bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
+    return true;
+}
+
 bool PlatGetExePath(char* out, int cap) {
     if (out && cap > 0) out[0] = 0;
     return false;
@@ -4251,6 +4363,9 @@ bool PlatCleanOnEscape() {
     return true;
 }
 bool PlatScrollBounceTouch() {
+    return false;
+}
+bool PlatOverscrollPhaselessStops() {
     return false;
 }
 const char* PlatMonoFontName() {
@@ -4452,6 +4567,10 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
     return true;
 }
 
+bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
+    return true;
+}
+
 bool PlatGetExePath(char* out, int cap) {
     if (!out || cap <= 0) return false;
     out[0] = 0;
@@ -4648,6 +4767,9 @@ bool PlatCleanOnEscape() {
     return true;
 }
 bool PlatScrollBounceTouch() {
+    return false;
+}
+bool PlatOverscrollPhaselessStops() {
     return false;
 }
 const char* PlatMonoFontName() {

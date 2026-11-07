@@ -538,35 +538,35 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "18be16887bc2cb462f7b0a33c18bf6183344e7de",
-  date: "2026-10-28",
-  subject: "menu: Make submenu rows activatable (#3714)",
+  sha: "46bf6d498fa101a3b11cc64e6d8c20d28d17b720",
+  date: "2026-11-07",
+  subject: "input: Let the completions test run the IME caret reports before counting frames (#3837)",
   crates: {
-    "gpui-kit": "0.8.1",
-    "gpui-base": "0.8.1",
-    "gpui-component": "0.8.1",
-    "gpui-component-story": "0.8.1",
-    "gpui-webview": "0.8.1",
-    "gpui-shell": "0.8.1",
+    "gpui-kit": "0.9.0",
+    "gpui-base": "0.9.0",
+    "gpui-component": "0.9.0",
+    "gpui-component-story": "0.9.0",
+    "gpui-webview": "0.9.0",
+    "gpui-shell": "0.9.0",
   },
   dir: ".work/gpui-component",
 } as const;
 
 /**
- * Zed reference snapshot recorded in gpui-pre 0.3.10's package metadata.
+ * Zed reference snapshot recorded in gpui-pre 0.3.11's package metadata.
  * Cargo.lock now resolves registry packages rather than a Zed git source.
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "08cbb88a152c3751a43e853425a70e9f631a5918",
-  date: "2026-10-25",
-  subject: "git_ui: Fix git graph lagging when toggling commit details panel (#66132)",
+  sha: "f816e1f9263e3a8ef63c4baaa02e1441ce1c6038",
+  date: "2026-11-01",
+  subject: "gpui: Render macOS window screenshots offscreen (#66344)",
   crates: {
-    "gpui-pre": "0.3.10",
-    "gpui-pre-platform": "0.3.10",
-    "gpui-pre-macros": "0.3.10",
+    "gpui-pre": "0.3.11",
+    "gpui-pre-platform": "0.3.11",
+    "gpui-pre-macros": "0.3.11",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.10",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.11",
 } as const;
 
 /**
