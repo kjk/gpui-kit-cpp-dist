@@ -26287,6 +26287,10 @@ bool AppIsMaximized(Window* win) {
     return win && win->maximized;
 }
 
+bool AppIsMinimized(Window* win) {
+    return win && win->minimized;
+}
+
 void WindowSetCursorVisible(Window* win, bool visible) {
     if (!win || win->cursorHidden == !visible) {
         return;
@@ -254790,7 +254794,7 @@ static Str gClipboard = {};
 
 static Atom aWmDeleteWindow, aWmProtocols, aNetWmName, aUtf8String;
 static Atom aNetWmState, aNetWmStateMaxVert, aNetWmStateMaxHorz;
-static Atom aNetWmStateFullscreen;
+static Atom aNetWmStateFullscreen, aNetWmStateHidden, aWmState;
 static Atom aNetFrameExtents;
 static Atom aNetWmMoveResize, aMotifWmHints, aGtkShowWindowMenu;
 static Atom aGtkEdgeConstraints;
@@ -254877,10 +254881,29 @@ static void Redraw(Window* win) {
     XFlush(gDpy);
 }
 
-static bool ReadMaximized(Window* win) {
-    PlatWindow* pw = win->plat;
-    if (!pw) {
+static bool ReadIconic(PlatWindow* pw) {
+    Atom type = 0;
+    int format = 0;
+    unsigned long n = 0, after = 0;
+    unsigned char* data = nullptr;
+    if (XGetWindowProperty(gDpy, pw->xwin, aWmState, 0, 2, False, aWmState,
+                           &type, &format, &n, &after, &data) != Success) {
         return false;
+    }
+    bool iconic =
+        data && format == 32 && n >= 1 && ((long*)data)[0] == IconicState;
+    if (data) {
+        XFree(data);
+    }
+    return iconic;
+}
+
+static void ReadWmState(Window* win) {
+    PlatWindow* pw = win->plat;
+    win->maximized = false;
+    win->minimized = false;
+    if (!pw) {
+        return;
     }
     Atom type = 0;
     int format = 0;
@@ -254888,7 +254911,7 @@ static bool ReadMaximized(Window* win) {
     unsigned char* data = nullptr;
     if (XGetWindowProperty(gDpy, pw->xwin, aNetWmState, 0, 32, False, XA_ATOM,
                            &type, &format, &n, &after, &data) != Success) {
-        return false;
+        return;
     }
     bool vert = false;
     bool horz = false;
@@ -254901,10 +254924,16 @@ static bool ReadMaximized(Window* win) {
             if (atoms[i] == aNetWmStateMaxHorz) {
                 horz = true;
             }
+            if (atoms[i] == aNetWmStateHidden) {
+                win->minimized = true;
+            }
         }
         XFree(data);
     }
-    return vert && horz;
+    win->maximized = vert && horz;
+    if (!win->minimized) {
+        win->minimized = ReadIconic(pw);
+    }
 }
 
 static Tiling ReadTiling(Window* win, bool maximized) {
@@ -256453,8 +256482,9 @@ static void HandleEvent(App* app, XEvent* ev) {
             break;
         case PropertyNotify:
             if (ev->xproperty.atom == aNetWmState ||
+                ev->xproperty.atom == aWmState ||
                 ev->xproperty.atom == aGtkEdgeConstraints) {
-                win->maximized = ReadMaximized(win);
+                ReadWmState(win);
                 win->tiling = ReadTiling(win, win->maximized);
                 pw->dirty = true;
             }
@@ -256868,6 +256898,8 @@ bool PlatInit(App* app) {
         XInternAtom(gDpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
     aNetWmStateFullscreen =
         XInternAtom(gDpy, "_NET_WM_STATE_FULLSCREEN", False);
+    aNetWmStateHidden = XInternAtom(gDpy, "_NET_WM_STATE_HIDDEN", False);
+    aWmState = XInternAtom(gDpy, "WM_STATE", False);
     aNetWmMoveResize = XInternAtom(gDpy, "_NET_WM_MOVERESIZE", False);
     aMotifWmHints = XInternAtom(gDpy, "_MOTIF_WM_HINTS", False);
     aGtkShowWindowMenu = XInternAtom(gDpy, "_GTK_SHOW_WINDOW_MENU", False);
@@ -258179,6 +258211,21 @@ static bool PressedButton(MouseButton* out) {
 - (void)windowDidResize:(NSNotification*)note {
     (void)note;
     gpui::AppInvalidate(win);
+}
+
+- (void)windowDidMiniaturize:(NSNotification*)note {
+    (void)note;
+    if (win) {
+        win->minimized = true;
+    }
+}
+
+- (void)windowDidDeminiaturize:(NSNotification*)note {
+    (void)note;
+    if (win) {
+        win->minimized = false;
+        gpui::AppInvalidate(win);
+    }
 }
 
 - (void)windowDidChangeBackingProperties:(NSNotification*)note {
@@ -261345,6 +261392,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
         case WM_SIZE:
             win->paint.dpi = HostDpi(hwnd);
+            win->minimized = wParam == SIZE_MINIMIZED;
 
             if (wParam != SIZE_MINIMIZED) {
                 RenderFrame(win);

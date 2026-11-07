@@ -8716,6 +8716,8 @@ struct Window {
     bool cursorHidden = false;
     bool maximized = false;
 
+    bool minimized = false;
+
     float clientInset = -1;
     Tiling tiling = {};
 
@@ -9562,6 +9564,7 @@ void WindowOnShouldClose(Window* win, WindowShouldCloseFn fn, void* data);
 void AppClose(Window* win);
 void AppDrag(Window* win);
 bool AppIsMaximized(Window* win);
+bool AppIsMinimized(Window* win);
 }
 
 int GpuiMain(int argc, char** argv);
