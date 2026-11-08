@@ -562,74 +562,50 @@ static void AppendMappedSpan(StrBuilder* out, Str span) {
     }
 }
 
-static int MatchLeft(Str s, int i) {
-    int a = MatchClassRun(s, i, IsCjOrWordClassCp);
+static int MatchRunPunctSpaces(Str s, int i, bool (*cls)(uint32_t),
+                               bool (*punct)(char)) {
+    int a = MatchClassRun(s, i, cls);
     if (a <= 0) {
         return -1;
     }
     int at = i + a;
-    if (at >= len(s) || !IsNormalPunct(s.s[at])) {
+    if (at >= len(s) || !punct(s.s[at])) {
         return -1;
     }
     at++;
     while (at < len(s) && s.s[at] == ' ') {
         at++;
     }
-    int b = MatchClassRun(s, at, IsCjClassCp);
-    if (b <= 0) {
+    return at;
+}
+
+static int MatchThenCjRun(Str s, int i, int at) {
+    if (at < 0) {
         return -1;
     }
-    return at + b - i;
+    int b = MatchClassRun(s, at, IsCjClassCp);
+    return b > 0 ? at + b - i : -1;
+}
+
+static int MatchLeft(Str s, int i) {
+    return MatchThenCjRun(
+        s, i, MatchRunPunctSpaces(s, i, IsCjOrWordClassCp, IsNormalPunct));
 }
 
 static int MatchRight(Str s, int i) {
-    int a = MatchClassRun(s, i, IsCjClassCp);
-    if (a <= 0) {
-        return -1;
-    }
-    int at = i + a;
-    if (at >= len(s) || !IsNormalPunct(s.s[at])) {
-        return -1;
-    }
-    at++;
-    while (at < len(s) && s.s[at] == ' ') {
-        at++;
-    }
-    return at - i;
+    int at = MatchRunPunctSpaces(s, i, IsCjClassCp, IsNormalPunct);
+    return at < 0 ? -1 : at - i;
 }
 
 static int MatchSpecial(Str s, int i) {
-    int a = MatchClassRun(s, i, IsCjClassCp);
-    if (a <= 0) {
-        return -1;
-    }
-    int at = i + a;
-    if (at >= len(s) || !IsSpecialPunct(s.s[at])) {
-        return -1;
-    }
-    at++;
-    while (at < len(s) && s.s[at] == ' ') {
-        at++;
-    }
-    int b = MatchClassRun(s, at, IsCjClassCp);
-    if (b <= 0) {
-        return -1;
-    }
-    return at + b - i;
+    return MatchThenCjRun(
+        s, i, MatchRunPunctSpaces(s, i, IsCjClassCp, IsSpecialPunct));
 }
 
 static int MatchSpecialLast(Str s, int i) {
-    int a = MatchClassRun(s, i, IsCjClassCp);
-    if (a <= 0) {
+    int at = MatchRunPunctSpaces(s, i, IsCjClassCp, IsSpecialPunct);
+    if (at < 0) {
         return -1;
-    }
-    int at = i + a;
-    if (at >= len(s) || !IsSpecialPunct(s.s[at])) {
-        return -1;
-    }
-    at++;
-    while (at < len(s) && s.s[at] == ' ') {
-        at++;
     }
     if (at < len(s) && (s.s[at] == '"' || s.s[at] == '\'')) {
         at++;
@@ -650,9 +626,7 @@ static bool PassReplace(Str in, MatchFn match, StrBuilder* out) {
             changed = true;
             continue;
         }
-        int step = Utf8Len(in, i);
-        out->Append(Str(in.s + i, step));
-        i += step;
+        Utf8CopyNext(in, &i, out);
     }
     return changed;
 }
@@ -691,37 +665,11 @@ static bool IsAlnumCharCp(uint32_t cp) {
 }
 
 static bool IsWhitespaceCp(uint32_t cp) {
-    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' ||
-        cp == 0x0B || cp == 0x85 || cp == 0xA0) {
-        return true;
-    }
-    return cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
-           cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+    return base::IsUnicodeWhitespace(cp);
 }
 
 static void AppendCp(StrBuilder* out, uint32_t cp) {
-    char buf[4];
-    int n;
-    if (cp < 0x80) {
-        buf[0] = (char)cp;
-        n = 1;
-    } else if (cp < 0x800) {
-        buf[0] = (char)(0xC0 | (cp >> 6));
-        buf[1] = (char)(0x80 | (cp & 0x3F));
-        n = 2;
-    } else if (cp < 0x10000) {
-        buf[0] = (char)(0xE0 | (cp >> 12));
-        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        buf[2] = (char)(0x80 | (cp & 0x3F));
-        n = 3;
-    } else {
-        buf[0] = (char)(0xF0 | (cp >> 18));
-        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        buf[3] = (char)(0x80 | (cp & 0x3F));
-        n = 4;
-    }
-    out->Append(Str(buf, n));
+    out->AppendUtf8(cp);
 }
 
 bool FormatHalfwidthWord(Arena* a, Str in, Str* out) {
@@ -823,17 +771,23 @@ static bool IsEnglishSep(uint32_t cp) {
            cp == '!' || cp == '&' || cp == ':';
 }
 
+static bool SkipWordRun(Str s, int* i) {
+    while (*i < len(s) && !IsWordCp(Utf8At(s, *i))) {
+        Utf8Next(s, i);
+    }
+    if (*i >= len(s)) {
+        return false;
+    }
+    while (*i < len(s) && IsWordCp(Utf8At(s, *i))) {
+        Utf8Next(s, i);
+    }
+    return true;
+}
+
 static bool HasEnglishShape(Str s) {
     int i = 0;
-    while (i < len(s)) {
-        if (!IsWordCp(Utf8At(s, i))) {
-            Utf8Next(s, &i);
-            continue;
-        }
 
-        while (i < len(s) && IsWordCp(Utf8At(s, i))) {
-            Utf8Next(s, &i);
-        }
+    while (SkipWordRun(s, &i)) {
 
         int seps = 0;
         while (i < len(s) && IsEnglishSep(Utf8At(s, i))) {
@@ -929,14 +883,7 @@ static bool LooksLikeCodeString(Str s) {
         }
     }
     int i = 0;
-    while (i < len(s)) {
-        if (!IsWordCp(Utf8At(s, i))) {
-            Utf8Next(s, &i);
-            continue;
-        }
-        while (i < len(s) && IsWordCp(Utf8At(s, i))) {
-            Utf8Next(s, &i);
-        }
+    while (SkipWordRun(s, &i)) {
         if (i + 1 < len(s) && s.s[i] == '.' && IsWordCp(Utf8At(s, i + 1))) {
             int j = i + 1;
             while (j < len(s) && IsWordCp(Utf8At(s, j))) {
@@ -1099,14 +1046,7 @@ static int MatchTag(Str s, int i) {
     char quote = 0;
     for (int at = i + 1; at < len(s); at++) {
         char c = s.s[at];
-        if (quote) {
-            if (c == quote) {
-                quote = 0;
-            }
-            continue;
-        }
-        if (c == '"' || c == '\'') {
-            quote = c;
+        if (base::ScanSkipQuoted(c, &quote)) {
             continue;
         }
         if (c == '>') {
@@ -1160,13 +1100,8 @@ static bool AtOpenTag(Str s, int i, const char* name) {
 }
 
 void ScanHtml(Results* res, Str raw) {
-    int ignoreStart = 0;
+    IgnoreRun run{res, raw};
     int i = 0;
-    auto flush = [&](int upTo) {
-        if (upTo > ignoreStart) {
-            EmitIgnore(res, Str(raw.s + ignoreStart, upTo - ignoreStart));
-        }
-    };
     while (i < len(raw)) {
         if (raw.s[i] != '<') {
 
@@ -1174,9 +1109,7 @@ void ScanHtml(Results* res, Str raw) {
             while (i < len(raw) && raw.s[i] != '<') {
                 i++;
             }
-            flush(start);
-            EmitText(res, StrL("text"), Str(raw.s + start, i - start));
-            ignoreStart = i;
+            run.Text(StrL("text"), start, i - start);
             continue;
         }
 
@@ -1190,9 +1123,7 @@ void ScanHtml(Results* res, Str raw) {
                 }
             }
             if (end > 0) {
-                flush(i);
-                EmitText(res, StrL("comment"), Str(raw.s + i, end - i));
-                ignoreStart = end;
+                run.Text(StrL("comment"), i, end - i);
                 i = end;
                 continue;
             }
@@ -1250,10 +1181,10 @@ void ScanHtml(Results* res, Str raw) {
                 break;
             }
             if (el.rule) {
-                flush(i + tag);
+                run.Flush(i + tag);
                 EmitInlineScript(res, Str(el.rule),
                                  Str(raw.s + i + tag, close - (i + tag)));
-                ignoreStart = close;
+                run.start = close;
             }
             i = close + closeLen;
             handled = true;
@@ -1271,7 +1202,7 @@ void ScanHtml(Results* res, Str raw) {
 
         i++;
     }
-    flush(len(raw));
+    run.Flush(len(raw));
 }
 
 }
@@ -2281,6 +2212,16 @@ int MatchNewlinePlus(Str s, int i) {
     return count > 0 ? at - i : -1;
 }
 
+static MdNode* EndAtNewlines(Str s, int at, MdNode* n, int* pos) {
+    int nl = MatchNewlinePlus(s, at);
+    if (nl < 0) {
+        return nullptr;
+    }
+    n->end = at + nl;
+    *pos = n->end;
+    return n;
+}
+
 MdNode* ParseListItem(MdParser* p, int* pos) {
     Str s = p->s;
     int i = *pos;
@@ -2293,13 +2234,7 @@ MdNode* ParseListItem(MdParser* p, int* pos) {
     if (ParseInlineOrStringSeq(p, &at, n) == 0) {
         return nullptr;
     }
-    int nl = MatchNewlinePlus(s, at);
-    if (nl < 0) {
-        return nullptr;
-    }
-    n->end = at + nl;
-    *pos = n->end;
-    return n;
+    return EndAtNewlines(s, at, n, pos);
 }
 
 MdNode* ParseListParagraph(MdParser* p, int* pos) {
@@ -2312,13 +2247,7 @@ MdNode* ParseListParagraph(MdParser* p, int* pos) {
     MdNode* n = NewNode(p, MdRule::Container, i);
     int at = i + indent;
     ParseInlineOrStringSeq(p, &at, n);
-    int nl = MatchNewlinePlus(s, at);
-    if (nl < 0) {
-        return nullptr;
-    }
-    n->end = at + nl;
-    *pos = n->end;
-    return n;
+    return EndAtNewlines(s, at, n, pos);
 }
 
 MdNode* ParseList(MdParser* p, int* pos) {
@@ -2877,36 +2806,29 @@ struct Alt {
     const char* rule;
 };
 
+static bool ScanAltAt(IgnoreRun* run, const Alt* alts, int nAlts, int* i) {
+    for (int k = 0; k < nAlts; k++) {
+        int matched = alts[k].match(run->raw, *i);
+        if (matched > 0) {
+            if (alts[k].rule) {
+                run->Text(Str(alts[k].rule), *i, matched);
+            }
+            *i += matched;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ScanAlts(Results* res, Str raw, const Alt* alts, int nAlts) {
-    int ignoreStart = 0;
+    IgnoreRun run{res, raw};
     int i = 0;
     while (i < len(raw)) {
-        int matched = -1;
-        const Alt* hit = nullptr;
-        for (int k = 0; k < nAlts; k++) {
-            matched = alts[k].match(raw, i);
-            if (matched > 0) {
-                hit = &alts[k];
-                break;
-            }
-        }
-        if (!hit) {
+        if (!ScanAltAt(&run, alts, nAlts, &i)) {
             i++;
-            continue;
         }
-        if (hit->rule) {
-            if (i > ignoreStart) {
-                EmitIgnore(res, Str(raw.s + ignoreStart, i - ignoreStart));
-            }
-            EmitText(res, Str(hit->rule), Str(raw.s + i, matched));
-            ignoreStart = i + matched;
-        }
-
-        i += matched;
     }
-    if (len(raw) > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
-    }
+    run.Flush(len(raw));
 }
 
 static int CppLineComment(Str s, int i) {
@@ -3029,41 +2951,37 @@ static int ObjcSkipBlank(Str s, int i) {
     return i;
 }
 
-static int ObjcIgnoreString(Str s, int i) {
-    static const char* const kMethods[] = {"NSRegularExpression",
-                                           "NSLocalizedString", "Match"};
-    for (const char* m : kMethods) {
-        int n = LitLen(s, i, m);
+static int MatchWordThenString(Str s, int i, const char* const* words,
+                               int nWords, char sep, int (*str)(Str, int)) {
+    for (int k = 0; k < nWords; k++) {
+        int n = LitLen(s, i, words[k]);
         if (n < 0) {
             continue;
         }
         int at = i + n;
-        if (at >= len(s) || s.s[at] != '(') {
+        if (at >= len(s) || s.s[at] != sep) {
             continue;
         }
         at = ObjcSkipBlank(s, at + 1);
-        int sn = ObjcString(s, at);
-        if (sn > 0) {
-            return at + sn - i;
-        }
-    }
-    static const char* const kArgs[] = {"WithPattern", "WithKey"};
-    for (const char* arg : kArgs) {
-        int n = LitLen(s, i, arg);
-        if (n < 0) {
-            continue;
-        }
-        int at = i + n;
-        if (at >= len(s) || s.s[at] != ':') {
-            continue;
-        }
-        at = ObjcSkipBlank(s, at + 1);
-        int sn = ObjcString(s, at);
+        int sn = str(s, at);
         if (sn > 0) {
             return at + sn - i;
         }
     }
     return -1;
+}
+
+static const char* const kObjcIgnoreMethods[] = {"NSRegularExpression",
+                                                 "NSLocalizedString", "Match"};
+
+static int ObjcIgnoreString(Str s, int i) {
+    static const char* const kArgs[] = {"WithPattern", "WithKey"};
+    int n =
+        MatchWordThenString(s, i, kObjcIgnoreMethods,
+                            (int)dimof(kObjcIgnoreMethods), '(', ObjcString);
+    return n > 0 ? n
+                 : MatchWordThenString(s, i, kArgs, (int)dimof(kArgs), ':',
+                                       ObjcString);
 }
 
 void ScanObjectiveC(Results* res, Str raw) {
@@ -3289,40 +3207,13 @@ static int SwiftString(Str s, int i) {
     return n > 0 ? n : MatchSingleLine(s, i, '"');
 }
 static int SwiftIgnoreString(Str s, int i) {
-    static const char* const kMethods[] = {"NSRegularExpression",
-                                           "NSLocalizedString", "Match"};
-    for (const char* m : kMethods) {
-        int n = LitLen(s, i, m);
-        if (n < 0) {
-            continue;
-        }
-        int at = i + n;
-        if (at >= len(s) || s.s[at] != '(') {
-            continue;
-        }
-        at = ObjcSkipBlank(s, at + 1);
-        int sn = SwiftString(s, at);
-        if (sn > 0) {
-            return at + sn - i;
-        }
-    }
     static const char* const kArgs[] = {"pattern", "key"};
-    for (const char* arg : kArgs) {
-        int n = LitLen(s, i, arg);
-        if (n < 0) {
-            continue;
-        }
-        int at = i + n;
-        if (at >= len(s) || s.s[at] != ':') {
-            continue;
-        }
-        at = ObjcSkipBlank(s, at + 1);
-        int sn = SwiftString(s, at);
-        if (sn > 0) {
-            return at + sn - i;
-        }
-    }
-    return -1;
+    int n =
+        MatchWordThenString(s, i, kObjcIgnoreMethods,
+                            (int)dimof(kObjcIgnoreMethods), '(', SwiftString);
+    return n > 0 ? n
+                 : MatchWordThenString(s, i, kArgs, (int)dimof(kArgs), ':',
+                                       SwiftString);
 }
 
 void ScanSwift(Results* res, Str raw) {
@@ -3570,22 +3461,15 @@ static int JsHtmlNode(Str s, int i) {
 }
 
 void ScanJavascript(Results* res, Str raw) {
-    int ignoreStart = 0;
+    IgnoreRun run{res, raw};
     int i = 0;
-    auto flush = [&](int upTo) {
-        if (upTo > ignoreStart) {
-            EmitIgnore(res, Str(raw.s + ignoreStart, upTo - ignoreStart));
-        }
-    };
     while (i < len(raw)) {
         int n = CppLineComment(raw, i);
         if (n < 0) {
             n = CppBlockComment(raw, i);
         }
         if (n > 0) {
-            flush(i);
-            EmitText(res, StrL("COMMENT"), Str(raw.s + i, n));
-            ignoreStart = i + n;
+            run.Text(StrL("COMMENT"), i, n);
             i += n;
             continue;
         }
@@ -3603,16 +3487,12 @@ void ScanJavascript(Results* res, Str raw) {
                 }
                 int vn = JsString(raw, at);
                 if (vn > 0) {
-                    flush(at);
-                    EmitText(res, StrL("string"), Str(raw.s + at, vn));
-                    ignoreStart = at + vn;
+                    run.Text(StrL("string"), at, vn);
                     i = at + vn;
                     continue;
                 }
             }
-            flush(i);
-            EmitText(res, StrL("string"), Str(raw.s + i, n));
-            ignoreStart = i + n;
+            run.Text(StrL("string"), i, n);
             i += n;
             continue;
         }
@@ -3637,9 +3517,7 @@ void ScanJavascript(Results* res, Str raw) {
                     while (textEnd < end && raw.s[textEnd] != '<') {
                         textEnd++;
                     }
-                    flush(at);
-                    EmitText(res, StrL("text"), Str(raw.s + at, textEnd - at));
-                    ignoreStart = textEnd;
+                    run.Text(StrL("text"), at, textEnd - at);
                     at = textEnd;
                 }
                 i = end;
@@ -3654,7 +3532,7 @@ void ScanJavascript(Results* res, Str raw) {
         }
         i++;
     }
-    flush(len(raw));
+    run.Flush(len(raw));
 }
 
 static int PhpString(Str s, int i) {
@@ -3670,7 +3548,7 @@ static int PhpRegexp(Str s, int i) {
 }
 
 void ScanPhp(Results* res, Str raw) {
-    int ignoreStart = 0;
+    IgnoreRun run{res, raw};
     int i = 0;
     bool inPhp = false;
     static const Alt kAlts[] = {
@@ -3681,22 +3559,7 @@ void ScanPhp(Results* res, Str raw) {
     while (i < len(raw)) {
         if (!inPhp) {
 
-            int matched = -1;
-            const Alt* hit = nullptr;
-            for (int k = 0; k < 3; k++) {
-                matched = kAlts[k].match(raw, i);
-                if (matched > 0) {
-                    hit = &kAlts[k];
-                    break;
-                }
-            }
-            if (hit) {
-                if (i > ignoreStart) {
-                    EmitIgnore(res, Str(raw.s + ignoreStart, i - ignoreStart));
-                }
-                EmitText(res, Str(hit->rule), Str(raw.s + i, matched));
-                ignoreStart = i + matched;
-                i += matched;
+            if (ScanAltAt(&run, kAlts, 3, &i)) {
                 continue;
             }
             if (LitLen(raw, i, "<?php") > 0) {
@@ -3712,31 +3575,11 @@ void ScanPhp(Results* res, Str raw) {
             i += 2;
             continue;
         }
-        int matched = -1;
-        const Alt* hit = nullptr;
-        for (const Alt& alt : kAlts) {
-            matched = alt.match(raw, i);
-            if (matched > 0) {
-                hit = &alt;
-                break;
-            }
-        }
-        if (!hit) {
+        if (!ScanAltAt(&run, kAlts, (int)dimof(kAlts), &i)) {
             i++;
-            continue;
         }
-        if (hit->rule) {
-            if (i > ignoreStart) {
-                EmitIgnore(res, Str(raw.s + ignoreStart, i - ignoreStart));
-            }
-            EmitText(res, Str(hit->rule), Str(raw.s + i, matched));
-            ignoreStart = i + matched;
-        }
-        i += matched;
     }
-    if (len(raw) > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
-    }
+    run.Flush(len(raw));
 }
 
 static int JsonString(Str s, int i) {
@@ -3757,7 +3600,7 @@ static int JsonString(Str s, int i) {
 }
 
 void ScanJson(Results* res, Str raw) {
-    int ignoreStart = 0;
+    IgnoreRun run{res, raw};
     int i = 0;
     while (i < len(raw)) {
         int n = CppLineComment(raw, i);
@@ -3767,11 +3610,7 @@ void ScanJson(Results* res, Str raw) {
             isComment = n > 0;
         }
         if (isComment) {
-            if (i > ignoreStart) {
-                EmitIgnore(res, Str(raw.s + ignoreStart, i - ignoreStart));
-            }
-            EmitText(res, StrL("COMMENT"), Str(raw.s + i, n));
-            ignoreStart = i + n;
+            run.Text(StrL("COMMENT"), i, n);
             i += n;
             continue;
         }
@@ -3784,24 +3623,18 @@ void ScanJson(Results* res, Str raw) {
             }
             bool isKey = at < len(raw) && raw.s[at] == ':';
             if (!isKey) {
-                if (i > ignoreStart) {
-                    EmitIgnore(res, Str(raw.s + ignoreStart, i - ignoreStart));
-                }
-                EmitText(res, StrL("string"), Str(raw.s + i, n));
-                ignoreStart = i + n;
+                run.Text(StrL("string"), i, n);
             }
             i += n;
             continue;
         }
         i++;
     }
-    if (len(raw) > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
-    }
+    run.Flush(len(raw));
 }
 
 void ScanYaml(Results* res, Str raw) {
-    int ignoreStart = 0;
+    IgnoreRun run{res, raw};
     int i = 0;
     while (i < len(raw)) {
         int at = i;
@@ -3813,11 +3646,7 @@ void ScanYaml(Results* res, Str raw) {
             while (end < len(raw) && raw.s[end] != '\n') {
                 end++;
             }
-            if (at > ignoreStart) {
-                EmitIgnore(res, Str(raw.s + ignoreStart, at - ignoreStart));
-            }
-            EmitText(res, StrL("comment"), Str(raw.s + at, end - at));
-            ignoreStart = end;
+            run.Text(StrL("comment"), at, end - at);
             i = end < len(raw) ? end + 1 : end;
             continue;
         }
@@ -3862,12 +3691,7 @@ void ScanYaml(Results* res, Str raw) {
                 valueEnd++;
             }
         }
-        if (valueStart > ignoreStart) {
-            EmitIgnore(res, Str(raw.s + ignoreStart, valueStart - ignoreStart));
-        }
-        EmitText(res, StrL("string"),
-                 Str(raw.s + valueStart, valueEnd - valueStart));
-        ignoreStart = valueEnd;
+        run.Text(StrL("string"), valueStart, valueEnd - valueStart);
         i = valueEnd;
         while (i < len(raw) && raw.s[i] != '\n') {
             i++;
@@ -3876,9 +3700,7 @@ void ScanYaml(Results* res, Str raw) {
             i++;
         }
     }
-    if (len(raw) > ignoreStart) {
-        EmitIgnore(res, Str(raw.s + ignoreStart, len(raw) - ignoreStart));
-    }
+    run.Flush(len(raw));
 }
 
 }
@@ -4026,27 +3848,9 @@ bool ToggleIsEnabled(const Toggle* t) {
 namespace autocorrect {
 
 uint32_t Utf8Next(Str s, int* i) {
-    int at = *i;
-    uint8_t b0 = (uint8_t)s.s[at];
 
-    int size = 1;
-    uint32_t cp = b0;
-    if ((b0 & 0xE0) == 0xC0 && at + 1 < len(s)) {
-        size = 2;
-        cp = ((uint32_t)(b0 & 0x1F) << 6) | ((uint8_t)s.s[at + 1] & 0x3F);
-    } else if ((b0 & 0xF0) == 0xE0 && at + 2 < len(s)) {
-        size = 3;
-        cp = ((uint32_t)(b0 & 0x0F) << 12) |
-             (((uint32_t)(uint8_t)s.s[at + 1] & 0x3F) << 6) |
-             ((uint8_t)s.s[at + 2] & 0x3F);
-    } else if ((b0 & 0xF8) == 0xF0 && at + 3 < len(s)) {
-        size = 4;
-        cp = ((uint32_t)(b0 & 0x07) << 18) |
-             (((uint32_t)(uint8_t)s.s[at + 1] & 0x3F) << 12) |
-             (((uint32_t)(uint8_t)s.s[at + 2] & 0x3F) << 6) |
-             ((uint8_t)s.s[at + 3] & 0x3F);
-    }
-    *i = at + size;
+    uint32_t cp = 0;
+    *i += base::Utf8At(s, *i, &cp);
     return cp;
 }
 
@@ -4054,6 +3858,12 @@ int Utf8Len(Str s, int i) {
     int at = i;
     Utf8Next(s, &at);
     return at - i;
+}
+
+void Utf8CopyNext(Str s, int* i, StrBuilder* out) {
+    int step = Utf8Len(s, *i);
+    out->Append(Str(s.s + *i, step));
+    *i += step;
 }
 
 uint32_t Utf8At(Str s, int i) {
@@ -4202,12 +4012,7 @@ static bool IsAsciiAlnumCp(uint32_t cp) {
 }
 
 static bool IsSpaceCp(uint32_t cp) {
-    if (cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' ||
-        cp == 0x0B || cp == 0x85 || cp == 0xA0) {
-        return true;
-    }
-    return cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 ||
-           cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
+    return base::IsUnicodeWhitespace(cp);
 }
 
 static bool IsCjkClassCp(uint32_t cp) {
@@ -4455,9 +4260,7 @@ static bool PassAdd(Str in, SideFn one, SideFn other, StrBuilder* out) {
                 continue;
             }
         }
-        int step = Utf8Len(in, i);
-        out->Append(Str(in.s + i, step));
-        i += step;
+        Utf8CopyNext(in, &i, out);
     }
     return changed;
 }
@@ -4483,9 +4286,7 @@ static bool PassRemove(Str in, SideFn one, SideFn other, StrBuilder* out) {
                 }
             }
         }
-        int step = Utf8Len(in, i);
-        out->Append(Str(in.s + i, step));
-        i += step;
+        Utf8CopyNext(in, &i, out);
     }
     return changed;
 }
@@ -4578,9 +4379,7 @@ static bool PassBacktickThenCjk(Str in, StrBuilder* out) {
                 continue;
             }
         }
-        int step = Utf8Len(in, i);
-        out->Append(Str(in.s + i, step));
-        i += step;
+        Utf8CopyNext(in, &i, out);
     }
     return changed;
 }

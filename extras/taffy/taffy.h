@@ -143,12 +143,17 @@ uint64_t PlatLargePageSize();
 
 uint64_t PlatArenaReserveSize();
 void* PlatMemReserve(uint64_t size);
+
 bool PlatMemCommit(void* base, uint64_t size, bool largePages);
+bool PlatMemCommitPages(void* base, uint64_t size, bool largePages);
 void* PlatMemReserveCommit(uint64_t size, bool largePages);
 void PlatMemRelease(void* base, uint64_t size);
 
 int StrCmpI(const char* a, const char* b);
 int StrCmpNI(const char* a, const char* b, int n);
+
+int StrCopyCapped(char* dst, int cap, Str src);
+
 void StrCopyZ(char* dst, int cap, const char* src);
 
 bool PlatDirExists(const char* path);
@@ -158,6 +163,12 @@ bool PlatCanonicalPath(const char* path, char* out, int cap);
 void PlatGetExeDir(char* out, int cap);
 
 bool PlatGetExePath(char* out, int cap);
+
+void PlatExeDirFromExePath(char* out, int cap);
+
+void PlatDirNameInPlace(char* path);
+
+bool PlatProcSelfExePath(char* out, int cap);
 
 bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status);
 
@@ -180,21 +191,59 @@ int PlatListDir(const char* dir, DirEntry* out, int max);
 int PlatCoreCount();
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes);
 
+struct PlatFacts {
+    char pathSep = '/';
+    bool pathsCaseFold = false;
+    bool isWindows = false;
+
+    bool secondaryIsCommand = false;
+
+    bool showsWindowControls = true;
+
+    bool titleBarCloseIsElement = false;
+
+    float caretWidth = 1.f;
+
+    bool scrollBounce = false;
+
+    bool cleanOnEscape = true;
+
+    bool scrollBounceTouch = false;
+
+    bool overscrollPhaselessStops = false;
+    const char* monoFontName = "DejaVu Sans Mono";
+
+    const char* shellDataDir = "/.local/share";
+
+    const char* shellPlatformName = "linux";
+
+    bool blockSelectUsesControl = false;
+
+    bool scrollGestureLocks = true;
+
+    bool asyncIo = false;
+
+    float windowShadowSize = 0.f;
+
+    uint64_t arenaReserveSize = 64ull * 1024ull * 1024ull;
+
+    bool (*exePath)(char* out, int cap) = nullptr;
+
+    bool (*disclaimSpeechResponsibility)(int argc, char** argv,
+                                         int* status) = nullptr;
+};
+extern const PlatFacts kPlatFacts;
+
 char PlatPathSep();
 bool PlatPathsCaseFold();
 bool PlatIsWindows();
 bool PlatSecondaryIsCommand();
 bool PlatShowsWindowControls();
-
 bool PlatTitleBarCloseIsElement();
-
 float PlatCaretWidth();
 bool PlatScrollBounce();
-
 bool PlatCleanOnEscape();
-
 bool PlatScrollBounceTouch();
-
 bool PlatOverscrollPhaselessStops();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
@@ -363,8 +412,55 @@ struct CondVar {
     ~CondVar() = default;
 };
 
+#if GPUI_OS_WINDOWS
+
+template <typename First, typename... Rest, typename Self>
+HRESULT ComQueryInterface(Self* self, REFIID riid, void** ppv) {
+    if (!ppv) {
+        return E_POINTER;
+    }
+    *ppv = nullptr;
+    if (riid == __uuidof(IUnknown)) {
+        *ppv = static_cast<First*>(self);
+    }
+    ((!*ppv && riid == __uuidof(Rest) ? (void)(*ppv = static_cast<Rest*>(self))
+                                      : (void)0),
+     ...);
+    if (!*ppv && riid == __uuidof(First)) {
+        *ppv = static_cast<First*>(self);
+    }
+    if (!*ppv) {
+        return E_NOINTERFACE;
+    }
+    self->AddRef();
+    return S_OK;
+}
+
+template <typename... Is>
+struct ComObject : Is... {
+    LONG refs = 1;
+
+    virtual ~ComObject() = default;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        return ComQueryInterface<Is...>(this, riid, ppv);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return (ULONG)InterlockedIncrement(&refs);
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG left = InterlockedDecrement(&refs);
+        if (left == 0) {
+            delete this;
+        }
+        return (ULONG)left;
+    }
+};
+#endif
+
 bool PlatThreadRun(Func0 f);
 uint64_t PlatThreadId();
+uint64_t PlatProcessId();
 void PlatSleepMs(int ms);
 
 static const uint64_t kArenaHeaderSize = 256;
@@ -1132,6 +1228,8 @@ LocalTime TimeOfDayNow();
 void StrFree(Str s);
 void StrFree(const char*) = delete;
 
+void StrVecFree(Vec<Str>* v);
+
 Str StrDup(Arena*, Str str);
 Str StrDup(Str s);
 
@@ -1159,6 +1257,20 @@ inline bool StrEqI(Str s1, const char* s2) {
     return StrEqI(s1, Str(s2));
 }
 bool StrStartsWith(Str s, Str prefix);
+
+inline bool ScanSkipQuoted(char c, char* quote) {
+    if (*quote) {
+        if (c == *quote) {
+            *quote = 0;
+        }
+        return true;
+    }
+    if (c == '"' || c == '\'') {
+        *quote = c;
+        return true;
+    }
+    return false;
+}
 inline bool StrStartsWith(Str s, const char* prefix) {
     return StrStartsWith(s, Str(prefix));
 }
@@ -1205,6 +1317,50 @@ Str SeqStrByIndex(SeqStrings strs, int idx);
 int SeqStrCount(SeqStrings strs);
 void StrLowerAscii(char* s);
 
+constexpr int HexDigitValue(char c) {
+    return c >= '0' && c <= '9'   ? c - '0'
+           : c >= 'a' && c <= 'f' ? c - 'a' + 10
+           : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                  : -1;
+}
+
+void HexEncode(const void* bytes, int n, char* out);
+
+bool ParseHexRgba(Str digits, uint32_t* rgba);
+
+int PercentDecode(Str s, char* out);
+
+constexpr bool IsUnicodeWhitespace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+
+int Utf8Encode(char* out, uint32_t cp);
+
+constexpr int Utf8LeadLen(uint8_t lead) {
+    return (lead & 0xE0) == 0xC0   ? 2
+           : (lead & 0xF0) == 0xE0 ? 3
+           : (lead & 0xF8) == 0xF0 ? 4
+                                   : 1;
+}
+
+int Utf8At(Str s, int i, uint32_t* out);
+
+int Utf8Prev(Str s, int i);
+
+int Utf8StrictAt(const uint8_t* b, int avail, uint32_t* cp);
+
+bool Utf8IsCharBoundary(Str s, int i);
+
+int Utf8CharCount(Str s);
+
+Str HtmlNamedCharRef(Str name);
+
+int HtmlNamedCharRefCount();
+void HtmlNamedCharRefAt(int i, Str* name, Str* value);
+
 struct StrBuilder : Vec<char> {
     Arena* a = nullptr;
 
@@ -1214,11 +1370,16 @@ struct StrBuilder : Vec<char> {
     bool Reserve(int cap);
     bool AppendChar(char c);
     bool Append(Str src);
+
+    bool AppendUtf8(uint32_t cp);
     char RemoveAt(int idx, int count = 1);
     char RemoveLast();
     Str TakeStr();
     char LastChar() const;
 };
+
+void AppendHtmlEscaped(StrBuilder& out, Str value, bool escapeGt,
+                       bool escapeQuote);
 
 void StrBuilderUseExternalBuffer(StrBuilder& b, Str buf);
 
@@ -4339,6 +4500,94 @@ LayoutOutput ComputeGridLayout(TaffyTree* tree, NodeId node,
 LayoutOutput ComputeBlockLayout(TaffyTree* tree, NodeId node,
                                 const LayoutInput& inputs,
                                 BlockContext* blockCtx);
+
+inline SizeF BoxSizingAdjustment(BoxSizing boxSizing, SizeF paddingBorderSize) {
+    return boxSizing == BoxSizing::ContentBox ? paddingBorderSize
+                                              : SizeF::Zero();
+}
+
+inline SizeFOpt ResolveStyledSize(const SizeDim& size, SizeFOpt context,
+                                  CalcResolver calc, Optf aspectRatio,
+                                  SizeF boxSizingAdjustment) {
+    return MaybeAdd(
+        MaybeApplyAspectRatio(size.MaybeResolve(context, calc), aspectRatio),
+        boxSizingAdjustment);
+}
+
+inline SizeFOpt MinMaxDefiniteSize(SizeFOpt minSize, SizeFOpt maxSize) {
+    SizeFOpt out = SizeFOptNone();
+    if (IsSome(minSize.w) && IsSome(maxSize.w) && maxSize.w <= minSize.w) {
+        out.w = minSize.w;
+    }
+    if (IsSome(minSize.h) && IsSome(maxSize.h) && maxSize.h <= minSize.h) {
+        out.h = minSize.h;
+    }
+    return out;
+}
+
+struct NodeStyledSizes {
+    SizeFOpt size;
+    SizeFOpt minSize;
+    SizeFOpt maxSize;
+    SizeFOpt clampedSize;
+    SizeFOpt minMaxDefiniteSize;
+};
+
+inline NodeStyledSizes ResolveNodeStyledSizes(const Style& style,
+                                              SizeFOpt parentSize,
+                                              CalcResolver calc,
+                                              SizeF paddingBorderSize,
+                                              bool inherentSize) {
+    Optf aspectRatio = style.aspectRatio;
+    SizeF boxSizingAdjustment =
+        BoxSizingAdjustment(style.boxSizing, paddingBorderSize);
+    NodeStyledSizes out;
+    out.minSize = ResolveStyledSize(style.minSize, parentSize, calc,
+                                    aspectRatio, boxSizingAdjustment);
+    out.maxSize = ResolveStyledSize(style.maxSize, parentSize, calc,
+                                    aspectRatio, boxSizingAdjustment);
+    out.size = SizeFOptNone();
+    if (inherentSize) {
+        out.size = ResolveStyledSize(style.size, parentSize, calc, aspectRatio,
+                                     boxSizingAdjustment);
+    }
+    out.clampedSize = MaybeClamp(out.size, out.minSize, out.maxSize);
+    out.minMaxDefiniteSize = MinMaxDefiniteSize(out.minSize, out.maxSize);
+    return out;
+}
+
+inline bool ComputeSizeFromStyles(const LayoutInput& inputs,
+                                  SizeFOpt styledKnownDimensions,
+                                  LayoutOutput* out) {
+    if (inputs.runMode != RunMode::ComputeSize) {
+        return false;
+    }
+    if (BothAxisDefined(styledKnownDimensions)) {
+        *out = LayoutOutput::FromOuterSize(
+            {styledKnownDimensions.w, styledKnownDimensions.h});
+        return true;
+    }
+    if (inputs.axis == RequestedAxis::Horizontal &&
+        IsSome(styledKnownDimensions.w)) {
+        *out = LayoutOutput::FromOuterSize({styledKnownDimensions.w, 0.0f});
+        return true;
+    }
+    return false;
+}
+
+inline PointF RelativePositionOffset(RectFOpt inset, Direction direction) {
+    Optf negRight = inset.right;
+    if (IsSome(negRight)) {
+        negRight = -negRight;
+    }
+    Optf negBottom = inset.bottom;
+    if (IsSome(negBottom)) {
+        negBottom = -negBottom;
+    }
+    Optf dx =
+        IsRtl(direction) ? Or(negRight, inset.left) : Or(inset.left, negRight);
+    return {UnwrapOr(dx, 0.0f), UnwrapOr(Or(inset.top, negBottom), 0.0f)};
+}
 
 inline AlignItemsKeyword ResolveSelfAlignmentSafety(AlignItems alignment,
                                                     bool overflows) {

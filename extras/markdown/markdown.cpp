@@ -937,6 +937,34 @@ void StrFree(Str s) {
     free(s.s);
 }
 
+int StrCopyCapped(char* dst, int cap, Str src) {
+    if (!dst || cap <= 0) {
+        return 0;
+    }
+    int n = std::min(len(src), cap - 1);
+    if (n > 0) {
+        memcpy(dst, src.s, (size_t)n);
+    } else {
+        n = 0;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+void StrCopyZ(char* dst, int cap, const char* src) {
+    StrCopyCapped(dst, cap, src ? Str(src) : Str{});
+}
+
+void StrVecFree(Vec<Str>* v) {
+    if (!v) {
+        return;
+    }
+    for (int i = 0; i < len(*v); i++) {
+        StrFree((*v)[i]);
+    }
+    VecReset(*v);
+}
+
 static bool DateParseIso(const char* s, LocalDate* out) {
     int part[3] = {0, 0, 0};
     for (int i = 0; i < 3; i++) {
@@ -974,7 +1002,6 @@ static LocalDate gTodayPinned = {};
 
 LocalDate DateToday() {
     if (!gTodayChecked) {
-        gTodayChecked = true;
         const char* env = getenv("GPUI_TODAY");
         if (env) {
             LocalDate pinned;
@@ -982,6 +1009,8 @@ LocalDate DateToday() {
                 gTodayPinned = pinned;
             }
         }
+
+        gTodayChecked = true;
     }
     if (gTodayPinned.year != 0) {
         return gTodayPinned;
@@ -1154,35 +1183,182 @@ Str StrTrimAscii(Str s) {
     return Str(s.s + start, end - start);
 }
 
-static bool IsUnicodeWhiteSpace(uint32_t cp) {
-    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
-           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
-           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
-           cp == 0x3000;
+void HexEncode(const void* bytes, int n, char* out) {
+    static const char kDigits[] = "0123456789abcdef";
+    const uint8_t* p = (const uint8_t*)bytes;
+    for (int i = 0; i < n; i++) {
+        out[i * 2] = kDigits[p[i] >> 4];
+        out[i * 2 + 1] = kDigits[p[i] & 15];
+    }
 }
 
-static uint32_t StrTrimDecode(Str s, int i, int* n) {
-    uint8_t c = (uint8_t)s.s[i];
-    int want = c < 0x80         ? 1
-               : (c >> 5) == 6  ? 2
-               : (c >> 4) == 14 ? 3
-               : (c >> 3) == 30 ? 4
-                                : 0;
-    if (want <= 1 || i + want > len(s)) {
-        *n = 1;
-        return c;
+bool ParseHexRgba(Str digits, uint32_t* rgba) {
+    int n = len(digits);
+    if (!digits.s || (n != 3 && n != 4 && n != 6 && n != 8)) {
+        return false;
     }
-    uint32_t cp = c & (0x7F >> want);
-    for (int k = 1; k < want; k++) {
-        uint8_t b = (uint8_t)s.s[i + k];
-        if ((b & 0xC0) != 0x80) {
-            *n = 1;
-            return c;
+    int d[8];
+    for (int i = 0; i < n; i++) {
+        d[i] = HexDigitValue(digits.s[i]);
+        if (d[i] < 0) {
+            return false;
         }
-        cp = (cp << 6) | (b & 0x3F);
     }
-    *n = want;
-    return cp;
+    uint32_t v[4] = {0, 0, 0, 255};
+    bool doubled = n <= 4;
+    for (int i = 0; i < (doubled ? n : n / 2); i++) {
+        v[i] = doubled ? (uint32_t)(d[i] * 17)
+                       : (uint32_t)(d[i * 2] * 16 + d[i * 2 + 1]);
+    }
+    *rgba = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+    return true;
+}
+
+int PercentDecode(Str s, char* out) {
+    int n = 0;
+    for (int i = 0; i < len(s); i++) {
+        char c = s.s[i];
+        if (c == '%' && i + 2 < len(s)) {
+            int hi = HexDigitValue(s.s[i + 1]);
+            int lo = HexDigitValue(s.s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                c = (char)((hi << 4) | lo);
+                i += 2;
+            }
+        }
+        out[n++] = c;
+    }
+    return n;
+}
+
+int Utf8Encode(char* out, uint32_t cp) {
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+int Utf8StrictAt(const uint8_t* b, int avail, uint32_t* cp) {
+    if (avail <= 0) {
+        return 0;
+    }
+    uint8_t lead = b[0];
+    if (lead < 0x80) {
+        if (cp) {
+            *cp = lead;
+        }
+        return 1;
+    }
+
+    int need = 0;
+    uint8_t lo = 0x80;
+    uint8_t hi = 0xBF;
+    if (lead >= 0xC2 && lead <= 0xDF) {
+        need = 2;
+    } else if (lead == 0xE0) {
+        need = 3;
+        lo = 0xA0;
+    } else if (lead == 0xED) {
+        need = 3;
+        hi = 0x9F;
+    } else if (lead >= 0xE1 && lead <= 0xEF) {
+        need = 3;
+    } else if (lead == 0xF0) {
+        need = 4;
+        lo = 0x90;
+    } else if (lead >= 0xF1 && lead <= 0xF3) {
+        need = 4;
+    } else if (lead == 0xF4) {
+        need = 4;
+        hi = 0x8F;
+    } else {
+        return 0;
+    }
+    uint32_t value = lead & (0x7F >> need);
+    for (int k = 1; k < need; k++) {
+        if (k >= avail) {
+            return -1;
+        }
+        uint8_t byte = b[k];
+        uint8_t min = k == 1 ? lo : (uint8_t)0x80;
+        uint8_t max = k == 1 ? hi : (uint8_t)0xBF;
+        if (byte < min || byte > max) {
+            return 0;
+        }
+        value = (value << 6) | (byte & 0x3F);
+    }
+    if (cp) {
+        *cp = value;
+    }
+    return need;
+}
+
+int Utf8At(Str s, int i, uint32_t* out) {
+    const uint8_t* p = (const uint8_t*)s.s + i;
+    uint8_t c = p[0];
+    if (c < 0x80) {
+        *out = c;
+        return 1;
+    }
+    int n = Utf8LeadLen(c);
+    if (n == 1 || i + n > len(s)) {
+        *out = c;
+        return 1;
+    }
+    uint32_t cp = (uint32_t)(c & (0xFF >> (n + 1)));
+    for (int k = 1; k < n; k++) {
+        if ((p[k] & 0xC0) != 0x80) {
+            *out = c;
+            return 1;
+        }
+        cp = (cp << 6) | (uint32_t)(p[k] & 0x3F);
+    }
+    *out = cp;
+    return n;
+}
+
+int Utf8Prev(Str s, int i) {
+    int j = i - 1;
+    while (j > 0 && ((uint8_t)s.s[j] & 0xC0) == 0x80) {
+        j--;
+    }
+    return j < 0 ? 0 : j;
+}
+
+bool Utf8IsCharBoundary(Str s, int i) {
+    if (i < 0 || i > len(s)) {
+        return false;
+    }
+    if (i == 0 || i == len(s)) {
+        return true;
+    }
+    return ((uint8_t)s.s[i] & 0xC0) != 0x80;
+}
+
+int Utf8CharCount(Str s) {
+    int n = 0;
+    for (int i = 0; i < len(s); i++) {
+        if (((uint8_t)s.s[i] & 0xC0) != 0x80) {
+            n++;
+        }
+    }
+    return n;
 }
 
 Str StrTrim(Str s) {
@@ -1192,8 +1368,9 @@ Str StrTrim(Str s) {
     int start = 0;
     int end = len(s);
     while (start < end) {
-        int n = 1;
-        if (!IsUnicodeWhiteSpace(StrTrimDecode(s, start, &n))) {
+        uint32_t cp = 0;
+        int n = Utf8At(s, start, &cp);
+        if (!IsUnicodeWhitespace(cp)) {
             break;
         }
         start += n;
@@ -1205,9 +1382,9 @@ Str StrTrim(Str s) {
                end - at < 4) {
             at--;
         }
-        int n = 1;
-        uint32_t cp = StrTrimDecode(s, at, &n);
-        if (at + n != end || !IsUnicodeWhiteSpace(cp)) {
+        uint32_t cp = 0;
+        int n = Utf8At(s, at, &cp);
+        if (at + n != end || !IsUnicodeWhitespace(cp)) {
             break;
         }
         end = at;
@@ -1405,6 +1582,30 @@ bool StrBuilder::Append(Str src) {
     len += src.len;
     StrBuilderTerminate(*this);
     return true;
+}
+
+bool StrBuilder::AppendUtf8(uint32_t cp) {
+    char buf[4];
+    int n = Utf8Encode(buf, cp);
+    return Append(Str(buf, n));
+}
+
+void AppendHtmlEscaped(StrBuilder& out, Str value, bool escapeGt,
+                       bool escapeQuote) {
+    for (int i = 0; i < len(value); i++) {
+        char c = value.s[i];
+        if (c == '&') {
+            out.Append(StrL("&amp;"));
+        } else if (c == '<') {
+            out.Append(StrL("&lt;"));
+        } else if (c == '>' && escapeGt) {
+            out.Append(StrL("&gt;"));
+        } else if (c == '"' && escapeQuote) {
+            out.Append(StrL("&quot;"));
+        } else {
+            out.AppendChar(c);
+        }
+    }
 }
 
 char StrBuilder::RemoveAt(int idx, int count) {
@@ -1983,85 +2184,115 @@ static int VsnprintfUtf8(Str buf, const char* fmt, va_list args) {
 #endif
     return vsnprintf(buf.s, (size_t)len(buf), fmt, args);
 }
+
+char PlatPathSep() {
+    return kPlatFacts.pathSep;
+}
+bool PlatPathsCaseFold() {
+    return kPlatFacts.pathsCaseFold;
+}
+bool PlatIsWindows() {
+    return kPlatFacts.isWindows;
+}
+bool PlatSecondaryIsCommand() {
+    return kPlatFacts.secondaryIsCommand;
+}
+bool PlatShowsWindowControls() {
+    return kPlatFacts.showsWindowControls;
+}
+bool PlatTitleBarCloseIsElement() {
+    return kPlatFacts.titleBarCloseIsElement;
+}
+float PlatCaretWidth() {
+    return kPlatFacts.caretWidth;
+}
+bool PlatScrollBounce() {
+    return kPlatFacts.scrollBounce;
+}
+bool PlatCleanOnEscape() {
+    return kPlatFacts.cleanOnEscape;
+}
+bool PlatScrollBounceTouch() {
+    return kPlatFacts.scrollBounceTouch;
+}
+bool PlatOverscrollPhaselessStops() {
+    return kPlatFacts.overscrollPhaselessStops;
+}
+const char* PlatMonoFontName() {
+    return kPlatFacts.monoFontName;
+}
+const char* PlatShellDataDir() {
+    return kPlatFacts.shellDataDir;
+}
+const char* PlatShellPlatformName() {
+    return kPlatFacts.shellPlatformName;
+}
+bool PlatBlockSelectUsesControl() {
+    return kPlatFacts.blockSelectUsesControl;
+}
+bool PlatScrollGestureLocks() {
+    return kPlatFacts.scrollGestureLocks;
+}
+bool PlatAsyncIo() {
+    return kPlatFacts.asyncIo;
+}
+float PlatWindowShadowSize() {
+    return kPlatFacts.windowShadowSize;
+}
+uint64_t PlatArenaReserveSize() {
+    return kPlatFacts.arenaReserveSize;
 }
 
-#line 1 "src/markdown/constant.cpp"
+bool PlatGetExePath(char* out, int cap) {
+    if (!out || cap <= 0) {
+        return false;
+    }
+    out[0] = 0;
+    return kPlatFacts.exePath && kPlatFacts.exePath(out, cap);
+}
 
-namespace markdown {
+bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status) {
+    if (!kPlatFacts.disclaimSpeechResponsibility) {
+        return true;
+    }
+    return kPlatFacts.disclaimSpeechResponsibility(argc, argv, status);
+}
 
-extern const Str kHtmlCdataPrefix = StrL("CDATA[");
+void PlatDirNameInPlace(char* path) {
+    if (!path) {
+        return;
+    }
+    int i = (int)strlen(path);
+    while (i > 0 && path[i - 1] != '/') {
+        path[--i] = 0;
+    }
+    while (i > 1 && path[i - 1] == '/') {
+        path[--i] = 0;
+    }
+}
 
-const char kHtmlBlockNames[] =
-    "address\0"
-    "article\0"
-    "aside\0"
-    "base\0"
-    "basefont\0"
-    "blockquote\0"
-    "body\0"
-    "caption\0"
-    "center\0"
-    "col\0"
-    "colgroup\0"
-    "dd\0"
-    "details\0"
-    "dialog\0"
-    "dir\0"
-    "div\0"
-    "dl\0"
-    "dt\0"
-    "fieldset\0"
-    "figcaption\0"
-    "figure\0"
-    "footer\0"
-    "form\0"
-    "frame\0"
-    "frameset\0"
-    "h1\0"
-    "h2\0"
-    "h3\0"
-    "h4\0"
-    "h5\0"
-    "h6\0"
-    "head\0"
-    "header\0"
-    "hr\0"
-    "html\0"
-    "iframe\0"
-    "legend\0"
-    "li\0"
-    "link\0"
-    "main\0"
-    "menu\0"
-    "menuitem\0"
-    "nav\0"
-    "noframes\0"
-    "ol\0"
-    "optgroup\0"
-    "option\0"
-    "p\0"
-    "param\0"
-    "search\0"
-    "section\0"
-    "summary\0"
-    "table\0"
-    "tbody\0"
-    "td\0"
-    "tfoot\0"
-    "th\0"
-    "thead\0"
-    "title\0"
-    "tr\0"
-    "track\0"
-    "ul\0";
+void PlatExeDirFromExePath(char* out, int cap) {
+    if (PlatGetExePath(out, cap)) {
+        PlatDirNameInPlace(out);
+    }
+}
 
-const char kHtmlRawNames[] =
-    "pre\0"
-    "script\0"
-    "style\0"
-    "textarea\0";
+bool PlatMemCommit(void* base, uint64_t size, bool largePages) {
+    if (size == 0) {
+        return true;
+    }
+    if (!base) {
+        return false;
+    }
+    return PlatMemCommitPages(base, size, largePages);
+}
+}
 
-const char kCharacterReferenceNames[] =
+#line 1 "src/base_entities.cpp"
+
+namespace base {
+
+static const char kHtmlEntityNames[] =
     "AElig\0"
     "AMP\0"
     "Aacute\0"
@@ -4188,7 +4419,7 @@ const char kCharacterReferenceNames[] =
     "zwj\0"
     "zwnj\0";
 
-const char kCharacterReferenceValues[] =
+static const char kHtmlEntityValues[] =
     "Æ\0"
     "&\0"
     "Á\0"
@@ -6315,7 +6546,12 @@ const char kCharacterReferenceValues[] =
     "‍\0"
     "‌\0";
 
-const CharacterReference kCharacterReferences[2125] = {
+struct HtmlEntity {
+    int32_t nameOff;
+    int32_t valueOff;
+};
+
+static const HtmlEntity kHtmlEntities[2125] = {
     {0, 0},
     {6, 3},
     {10, 5},
@@ -8443,6 +8679,111 @@ const CharacterReference kCharacterReferences[2125] = {
     {16124, 8337},
 };
 
+Str HtmlNamedCharRef(Str name) {
+    int lo = 0;
+    int hi = (int)dimof(kHtmlEntities) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const char* candidate = kHtmlEntityNames + kHtmlEntities[mid].nameOff;
+        int cmp = StrCmp(Str(candidate), name);
+        if (cmp < 0) {
+            lo = mid + 1;
+        } else if (cmp > 0) {
+            hi = mid - 1;
+        } else {
+            return Str(kHtmlEntityValues + kHtmlEntities[mid].valueOff);
+        }
+    }
+    return {};
+}
+
+int HtmlNamedCharRefCount() {
+    return (int)dimof(kHtmlEntities);
+}
+
+void HtmlNamedCharRefAt(int i, Str* name, Str* value) {
+    *name = Str(kHtmlEntityNames + kHtmlEntities[i].nameOff);
+    *value = Str(kHtmlEntityValues + kHtmlEntities[i].valueOff);
+}
+
+}
+
+#line 1 "src/markdown/constant.cpp"
+
+namespace markdown {
+
+extern const Str kHtmlCdataPrefix = StrL("CDATA[");
+
+const char kHtmlBlockNames[] =
+    "address\0"
+    "article\0"
+    "aside\0"
+    "base\0"
+    "basefont\0"
+    "blockquote\0"
+    "body\0"
+    "caption\0"
+    "center\0"
+    "col\0"
+    "colgroup\0"
+    "dd\0"
+    "details\0"
+    "dialog\0"
+    "dir\0"
+    "div\0"
+    "dl\0"
+    "dt\0"
+    "fieldset\0"
+    "figcaption\0"
+    "figure\0"
+    "footer\0"
+    "form\0"
+    "frame\0"
+    "frameset\0"
+    "h1\0"
+    "h2\0"
+    "h3\0"
+    "h4\0"
+    "h5\0"
+    "h6\0"
+    "head\0"
+    "header\0"
+    "hr\0"
+    "html\0"
+    "iframe\0"
+    "legend\0"
+    "li\0"
+    "link\0"
+    "main\0"
+    "menu\0"
+    "menuitem\0"
+    "nav\0"
+    "noframes\0"
+    "ol\0"
+    "optgroup\0"
+    "option\0"
+    "p\0"
+    "param\0"
+    "search\0"
+    "section\0"
+    "summary\0"
+    "table\0"
+    "tbody\0"
+    "td\0"
+    "tfoot\0"
+    "th\0"
+    "thead\0"
+    "title\0"
+    "tr\0"
+    "track\0"
+    "ul\0";
+
+const char kHtmlRawNames[] =
+    "pre\0"
+    "script\0"
+    "style\0"
+    "textarea\0";
+
 }
 
 #line 1 "src/markdown/construct_document.cpp"
@@ -9746,9 +10087,7 @@ State DefinitionBefore(Tokenizer* t) {
 }
 
 State DefinitionLabelAfter(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
+    ResetLabelTokens(t);
     if (t->current == ':') {
         Name labelString = Name::DefinitionLabelString;
         t->tokenizeState
@@ -9762,9 +10101,7 @@ State DefinitionLabelAfter(Tokenizer* t) {
 }
 
 State DefinitionLabelNok(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
+    ResetLabelTokens(t);
     return StateNok();
 }
 
@@ -9787,24 +10124,14 @@ State DefinitionDestinationBefore(Tokenizer* t) {
 }
 
 State DefinitionDestinationAfter(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
-    t->tokenizeState.token4 = Name::Data;
-    t->tokenizeState.token5 = Name::Data;
-    t->tokenizeState.sizeB = 0;
+    ResetDestinationTokens(t);
     TokenizerAttempt(t, StateNext(StateName::DefinitionAfter),
                      StateNext(StateName::DefinitionAfter));
     return StateRetry(StateName::DefinitionTitleBefore);
 }
 
 State DefinitionDestinationMissing(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
-    t->tokenizeState.token4 = Name::Data;
-    t->tokenizeState.token5 = Name::Data;
-    t->tokenizeState.sizeB = 0;
+    ResetDestinationTokens(t);
     t->tokenizeState.end = 0;
     return StateNok();
 }
@@ -9854,9 +10181,7 @@ State DefinitionTitleBeforeMarker(Tokenizer* t) {
 }
 
 State DefinitionTitleAfter(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
+    ResetLabelTokens(t);
     if (t->current == '\t' || t->current == ' ') {
         TokenizerAttempt(
             t, StateNext(StateName::DefinitionTitleAfterOptionalWhitespace),
@@ -9906,15 +10231,19 @@ State FrontmatterOpenSequence(Tokenizer* t) {
     return StateNok();
 }
 
+static State FrontmatterLineEnding(Tokenizer* t) {
+    Enter(t, Name::LineEnding);
+    Consume(t);
+    Exit(t, Name::LineEnding);
+    TokenizerAttempt(t, StateNext(StateName::FrontmatterAfter),
+                     StateNext(StateName::FrontmatterContentStart));
+    return StateNext(StateName::FrontmatterCloseStart);
+}
+
 State FrontmatterOpenAfter(Tokenizer* t) {
     if (t->current == '\n') {
         Exit(t, Name::FrontmatterFence);
-        Enter(t, Name::LineEnding);
-        Consume(t);
-        Exit(t, Name::LineEnding);
-        TokenizerAttempt(t, StateNext(StateName::FrontmatterAfter),
-                         StateNext(StateName::FrontmatterContentStart));
-        return StateNext(StateName::FrontmatterCloseStart);
+        return FrontmatterLineEnding(t);
     }
     t->tokenizeState.marker = 0;
     return StateNok();
@@ -9979,12 +10308,7 @@ State FrontmatterContentEnd(Tokenizer* t) {
         t->tokenizeState.marker = 0;
         return StateNok();
     }
-    Enter(t, Name::LineEnding);
-    Consume(t);
-    Exit(t, Name::LineEnding);
-    TokenizerAttempt(t, StateNext(StateName::FrontmatterAfter),
-                     StateNext(StateName::FrontmatterContentStart));
-    return StateNext(StateName::FrontmatterCloseStart);
+    return FrontmatterLineEnding(t);
 }
 
 State FrontmatterAfter(Tokenizer* t) {
@@ -12062,12 +12386,7 @@ State LabelEndResourceOpen(Tokenizer* t) {
 }
 
 State LabelEndResourceDestinationAfter(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
-    t->tokenizeState.token4 = Name::Data;
-    t->tokenizeState.token5 = Name::Data;
-    t->tokenizeState.sizeB = 0;
+    ResetDestinationTokens(t);
     if (t->current == '\t' || t->current == '\n' || t->current == ' ') {
         TokenizerAttempt(t, StateNext(StateName::LabelEndResourceBetween),
                          StateNext(StateName::LabelEndResourceEnd));
@@ -12077,12 +12396,7 @@ State LabelEndResourceDestinationAfter(Tokenizer* t) {
 }
 
 State LabelEndResourceDestinationMissing(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
-    t->tokenizeState.token4 = Name::Data;
-    t->tokenizeState.token5 = Name::Data;
-    t->tokenizeState.sizeB = 0;
+    ResetDestinationTokens(t);
     return StateNok();
 }
 
@@ -12099,9 +12413,7 @@ State LabelEndResourceBetween(Tokenizer* t) {
 }
 
 State LabelEndResourceTitleAfter(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
+    ResetLabelTokens(t);
     if (t->current == '\t' || t->current == '\n' || t->current == ' ') {
         TokenizerAttempt(t, StateNext(StateName::LabelEndResourceEnd),
                          StateNext(StateName::LabelEndResourceEnd));
@@ -12131,9 +12443,7 @@ State LabelEndReferenceFull(Tokenizer* t) {
 }
 
 State LabelEndReferenceFullAfter(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
+    ResetLabelTokens(t);
     Name referenceString = Name::ReferenceString;
     int32_t at = SkipToBack(t->events, t->events.len - 1, &referenceString, 1);
     Position position = PositionFromExitEvent(t->events, at);
@@ -12146,9 +12456,7 @@ State LabelEndReferenceFullAfter(Tokenizer* t) {
 }
 
 State LabelEndReferenceFullMissing(Tokenizer* t) {
-    t->tokenizeState.token1 = Name::Data;
-    t->tokenizeState.token2 = Name::Data;
-    t->tokenizeState.token3 = Name::Data;
+    ResetLabelTokens(t);
     return StateNok();
 }
 
@@ -12367,18 +12675,28 @@ StateName SpaceOrTabEol(Tokenizer* t) {
     return SpaceOrTabEolWithOptions(t, options);
 }
 
+static StateName SpaceOrTabEolWhitespace(Tokenizer* t) {
+    SpaceOrTabOptions options;
+    options.kind = Name::SpaceOrTab;
+    options.min = 1;
+    options.max = kSizeMax;
+    options.content = t->tokenizeState.spaceOrTabEolContent;
+    options.contentSome = t->tokenizeState.spaceOrTabEolContentSome;
+    options.connect = t->tokenizeState.spaceOrTabEolConnect;
+    return SpaceOrTabWithOptions(t, options);
+}
+
+static void SpaceOrTabEolReset(Tokenizer* t) {
+    t->tokenizeState.spaceOrTabEolContentSome = false;
+    t->tokenizeState.spaceOrTabEolConnect = false;
+    t->tokenizeState.spaceOrTabEolOk = false;
+}
+
 State SpaceOrTabEolStart(Tokenizer* t) {
     if (t->current == '\t' || t->current == ' ') {
         TokenizerAttempt(t, StateNext(StateName::SpaceOrTabEolAfterFirst),
                          StateNext(StateName::SpaceOrTabEolAtEol));
-        SpaceOrTabOptions options;
-        options.kind = Name::SpaceOrTab;
-        options.min = 1;
-        options.max = kSizeMax;
-        options.content = t->tokenizeState.spaceOrTabEolContent;
-        options.contentSome = t->tokenizeState.spaceOrTabEolContentSome;
-        options.connect = t->tokenizeState.spaceOrTabEolConnect;
-        return StateRetry(SpaceOrTabWithOptions(t, options));
+        return StateRetry(SpaceOrTabEolWhitespace(t));
     }
     return StateRetry(StateName::SpaceOrTabEolAtEol);
 }
@@ -12407,9 +12725,7 @@ State SpaceOrTabEolAtEol(Tokenizer* t) {
         return StateNext(StateName::SpaceOrTabEolAfterEol);
     }
     bool ok = t->tokenizeState.spaceOrTabEolOk;
-    t->tokenizeState.spaceOrTabEolContentSome = false;
-    t->tokenizeState.spaceOrTabEolConnect = false;
-    t->tokenizeState.spaceOrTabEolOk = false;
+    SpaceOrTabEolReset(t);
     return ok ? StateOk() : StateNok();
 }
 
@@ -12417,22 +12733,13 @@ State SpaceOrTabEolAfterEol(Tokenizer* t) {
     if (t->current == '\t' || t->current == ' ') {
         TokenizerAttempt(t, StateNext(StateName::SpaceOrTabEolAfterMore),
                          StateNok());
-        SpaceOrTabOptions options;
-        options.kind = Name::SpaceOrTab;
-        options.min = 1;
-        options.max = kSizeMax;
-        options.content = t->tokenizeState.spaceOrTabEolContent;
-        options.contentSome = t->tokenizeState.spaceOrTabEolContentSome;
-        options.connect = t->tokenizeState.spaceOrTabEolConnect;
-        return StateRetry(SpaceOrTabWithOptions(t, options));
+        return StateRetry(SpaceOrTabEolWhitespace(t));
     }
     return StateRetry(StateName::SpaceOrTabEolAfterMore);
 }
 
 State SpaceOrTabEolAfterMore(Tokenizer* t) {
-    t->tokenizeState.spaceOrTabEolContentSome = false;
-    t->tokenizeState.spaceOrTabEolConnect = false;
-    t->tokenizeState.spaceOrTabEolOk = false;
+    SpaceOrTabEolReset(t);
     return StateOk();
 }
 
@@ -12610,6 +12917,17 @@ State DestinationRawEscape(Tokenizer* t) {
     return StateRetry(StateName::DestinationRaw);
 }
 
+static void EnterConnectedStringData(Tokenizer* t) {
+    Link link;
+    link.content = ContentKind::String;
+    EnterLink(t, Name::Data, link);
+    if (t->tokenizeState.connect) {
+        SubtokenizeLink(t->events, t->events.len - 1);
+    } else {
+        t->tokenizeState.connect = true;
+    }
+}
+
 State LabelStart(Tokenizer* t) {
     Enter(t, t->tokenizeState.token1);
     Enter(t, t->tokenizeState.token2);
@@ -12644,14 +12962,7 @@ State LabelAtBreak(Tokenizer* t) {
         t->tokenizeState.size = 0;
         return StateOk();
     }
-    Link link;
-    link.content = ContentKind::String;
-    EnterLink(t, Name::Data, link);
-    if (t->tokenizeState.connect) {
-        SubtokenizeLink(t->events, t->events.len - 1);
-    } else {
-        t->tokenizeState.connect = true;
-    }
+    EnterConnectedStringData(t);
     return StateRetry(StateName::LabelInside);
 }
 
@@ -12740,14 +13051,7 @@ State TitleAtBreak(Tokenizer* t) {
         options.connect = t->tokenizeState.connect;
         return StateRetry(SpaceOrTabEolWithOptions(t, options));
     }
-    Link link;
-    link.content = ContentKind::String;
-    EnterLink(t, Name::Data, link);
-    if (t->tokenizeState.connect) {
-        SubtokenizeLink(t->events, t->events.len - 1);
-    } else {
-        t->tokenizeState.connect = true;
-    }
+    EnterConnectedStringData(t);
     return StateRetry(StateName::TitleInside);
 }
 
@@ -13052,6 +13356,16 @@ State RawFlowInfoBefore(Tokenizer* t) {
     return StateRetry(StateName::RawFlowInfo);
 }
 
+static bool RawFlowInfoHasMarker(Tokenizer* t) {
+    if (t->current == (int32_t)t->tokenizeState.marker &&
+        (t->current == '$' || t->current == '`')) {
+        t->concrete = false;
+        RawFlowClear(t);
+        return true;
+    }
+    return false;
+}
+
 State RawFlowInfo(Tokenizer* t) {
     if (t->current < 0 || t->current == '\n') {
         Exit(t, Name::Data);
@@ -13065,10 +13379,7 @@ State RawFlowInfo(Tokenizer* t) {
                          StateNok());
         return StateRetry(SpaceOrTab(t));
     }
-    if (t->current == (int32_t)t->tokenizeState.marker &&
-        (t->current == '$' || t->current == '`')) {
-        t->concrete = false;
-        RawFlowClear(t);
+    if (RawFlowInfoHasMarker(t)) {
         return StateNok();
     }
     Consume(t);
@@ -13092,10 +13403,7 @@ State RawFlowMeta(Tokenizer* t) {
         Exit(t, t->tokenizeState.token5);
         return StateRetry(StateName::RawFlowInfoBefore);
     }
-    if (t->current == (int32_t)t->tokenizeState.marker &&
-        (t->current == '$' || t->current == '`')) {
-        t->concrete = false;
-        RawFlowClear(t);
+    if (RawFlowInfoHasMarker(t)) {
         return StateNok();
     }
     Consume(t);
@@ -14019,23 +14327,6 @@ bool AttentionResolve(Tokenizer* t, Subresult*) {
 
 namespace markdown {
 
-Constructs Constructs::Gfm() {
-    Constructs constructs;
-    constructs.gfmAutolinkLiteral = true;
-    constructs.gfmFootnoteDefinition = true;
-    constructs.gfmLabelStartFootnote = true;
-    constructs.gfmStrikethrough = true;
-    constructs.gfmTable = true;
-    constructs.gfmTaskListItem = true;
-    return constructs;
-}
-
-ParseOptions ParseOptions::Gfm() {
-    ParseOptions options;
-    options.constructs = Constructs::Gfm();
-    return options;
-}
-
 Node* ToMdast(Arena* a, Str source, const ParseOptions& options) {
     return ToMdast(a, source, options, nullptr);
 }
@@ -14697,323 +14988,9 @@ namespace markdown {
 using StateFn = State (*)(Tokenizer*);
 
 static StateFn const kStateFns[] = {
-    AttentionStart,
-    AttentionInside,
-    AutolinkStart,
-    AutolinkOpen,
-    AutolinkSchemeOrEmailAtext,
-    AutolinkSchemeInsideOrEmailAtext,
-    AutolinkUrlInside,
-    AutolinkEmailAtSignOrDot,
-    AutolinkEmailAtext,
-    AutolinkEmailValue,
-    AutolinkEmailLabel,
-    BlankLineStart,
-    BlankLineAfter,
-    BlockQuoteStart,
-    BlockQuoteContStart,
-    BlockQuoteContBefore,
-    BlockQuoteContAfter,
-    BomStart,
-    BomInside,
-    CharacterEscapeStart,
-    CharacterEscapeInside,
-    CharacterReferenceStart,
-    CharacterReferenceOpen,
-    CharacterReferenceNumeric,
-    CharacterReferenceValue,
-    CodeIndentedStart,
-    CodeIndentedAtBreak,
-    CodeIndentedAfter,
-    CodeIndentedFurtherStart,
-    CodeIndentedInside,
-    CodeIndentedFurtherBegin,
-    CodeIndentedFurtherAfter,
-    ContentChunkStart,
-    ContentChunkInside,
-    ContentDefinitionBefore,
-    ContentDefinitionAfter,
-    DataStart,
-    DataInside,
-    DataAtBreak,
-    DefinitionStart,
-    DefinitionBefore,
-    DefinitionLabelAfter,
-    DefinitionLabelNok,
-    DefinitionMarkerAfter,
-    DefinitionDestinationBefore,
-    DefinitionDestinationAfter,
-    DefinitionDestinationMissing,
-    DefinitionTitleBefore,
-    DefinitionAfter,
-    DefinitionAfterWhitespace,
-    DefinitionTitleBeforeMarker,
-    DefinitionTitleAfter,
-    DefinitionTitleAfterOptionalWhitespace,
-    DestinationStart,
-    DestinationEnclosedBefore,
-    DestinationEnclosed,
-    DestinationEnclosedEscape,
-    DestinationRaw,
-    DestinationRawEscape,
-    DocumentStart,
-    DocumentBeforeFrontmatter,
-    DocumentContainerExistingBefore,
-    DocumentContainerExistingAfter,
-    DocumentContainerNewBefore,
-    DocumentContainerNewBeforeNotBlockQuote,
-    DocumentContainerNewBeforeNotList,
-    DocumentContainerNewBeforeNotGfmFootnoteDefinition,
-    DocumentContainerNewAfter,
-    DocumentContainersAfter,
-    DocumentFlowInside,
-    DocumentFlowEnd,
-    FlowStart,
-    FlowBeforeGfmTable,
-    FlowBeforeCodeIndented,
-    FlowBeforeRaw,
-    FlowBeforeHtml,
-    FlowBeforeHeadingAtx,
-    FlowBeforeHeadingSetext,
-    FlowBeforeThematicBreak,
-    FlowAfter,
-    FlowBlankLineBefore,
-    FlowBlankLineAfter,
-    FlowBeforeContent,
-    FrontmatterStart,
-    FrontmatterOpenSequence,
-    FrontmatterOpenAfter,
-    FrontmatterAfter,
-    FrontmatterContentStart,
-    FrontmatterContentInside,
-    FrontmatterContentEnd,
-    FrontmatterCloseStart,
-    FrontmatterCloseSequence,
-    FrontmatterCloseAfter,
-    GfmAutolinkLiteralProtocolStart,
-    GfmAutolinkLiteralProtocolAfter,
-    GfmAutolinkLiteralProtocolPrefixInside,
-    GfmAutolinkLiteralProtocolSlashesInside,
-    GfmAutolinkLiteralWwwStart,
-    GfmAutolinkLiteralWwwAfter,
-    GfmAutolinkLiteralWwwPrefixInside,
-    GfmAutolinkLiteralWwwPrefixAfter,
-    GfmAutolinkLiteralDomainInside,
-    GfmAutolinkLiteralDomainAtPunctuation,
-    GfmAutolinkLiteralDomainAfter,
-    GfmAutolinkLiteralPathInside,
-    GfmAutolinkLiteralPathAtPunctuation,
-    GfmAutolinkLiteralPathAfter,
-    GfmAutolinkLiteralTrail,
-    GfmAutolinkLiteralTrailCharRefInside,
-    GfmAutolinkLiteralTrailCharRefStart,
-    GfmAutolinkLiteralTrailBracketAfter,
-    GfmFootnoteDefinitionStart,
-    GfmFootnoteDefinitionLabelBefore,
-    GfmFootnoteDefinitionLabelAtMarker,
-    GfmFootnoteDefinitionLabelInside,
-    GfmFootnoteDefinitionLabelEscape,
-    GfmFootnoteDefinitionLabelAfter,
-    GfmFootnoteDefinitionWhitespaceAfter,
-    GfmFootnoteDefinitionContStart,
-    GfmFootnoteDefinitionContBlank,
-    GfmFootnoteDefinitionContFilled,
-    GfmLabelStartFootnoteStart,
-    GfmLabelStartFootnoteOpen,
-    GfmTaskListItemCheckStart,
-    GfmTaskListItemCheckInside,
-    GfmTaskListItemCheckClose,
-    GfmTaskListItemCheckAfter,
-    GfmTaskListItemCheckAfterSpaceOrTab,
-    GfmTableStart,
-    GfmTableHeadRowBefore,
-    GfmTableHeadRowStart,
-    GfmTableHeadRowBreak,
-    GfmTableHeadRowData,
-    GfmTableHeadRowEscape,
-    GfmTableHeadDelimiterStart,
-    GfmTableHeadDelimiterBefore,
-    GfmTableHeadDelimiterCellBefore,
-    GfmTableHeadDelimiterValueBefore,
-    GfmTableHeadDelimiterLeftAlignmentAfter,
-    GfmTableHeadDelimiterFiller,
-    GfmTableHeadDelimiterRightAlignmentAfter,
-    GfmTableHeadDelimiterCellAfter,
-    GfmTableHeadDelimiterNok,
-    GfmTableBodyRowStart,
-    GfmTableBodyRowBreak,
-    GfmTableBodyRowData,
-    GfmTableBodyRowEscape,
-    HardBreakEscapeStart,
-    HardBreakEscapeAfter,
-    HeadingAtxStart,
-    HeadingAtxBefore,
-    HeadingAtxSequenceOpen,
-    HeadingAtxAtBreak,
-    HeadingAtxSequenceFurther,
-    HeadingAtxData,
-    HeadingSetextStart,
-    HeadingSetextBefore,
-    HeadingSetextInside,
-    HeadingSetextAfter,
-    HtmlFlowStart,
-    HtmlFlowBefore,
-    HtmlFlowOpen,
-    HtmlFlowDeclarationOpen,
-    HtmlFlowCommentOpenInside,
-    HtmlFlowCdataOpenInside,
-    HtmlFlowTagCloseStart,
-    HtmlFlowTagName,
-    HtmlFlowBasicSelfClosing,
-    HtmlFlowCompleteClosingTagAfter,
-    HtmlFlowCompleteEnd,
-    HtmlFlowCompleteAttributeNameBefore,
-    HtmlFlowCompleteAttributeName,
-    HtmlFlowCompleteAttributeNameAfter,
-    HtmlFlowCompleteAttributeValueBefore,
-    HtmlFlowCompleteAttributeValueQuoted,
-    HtmlFlowCompleteAttributeValueQuotedAfter,
-    HtmlFlowCompleteAttributeValueUnquoted,
-    HtmlFlowCompleteAfter,
-    HtmlFlowBlankLineBefore,
-    HtmlFlowContinuation,
-    HtmlFlowContinuationDeclarationInside,
-    HtmlFlowContinuationAfter,
-    HtmlFlowContinuationStart,
-    HtmlFlowContinuationBefore,
-    HtmlFlowContinuationCommentInside,
-    HtmlFlowContinuationRawTagOpen,
-    HtmlFlowContinuationRawEndTag,
-    HtmlFlowContinuationClose,
-    HtmlFlowContinuationCdataInside,
-    HtmlFlowContinuationStartNonLazy,
-    HtmlTextStart,
-    HtmlTextOpen,
-    HtmlTextDeclarationOpen,
-    HtmlTextTagCloseStart,
-    HtmlTextTagClose,
-    HtmlTextTagCloseBetween,
-    HtmlTextTagOpen,
-    HtmlTextTagOpenBetween,
-    HtmlTextTagOpenAttributeName,
-    HtmlTextTagOpenAttributeNameAfter,
-    HtmlTextTagOpenAttributeValueBefore,
-    HtmlTextTagOpenAttributeValueQuoted,
-    HtmlTextTagOpenAttributeValueQuotedAfter,
-    HtmlTextTagOpenAttributeValueUnquoted,
-    HtmlTextCdata,
-    HtmlTextCdataOpenInside,
-    HtmlTextCdataClose,
-    HtmlTextCdataEnd,
-    HtmlTextCommentOpenInside,
-    HtmlTextComment,
-    HtmlTextCommentClose,
-    HtmlTextCommentEnd,
-    HtmlTextDeclaration,
-    HtmlTextEnd,
-    HtmlTextInstruction,
-    HtmlTextInstructionClose,
-    HtmlTextLineEndingBefore,
-    HtmlTextLineEndingAfter,
-    HtmlTextLineEndingAfterPrefix,
-    LabelStart,
-    LabelAtBreak,
-    LabelEolAfter,
-    LabelEscape,
-    LabelInside,
-    LabelNok,
-    LabelEndStart,
-    LabelEndAfter,
-    LabelEndResourceStart,
-    LabelEndResourceBefore,
-    LabelEndResourceOpen,
-    LabelEndResourceDestinationAfter,
-    LabelEndResourceDestinationMissing,
-    LabelEndResourceBetween,
-    LabelEndResourceTitleAfter,
-    LabelEndResourceEnd,
-    LabelEndOk,
-    LabelEndNok,
-    LabelEndReferenceFull,
-    LabelEndReferenceFullAfter,
-    LabelEndReferenceFullMissing,
-    LabelEndReferenceNotFull,
-    LabelEndReferenceCollapsed,
-    LabelEndReferenceCollapsedOpen,
-    LabelStartImageStart,
-    LabelStartImageOpen,
-    LabelStartImageAfter,
-    LabelStartLinkStart,
-    ListItemStart,
-    ListItemBefore,
-    ListItemBeforeOrdered,
-    ListItemBeforeUnordered,
-    ListItemValue,
-    ListItemMarker,
-    ListItemMarkerAfter,
-    ListItemAfter,
-    ListItemMarkerAfterFilled,
-    ListItemWhitespace,
-    ListItemPrefixOther,
-    ListItemWhitespaceAfter,
-    ListItemContStart,
-    ListItemContBlank,
-    ListItemContFilled,
-    NonLazyContinuationStart,
-    NonLazyContinuationAfter,
-    ParagraphStart,
-    ParagraphLineStart,
-    ParagraphInside,
-    RawFlowStart,
-    RawFlowBeforeSequenceOpen,
-    RawFlowSequenceOpen,
-    RawFlowInfoBefore,
-    RawFlowInfo,
-    RawFlowMetaBefore,
-    RawFlowMeta,
-    RawFlowAtNonLazyBreak,
-    RawFlowCloseStart,
-    RawFlowBeforeSequenceClose,
-    RawFlowSequenceClose,
-    RawFlowAfterSequenceClose,
-    RawFlowContentBefore,
-    RawFlowContentStart,
-    RawFlowBeforeContentChunk,
-    RawFlowContentChunk,
-    RawFlowAfter,
-    RawTextStart,
-    RawTextSequenceOpen,
-    RawTextBetween,
-    RawTextData,
-    RawTextSequenceClose,
-    SpaceOrTabStart,
-    SpaceOrTabInside,
-    SpaceOrTabAfter,
-    SpaceOrTabEolStart,
-    SpaceOrTabEolAfterFirst,
-    SpaceOrTabEolAfterEol,
-    SpaceOrTabEolAtEol,
-    SpaceOrTabEolAfterMore,
-    StringStart,
-    StringBefore,
-    StringBeforeData,
-    TextStart,
-    TextBefore,
-    TextBeforeHtml,
-    TextBeforeHardBreakEscape,
-    TextBeforeLabelStartLink,
-    TextBeforeData,
-    ThematicBreakStart,
-    ThematicBreakBefore,
-    ThematicBreakSequence,
-    ThematicBreakAtBreak,
-    TitleStart,
-    TitleBegin,
-    TitleAfterEol,
-    TitleAtBreak,
-    TitleEscape,
-    TitleInside,
-    TitleNok,
+#define GPUI_MARKDOWN_STATE_FN(name) name,
+    GPUI_MARKDOWN_STATES(GPUI_MARKDOWN_STATE_FN)
+#undef GPUI_MARKDOWN_STATE_FN
 };
 static_assert(sizeof(kStateFns) / sizeof(kStateFns[0]) ==
               (uint16_t)StateName::Count);
@@ -15231,20 +15208,23 @@ static void OnEnterMedia(CompileContext* c, NodeKind kind) {
     VecAppend(c->mediaReferenceStack, reference);
 }
 
+#define MDAST_DATA_CHUNK_CASES       \
+    case Name::CharacterEscapeValue: \
+    case Name::CodeFlowChunk:        \
+    case Name::CodeTextData:         \
+    case Name::Data:                 \
+    case Name::FrontmatterChunk:     \
+    case Name::HtmlFlowData:         \
+    case Name::HtmlTextData:         \
+    case Name::MathFlowChunk:        \
+    case Name::MathTextData:
+
 static void Enter(CompileContext* c) {
     switch ((*c->events)[c->index].name) {
         case Name::AutolinkEmail:
         case Name::AutolinkProtocol:
-        case Name::CharacterEscapeValue:
         case Name::CharacterReference:
-        case Name::CodeFlowChunk:
-        case Name::CodeTextData:
-        case Name::Data:
-        case Name::FrontmatterChunk:
-        case Name::HtmlFlowData:
-        case Name::HtmlTextData:
-        case Name::MathFlowChunk:
-        case Name::MathTextData:
+            MDAST_DATA_CHUNK_CASES
             OnEnterData(c);
             break;
 
@@ -15696,15 +15676,7 @@ static void Exit(CompileContext* c) {
             OnExit(c);
             break;
 
-        case Name::CharacterEscapeValue:
-        case Name::CodeFlowChunk:
-        case Name::CodeTextData:
-        case Name::Data:
-        case Name::FrontmatterChunk:
-        case Name::HtmlFlowData:
-        case Name::HtmlTextData:
-        case Name::MathFlowChunk:
-        case Name::MathTextData:
+            MDAST_DATA_CHUNK_CASES
             OnExitData(c);
             break;
 
@@ -16459,63 +16431,10 @@ Str StrOwn(Arena* a, Str s) {
     return StrOwn(a, s.s, len(s));
 }
 
-int32_t Utf8Encode(char* out, uint32_t cp) {
-    if (cp < 0x80) {
-        out[0] = (char)cp;
-        return 1;
-    }
-    if (cp < 0x800) {
-        out[0] = (char)(0xc0 | (cp >> 6));
-        out[1] = (char)(0x80 | (cp & 0x3f));
-        return 2;
-    }
-    if (cp < 0x10000) {
-        out[0] = (char)(0xe0 | (cp >> 12));
-        out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
-        out[2] = (char)(0x80 | (cp & 0x3f));
-        return 3;
-    }
-    out[0] = (char)(0xf0 | (cp >> 18));
-    out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
-    out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
-    out[3] = (char)(0x80 | (cp & 0x3f));
-    return 4;
-}
-
-static int32_t Utf8Len(uint8_t b) {
-    if (b < 0x80) {
-        return 1;
-    }
-    if ((b & 0xe0) == 0xc0) {
-        return 2;
-    }
-    if ((b & 0xf0) == 0xe0) {
-        return 3;
-    }
-    if ((b & 0xf8) == 0xf0) {
-        return 4;
-    }
-    return 1;
-}
-
 static int32_t Utf8Decode(Str bytes, int32_t index) {
-    uint8_t b = (uint8_t)bytes.s[index];
-    int32_t len = Utf8Len(b);
-    if (len == 1) {
-        return b < 0x80 ? (int32_t)b : 0xfffd;
-    }
-    if (index + len > bytes.len) {
-        return 0xfffd;
-    }
-    uint32_t cp = (uint32_t)(b & (0xff >> (len + 1)));
-    for (int32_t i = 1; i < len; i++) {
-        uint8_t c = (uint8_t)bytes.s[index + i];
-        if ((c & 0xc0) != 0x80) {
-            return 0xfffd;
-        }
-        cp = (cp << 6) | (uint32_t)(c & 0x3f);
-    }
-    return (int32_t)cp;
+    uint32_t cp = 0;
+    int n = base::Utf8At(bytes, index, &cp);
+    return n == 1 && cp >= 0x80 ? 0xfffd : (int32_t)cp;
 }
 
 int32_t CharAfterIndex(Str bytes, int32_t index) {
@@ -16538,25 +16457,12 @@ int32_t CharBeforeIndex(Str bytes, int32_t index) {
     return Utf8Decode(bytes, start);
 }
 
-static bool IsUnicodeWhitespace(uint32_t cp) {
-    if (cp <= 0x20) {
-        return cp == 0x20 || (cp >= 0x09 && cp <= 0x0d);
-    }
-    if (cp == 0x85 || cp == 0xa0 || cp == 0x1680) {
-        return true;
-    }
-    if (cp >= 0x2000 && cp <= 0x200a) {
-        return true;
-    }
-    return cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f ||
-           cp == 0x3000;
-}
-
 CharKind Classify(int32_t cp) {
     if (cp < 0) {
         return CharKind::Whitespace;
     }
-    if (IsUnicodeWhitespace((uint32_t)cp)) {
+
+    if (base::IsUnicodeWhitespace((uint32_t)cp)) {
         return CharKind::Whitespace;
     }
     if ((cp < 0x80 && IsAsciiPunctuation((uint8_t)cp)) ||
@@ -17083,50 +16989,22 @@ bool CharacterReferenceValueTest(uint8_t marker, uint8_t byte) {
     return IsAsciiDigit(byte);
 }
 
-static const char* NamedValue(Str name) {
-
-    int32_t lo = 0;
-    int32_t hi = 2125 - 1;
-    while (lo <= hi) {
-        int32_t mid = (lo + hi) / 2;
-        const char* candidate =
-            kCharacterReferenceNames + kCharacterReferences[mid].nameOff;
-        int cmp = StrCmp(Str(candidate), name);
-        if (cmp < 0) {
-            lo = mid + 1;
-        } else if (cmp > 0) {
-            hi = mid - 1;
-        } else {
-            return kCharacterReferenceValues + kCharacterReferences[mid]
-                                                   .valueOff;
-        }
-    }
-    return nullptr;
-}
-
 Str DecodeNamed(Arena* a, Str name) {
-    const char* value = NamedValue(name);
-    return value ? StrOwn(a, value, (int32_t)strlen(value)) : Str{};
+    Str value = base::HtmlNamedCharRef(name);
+    return value.s ? StrOwn(a, value) : Str{};
 }
 
 static uint32_t DecodeNumericCp(Str value, int radix) {
     uint32_t cp = 0;
     bool overflow = false;
     for (int32_t i = 0; i < len(value); i++) {
-        uint8_t c = (uint8_t)value.s[i];
-        uint32_t digit;
-        if (c >= '0' && c <= '9') {
-            digit = (uint32_t)(c - '0');
-        } else if (c >= 'a' && c <= 'f') {
-            digit = (uint32_t)(c - 'a' + 10);
-        } else {
-            digit = (uint32_t)(c - 'A' + 10);
-        }
-        if (cp > 0x10ffff) {
+
+        int digit = base::HexDigitValue(value.s[i]);
+        if (digit < 0 || cp > 0x10ffff) {
             overflow = true;
             break;
         }
-        cp = cp * (uint32_t)radix + digit;
+        cp = cp * (uint32_t)radix + (uint32_t)digit;
     }
 
     bool bad = overflow || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ||
@@ -17148,8 +17026,7 @@ base::TempStr CharacterReferenceDecodeTemp(Str value, uint8_t marker) {
         out.len = Utf8Encode(out.s, cp);
         return out;
     }
-    const char* found = NamedValue(value);
-    return found ? Str((char*)found, (int32_t)strlen(found)) : Str{};
+    return base::HtmlNamedCharRef(value);
 }
 
 Str CharacterReferenceDecode(Arena* a, Str value, uint8_t marker) {
@@ -17167,74 +17044,15 @@ Str CharacterReferenceDecode(Arena* a, Str value, uint8_t marker) {
 #if GPUI_OS_ANDROID
 #line 1 "src/base_android.cpp"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 namespace base {
 
-bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
-    return true;
-}
+const PlatFacts kPlatFacts = {
+    .scrollBounce = true,
 
-bool PlatGetExePath(char* out, int cap) {
-    if (!out || cap <= 0) return false;
-    out[0] = 0;
-    ssize_t n = readlink("/proc/self/exe", out, (size_t)cap - 1);
-    if (n <= 0) return false;
-    out[n] = 0;
-    return true;
-}
-
-uint64_t PlatStatModifiedNs(const struct stat* st) {
-    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
-                                                              .tv_nsec;
-}
-
-bool PlatSecondaryIsCommand() {
-    return false;
-}
-bool PlatTitleBarCloseIsElement() {
-    return false;
-}
-bool PlatShowsWindowControls() {
-    return true;
-}
-float PlatCaretWidth() {
-    return 1.f;
-}
-bool PlatScrollBounce() {
-    return true;
-}
-bool PlatCleanOnEscape() {
-    return false;
-}
-bool PlatScrollBounceTouch() {
-    return true;
-}
-bool PlatOverscrollPhaselessStops() {
-    return false;
-}
-const char* PlatMonoFontName() {
-    return "DejaVu Sans Mono";
-}
-const char* PlatShellDataDir() {
-    return "/.local/share";
-}
-const char* PlatShellPlatformName() {
-    return "linux";
-}
-bool PlatBlockSelectUsesControl() {
-    return false;
-}
-bool PlatScrollGestureLocks() {
-    return true;
-}
-bool PlatAsyncIo() {
-    return false;
-}
-float PlatWindowShadowSize() {
-    return 0.f;
-}
+    .cleanOnEscape = false,
+    .scrollBounceTouch = true,
+    .exePath = PlatProcSelfExePath,
+};
 
 }
 
@@ -17243,69 +17061,12 @@ float PlatWindowShadowSize() {
 #if GPUI_OS_IOS
 #line 1 "src/base_ios.cpp"
 
-#include <sys/stat.h>
-
 namespace base {
 
-bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
-    return true;
-}
-
-bool PlatGetExePath(char* out, int cap) {
-    if (out && cap > 0) out[0] = 0;
-    return false;
-}
-
-uint64_t PlatStatModifiedNs(const struct stat* st) {
-    return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
-           (uint64_t)st->st_mtimespec.tv_nsec;
-}
-
-bool PlatSecondaryIsCommand() {
-    return false;
-}
-bool PlatTitleBarCloseIsElement() {
-    return false;
-}
-bool PlatShowsWindowControls() {
-    return true;
-}
-float PlatCaretWidth() {
-    return 1.f;
-}
-bool PlatScrollBounce() {
-    return true;
-}
-bool PlatCleanOnEscape() {
-    return true;
-}
-bool PlatScrollBounceTouch() {
-    return true;
-}
-bool PlatOverscrollPhaselessStops() {
-    return false;
-}
-const char* PlatMonoFontName() {
-    return "DejaVu Sans Mono";
-}
-const char* PlatShellDataDir() {
-    return "/.local/share";
-}
-const char* PlatShellPlatformName() {
-    return "linux";
-}
-bool PlatBlockSelectUsesControl() {
-    return false;
-}
-bool PlatScrollGestureLocks() {
-    return true;
-}
-bool PlatAsyncIo() {
-    return false;
-}
-float PlatWindowShadowSize() {
-    return 0.f;
-}
+const PlatFacts kPlatFacts = {
+    .scrollBounce = true,
+    .scrollBounceTouch = true,
+};
 
 }
 
@@ -17321,24 +17082,8 @@ float PlatWindowShadowSize() {
 
 namespace base {
 
-void PlatDirNameInPlace(char* path);
-
-bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
-    return true;
-}
-
-bool PlatGetExePath(char* out, int cap) {
-    if (!out || cap <= 0) return false;
-    out[0] = 0;
-    ssize_t n = readlink("/proc/self/exe", out, (size_t)cap - 1);
-    if (n <= 0) return false;
-    out[n] = 0;
-    return true;
-}
-
 void PlatGetExeDir(char* out, int cap) {
-    if (!PlatGetExePath(out, cap)) return;
-    PlatDirNameInPlace(out);
+    PlatExeDirFromExePath(out, cap);
 }
 
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
@@ -17370,56 +17115,14 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
     return true;
 }
 
-uint64_t PlatStatModifiedNs(const struct stat* st) {
-    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
-                                                              .tv_nsec;
-}
+const PlatFacts kPlatFacts = {
 
-bool PlatSecondaryIsCommand() {
-    return false;
-}
-bool PlatShowsWindowControls() {
-    return true;
-}
-bool PlatTitleBarCloseIsElement() {
-    return true;
-}
-float PlatCaretWidth() {
-    return 1.f;
-}
-bool PlatScrollBounce() {
-    return false;
-}
-bool PlatCleanOnEscape() {
-    return true;
-}
-bool PlatScrollBounceTouch() {
-    return false;
-}
-bool PlatOverscrollPhaselessStops() {
-    return false;
-}
-const char* PlatMonoFontName() {
-    return "DejaVu Sans Mono";
-}
-const char* PlatShellDataDir() {
-    return "/.local/share";
-}
-const char* PlatShellPlatformName() {
-    return "linux";
-}
-bool PlatBlockSelectUsesControl() {
-    return true;
-}
-bool PlatScrollGestureLocks() {
-    return true;
-}
-bool PlatAsyncIo() {
-    return false;
-}
-float PlatWindowShadowSize() {
-    return 20.f;
-}
+    .titleBarCloseIsElement = true,
+    .blockSelectUsesControl = true,
+
+    .windowShadowSize = 20.f,
+    .exePath = PlatProcSelfExePath,
+};
 
 }
 
@@ -17445,18 +17148,14 @@ extern "C" char** environ;
 
 namespace base {
 
-void PlatDirNameInPlace(char* path);
-
-bool PlatGetExePath(char* out, int cap) {
-    if (!out || cap <= 0) return false;
-    out[0] = 0;
+static bool ExePath(char* out, int cap) {
     uint32_t n = (uint32_t)cap;
     if (_NSGetExecutablePath(out, &n) != 0) return false;
     out[cap - 1] = 0;
     return out[0] != 0;
 }
 
-bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status) {
+static bool DisclaimSpeechResponsibility(int argc, char** argv, int* status) {
     if (getenv("SPEECH_RESPONSIBILITY_DISCLAIMED")) {
         return true;
     }
@@ -17530,8 +17229,7 @@ bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status) {
 }
 
 void PlatGetExeDir(char* out, int cap) {
-    if (!PlatGetExePath(out, cap)) return;
-    PlatDirNameInPlace(out);
+    PlatExeDirFromExePath(out, cap);
 }
 
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
@@ -17564,56 +17262,18 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
     return true;
 }
 
-uint64_t PlatStatModifiedNs(const struct stat* st) {
-    return (uint64_t)st->st_mtimespec.tv_sec * 1000000000ull +
-           (uint64_t)st->st_mtimespec.tv_nsec;
-}
+const PlatFacts kPlatFacts = {
+    .secondaryIsCommand = true,
 
-bool PlatSecondaryIsCommand() {
-    return true;
-}
-bool PlatTitleBarCloseIsElement() {
-    return false;
-}
-bool PlatShowsWindowControls() {
-    return false;
-}
-float PlatCaretWidth() {
-    return 1.f;
-}
-bool PlatScrollBounce() {
-    return true;
-}
-bool PlatCleanOnEscape() {
-    return true;
-}
-bool PlatScrollBounceTouch() {
-    return false;
-}
-bool PlatOverscrollPhaselessStops() {
-    return true;
-}
-const char* PlatMonoFontName() {
-    return "Menlo";
-}
-const char* PlatShellDataDir() {
-    return "/Library/Application Support";
-}
-const char* PlatShellPlatformName() {
-    return "macos";
-}
-bool PlatBlockSelectUsesControl() {
-    return false;
-}
-bool PlatScrollGestureLocks() {
-    return true;
-}
-bool PlatAsyncIo() {
-    return false;
-}
-float PlatWindowShadowSize() {
-    return 0.f;
-}
+    .showsWindowControls = false,
+    .scrollBounce = true,
+    .overscrollPhaselessStops = true,
+    .monoFontName = "Menlo",
+    .shellDataDir = "/Library/Application Support",
+    .shellPlatformName = "macos",
+    .exePath = ExePath,
+    .disclaimSpeechResponsibility = DisclaimSpeechResponsibility,
+};
 
 }
 
@@ -17649,14 +17309,8 @@ void* PlatMemReserve(uint64_t size) {
     return p == MAP_FAILED ? nullptr : p;
 }
 
-bool PlatMemCommit(void* base, uint64_t size, bool largePages) {
+bool PlatMemCommitPages(void* base, uint64_t size, bool largePages) {
     (void)largePages;
-    if (size == 0) {
-        return true;
-    }
-    if (!base) {
-        return false;
-    }
 
     uint64_t page = PlatPageSize();
     uintptr_t start = (uintptr_t)base & ~(uintptr_t)(page - 1);
@@ -17682,10 +17336,6 @@ void PlatMemRelease(void* base, uint64_t size) {
     }
 }
 
-uint64_t PlatArenaReserveSize() {
-    return 64ull * 1024ull * 1024ull;
-}
-
 }
 
 #endif
@@ -17704,7 +17354,28 @@ uint64_t PlatArenaReserveSize() {
 
 namespace base {
 
-uint64_t PlatStatModifiedNs(const struct stat* st);
+template <typename S>
+static auto StatMtime(const S* st, int) -> decltype(st->st_mtim) {
+    return st->st_mtim;
+}
+template <typename S>
+static auto StatMtime(const S* st, long) -> decltype(st->st_mtimespec) {
+    return st->st_mtimespec;
+}
+
+uint64_t PlatStatModifiedNs(const struct stat* st) {
+    auto t = StatMtime(st, 0);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+bool PlatProcSelfExePath(char* out, int cap) {
+    ssize_t n = readlink("/proc/self/exe", out, (size_t)cap - 1);
+    if (n <= 0) {
+        return false;
+    }
+    out[n] = 0;
+    return true;
+}
 
 int StrCmpI(const char* a, const char* b) {
     return strcasecmp(a ? a : "", b ? b : "");
@@ -17715,22 +17386,6 @@ int StrCmpNI(const char* a, const char* b, int n) {
         return 0;
     }
     return strncasecmp(a ? a : "", b ? b : "", (size_t)n);
-}
-
-void StrCopyZ(char* dst, int cap, const char* src) {
-    if (!dst || cap <= 0) {
-        return;
-    }
-    if (!src) {
-        dst[0] = 0;
-        return;
-    }
-    int n = (int)strlen(src);
-    if (n > cap - 1) {
-        n = cap - 1;
-    }
-    memcpy(dst, src, (size_t)n);
-    dst[n] = 0;
 }
 
 bool PlatDirExists(const char* path) {
@@ -17801,19 +17456,6 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
     memcpy(out, resolved, (size_t)n + 1);
     free(resolved);
     return true;
-}
-
-void PlatDirNameInPlace(char* path) {
-    if (!path) {
-        return;
-    }
-    int i = (int)strlen(path);
-    while (i > 0 && path[i - 1] != '/') {
-        path[--i] = 0;
-    }
-    while (i > 1 && path[i - 1] == '/') {
-        path[--i] = 0;
-    }
 }
 
 int PlatListDir(const char* dir, DirEntry* out, int max) {
@@ -17906,6 +17548,10 @@ uint64_t PlatThreadId() {
     return id;
 }
 
+uint64_t PlatProcessId() {
+    return (uint64_t)getpid();
+}
+
 void PlatSleepMs(int ms) {
     if (ms <= 0) {
         return;
@@ -17914,16 +17560,6 @@ void PlatSleepMs(int ms) {
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, nullptr);
-}
-
-char PlatPathSep() {
-    return '/';
-}
-bool PlatPathsCaseFold() {
-    return false;
-}
-bool PlatIsWindows() {
-    return false;
 }
 
 }
@@ -17959,14 +17595,8 @@ void* PlatMemReserve(uint64_t size) {
     return aligned_alloc((size_t)PlatPageSize(), (size_t)size);
 }
 
-bool PlatMemCommit(void* base, uint64_t size, bool largePages) {
+bool PlatMemCommitPages(void* base, uint64_t size, bool largePages) {
     (void)largePages;
-    if (size == 0) {
-        return true;
-    }
-    if (!base) {
-        return false;
-    }
 
     memset(base, 0, (size_t)size);
     return true;
@@ -17989,23 +17619,7 @@ void PlatMemRelease(void* base, uint64_t size) {
     free(base);
 }
 
-uint64_t PlatArenaReserveSize() {
-    return 4ull * 1024ull * 1024ull;
-}
-
-bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
-    return true;
-}
-
-bool PlatGetExePath(char* out, int cap) {
-    if (out && cap > 0) out[0] = 0;
-    return false;
-}
-
 void PlatGetExeDir(char* out, int cap) {
-    if (!out || cap <= 0) {
-        return;
-    }
     StrCopyZ(out, cap, "/");
 }
 
@@ -18021,56 +17635,14 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
     return true;
 }
 
-uint64_t PlatStatModifiedNs(const struct stat* st) {
-    return (uint64_t)st->st_mtim.tv_sec * 1000000000ull + (uint64_t)st->st_mtim
-                                                              .tv_nsec;
-}
+const PlatFacts kPlatFacts = {
+    .shellPlatformName = "emscripten",
+    .scrollGestureLocks = false,
 
-bool PlatSecondaryIsCommand() {
-    return false;
-}
-bool PlatTitleBarCloseIsElement() {
-    return false;
-}
-bool PlatShowsWindowControls() {
-    return true;
-}
-float PlatCaretWidth() {
-    return 1.f;
-}
-bool PlatScrollBounce() {
-    return false;
-}
-bool PlatCleanOnEscape() {
-    return true;
-}
-bool PlatScrollBounceTouch() {
-    return false;
-}
-bool PlatOverscrollPhaselessStops() {
-    return false;
-}
-const char* PlatMonoFontName() {
-    return "DejaVu Sans Mono";
-}
-const char* PlatShellDataDir() {
-    return "/.local/share";
-}
-const char* PlatShellPlatformName() {
-    return "emscripten";
-}
-bool PlatBlockSelectUsesControl() {
-    return false;
-}
-bool PlatScrollGestureLocks() {
-    return false;
-}
-bool PlatAsyncIo() {
-    return true;
-}
-float PlatWindowShadowSize() {
-    return 0.f;
-}
+    .asyncIo = true,
+
+    .arenaReserveSize = 4ull * 1024ull * 1024ull,
+};
 
 }
 
@@ -18102,10 +17674,7 @@ uint64_t PlatLargePageSize() {
     return largePageSize;
 }
 
-bool PlatMemCommit(void* base, uint64_t size, bool largePages) {
-    if (size == 0) {
-        return true;
-    }
+bool PlatMemCommitPages(void* base, uint64_t size, bool largePages) {
     DWORD flags = MEM_COMMIT;
     if (largePages) {
         flags |= MEM_LARGE_PAGES;
@@ -18130,10 +17699,6 @@ void PlatMemRelease(void* base, uint64_t size) {
     VirtualFree(base, 0, MEM_RELEASE);
 }
 
-uint64_t PlatArenaReserveSize() {
-    return 64ull * 1024ull * 1024ull;
-}
-
 int StrCmpI(const char* a, const char* b) {
     return _stricmp(a ? a : "", b ? b : "");
 }
@@ -18143,13 +17708,6 @@ int StrCmpNI(const char* a, const char* b, int n) {
         return 0;
     }
     return _strnicmp(a ? a : "", b ? b : "", (size_t)n);
-}
-
-void StrCopyZ(char* dst, int cap, const char* src) {
-    if (!dst || cap <= 0) {
-        return;
-    }
-    strncpy_s(dst, (size_t)cap, src ? src : "", _TRUNCATE);
 }
 
 WCHAR* ToCWstrTemp(Str s) {
@@ -18249,13 +17807,7 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
     return true;
 }
 
-bool PlatDisclaimSpeechResponsibility(int, char**, int*) {
-    return true;
-}
-
-bool PlatGetExePath(char* out, int cap) {
-    if (!out || cap <= 0) return false;
-    out[0] = 0;
+static bool ExePath(char* out, int cap) {
     DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
     if (n == 0 || n >= (DWORD)cap) {
         out[0] = 0;
@@ -18269,10 +17821,7 @@ bool PlatGetExePath(char* out, int cap) {
 }
 
 void PlatGetExeDir(char* out, int cap) {
-    if (!PlatGetExePath(out, cap)) return;
-    int n = (int)strlen(out);
-    while (n > 0 && out[n - 1] != '/') out[--n] = 0;
-    while (n > 0 && out[n - 1] == '/') out[--n] = 0;
+    PlatExeDirFromExePath(out, cap);
 }
 
 bool PlatFileIsExecutable(const char* path) {
@@ -18417,64 +17966,23 @@ uint64_t PlatThreadId() {
     return (uint64_t)GetCurrentThreadId();
 }
 
+uint64_t PlatProcessId() {
+    return (uint64_t)GetCurrentProcessId();
+}
+
 void PlatSleepMs(int ms) {
     Sleep((DWORD)(ms < 0 ? 0 : ms));
 }
 
-char PlatPathSep() {
-    return '\\';
-}
-bool PlatPathsCaseFold() {
-    return true;
-}
-bool PlatIsWindows() {
-    return true;
-}
-bool PlatSecondaryIsCommand() {
-    return false;
-}
-bool PlatTitleBarCloseIsElement() {
-    return false;
-}
-bool PlatShowsWindowControls() {
-    return true;
-}
-float PlatCaretWidth() {
-    return 1.f;
-}
-bool PlatScrollBounce() {
-    return false;
-}
-bool PlatCleanOnEscape() {
-    return true;
-}
-bool PlatScrollBounceTouch() {
-    return false;
-}
-bool PlatOverscrollPhaselessStops() {
-    return false;
-}
-const char* PlatMonoFontName() {
-    return "Consolas";
-}
-const char* PlatShellDataDir() {
-    return "\\AppData\\Roaming";
-}
-const char* PlatShellPlatformName() {
-    return "windows";
-}
-bool PlatBlockSelectUsesControl() {
-    return false;
-}
-bool PlatScrollGestureLocks() {
-    return true;
-}
-bool PlatAsyncIo() {
-    return false;
-}
-float PlatWindowShadowSize() {
-    return 0.f;
-}
+const PlatFacts kPlatFacts = {
+    .pathSep = '\\',
+    .pathsCaseFold = true,
+    .isWindows = true,
+    .monoFontName = "Consolas",
+    .shellDataDir = "\\AppData\\Roaming",
+    .shellPlatformName = "windows",
+    .exePath = ExePath,
+};
 
 }
 

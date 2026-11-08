@@ -143,12 +143,17 @@ uint64_t PlatLargePageSize();
 
 uint64_t PlatArenaReserveSize();
 void* PlatMemReserve(uint64_t size);
+
 bool PlatMemCommit(void* base, uint64_t size, bool largePages);
+bool PlatMemCommitPages(void* base, uint64_t size, bool largePages);
 void* PlatMemReserveCommit(uint64_t size, bool largePages);
 void PlatMemRelease(void* base, uint64_t size);
 
 int StrCmpI(const char* a, const char* b);
 int StrCmpNI(const char* a, const char* b, int n);
+
+int StrCopyCapped(char* dst, int cap, Str src);
+
 void StrCopyZ(char* dst, int cap, const char* src);
 
 bool PlatDirExists(const char* path);
@@ -158,6 +163,12 @@ bool PlatCanonicalPath(const char* path, char* out, int cap);
 void PlatGetExeDir(char* out, int cap);
 
 bool PlatGetExePath(char* out, int cap);
+
+void PlatExeDirFromExePath(char* out, int cap);
+
+void PlatDirNameInPlace(char* path);
+
+bool PlatProcSelfExePath(char* out, int cap);
 
 bool PlatDisclaimSpeechResponsibility(int argc, char** argv, int* status);
 
@@ -180,21 +191,59 @@ int PlatListDir(const char* dir, DirEntry* out, int max);
 int PlatCoreCount();
 bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes);
 
+struct PlatFacts {
+    char pathSep = '/';
+    bool pathsCaseFold = false;
+    bool isWindows = false;
+
+    bool secondaryIsCommand = false;
+
+    bool showsWindowControls = true;
+
+    bool titleBarCloseIsElement = false;
+
+    float caretWidth = 1.f;
+
+    bool scrollBounce = false;
+
+    bool cleanOnEscape = true;
+
+    bool scrollBounceTouch = false;
+
+    bool overscrollPhaselessStops = false;
+    const char* monoFontName = "DejaVu Sans Mono";
+
+    const char* shellDataDir = "/.local/share";
+
+    const char* shellPlatformName = "linux";
+
+    bool blockSelectUsesControl = false;
+
+    bool scrollGestureLocks = true;
+
+    bool asyncIo = false;
+
+    float windowShadowSize = 0.f;
+
+    uint64_t arenaReserveSize = 64ull * 1024ull * 1024ull;
+
+    bool (*exePath)(char* out, int cap) = nullptr;
+
+    bool (*disclaimSpeechResponsibility)(int argc, char** argv,
+                                         int* status) = nullptr;
+};
+extern const PlatFacts kPlatFacts;
+
 char PlatPathSep();
 bool PlatPathsCaseFold();
 bool PlatIsWindows();
 bool PlatSecondaryIsCommand();
 bool PlatShowsWindowControls();
-
 bool PlatTitleBarCloseIsElement();
-
 float PlatCaretWidth();
 bool PlatScrollBounce();
-
 bool PlatCleanOnEscape();
-
 bool PlatScrollBounceTouch();
-
 bool PlatOverscrollPhaselessStops();
 const char* PlatMonoFontName();
 const char* PlatShellDataDir();
@@ -363,8 +412,55 @@ struct CondVar {
     ~CondVar() = default;
 };
 
+#if GPUI_OS_WINDOWS
+
+template <typename First, typename... Rest, typename Self>
+HRESULT ComQueryInterface(Self* self, REFIID riid, void** ppv) {
+    if (!ppv) {
+        return E_POINTER;
+    }
+    *ppv = nullptr;
+    if (riid == __uuidof(IUnknown)) {
+        *ppv = static_cast<First*>(self);
+    }
+    ((!*ppv && riid == __uuidof(Rest) ? (void)(*ppv = static_cast<Rest*>(self))
+                                      : (void)0),
+     ...);
+    if (!*ppv && riid == __uuidof(First)) {
+        *ppv = static_cast<First*>(self);
+    }
+    if (!*ppv) {
+        return E_NOINTERFACE;
+    }
+    self->AddRef();
+    return S_OK;
+}
+
+template <typename... Is>
+struct ComObject : Is... {
+    LONG refs = 1;
+
+    virtual ~ComObject() = default;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        return ComQueryInterface<Is...>(this, riid, ppv);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return (ULONG)InterlockedIncrement(&refs);
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        LONG left = InterlockedDecrement(&refs);
+        if (left == 0) {
+            delete this;
+        }
+        return (ULONG)left;
+    }
+};
+#endif
+
 bool PlatThreadRun(Func0 f);
 uint64_t PlatThreadId();
+uint64_t PlatProcessId();
 void PlatSleepMs(int ms);
 
 static const uint64_t kArenaHeaderSize = 256;
@@ -1132,6 +1228,8 @@ LocalTime TimeOfDayNow();
 void StrFree(Str s);
 void StrFree(const char*) = delete;
 
+void StrVecFree(Vec<Str>* v);
+
 Str StrDup(Arena*, Str str);
 Str StrDup(Str s);
 
@@ -1159,6 +1257,20 @@ inline bool StrEqI(Str s1, const char* s2) {
     return StrEqI(s1, Str(s2));
 }
 bool StrStartsWith(Str s, Str prefix);
+
+inline bool ScanSkipQuoted(char c, char* quote) {
+    if (*quote) {
+        if (c == *quote) {
+            *quote = 0;
+        }
+        return true;
+    }
+    if (c == '"' || c == '\'') {
+        *quote = c;
+        return true;
+    }
+    return false;
+}
 inline bool StrStartsWith(Str s, const char* prefix) {
     return StrStartsWith(s, Str(prefix));
 }
@@ -1205,6 +1317,50 @@ Str SeqStrByIndex(SeqStrings strs, int idx);
 int SeqStrCount(SeqStrings strs);
 void StrLowerAscii(char* s);
 
+constexpr int HexDigitValue(char c) {
+    return c >= '0' && c <= '9'   ? c - '0'
+           : c >= 'a' && c <= 'f' ? c - 'a' + 10
+           : c >= 'A' && c <= 'F' ? c - 'A' + 10
+                                  : -1;
+}
+
+void HexEncode(const void* bytes, int n, char* out);
+
+bool ParseHexRgba(Str digits, uint32_t* rgba);
+
+int PercentDecode(Str s, char* out);
+
+constexpr bool IsUnicodeWhitespace(uint32_t cp) {
+    return (cp >= 0x09 && cp <= 0x0D) || cp == 0x20 || cp == 0x85 ||
+           cp == 0xA0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F ||
+           cp == 0x3000;
+}
+
+int Utf8Encode(char* out, uint32_t cp);
+
+constexpr int Utf8LeadLen(uint8_t lead) {
+    return (lead & 0xE0) == 0xC0   ? 2
+           : (lead & 0xF0) == 0xE0 ? 3
+           : (lead & 0xF8) == 0xF0 ? 4
+                                   : 1;
+}
+
+int Utf8At(Str s, int i, uint32_t* out);
+
+int Utf8Prev(Str s, int i);
+
+int Utf8StrictAt(const uint8_t* b, int avail, uint32_t* cp);
+
+bool Utf8IsCharBoundary(Str s, int i);
+
+int Utf8CharCount(Str s);
+
+Str HtmlNamedCharRef(Str name);
+
+int HtmlNamedCharRefCount();
+void HtmlNamedCharRefAt(int i, Str* name, Str* value);
+
 struct StrBuilder : Vec<char> {
     Arena* a = nullptr;
 
@@ -1214,11 +1370,16 @@ struct StrBuilder : Vec<char> {
     bool Reserve(int cap);
     bool AppendChar(char c);
     bool Append(Str src);
+
+    bool AppendUtf8(uint32_t cp);
     char RemoveAt(int idx, int count = 1);
     char RemoveLast();
     Str TakeStr();
     char LastChar() const;
 };
+
+void AppendHtmlEscaped(StrBuilder& out, Str value, bool escapeGt,
+                       bool escapeQuote);
 
 void StrBuilderUseExternalBuffer(StrBuilder& b, Str buf);
 
@@ -1339,14 +1500,6 @@ constexpr int kThematicBreakMarkerCountMin = 3;
 
 extern const char kHtmlBlockNames[];
 extern const char kHtmlRawNames[];
-
-struct CharacterReference {
-    int32_t nameOff;
-    int32_t valueOff;
-};
-extern const char kCharacterReferenceNames[];
-extern const char kCharacterReferenceValues[];
-extern const CharacterReference kCharacterReferences[2125];
 
 }
 
@@ -1658,6 +1811,23 @@ struct ParseOptions {
     static ParseOptions Gfm();
 };
 
+inline Constructs Constructs::Gfm() {
+    Constructs constructs;
+    constructs.gfmAutolinkLiteral = true;
+    constructs.gfmFootnoteDefinition = true;
+    constructs.gfmLabelStartFootnote = true;
+    constructs.gfmStrikethrough = true;
+    constructs.gfmTable = true;
+    constructs.gfmTaskListItem = true;
+    return constructs;
+}
+
+inline ParseOptions ParseOptions::Gfm() {
+    ParseOptions options;
+    options.constructs = Constructs::Gfm();
+    return options;
+}
+
 Node* ToMdast(Arena* a, Str source, const ParseOptions& options);
 
 struct NodeSpan {
@@ -1689,324 +1859,329 @@ namespace markdown {
 
 struct Tokenizer;
 
+#define GPUI_MARKDOWN_STATES(X)                           \
+    X(AttentionStart)                                     \
+    X(AttentionInside)                                    \
+    X(AutolinkStart)                                      \
+    X(AutolinkOpen)                                       \
+    X(AutolinkSchemeOrEmailAtext)                         \
+    X(AutolinkSchemeInsideOrEmailAtext)                   \
+    X(AutolinkUrlInside)                                  \
+    X(AutolinkEmailAtSignOrDot)                           \
+    X(AutolinkEmailAtext)                                 \
+    X(AutolinkEmailValue)                                 \
+    X(AutolinkEmailLabel)                                 \
+    X(BlankLineStart)                                     \
+    X(BlankLineAfter)                                     \
+    X(BlockQuoteStart)                                    \
+    X(BlockQuoteContStart)                                \
+    X(BlockQuoteContBefore)                               \
+    X(BlockQuoteContAfter)                                \
+    X(BomStart)                                           \
+    X(BomInside)                                          \
+    X(CharacterEscapeStart)                               \
+    X(CharacterEscapeInside)                              \
+    X(CharacterReferenceStart)                            \
+    X(CharacterReferenceOpen)                             \
+    X(CharacterReferenceNumeric)                          \
+    X(CharacterReferenceValue)                            \
+    X(CodeIndentedStart)                                  \
+    X(CodeIndentedAtBreak)                                \
+    X(CodeIndentedAfter)                                  \
+    X(CodeIndentedFurtherStart)                           \
+    X(CodeIndentedInside)                                 \
+    X(CodeIndentedFurtherBegin)                           \
+    X(CodeIndentedFurtherAfter)                           \
+    X(ContentChunkStart)                                  \
+    X(ContentChunkInside)                                 \
+    X(ContentDefinitionBefore)                            \
+    X(ContentDefinitionAfter)                             \
+    X(DataStart)                                          \
+    X(DataInside)                                         \
+    X(DataAtBreak)                                        \
+    X(DefinitionStart)                                    \
+    X(DefinitionBefore)                                   \
+    X(DefinitionLabelAfter)                               \
+    X(DefinitionLabelNok)                                 \
+    X(DefinitionMarkerAfter)                              \
+    X(DefinitionDestinationBefore)                        \
+    X(DefinitionDestinationAfter)                         \
+    X(DefinitionDestinationMissing)                       \
+    X(DefinitionTitleBefore)                              \
+    X(DefinitionAfter)                                    \
+    X(DefinitionAfterWhitespace)                          \
+    X(DefinitionTitleBeforeMarker)                        \
+    X(DefinitionTitleAfter)                               \
+    X(DefinitionTitleAfterOptionalWhitespace)             \
+    X(DestinationStart)                                   \
+    X(DestinationEnclosedBefore)                          \
+    X(DestinationEnclosed)                                \
+    X(DestinationEnclosedEscape)                          \
+    X(DestinationRaw)                                     \
+    X(DestinationRawEscape)                               \
+    X(DocumentStart)                                      \
+    X(DocumentBeforeFrontmatter)                          \
+    X(DocumentContainerExistingBefore)                    \
+    X(DocumentContainerExistingAfter)                     \
+    X(DocumentContainerNewBefore)                         \
+    X(DocumentContainerNewBeforeNotBlockQuote)            \
+    X(DocumentContainerNewBeforeNotList)                  \
+    X(DocumentContainerNewBeforeNotGfmFootnoteDefinition) \
+    X(DocumentContainerNewAfter)                          \
+    X(DocumentContainersAfter)                            \
+    X(DocumentFlowInside)                                 \
+    X(DocumentFlowEnd)                                    \
+    X(FlowStart)                                          \
+    X(FlowBeforeGfmTable)                                 \
+    X(FlowBeforeCodeIndented)                             \
+    X(FlowBeforeRaw)                                      \
+    X(FlowBeforeHtml)                                     \
+    X(FlowBeforeHeadingAtx)                               \
+    X(FlowBeforeHeadingSetext)                            \
+    X(FlowBeforeThematicBreak)                            \
+    X(FlowAfter)                                          \
+    X(FlowBlankLineBefore)                                \
+    X(FlowBlankLineAfter)                                 \
+    X(FlowBeforeContent)                                  \
+    X(FrontmatterStart)                                   \
+    X(FrontmatterOpenSequence)                            \
+    X(FrontmatterOpenAfter)                               \
+    X(FrontmatterAfter)                                   \
+    X(FrontmatterContentStart)                            \
+    X(FrontmatterContentInside)                           \
+    X(FrontmatterContentEnd)                              \
+    X(FrontmatterCloseStart)                              \
+    X(FrontmatterCloseSequence)                           \
+    X(FrontmatterCloseAfter)                              \
+    X(GfmAutolinkLiteralProtocolStart)                    \
+    X(GfmAutolinkLiteralProtocolAfter)                    \
+    X(GfmAutolinkLiteralProtocolPrefixInside)             \
+    X(GfmAutolinkLiteralProtocolSlashesInside)            \
+    X(GfmAutolinkLiteralWwwStart)                         \
+    X(GfmAutolinkLiteralWwwAfter)                         \
+    X(GfmAutolinkLiteralWwwPrefixInside)                  \
+    X(GfmAutolinkLiteralWwwPrefixAfter)                   \
+    X(GfmAutolinkLiteralDomainInside)                     \
+    X(GfmAutolinkLiteralDomainAtPunctuation)              \
+    X(GfmAutolinkLiteralDomainAfter)                      \
+    X(GfmAutolinkLiteralPathInside)                       \
+    X(GfmAutolinkLiteralPathAtPunctuation)                \
+    X(GfmAutolinkLiteralPathAfter)                        \
+    X(GfmAutolinkLiteralTrail)                            \
+    X(GfmAutolinkLiteralTrailCharRefInside)               \
+    X(GfmAutolinkLiteralTrailCharRefStart)                \
+    X(GfmAutolinkLiteralTrailBracketAfter)                \
+    X(GfmFootnoteDefinitionStart)                         \
+    X(GfmFootnoteDefinitionLabelBefore)                   \
+    X(GfmFootnoteDefinitionLabelAtMarker)                 \
+    X(GfmFootnoteDefinitionLabelInside)                   \
+    X(GfmFootnoteDefinitionLabelEscape)                   \
+    X(GfmFootnoteDefinitionLabelAfter)                    \
+    X(GfmFootnoteDefinitionWhitespaceAfter)               \
+    X(GfmFootnoteDefinitionContStart)                     \
+    X(GfmFootnoteDefinitionContBlank)                     \
+    X(GfmFootnoteDefinitionContFilled)                    \
+    X(GfmLabelStartFootnoteStart)                         \
+    X(GfmLabelStartFootnoteOpen)                          \
+    X(GfmTaskListItemCheckStart)                          \
+    X(GfmTaskListItemCheckInside)                         \
+    X(GfmTaskListItemCheckClose)                          \
+    X(GfmTaskListItemCheckAfter)                          \
+    X(GfmTaskListItemCheckAfterSpaceOrTab)                \
+    X(GfmTableStart)                                      \
+    X(GfmTableHeadRowBefore)                              \
+    X(GfmTableHeadRowStart)                               \
+    X(GfmTableHeadRowBreak)                               \
+    X(GfmTableHeadRowData)                                \
+    X(GfmTableHeadRowEscape)                              \
+    X(GfmTableHeadDelimiterStart)                         \
+    X(GfmTableHeadDelimiterBefore)                        \
+    X(GfmTableHeadDelimiterCellBefore)                    \
+    X(GfmTableHeadDelimiterValueBefore)                   \
+    X(GfmTableHeadDelimiterLeftAlignmentAfter)            \
+    X(GfmTableHeadDelimiterFiller)                        \
+    X(GfmTableHeadDelimiterRightAlignmentAfter)           \
+    X(GfmTableHeadDelimiterCellAfter)                     \
+    X(GfmTableHeadDelimiterNok)                           \
+    X(GfmTableBodyRowStart)                               \
+    X(GfmTableBodyRowBreak)                               \
+    X(GfmTableBodyRowData)                                \
+    X(GfmTableBodyRowEscape)                              \
+    X(HardBreakEscapeStart)                               \
+    X(HardBreakEscapeAfter)                               \
+    X(HeadingAtxStart)                                    \
+    X(HeadingAtxBefore)                                   \
+    X(HeadingAtxSequenceOpen)                             \
+    X(HeadingAtxAtBreak)                                  \
+    X(HeadingAtxSequenceFurther)                          \
+    X(HeadingAtxData)                                     \
+    X(HeadingSetextStart)                                 \
+    X(HeadingSetextBefore)                                \
+    X(HeadingSetextInside)                                \
+    X(HeadingSetextAfter)                                 \
+    X(HtmlFlowStart)                                      \
+    X(HtmlFlowBefore)                                     \
+    X(HtmlFlowOpen)                                       \
+    X(HtmlFlowDeclarationOpen)                            \
+    X(HtmlFlowCommentOpenInside)                          \
+    X(HtmlFlowCdataOpenInside)                            \
+    X(HtmlFlowTagCloseStart)                              \
+    X(HtmlFlowTagName)                                    \
+    X(HtmlFlowBasicSelfClosing)                           \
+    X(HtmlFlowCompleteClosingTagAfter)                    \
+    X(HtmlFlowCompleteEnd)                                \
+    X(HtmlFlowCompleteAttributeNameBefore)                \
+    X(HtmlFlowCompleteAttributeName)                      \
+    X(HtmlFlowCompleteAttributeNameAfter)                 \
+    X(HtmlFlowCompleteAttributeValueBefore)               \
+    X(HtmlFlowCompleteAttributeValueQuoted)               \
+    X(HtmlFlowCompleteAttributeValueQuotedAfter)          \
+    X(HtmlFlowCompleteAttributeValueUnquoted)             \
+    X(HtmlFlowCompleteAfter)                              \
+    X(HtmlFlowBlankLineBefore)                            \
+    X(HtmlFlowContinuation)                               \
+    X(HtmlFlowContinuationDeclarationInside)              \
+    X(HtmlFlowContinuationAfter)                          \
+    X(HtmlFlowContinuationStart)                          \
+    X(HtmlFlowContinuationBefore)                         \
+    X(HtmlFlowContinuationCommentInside)                  \
+    X(HtmlFlowContinuationRawTagOpen)                     \
+    X(HtmlFlowContinuationRawEndTag)                      \
+    X(HtmlFlowContinuationClose)                          \
+    X(HtmlFlowContinuationCdataInside)                    \
+    X(HtmlFlowContinuationStartNonLazy)                   \
+    X(HtmlTextStart)                                      \
+    X(HtmlTextOpen)                                       \
+    X(HtmlTextDeclarationOpen)                            \
+    X(HtmlTextTagCloseStart)                              \
+    X(HtmlTextTagClose)                                   \
+    X(HtmlTextTagCloseBetween)                            \
+    X(HtmlTextTagOpen)                                    \
+    X(HtmlTextTagOpenBetween)                             \
+    X(HtmlTextTagOpenAttributeName)                       \
+    X(HtmlTextTagOpenAttributeNameAfter)                  \
+    X(HtmlTextTagOpenAttributeValueBefore)                \
+    X(HtmlTextTagOpenAttributeValueQuoted)                \
+    X(HtmlTextTagOpenAttributeValueQuotedAfter)           \
+    X(HtmlTextTagOpenAttributeValueUnquoted)              \
+    X(HtmlTextCdata)                                      \
+    X(HtmlTextCdataOpenInside)                            \
+    X(HtmlTextCdataClose)                                 \
+    X(HtmlTextCdataEnd)                                   \
+    X(HtmlTextCommentOpenInside)                          \
+    X(HtmlTextComment)                                    \
+    X(HtmlTextCommentClose)                               \
+    X(HtmlTextCommentEnd)                                 \
+    X(HtmlTextDeclaration)                                \
+    X(HtmlTextEnd)                                        \
+    X(HtmlTextInstruction)                                \
+    X(HtmlTextInstructionClose)                           \
+    X(HtmlTextLineEndingBefore)                           \
+    X(HtmlTextLineEndingAfter)                            \
+    X(HtmlTextLineEndingAfterPrefix)                      \
+    X(LabelStart)                                         \
+    X(LabelAtBreak)                                       \
+    X(LabelEolAfter)                                      \
+    X(LabelEscape)                                        \
+    X(LabelInside)                                        \
+    X(LabelNok)                                           \
+    X(LabelEndStart)                                      \
+    X(LabelEndAfter)                                      \
+    X(LabelEndResourceStart)                              \
+    X(LabelEndResourceBefore)                             \
+    X(LabelEndResourceOpen)                               \
+    X(LabelEndResourceDestinationAfter)                   \
+    X(LabelEndResourceDestinationMissing)                 \
+    X(LabelEndResourceBetween)                            \
+    X(LabelEndResourceTitleAfter)                         \
+    X(LabelEndResourceEnd)                                \
+    X(LabelEndOk)                                         \
+    X(LabelEndNok)                                        \
+    X(LabelEndReferenceFull)                              \
+    X(LabelEndReferenceFullAfter)                         \
+    X(LabelEndReferenceFullMissing)                       \
+    X(LabelEndReferenceNotFull)                           \
+    X(LabelEndReferenceCollapsed)                         \
+    X(LabelEndReferenceCollapsedOpen)                     \
+    X(LabelStartImageStart)                               \
+    X(LabelStartImageOpen)                                \
+    X(LabelStartImageAfter)                               \
+    X(LabelStartLinkStart)                                \
+    X(ListItemStart)                                      \
+    X(ListItemBefore)                                     \
+    X(ListItemBeforeOrdered)                              \
+    X(ListItemBeforeUnordered)                            \
+    X(ListItemValue)                                      \
+    X(ListItemMarker)                                     \
+    X(ListItemMarkerAfter)                                \
+    X(ListItemAfter)                                      \
+    X(ListItemMarkerAfterFilled)                          \
+    X(ListItemWhitespace)                                 \
+    X(ListItemPrefixOther)                                \
+    X(ListItemWhitespaceAfter)                            \
+    X(ListItemContStart)                                  \
+    X(ListItemContBlank)                                  \
+    X(ListItemContFilled)                                 \
+    X(NonLazyContinuationStart)                           \
+    X(NonLazyContinuationAfter)                           \
+    X(ParagraphStart)                                     \
+    X(ParagraphLineStart)                                 \
+    X(ParagraphInside)                                    \
+    X(RawFlowStart)                                       \
+    X(RawFlowBeforeSequenceOpen)                          \
+    X(RawFlowSequenceOpen)                                \
+    X(RawFlowInfoBefore)                                  \
+    X(RawFlowInfo)                                        \
+    X(RawFlowMetaBefore)                                  \
+    X(RawFlowMeta)                                        \
+    X(RawFlowAtNonLazyBreak)                              \
+    X(RawFlowCloseStart)                                  \
+    X(RawFlowBeforeSequenceClose)                         \
+    X(RawFlowSequenceClose)                               \
+    X(RawFlowAfterSequenceClose)                          \
+    X(RawFlowContentBefore)                               \
+    X(RawFlowContentStart)                                \
+    X(RawFlowBeforeContentChunk)                          \
+    X(RawFlowContentChunk)                                \
+    X(RawFlowAfter)                                       \
+    X(RawTextStart)                                       \
+    X(RawTextSequenceOpen)                                \
+    X(RawTextBetween)                                     \
+    X(RawTextData)                                        \
+    X(RawTextSequenceClose)                               \
+    X(SpaceOrTabStart)                                    \
+    X(SpaceOrTabInside)                                   \
+    X(SpaceOrTabAfter)                                    \
+    X(SpaceOrTabEolStart)                                 \
+    X(SpaceOrTabEolAfterFirst)                            \
+    X(SpaceOrTabEolAfterEol)                              \
+    X(SpaceOrTabEolAtEol)                                 \
+    X(SpaceOrTabEolAfterMore)                             \
+    X(StringStart)                                        \
+    X(StringBefore)                                       \
+    X(StringBeforeData)                                   \
+    X(TextStart)                                          \
+    X(TextBefore)                                         \
+    X(TextBeforeHtml)                                     \
+    X(TextBeforeHardBreakEscape)                          \
+    X(TextBeforeLabelStartLink)                           \
+    X(TextBeforeData)                                     \
+    X(ThematicBreakStart)                                 \
+    X(ThematicBreakBefore)                                \
+    X(ThematicBreakSequence)                              \
+    X(ThematicBreakAtBreak)                               \
+    X(TitleStart)                                         \
+    X(TitleBegin)                                         \
+    X(TitleAfterEol)                                      \
+    X(TitleAtBreak)                                       \
+    X(TitleEscape)                                        \
+    X(TitleInside)                                        \
+    X(TitleNok)
+
 enum class StateName : uint16_t {
-    AttentionStart,
-    AttentionInside,
-    AutolinkStart,
-    AutolinkOpen,
-    AutolinkSchemeOrEmailAtext,
-    AutolinkSchemeInsideOrEmailAtext,
-    AutolinkUrlInside,
-    AutolinkEmailAtSignOrDot,
-    AutolinkEmailAtext,
-    AutolinkEmailValue,
-    AutolinkEmailLabel,
-    BlankLineStart,
-    BlankLineAfter,
-    BlockQuoteStart,
-    BlockQuoteContStart,
-    BlockQuoteContBefore,
-    BlockQuoteContAfter,
-    BomStart,
-    BomInside,
-    CharacterEscapeStart,
-    CharacterEscapeInside,
-    CharacterReferenceStart,
-    CharacterReferenceOpen,
-    CharacterReferenceNumeric,
-    CharacterReferenceValue,
-    CodeIndentedStart,
-    CodeIndentedAtBreak,
-    CodeIndentedAfter,
-    CodeIndentedFurtherStart,
-    CodeIndentedInside,
-    CodeIndentedFurtherBegin,
-    CodeIndentedFurtherAfter,
-    ContentChunkStart,
-    ContentChunkInside,
-    ContentDefinitionBefore,
-    ContentDefinitionAfter,
-    DataStart,
-    DataInside,
-    DataAtBreak,
-    DefinitionStart,
-    DefinitionBefore,
-    DefinitionLabelAfter,
-    DefinitionLabelNok,
-    DefinitionMarkerAfter,
-    DefinitionDestinationBefore,
-    DefinitionDestinationAfter,
-    DefinitionDestinationMissing,
-    DefinitionTitleBefore,
-    DefinitionAfter,
-    DefinitionAfterWhitespace,
-    DefinitionTitleBeforeMarker,
-    DefinitionTitleAfter,
-    DefinitionTitleAfterOptionalWhitespace,
-    DestinationStart,
-    DestinationEnclosedBefore,
-    DestinationEnclosed,
-    DestinationEnclosedEscape,
-    DestinationRaw,
-    DestinationRawEscape,
-    DocumentStart,
-    DocumentBeforeFrontmatter,
-    DocumentContainerExistingBefore,
-    DocumentContainerExistingAfter,
-    DocumentContainerNewBefore,
-    DocumentContainerNewBeforeNotBlockQuote,
-    DocumentContainerNewBeforeNotList,
-    DocumentContainerNewBeforeNotGfmFootnoteDefinition,
-    DocumentContainerNewAfter,
-    DocumentContainersAfter,
-    DocumentFlowInside,
-    DocumentFlowEnd,
-    FlowStart,
-    FlowBeforeGfmTable,
-    FlowBeforeCodeIndented,
-    FlowBeforeRaw,
-    FlowBeforeHtml,
-    FlowBeforeHeadingAtx,
-    FlowBeforeHeadingSetext,
-    FlowBeforeThematicBreak,
-    FlowAfter,
-    FlowBlankLineBefore,
-    FlowBlankLineAfter,
-    FlowBeforeContent,
-    FrontmatterStart,
-    FrontmatterOpenSequence,
-    FrontmatterOpenAfter,
-    FrontmatterAfter,
-    FrontmatterContentStart,
-    FrontmatterContentInside,
-    FrontmatterContentEnd,
-    FrontmatterCloseStart,
-    FrontmatterCloseSequence,
-    FrontmatterCloseAfter,
-    GfmAutolinkLiteralProtocolStart,
-    GfmAutolinkLiteralProtocolAfter,
-    GfmAutolinkLiteralProtocolPrefixInside,
-    GfmAutolinkLiteralProtocolSlashesInside,
-    GfmAutolinkLiteralWwwStart,
-    GfmAutolinkLiteralWwwAfter,
-    GfmAutolinkLiteralWwwPrefixInside,
-    GfmAutolinkLiteralWwwPrefixAfter,
-    GfmAutolinkLiteralDomainInside,
-    GfmAutolinkLiteralDomainAtPunctuation,
-    GfmAutolinkLiteralDomainAfter,
-    GfmAutolinkLiteralPathInside,
-    GfmAutolinkLiteralPathAtPunctuation,
-    GfmAutolinkLiteralPathAfter,
-    GfmAutolinkLiteralTrail,
-    GfmAutolinkLiteralTrailCharRefInside,
-    GfmAutolinkLiteralTrailCharRefStart,
-    GfmAutolinkLiteralTrailBracketAfter,
-    GfmFootnoteDefinitionStart,
-    GfmFootnoteDefinitionLabelBefore,
-    GfmFootnoteDefinitionLabelAtMarker,
-    GfmFootnoteDefinitionLabelInside,
-    GfmFootnoteDefinitionLabelEscape,
-    GfmFootnoteDefinitionLabelAfter,
-    GfmFootnoteDefinitionWhitespaceAfter,
-    GfmFootnoteDefinitionContStart,
-    GfmFootnoteDefinitionContBlank,
-    GfmFootnoteDefinitionContFilled,
-    GfmLabelStartFootnoteStart,
-    GfmLabelStartFootnoteOpen,
-    GfmTaskListItemCheckStart,
-    GfmTaskListItemCheckInside,
-    GfmTaskListItemCheckClose,
-    GfmTaskListItemCheckAfter,
-    GfmTaskListItemCheckAfterSpaceOrTab,
-    GfmTableStart,
-    GfmTableHeadRowBefore,
-    GfmTableHeadRowStart,
-    GfmTableHeadRowBreak,
-    GfmTableHeadRowData,
-    GfmTableHeadRowEscape,
-    GfmTableHeadDelimiterStart,
-    GfmTableHeadDelimiterBefore,
-    GfmTableHeadDelimiterCellBefore,
-    GfmTableHeadDelimiterValueBefore,
-    GfmTableHeadDelimiterLeftAlignmentAfter,
-    GfmTableHeadDelimiterFiller,
-    GfmTableHeadDelimiterRightAlignmentAfter,
-    GfmTableHeadDelimiterCellAfter,
-    GfmTableHeadDelimiterNok,
-    GfmTableBodyRowStart,
-    GfmTableBodyRowBreak,
-    GfmTableBodyRowData,
-    GfmTableBodyRowEscape,
-    HardBreakEscapeStart,
-    HardBreakEscapeAfter,
-    HeadingAtxStart,
-    HeadingAtxBefore,
-    HeadingAtxSequenceOpen,
-    HeadingAtxAtBreak,
-    HeadingAtxSequenceFurther,
-    HeadingAtxData,
-    HeadingSetextStart,
-    HeadingSetextBefore,
-    HeadingSetextInside,
-    HeadingSetextAfter,
-    HtmlFlowStart,
-    HtmlFlowBefore,
-    HtmlFlowOpen,
-    HtmlFlowDeclarationOpen,
-    HtmlFlowCommentOpenInside,
-    HtmlFlowCdataOpenInside,
-    HtmlFlowTagCloseStart,
-    HtmlFlowTagName,
-    HtmlFlowBasicSelfClosing,
-    HtmlFlowCompleteClosingTagAfter,
-    HtmlFlowCompleteEnd,
-    HtmlFlowCompleteAttributeNameBefore,
-    HtmlFlowCompleteAttributeName,
-    HtmlFlowCompleteAttributeNameAfter,
-    HtmlFlowCompleteAttributeValueBefore,
-    HtmlFlowCompleteAttributeValueQuoted,
-    HtmlFlowCompleteAttributeValueQuotedAfter,
-    HtmlFlowCompleteAttributeValueUnquoted,
-    HtmlFlowCompleteAfter,
-    HtmlFlowBlankLineBefore,
-    HtmlFlowContinuation,
-    HtmlFlowContinuationDeclarationInside,
-    HtmlFlowContinuationAfter,
-    HtmlFlowContinuationStart,
-    HtmlFlowContinuationBefore,
-    HtmlFlowContinuationCommentInside,
-    HtmlFlowContinuationRawTagOpen,
-    HtmlFlowContinuationRawEndTag,
-    HtmlFlowContinuationClose,
-    HtmlFlowContinuationCdataInside,
-    HtmlFlowContinuationStartNonLazy,
-    HtmlTextStart,
-    HtmlTextOpen,
-    HtmlTextDeclarationOpen,
-    HtmlTextTagCloseStart,
-    HtmlTextTagClose,
-    HtmlTextTagCloseBetween,
-    HtmlTextTagOpen,
-    HtmlTextTagOpenBetween,
-    HtmlTextTagOpenAttributeName,
-    HtmlTextTagOpenAttributeNameAfter,
-    HtmlTextTagOpenAttributeValueBefore,
-    HtmlTextTagOpenAttributeValueQuoted,
-    HtmlTextTagOpenAttributeValueQuotedAfter,
-    HtmlTextTagOpenAttributeValueUnquoted,
-    HtmlTextCdata,
-    HtmlTextCdataOpenInside,
-    HtmlTextCdataClose,
-    HtmlTextCdataEnd,
-    HtmlTextCommentOpenInside,
-    HtmlTextComment,
-    HtmlTextCommentClose,
-    HtmlTextCommentEnd,
-    HtmlTextDeclaration,
-    HtmlTextEnd,
-    HtmlTextInstruction,
-    HtmlTextInstructionClose,
-    HtmlTextLineEndingBefore,
-    HtmlTextLineEndingAfter,
-    HtmlTextLineEndingAfterPrefix,
-    LabelStart,
-    LabelAtBreak,
-    LabelEolAfter,
-    LabelEscape,
-    LabelInside,
-    LabelNok,
-    LabelEndStart,
-    LabelEndAfter,
-    LabelEndResourceStart,
-    LabelEndResourceBefore,
-    LabelEndResourceOpen,
-    LabelEndResourceDestinationAfter,
-    LabelEndResourceDestinationMissing,
-    LabelEndResourceBetween,
-    LabelEndResourceTitleAfter,
-    LabelEndResourceEnd,
-    LabelEndOk,
-    LabelEndNok,
-    LabelEndReferenceFull,
-    LabelEndReferenceFullAfter,
-    LabelEndReferenceFullMissing,
-    LabelEndReferenceNotFull,
-    LabelEndReferenceCollapsed,
-    LabelEndReferenceCollapsedOpen,
-    LabelStartImageStart,
-    LabelStartImageOpen,
-    LabelStartImageAfter,
-    LabelStartLinkStart,
-    ListItemStart,
-    ListItemBefore,
-    ListItemBeforeOrdered,
-    ListItemBeforeUnordered,
-    ListItemValue,
-    ListItemMarker,
-    ListItemMarkerAfter,
-    ListItemAfter,
-    ListItemMarkerAfterFilled,
-    ListItemWhitespace,
-    ListItemPrefixOther,
-    ListItemWhitespaceAfter,
-    ListItemContStart,
-    ListItemContBlank,
-    ListItemContFilled,
-    NonLazyContinuationStart,
-    NonLazyContinuationAfter,
-    ParagraphStart,
-    ParagraphLineStart,
-    ParagraphInside,
-    RawFlowStart,
-    RawFlowBeforeSequenceOpen,
-    RawFlowSequenceOpen,
-    RawFlowInfoBefore,
-    RawFlowInfo,
-    RawFlowMetaBefore,
-    RawFlowMeta,
-    RawFlowAtNonLazyBreak,
-    RawFlowCloseStart,
-    RawFlowBeforeSequenceClose,
-    RawFlowSequenceClose,
-    RawFlowAfterSequenceClose,
-    RawFlowContentBefore,
-    RawFlowContentStart,
-    RawFlowBeforeContentChunk,
-    RawFlowContentChunk,
-    RawFlowAfter,
-    RawTextStart,
-    RawTextSequenceOpen,
-    RawTextBetween,
-    RawTextData,
-    RawTextSequenceClose,
-    SpaceOrTabStart,
-    SpaceOrTabInside,
-    SpaceOrTabAfter,
-    SpaceOrTabEolStart,
-    SpaceOrTabEolAfterFirst,
-    SpaceOrTabEolAfterEol,
-    SpaceOrTabEolAtEol,
-    SpaceOrTabEolAfterMore,
-    StringStart,
-    StringBefore,
-    StringBeforeData,
-    TextStart,
-    TextBefore,
-    TextBeforeHtml,
-    TextBeforeHardBreakEscape,
-    TextBeforeLabelStartLink,
-    TextBeforeData,
-    ThematicBreakStart,
-    ThematicBreakBefore,
-    ThematicBreakSequence,
-    ThematicBreakAtBreak,
-    TitleStart,
-    TitleBegin,
-    TitleAfterEol,
-    TitleAtBreak,
-    TitleEscape,
-    TitleInside,
-    TitleNok,
+#define GPUI_MARKDOWN_STATE_NAME(name) name,
+    GPUI_MARKDOWN_STATES(GPUI_MARKDOWN_STATE_NAME)
+#undef GPUI_MARKDOWN_STATE_NAME
     Count,
 };
 
@@ -2282,7 +2457,7 @@ inline bool IsAsciiDigit(uint8_t b) {
     return b >= '0' && b <= '9';
 }
 inline bool IsAsciiHexDigit(uint8_t b) {
-    return IsAsciiDigit(b) || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F');
+    return base::HexDigitValue((char)b) >= 0;
 }
 inline bool IsAsciiAlpha(uint8_t b) {
     return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z');
@@ -2294,7 +2469,7 @@ inline bool IsAsciiControl(uint8_t b) {
     return b < 0x20 || b == 0x7f;
 }
 
-int32_t Utf8Encode(char* out, uint32_t cp);
+using base::Utf8Encode;
 
 struct Position {
     Point start = {};
@@ -2574,6 +2749,18 @@ Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState,
 #line 1 "src/markdown/construct.h"
 
 namespace markdown {
+
+inline void ResetLabelTokens(Tokenizer* t) {
+    t->tokenizeState.token1 = Name::Data;
+    t->tokenizeState.token2 = Name::Data;
+    t->tokenizeState.token3 = Name::Data;
+}
+inline void ResetDestinationTokens(Tokenizer* t) {
+    ResetLabelTokens(t);
+    t->tokenizeState.token4 = Name::Data;
+    t->tokenizeState.token5 = Name::Data;
+    t->tokenizeState.sizeB = 0;
+}
 
 State AttentionStart(Tokenizer* t);
 State AttentionInside(Tokenizer* t);
