@@ -77,6 +77,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+
+#include <unknwn.h>
 #else
 #include <pthread.h>
 #include <limits.h>
