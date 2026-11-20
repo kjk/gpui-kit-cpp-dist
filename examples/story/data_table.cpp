@@ -275,7 +275,7 @@ static void DtExport(DataTableStory* self, Ctx* cx, const ClickEvent*) {
 static void DtMenuAct(DataTableStory* self, Ctx* cx, const ClickEvent*,
                       int64_t act) {
     if (act >= DtActGoTo) {
-        // Top and Bottom scroll_to_row; the other two set_selected_cell.
+        // The cell actions select, then explicitly reveal both axes.
         TableState* st = self->table.Get(cx);
         int which = (int)(act - DtActGoTo);
         if (st && which == 0) {
@@ -284,8 +284,12 @@ static void DtMenuAct(DataTableStory* self, Ctx* cx, const ClickEvent*,
             TableScrollToRow(st, st->rowCount - 1, ScrollStrategy::Center);
         } else if (st && which == 2) {
             TableSetSelectedCell(st, cx, 5, 3);
+            TableScrollToRow(st, 5, ScrollStrategy::Center);
+            TableScrollToCol(st, 3, ScrollStrategy::Top);
         } else if (st) {
             TableSetSelectedCell(st, cx, 10, 7);
+            TableScrollToRow(st, 10, ScrollStrategy::Center);
+            TableScrollToCol(st, 7, ScrollStrategy::Top);
         }
     } else if (act == DtActClear) {
         TableState* st = self->table.Get(cx);
@@ -326,8 +330,12 @@ static component::PopupMenu* DtContextMenu(Ctx* cx, void* data, int row,
                                            component::PopupMenu* menu) {
     (void)data;
     menu->Menu(StoryFmt(cx, "Selected Row: %d", row))->Separator();
-    for (int i = 0; i < kNSizes; i++) {
-        menu->Menu(StoryFmt(cx, "Size %s", kSizeLabels[i]));
+    static const Str kContextSizeLabels[kNSizes] = {
+        StrL("Size 48px"),  StrL("Size Large"),  StrL("Size Medium"),
+        StrL("Size Small"), StrL("Size XSmall"),
+    };
+    for (Str label : kContextSizeLabels) {
+        menu->Menu(label);
     }
     PopupMenuState* st = menu->state.Get(cx);
     if (st) {

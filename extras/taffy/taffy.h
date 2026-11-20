@@ -91,6 +91,9 @@ char (&DimofSizeHelper(T (&array)[N]) noexcept)[N];
 #ifndef dimof
 #define dimof(array) (sizeof(::base::DimofSizeHelper(array)))
 #endif
+#ifndef dimofi
+#define dimofi(array) ((int)sizeof(::base::DimofSizeHelper(array)))
+#endif
 
 enum : uint16_t {
     kMaxPath = 1024
@@ -130,7 +133,7 @@ void Panic(const char* msg);
 
 using TempStr = Str;
 
-#define StrL(lit) ::base::Str{(char*)(lit), (int)dimof(lit) - 1}
+#define StrL(lit) ::base::Str{(char*)(lit), dimofi(lit) - 1}
 
 TempStr AllocStrTemp(int size);
 TempStr StrDupTemp(Str s);
@@ -200,6 +203,8 @@ struct PlatFacts {
 
     bool secondaryIsCommand = false;
 
+    bool wordDeleteStopsAtWhitespace = true;
+
     bool showsWindowControls = true;
 
     bool titleBarCloseIsElement = false;
@@ -213,6 +218,8 @@ struct PlatFacts {
     bool scrollBounceTouch = false;
 
     bool overscrollPhaselessStops = false;
+
+    bool autoHideScrollbars = true;
     const char* monoFontName = "DejaVu Sans Mono";
 
     const char* shellDataDir = "/.local/share";
@@ -240,6 +247,7 @@ char PlatPathSep();
 bool PlatPathsCaseFold();
 bool PlatIsWindows();
 bool PlatSecondaryIsCommand();
+bool PlatWordDeleteStopsAtWhitespace();
 bool PlatShowsWindowControls();
 bool PlatTitleBarCloseIsElement();
 float PlatCaretWidth();

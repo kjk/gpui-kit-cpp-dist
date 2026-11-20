@@ -1691,7 +1691,7 @@ static void addRawStr(Fmt& fmt, int off, size_t n) {
     if (n == 0) {
         return;
     }
-    if (fmt.nInst >= (int)dimof(fmt.instructions)) {
+    if (fmt.nInst >= dimofi(fmt.instructions)) {
         fmt.isOk = false;
         return;
     }
@@ -1721,7 +1721,7 @@ static int parseArgDefBrace(Fmt& fmt, int off) {
         fmt.isOk = false;
         return off;
     }
-    if (fmt.nInst >= (int)dimof(fmt.instructions)) {
+    if (fmt.nInst >= dimofi(fmt.instructions)) {
         fmt.isOk = false;
         return off;
     }
@@ -1831,7 +1831,7 @@ static int parseArgDefPerc(Fmt& fmt, int off) {
     char conv = (off < len(f)) ? f.s[off] : 0;
     off++;
 
-    if (fmt.nInst >= (int)dimof(fmt.instructions)) {
+    if (fmt.nInst >= dimofi(fmt.instructions)) {
         fmt.isOk = false;
         return off;
     }
@@ -1936,7 +1936,7 @@ static bool appendConv(Fmt& fmt, const char* spec, ...) {
     va_start(args, spec);
     va_list retry;
     va_copy(retry, args);
-    Str bufS(fmt.buf, (int)dimof(fmt.buf));
+    Str bufS(fmt.buf, dimofi(fmt.buf));
     int n = VsnprintfUtf8(bufS, spec, args);
     va_end(args);
     fmt.buf[dimof(fmt.buf) - 1] = 0;
@@ -2038,7 +2038,7 @@ static bool evalPercInst(Fmt& fmt, const Inst& inst, const FmtArg& arg) {
     char fbuf[64];
     int k = 0;
     fbuf[k++] = '%';
-    for (int j = 0; j < inst.fwpLen && k < (int)dimof(fbuf) - 5; j++) {
+    for (int j = 0; j < inst.fwpLen && k < dimofi(fbuf) - 5; j++) {
         fbuf[k++] = fmt.format.s[inst.fwpOff + j];
     }
     bool wideInt =
@@ -2196,6 +2196,9 @@ bool PlatIsWindows() {
 }
 bool PlatSecondaryIsCommand() {
     return kPlatFacts.secondaryIsCommand;
+}
+bool PlatWordDeleteStopsAtWhitespace() {
+    return kPlatFacts.wordDeleteStopsAtWhitespace;
 }
 bool PlatShowsWindowControls() {
     return kPlatFacts.showsWindowControls;
@@ -8681,7 +8684,7 @@ static const HtmlEntity kHtmlEntities[2125] = {
 
 Str HtmlNamedCharRef(Str name) {
     int lo = 0;
-    int hi = (int)dimof(kHtmlEntities) - 1;
+    int hi = dimofi(kHtmlEntities) - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
         const char* candidate = kHtmlEntityNames + kHtmlEntities[mid].nameOff;
@@ -8698,7 +8701,7 @@ Str HtmlNamedCharRef(Str name) {
 }
 
 int HtmlNamedCharRefCount() {
-    return (int)dimof(kHtmlEntities);
+    return dimofi(kHtmlEntities);
 }
 
 void HtmlNamedCharRefAt(int i, Str* name, Str* value) {
@@ -14344,6 +14347,10 @@ Node* ToMdast(Arena* a, Str source, const ParseOptions& options,
     Node* tree = ToMdastCompile(events, &parseState, positions);
 
     base::ArenaDelete(parseState.scratch);
+    if (!tree) {
+        if (positions) VecClear(positions->spans);
+        return nullptr;
+    }
     if (positions && positions->spans.len > 1) {
 
         qsort(positions->spans.els, (size_t)positions->spans.len,
@@ -15033,6 +15040,7 @@ struct CompileContext {
     bool headingSetextTextAfter = false;
     Vec<Reference> mediaReferenceStack;
     bool rawFlowFenceSeen = false;
+    bool eventMismatch = false;
     Vec<TreeFrame> trees;
     int32_t index = 0;
     NodePositions* positions = nullptr;
@@ -15150,6 +15158,12 @@ static void TailPushAgain(CompileContext* c, Node* child) {
 
 static void TailPop(CompileContext* c) {
     TreeFrame& frame = TreeTail(c);
+    int opened = len(frame.eventStack);
+    if (opened == 0 || (*c->events)[frame.eventStack[opened - 1]]
+                               .name != (*c->events)[c->index].name) {
+        c->eventMismatch = true;
+        return;
+    }
     frame.stack.Pop();
     frame.eventStack.Pop();
     if (c->positions && frame.spanStack.len > 0) {
@@ -15837,9 +15851,12 @@ Node* ToMdastCompile(const Vec<Event>& events, ParseState* parseState,
         } else {
             Exit(&context);
         }
+        if (context.eventMismatch) return nullptr;
         index += 1;
     }
 
+    if (len(context.trees) != 1 || len(context.trees[0].eventStack) != 0)
+        return nullptr;
     return context.trees[0].tree;
 }
 
@@ -17118,6 +17135,7 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
 const PlatFacts kPlatFacts = {
 
     .titleBarCloseIsElement = true,
+    .autoHideScrollbars = false,
     .blockSelectUsesControl = true,
 
     .windowShadowSize = 20.f,
@@ -17264,6 +17282,7 @@ bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
 
 const PlatFacts kPlatFacts = {
     .secondaryIsCommand = true,
+    .wordDeleteStopsAtWhitespace = false,
 
     .showsWindowControls = false,
     .scrollBounce = true,

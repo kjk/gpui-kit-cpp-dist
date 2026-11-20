@@ -532,35 +532,35 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "46bf6d498fa101a3b11cc64e6d8c20d28d17b720",
-  date: "2026-11-07",
-  subject: "input: Let the completions test run the IME caret reports before counting frames (#3837)",
+  sha: "012cfa034885a4eee2820d3517487fd2f420504f",
+  date: "2026-11-20",
+  subject: "text_view: Expose the rendered body to the accessibility tree (#4056)",
   crates: {
-    "gpui-kit": "0.9.0",
-    "gpui-base": "0.9.0",
-    "gpui-component": "0.9.0",
-    "gpui-component-story": "0.9.0",
-    "gpui-webview": "0.9.0",
-    "gpui-shell": "0.9.0",
+    "gpui-kit": "0.10.0",
+    "gpui-base": "0.10.0",
+    "gpui-component": "0.10.0",
+    "gpui-component-story": "0.10.0",
+    "gpui-webview": "0.10.0",
+    "gpui-shell": "0.10.0",
   },
   dir: ".work/gpui-component",
 } as const;
 
 /**
- * Zed reference snapshot recorded in gpui-pre 0.3.11's package metadata.
+ * Zed reference snapshot recorded in gpui-pre 0.3.12's package metadata.
  * Cargo.lock now resolves registry packages rather than a Zed git source.
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "f816e1f9263e3a8ef63c4baaa02e1441ce1c6038",
-  date: "2026-11-01",
-  subject: "gpui: Render macOS window screenshots offscreen (#66344)",
+  sha: "d2a4fb6ded7c470be25d1541281da3882495b65b",
+  date: "2026-11-08",
+  subject: "tabular_data_preview: Range selection, edge jumps, and page navigation (#65161)",
   crates: {
-    "gpui-pre": "0.3.11",
-    "gpui-pre-platform": "0.3.11",
-    "gpui-pre-macros": "0.3.11",
+    "gpui-pre": "0.3.12",
+    "gpui-pre-platform": "0.3.12",
+    "gpui-pre-macros": "0.3.12",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.11",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.12",
 } as const;
 
 /**
@@ -833,6 +833,9 @@ function rustTwin(target: string): RustTwin | null {
   }
   if (target === "story") {
     return { pkg: "gpui-component-story" };
+  }
+  if (target === "link_tooltip") {
+    return { pkg: "example-link-tooltip" };
   }
   if (rustExamplePkgs.has(target)) {
     return { pkg: target };
