@@ -7,3 +7,4 @@ out/
 *.ilk
 *.exp
 *.lib
+.DS_Store
