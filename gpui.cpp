@@ -248981,6 +248981,8 @@ struct PlatWindow {
     bool hidden = false;
     bool activateOnShow = true;
 
+    bool painted = false;
+
     NSTimer* moveEndPoll = nil;
 
     bool a11yInstalled = false;
@@ -250388,6 +250390,7 @@ static void Redraw(Window* win) {
     win->dirty = false;
     win->maximized = [pw->window isZoomed] ? true : false;
     [pw->view display];
+    pw->painted = true;
     OrderFrontOnce(win);
 }
 
@@ -250734,8 +250737,12 @@ void PlatWindowShow(Window* win, bool visible, bool activate) {
         return;
     }
     if (!pw->ordered) {
-
         pw->activateOnShow = activate;
+        if (pw->painted) {
+            OrderFrontOnce(win);
+            return;
+        }
+
         AppInvalidate(win);
         return;
     }
