@@ -28647,6 +28647,11 @@ static PlatMenuItem* AppMenuToPlat(AppMenuState* state, Arena* a,
     for (int i = 0; i < n; i++) {
         const MenuRow& r = rows[i];
         PlatMenuItem& p = out[i];
+        if (r.role != MenuRole::None) {
+            p.role = r.role;
+            p.label = StrDup(a, r.label).s;
+            continue;
+        }
         if (r.separator || len(r.label) <= 0) {
             p.separator = true;
             continue;
@@ -28659,12 +28664,6 @@ static PlatMenuItem* AppMenuToPlat(AppMenuState* state, Arena* a,
             p.submenuN = r.submenuN;
             continue;
         }
-
-        if (r.disabled) {
-            continue;
-        }
-        VecAppend(state->rows, AppMenuBinding{r.action, r.arg});
-        p.id = state->rows.len;
 
         KeyChord chord = {};
         bool haveKey = false;
@@ -28685,12 +28684,22 @@ static PlatMenuItem* AppMenuToPlat(AppMenuState* state, Arena* a,
                 p.keyMods.function = chord.function;
             }
         }
+
+        if (r.disabled) {
+            continue;
+        }
+        VecAppend(state->rows, AppMenuBinding{r.action, r.arg});
+        p.id = state->rows.len;
     }
     return out;
 }
 
 bool AppHasMenuBar() {
     return PlatHasAppMenu();
+}
+
+void AppSetOsFullScreenMenuItem(bool shown) {
+    PlatSetOsFullScreenMenuItem(shown);
 }
 
 void AppSetMenus(App* app, const MenuDef* menus, int n) {
@@ -146880,6 +146889,10 @@ static component::PopupMenu* PopupFor(Ctx* cx, Str id, const MenuRow* rows,
     component::PopupMenu* popup = component::PopupMenu::New(cx, id);
     for (int i = 0; i < n; i++) {
         const MenuRow& row = rows[i];
+
+        if (row.role != MenuRole::None) {
+            continue;
+        }
         if (row.separator) {
             popup->Separator();
         } else if (row.submenu) {
@@ -252056,6 +252069,67 @@ static NSEventModifierFlags KeyEquivalentMask(const Modifiers& mods) {
     return mask;
 }
 
+static NSMenuItem* RoleMenuItem(const PlatMenuItem& it) {
+    NSString* label = it.label && it.label[0]
+                          ? [NSString stringWithUTF8String:it.label]
+                          : nil;
+    NSString* app = [[NSProcessInfo processInfo] processName];
+    SEL action = nil;
+    NSString* key = @"";
+    NSEventModifierFlags mods = NSEventModifierFlagCommand;
+    switch (it.role) {
+        case MenuRole::Services: {
+            NSMenuItem* item =
+                [[NSMenuItem alloc] initWithTitle:(label ? label : @"Services")
+                                           action:nil
+                                    keyEquivalent:@""];
+            NSMenu* services = [[NSMenu alloc] init];
+            [item setSubmenu:services];
+            [NSApp setServicesMenu:services];
+            return item;
+        }
+        case MenuRole::Hide:
+            if (!label) {
+                label = [@"Hide " stringByAppendingString:app];
+            }
+            action = @selector(hide:);
+            key = @"h";
+            break;
+        case MenuRole::HideOthers:
+            label = label ? label : @"Hide Others";
+            action = @selector(hideOtherApplications:);
+            key = @"h";
+            mods |= NSEventModifierFlagOption;
+            break;
+        case MenuRole::ShowAll:
+            label = label ? label : @"Show All";
+            action = @selector(unhideAllApplications:);
+            break;
+        case MenuRole::Minimize:
+            label = label ? label : @"Minimize";
+            action = @selector(performMiniaturize:);
+            key = @"m";
+            break;
+        case MenuRole::Zoom:
+            label = label ? label : @"Zoom";
+            action = @selector(performZoom:);
+            break;
+        case MenuRole::BringAllToFront:
+            label = label ? label : @"Bring All to Front";
+            action = @selector(arrangeInFront:);
+            break;
+        case MenuRole::None:
+            return nil;
+    }
+    NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:label
+                                                  action:action
+                                           keyEquivalent:key];
+    if ([key length] > 0) {
+        [item setKeyEquivalentModifierMask:mods];
+    }
+    return item;
+}
+
 static NSMenu* gpui_window_mac_BuildMenu(Window* win, const PlatMenuItem* items, int n,
                          id target, SEL sel) {
     NSMenu* menu = [[NSMenu alloc] init];
@@ -252065,6 +252139,13 @@ static NSMenu* gpui_window_mac_BuildMenu(Window* win, const PlatMenuItem* items,
         const PlatMenuItem& it = items[i];
         if (it.separator) {
             [menu addItem:[NSMenuItem separatorItem]];
+            continue;
+        }
+        if (it.role != MenuRole::None) {
+            NSMenuItem* item = RoleMenuItem(it);
+            if (item) {
+                [menu addItem:item];
+            }
             continue;
         }
         NSString* label =
@@ -252223,6 +252304,12 @@ static void InstallDefaultAppMenu() {
 
 bool PlatHasAppMenu() {
     return true;
+}
+
+void PlatSetOsFullScreenMenuItem(bool shown) {
+    [[NSUserDefaults standardUserDefaults]
+        setBool:(shown ? YES : NO)
+         forKey:@"NSFullScreenMenuItemEverywhere"];
 }
 
 void PlatSetMenuBarVisible(bool visible) {
@@ -252900,6 +252987,8 @@ bool PlatInit(App* app) {
             gAppDelegate = [[GpuiAppDelegate alloc] init];
         }
         [NSApp setDelegate:gAppDelegate];
+
+        [NSWindow setAllowsAutomaticWindowTabbing:NO];
         [NSApp finishLaunching];
 
         InstallDefaultAppMenu();
