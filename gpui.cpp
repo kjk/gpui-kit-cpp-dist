@@ -253558,6 +253558,8 @@ struct PlatWindow {
 
     bool firstMouse = false;
 
+    bool osPress = false;
+
     bool touchDown = false;
     bool touchScroll = false;
     float touchStartX = 0;
@@ -253959,12 +253961,14 @@ static void MouseDown(Window* win, MouseButton button, LPARAM lParam) {
     float y = PxToDip(&win->paint, GET_Y_LPARAM(lParam));
     bool first = win->plat->firstMouse;
     win->plat->firstMouse = false;
+    win->plat->osPress = true;
     PlatformInput in = InputMouseDown(
         button, x, y, ModsNow(), WindowClickCount(win, x, y, button), first);
     WindowDispatchInput(win, &in);
 }
 
 static void MouseUp(Window* win, MouseButton button, LPARAM lParam) {
+    win->plat->osPress = false;
     float x = PxToDip(&win->paint, GET_X_LPARAM(lParam));
     float y = PxToDip(&win->paint, GET_Y_LPARAM(lParam));
     PlatformInput in =
@@ -253973,6 +253977,10 @@ static void MouseUp(Window* win, MouseButton button, LPARAM lParam) {
 }
 
 static void MouseMove(Window* win, float x, float y) {
+
+    if (win->mouseDown && !win->plat->osPress) {
+        return;
+    }
     MouseButton pressed = MouseButton::Left;
     bool any = PressedButton(&pressed);
     PlatformInput in = InputMouseMove(x, y, any, pressed, ModsNow());
