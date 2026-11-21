@@ -24257,6 +24257,16 @@ void AppWindowAppearanceChanged(App* app) {
     app->onWindowAppearance(app, now);
 }
 
+static OpenExternalHookFn gOpenExternalHook = nullptr;
+
+void SetOpenExternalHook(OpenExternalHookFn fn) {
+    gOpenExternalHook = fn;
+}
+
+bool OpenExternalHooked(Str urlOrPath, bool isPath) {
+    return gOpenExternalHook && gOpenExternalHook(urlOrPath, isPath);
+}
+
 bool ClipboardSetImage(Window* win, const uint8_t* png, int pngLen) {
     if (!png || pngLen <= 0) {
         return false;
@@ -246901,7 +246911,7 @@ static void XdgOpen(const char* target) {
 }
 
 void OpenUrl(Str url) {
-    if (!url.s || len(url) <= 0) {
+    if (!url.s || len(url) <= 0 || OpenExternalHooked(url, false)) {
         return;
     }
     TempStr value = StrDupTemp(len(url) < 1023 ? url : Str(url.s, 1023));
@@ -246909,7 +246919,7 @@ void OpenUrl(Str url) {
 }
 
 void OpenPath(Str path) {
-    if (!path.s || len(path) <= 0) {
+    if (!path.s || len(path) <= 0 || OpenExternalHooked(path, true)) {
         return;
     }
 
@@ -251494,7 +251504,7 @@ bool PlatReduceMotion() {
 }
 
 void OpenUrl(Str url) {
-    if (!url.s || len(url) <= 0) {
+    if (!url.s || len(url) <= 0 || OpenExternalHooked(url, false)) {
         return;
     }
     NSString* s = [[NSString alloc] initWithBytes:url.s
@@ -251507,7 +251517,7 @@ void OpenUrl(Str url) {
 }
 
 void OpenPath(Str path) {
-    if (!path.s || len(path) <= 0) {
+    if (!path.s || len(path) <= 0 || OpenExternalHooked(path, true)) {
         return;
     }
     NSString* s = [[NSString alloc] initWithBytes:path.s
@@ -253312,7 +253322,7 @@ bool PlatReduceMotion() {
 }
 
 void OpenUrl(Str url) {
-    if (url.s && len(url) > 0) {
+    if (url.s && len(url) > 0 && !OpenExternalHooked(url, false)) {
         GpJsOpenUrl(url.s, len(url));
     }
 }
@@ -256298,7 +256308,7 @@ bool PlatReduceMotion() {
 }
 
 void OpenUrl(Str url) {
-    if (!url.s || len(url) <= 0) {
+    if (!url.s || len(url) <= 0 || OpenExternalHooked(url, false)) {
         return;
     }
     ShellExecuteW(nullptr, L"open", ToCWstrTemp(url), nullptr, nullptr,
@@ -256306,7 +256316,7 @@ void OpenUrl(Str url) {
 }
 
 void OpenPath(Str path) {
-    if (!path.s || len(path) <= 0) {
+    if (!path.s || len(path) <= 0 || OpenExternalHooked(path, true)) {
         return;
     }
     ShellExecuteW(nullptr, L"open", ToCWstrTemp(path), nullptr, nullptr,
