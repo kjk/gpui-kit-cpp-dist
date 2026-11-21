@@ -249735,6 +249735,7 @@ double TimeNow() {
 
 bool WindowMacKeyDown(Window* win, NSEvent* event);
 void WindowMacKeyUp(Window* win, NSEvent* event);
+void WindowMacFlagsChanged(Window* win, NSEvent* event);
 
 }
 
@@ -250758,6 +250759,10 @@ static gpui::Str TextInputString(id string) {
     gpui::WindowMacKeyUp(win, event);
 }
 
+- (void)flagsChanged:(NSEvent*)event {
+    gpui::WindowMacFlagsChanged(win, event);
+}
+
 - (BOOL)performKeyEquivalent:(NSEvent*)event {
     if ([[NSApp mainMenu] performKeyEquivalent:event]) {
         return YES;
@@ -251025,6 +251030,45 @@ void WindowMacKeyUp(Window* win, NSEvent* event) {
                 (mods & NSEventModifierFlagControl) != 0,
                 (mods & NSEventModifierFlagOption) != 0,
                 (mods & NSEventModifierFlagCommand) != 0, function);
+}
+
+void WindowMacFlagsChanged(Window* win, NSEvent* event) {
+    if (!win) {
+        return;
+    }
+
+    int key = 0;
+    NSEventModifierFlags flag = 0;
+    switch ([event keyCode]) {
+        case 56:
+        case 60:
+            key = KeyShift;
+            flag = NSEventModifierFlagShift;
+            break;
+        case 59:
+        case 62:
+            key = KeyControl;
+            flag = NSEventModifierFlagControl;
+            break;
+        case 58:
+        case 61:
+            key = KeyAlt;
+            flag = NSEventModifierFlagOption;
+            break;
+        default:
+            return;
+    }
+    NSEventModifierFlags mods = [event modifierFlags];
+    bool shift = (mods & NSEventModifierFlagShift) != 0;
+    bool ctrl = (mods & NSEventModifierFlagControl) != 0;
+    bool alt = (mods & NSEventModifierFlagOption) != 0;
+    bool platform = (mods & NSEventModifierFlagCommand) != 0;
+    if ((mods & flag) != 0) {
+        WindowKeyDown(win, key, shift, ctrl, alt, platform, false,
+                      KeyDownFlags{});
+        return;
+    }
+    WindowKeyUp(win, key, shift, ctrl, alt, platform, false);
 }
 
 bool WindowMacKeyDown(Window* win, NSEvent* event) {
