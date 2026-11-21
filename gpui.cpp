@@ -250762,6 +250762,12 @@ static gpui::Str TextInputString(id string) {
     if ([[NSApp mainMenu] performKeyEquivalent:event]) {
         return YES;
     }
+    constexpr unsigned short kTabKeyCode = 48;
+    bool ctrl = ([event modifierFlags] & NSEventModifierFlagControl) != 0;
+    if (ctrl && [event keyCode] == kTabKeyCode) {
+        [self keyDown:event];
+        return YES;
+    }
     return NO;
 }
 
