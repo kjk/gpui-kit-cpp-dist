@@ -209,7 +209,7 @@ LintResult LintTake(Results* res, Str raw) {
     (void)raw;
     LintResult out;
     out.lines = res->lines.Flatten(res->a);
-    out.nLines = res->lines.len;
+    out.nLines = len(res->lines);
     out.error = res->error;
     return out;
 }
@@ -220,7 +220,7 @@ FormatResult FormatTake(Results* res, Str raw) {
 
     out.out = len(res->error) > 0
                   ? base::StrDup(res->a, raw)
-                  : base::StrDup(res->a, Str(res->out.els, res->out.len));
+                  : base::StrDup(res->a, Str(res->out.els, len(res->out)));
     return out;
 }
 
@@ -640,7 +640,7 @@ bool FormatFullwidth(Arena* a, Str in, Str* out) {
     for (MatchFn pattern : kPatterns) {
         b.Reset();
         if (PassReplace(cur, pattern, &b)) {
-            cur = base::StrDup(a, Str(b.els, b.len));
+            cur = base::StrDup(a, Str(b.els, len(b)));
             changed = true;
         }
     }
@@ -692,7 +692,7 @@ bool FormatHalfwidthWord(Arena* a, Str in, Str* out) {
         AppendCp(&b, cp);
     }
 
-    Str cur = changed ? Str(b.els, b.len) : in;
+    Str cur = changed ? Str(b.els, len(b)) : in;
     StrBuilder t;
     bool timeHit = false;
     for (int i = 0; i < len(cur);) {
@@ -1311,7 +1311,7 @@ static bool PatternMatches(const IgnorePattern& pat, Str path, bool isDir) {
     if (pat.dirOnly && !isDir) {
         return false;
     }
-    const char* pe = pat.glob.s + pat.glob.len;
+    const char* pe = pat.glob.s + len(pat.glob);
     const char* te = path.s + len(path);
     if (pat.anchored) {
         return GlobMatch(pat.glob.s, pe, path.s, te);
@@ -1370,7 +1370,7 @@ static void AddPatternsFromFile(base::Vec<IgnorePattern>& out, Str workDir,
     if (len(path) >= 1024) {
         return;
     }
-    FILE* f = fopen(path.s, "rb");
+    FILE* f = base::PlatFileOpen(path, "rb");
     if (!f) {
         return;
     }
@@ -2692,7 +2692,7 @@ RuleResult FormatOrLintText(Arena* a, Str text, bool lint,
             joined.Append(sub.out);
             severity = sub.severity;
         }
-        result.out = base::StrDup(a, Str(joined.els, joined.len));
+        result.out = base::StrDup(a, Str(joined.els, len(joined)));
         result.severity = severity;
     } else {
         result.out = text;
@@ -3869,15 +3869,6 @@ uint32_t Utf8At(Str s, int i) {
     return Utf8Next(s, &at);
 }
 
-int Utf8Count(Str s) {
-    int n = 0;
-    for (int i = 0; i < len(s);) {
-        Utf8Next(s, &i);
-        n++;
-    }
-    return n;
-}
-
 struct CpRange {
     uint32_t lo;
     uint32_t hi;
@@ -4306,7 +4297,7 @@ static bool RunPasses(Arena* a, Str in, const Pass* passes, int nPasses,
                        ? PassRemove(cur, passes[p].one, passes[p].other, &b)
                        : PassAdd(cur, passes[p].one, passes[p].other, &b);
         if (hit) {
-            cur = base::StrDup(a, Str(b.els, b.len));
+            cur = base::StrDup(a, Str(b.els, len(b)));
             changed = true;
         }
     }
@@ -4387,12 +4378,12 @@ bool FormatSpaceBackticks(Arena* a, Str in, Str* out) {
     bool changed = false;
     StrBuilder b;
     if (PassAdd(cur, SideCjk, SideBacktickString, &b)) {
-        cur = base::StrDup(a, Str(b.els, b.len));
+        cur = base::StrDup(a, Str(b.els, len(b)));
         changed = true;
     }
     b.Reset();
     if (PassBacktickThenCjk(cur, &b)) {
-        cur = base::StrDup(a, Str(b.els, b.len));
+        cur = base::StrDup(a, Str(b.els, len(b)));
         changed = true;
     }
     if (changed) {

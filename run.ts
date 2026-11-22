@@ -452,7 +452,7 @@ const debuggerHelp: Record<DebuggerKind, string> = {
       ? "Install gdb:\n  brew install gdb\n" +
         "It also has to be code-signed to control another process; lldb needs none of that,\n" +
         "so prefer -lldb on macOS."
-      : "Install gdb:\n  sudo apt install gdb\n  (or: bash cmd/ubuntu-install-deps.sh)",
+      : `Install gdb:\n  sudo apt install gdb\n  (or: bash ${scriptPath("ubuntu-install-deps.sh")})`,
   lldb:
     process.platform === "darwin"
       ? "lldb ships with the Xcode command line tools:\n  xcode-select --install"
@@ -532,9 +532,9 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "012cfa034885a4eee2820d3517487fd2f420504f",
-  date: "2026-11-20",
-  subject: "text_view: Expose the rendered body to the accessibility tree (#4056)",
+  sha: "1c7e7f7c6c8d6585da909804496614da01bb8663",
+  date: "2026-11-23",
+  subject: "input: Report the document length so the iOS keyboard shows (#4082)",
   crates: {
     "gpui-kit": "0.10.0",
     "gpui-base": "0.10.0",

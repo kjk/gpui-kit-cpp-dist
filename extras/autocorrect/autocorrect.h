@@ -73,6 +73,8 @@
 
 #define GPUI_OS_POSIX (!GPUI_OS_WINDOWS)
 
+#define GPUI_HAVE_MACH_TASK_INFO (GPUI_OS_MAC || GPUI_OS_IOS)
+
 #if GPUI_OS_WINDOWS
 #define NOMINMAX
 #include <windows.h>
@@ -122,6 +124,10 @@ constexpr int len(Str s) noexcept {
     return s.len;
 }
 
+constexpr int len(const Str* s) noexcept {
+    return s->len;
+}
+
 float StrToFloatUnchecked(Str s);
 
 void log(Str s);
@@ -138,6 +144,11 @@ using TempStr = Str;
 TempStr AllocStrTemp(int size);
 TempStr StrDupTemp(Str s);
 TempStr ReadBoundedFileTemp(Str path, int limit);
+
+FILE* PlatFileOpen(Str path, const char* mode);
+bool PlatFileRemove(Str path);
+
+bool PlatFileRename(Str from, Str to);
 
 #if GPUI_OS_WINDOWS
 WCHAR* ToCWstrTemp(Str s);
@@ -716,6 +727,10 @@ template <typename T>
 inline int len(const Vec<T>& v) {
     return v.len;
 }
+template <typename T>
+inline int len(const Vec<T>* v) {
+    return v->len;
+}
 
 template <typename T>
 auto VecReserve(Arena* arena, T& v, int n) -> decltype(v.els) {
@@ -1130,6 +1145,10 @@ struct ArenaVec {
 template <typename T>
 inline int len(const ArenaVec<T>& v) {
     return v.len;
+}
+template <typename T>
+inline int len(const ArenaVec<T>* v) {
+    return v->len;
 }
 
 struct PointF {
@@ -1588,8 +1607,6 @@ int Utf8Len(Str s, int i);
 void Utf8CopyNext(Str s, int* i, StrBuilder* out);
 
 uint32_t Utf8At(Str s, int i);
-
-int Utf8Count(Str s);
 
 bool IsHan(uint32_t cp);
 bool IsHangul(uint32_t cp);

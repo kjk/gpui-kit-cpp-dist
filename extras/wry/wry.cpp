@@ -613,8 +613,7 @@ TempStr ReadBoundedFileTemp(Str path, int limit) {
     if (!path || limit <= 0) {
         return {};
     }
-    TempStr pathZ = StrDupTemp(path);
-    FILE* file = fopen(pathZ.s, "rb");
+    FILE* file = PlatFileOpen(path, "rb");
     if (!file) {
         return {};
     }
@@ -959,7 +958,7 @@ void StrVecFree(Vec<Str>* v) {
     if (!v) {
         return;
     }
-    for (int i = 0; i < len(*v); i++) {
+    for (int i = 0; i < len(v); i++) {
         StrFree((*v)[i]);
     }
     VecReset(*v);
@@ -8858,7 +8857,7 @@ void CookieListFree(Vec<Cookie>* cookies) {
     if (!cookies) {
         return;
     }
-    for (int i = 0; i < cookies->len; i++) {
+    for (int i = 0; i < len(cookies); i++) {
         Cookie& cookie = cookies->els[i];
         base::StrFree(cookie.name);
         base::StrFree(cookie.value);
@@ -9030,13 +9029,13 @@ int CustomProtocolsAppendCopy(Vec<CustomProtocol>* protocols,
                               const CustomProtocol& protocol) {
     CustomProtocol copy = protocol;
     copy.name = StrDup(protocol.name);
-    int index = len(*protocols);
+    int index = len(protocols);
     VecAppend(*protocols, copy);
     return index;
 }
 
 void CustomProtocolsFree(Vec<CustomProtocol>* protocols) {
-    for (int i = 0; i < len(*protocols); i++) {
+    for (int i = 0; i < len(protocols); i++) {
         StrFree((*protocols)[i].name);
     }
     VecReset(*protocols);
@@ -9096,39 +9095,6 @@ const PlatFacts kPlatFacts = {
 #include <unistd.h>
 
 namespace base {
-
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    struct rusage ru = {};
-    if (getrusage(RUSAGE_SELF, &ru) != 0) {
-        return false;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_utime.tv_usec +
-                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_stime.tv_usec;
-        *cpu100ns = us * 10ull;
-    }
-    if (memBytes) {
-        *memBytes = 0;
-        FILE* f = fopen("/proc/self/statm", "rb");
-        if (f) {
-            unsigned long total = 0, resident = 0;
-            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
-                long page = sysconf(_SC_PAGESIZE);
-                *memBytes =
-                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
-            }
-            fclose(f);
-        }
-    }
-    return true;
-}
 
 const PlatFacts kPlatFacts = {
 
@@ -9244,40 +9210,6 @@ static bool DisclaimSpeechResponsibility(int argc, char** argv, int* status) {
     return false;
 }
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    task_basic_info_data_t basic = {};
-    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
-                  &count) != KERN_SUCCESS) {
-        return false;
-    }
-    if (memBytes) {
-        *memBytes = (uint64_t)basic.resident_size;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
-                      (uint64_t)basic.user_time.microseconds +
-                      (uint64_t)basic.system_time.seconds * 1000000ull +
-                      (uint64_t)basic.system_time.microseconds;
-        count = TASK_THREAD_TIMES_INFO_COUNT;
-        task_thread_times_info_data_t threads = {};
-        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
-                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
-            us += (uint64_t)threads.user_time.seconds * 1000000ull +
-                  (uint64_t)threads.user_time.microseconds +
-                  (uint64_t)threads.system_time.seconds * 1000000ull +
-                  (uint64_t)threads.system_time.microseconds;
-        }
-        *cpu100ns = us * 10ull;
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
     .secondaryIsCommand = true,
     .wordDeleteStopsAtWhitespace = false,
@@ -9299,8 +9231,13 @@ const PlatFacts kPlatFacts = {
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/base_mem_posix.cpp"
 
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if GPUI_HAVE_MACH_TASK_INFO
+#include <mach/mach.h>
+#endif
 
 namespace base {
 
@@ -9352,6 +9289,71 @@ void PlatMemRelease(void* base, uint64_t size) {
         munmap(base, (size_t)size);
     }
 }
+
+void PlatGetExeDir(char* out, int cap) {
+    PlatExeDirFromExePath(out, cap);
+}
+
+#if GPUI_HAVE_MACH_TASK_INFO
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    task_basic_info_data_t basic = {};
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
+                  &count) != KERN_SUCCESS) {
+        return false;
+    }
+    if (memBytes) {
+        *memBytes = (uint64_t)basic.resident_size;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
+                      (uint64_t)basic.user_time.microseconds +
+                      (uint64_t)basic.system_time.seconds * 1000000ull +
+                      (uint64_t)basic.system_time.microseconds;
+        count = TASK_THREAD_TIMES_INFO_COUNT;
+        task_thread_times_info_data_t threads = {};
+        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
+                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
+            us += (uint64_t)threads.user_time.seconds * 1000000ull +
+                  (uint64_t)threads.user_time.microseconds +
+                  (uint64_t)threads.system_time.seconds * 1000000ull +
+                  (uint64_t)threads.system_time.microseconds;
+        }
+        *cpu100ns = us * 10ull;
+    }
+    return true;
+}
+#else
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    struct rusage ru = {};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return false;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_utime.tv_usec +
+                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_stime.tv_usec;
+        *cpu100ns = us * 10ull;
+    }
+    if (memBytes) {
+        *memBytes = 0;
+        FILE* f = fopen("/proc/self/statm", "rb");
+        if (f) {
+            unsigned long total = 0, resident = 0;
+            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
+                long page = sysconf(_SC_PAGESIZE);
+                *memBytes =
+                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
+            }
+            fclose(f);
+        }
+    }
+    return true;
+}
+#endif
 
 }
 
@@ -9436,6 +9438,24 @@ bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
         visit(Str(*at, (int)(eq - *at)), Str(eq + 1), user);
     }
     return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    return fopen(StrDupTemp(path).s, mode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && remove(StrDupTemp(path).s) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return rename(StrDupTemp(from).s, StrDupTemp(to).s) == 0;
 }
 
 bool PlatFileExists(const char* path) {
@@ -9534,6 +9554,8 @@ static void* ThreadMain(void* arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return nullptr;
 }
 
@@ -9745,11 +9767,45 @@ WCHAR* ToCWstrTemp(Str s) {
     return res;
 }
 
+static bool WideToUtf8Buf(const WCHAR* text, int wlen, char* out, int cap) {
+    out[0] = 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, wlen, nullptr, 0, nullptr,
+                                nullptr);
+    if (n <= 0 || n >= cap) {
+        return false;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, text, wlen, out, cap - 1, nullptr, nullptr);
+    out[n] = 0;
+    return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    WCHAR wmode[8] = {};
+    for (int i = 0; mode[i] && i < 7; i++) {
+        wmode[i] = (WCHAR)(unsigned char)mode[i];
+    }
+    return _wfopen(ToCWstrTemp(path), wmode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && _wremove(ToCWstrTemp(path)) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return _wrename(ToCWstrTemp(from), ToCWstrTemp(to)) == 0;
+}
+
 bool PlatDirExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -9758,7 +9814,7 @@ bool PlatFileExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
@@ -9768,7 +9824,11 @@ void PlatGetCwd(char* out, int cap) {
         return;
     }
     out[0] = 0;
-    GetCurrentDirectoryA((DWORD)cap, out);
+    WCHAR wide[kMaxPath] = {};
+    DWORD n = GetCurrentDirectoryW(kMaxPath, wide);
+    if (n > 0 && n < kMaxPath) {
+        WideToUtf8Buf(wide, (int)n, out, cap);
+    }
 }
 
 bool PlatCanonicalPath(const char* path, char* out, int cap) {
@@ -9825,13 +9885,14 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
 }
 
 static bool ExePath(char* out, int cap) {
-    DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
-    if (n == 0 || n >= (DWORD)cap) {
+    WCHAR wide[kMaxPath] = {};
+    DWORD wn = GetModuleFileNameW(nullptr, wide, kMaxPath);
+    if (wn == 0 || wn >= kMaxPath || !WideToUtf8Buf(wide, (int)wn, out, cap)) {
         out[0] = 0;
         return false;
     }
 
-    for (DWORD i = 0; i < n; i++) {
+    for (int i = 0; out[i]; i++) {
         if (out[i] == '\\') out[i] = '/';
     }
     return true;
@@ -9960,6 +10021,8 @@ static DWORD WINAPI ThreadMain(LPVOID arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return 0;
 }
 
@@ -10279,7 +10342,7 @@ static void FlushPendingScripts(WebView* wv) {
         return;
     }
     wv->pendingOpen = false;
-    for (int i = 0; i < wv->pendingScripts.len; i++) {
+    for (int i = 0; i < len(wv->pendingScripts); i++) {
         RunJavascript(wv, wv->pendingScripts[i], nullptr, nullptr);
     }
     StrVecFree(&wv->pendingScripts);
@@ -10483,7 +10546,7 @@ static void OnDragDataReceived(GtkWidget*, GdkDragContext*, gint, gint,
     DragDropEvent ev;
     ev.kind = DragDropKind::Enter;
     ev.paths = paths.els;
-    ev.pathCount = paths.len;
+    ev.pathCount = len(paths);
     ev.x = wv->dragX;
     ev.y = wv->dragY;
     wv->dragDropHandler(wv->ctx, &ev);
@@ -10522,7 +10585,7 @@ static gboolean OnDragDrop(GtkWidget*, GdkDragContext* context, gint x, gint y,
     DragDropEvent ev;
     ev.kind = DragDropKind::Drop;
     ev.paths = paths.els;
-    ev.pathCount = paths.len;
+    ev.pathCount = len(paths);
     ev.x = x;
     ev.y = y;
     bool handled = wv->dragDropHandler(wv->ctx, &ev);
@@ -10562,9 +10625,9 @@ struct DownloadState {
 
 static void ForgetDownload(DownloadState* state) {
     WebView* wv = state->wv;
-    for (int i = 0; i < wv->downloads.len; i++) {
+    for (int i = 0; i < len(wv->downloads); i++) {
         if (wv->downloads[i] == state) {
-            wv->downloads.els[i] = wv->downloads.els[wv->downloads.len - 1];
+            wv->downloads.els[i] = wv->downloads.els[len(wv->downloads) - 1];
             wv->downloads.len--;
             break;
         }
@@ -10693,7 +10756,7 @@ static void OnUriScheme(WebKitURISchemeRequest* request, gpointer data) {
     req.uri = FromCTemp(uri);
     req.method = method ? FromCTemp(method) : StrL("GET");
     req.headers = headers.els;
-    req.headerCount = headers.len;
+    req.headerCount = len(headers);
 
     Str id;
     WebKitWebView* webview = webkit_uri_scheme_request_get_web_view(request);
@@ -10722,7 +10785,7 @@ static gboolean FinishResponse(gpointer data) {
     webkit_uri_scheme_response_set_status(response, (guint)r->status, nullptr);
     SoupMessageHeaders* headers =
         soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
-    for (int i = 0; i < r->headers.len; i++) {
+    for (int i = 0; i < len(r->headers); i++) {
         const char* name = CStrTemp(r->headers[i].name);
         const char* value = CStrTemp(r->headers[i].value);
         if (g_ascii_strcasecmp(name, "content-type") == 0) {
@@ -10736,7 +10799,7 @@ static gboolean FinishResponse(gpointer data) {
     g_object_unref(input);
     g_object_unref(r->request);
     g_bytes_unref(r->body);
-    for (int i = 0; i < r->headers.len; i++) {
+    for (int i = 0; i < len(r->headers); i++) {
         StrFree(r->headers[i].name);
         StrFree(r->headers[i].value);
     }
@@ -10861,7 +10924,7 @@ static void FreeRelated(WebView* wv, int index, bool destroyWindow);
 
 static void OnRelatedWindowDestroy(GtkWidget* window, gpointer data) {
     WebView* wv = (WebView*)data;
-    for (int i = 0; i < wv->related.len; i++) {
+    for (int i = 0; i < len(wv->related); i++) {
         if (wv->related[i].window == window) {
             FreeRelated(wv, i, false);
             return;
@@ -11238,11 +11301,11 @@ static void FreeInner(WebView* wv) {
     if (wv->followsParent) {
         gdk_window_remove_filter(nullptr, ParentFilter, wv);
     }
-    while (wv->related.len > 0) {
-        FreeRelated(wv, wv->related.len - 1, true);
+    while (len(wv->related) > 0) {
+        FreeRelated(wv, len(wv->related) - 1, true);
     }
-    while (wv->downloads.len > 0) {
-        ForgetDownload(wv->downloads[wv->downloads.len - 1]);
+    while (len(wv->downloads) > 0) {
+        ForgetDownload(wv->downloads[len(wv->downloads) - 1]);
     }
     if (wv->dragLeaveIdle) {
         g_source_remove(wv->dragLeaveIdle);
@@ -11278,7 +11341,7 @@ static void FreeInner(WebView* wv) {
 
 static void FreeRelated(WebView* wv, int index, bool destroyWindow) {
     RelatedWebView r = wv->related[index];
-    wv->related.els[index] = wv->related.els[wv->related.len - 1];
+    wv->related.els[index] = wv->related.els[len(wv->related) - 1];
     wv->related.len--;
     g_signal_handlers_disconnect_by_data(r.window, wv);
     FreeInner(r.webview);
@@ -13277,7 +13340,7 @@ bool WebViewCookiesForUrl(WebView* wv, Str url, Vec<Cookie>* out) {
     Str domain = FromNSTemp(host);
     Str scheme = FromNSTemp(parsed.scheme.lowercaseString);
     int kept = 0;
-    for (int i = 0; i < len(*out); i++) {
+    for (int i = 0; i < len(out); i++) {
         Cookie cookie = (*out)[i];
         if (MacCookieMatchesUrl(&cookie, scheme, domain))
             (*out)[kept++] = cookie;
@@ -15823,7 +15886,7 @@ struct DragDropTarget : ComObject<IDropTarget> {
         DragDropEvent event;
         event.kind = kind;
         event.paths = paths ? paths->els : nullptr;
-        event.pathCount = paths ? paths->len : 0;
+        event.pathCount = paths ? len(paths) : 0;
         event.x = point.x;
         event.y = point.y;
 
@@ -17161,8 +17224,8 @@ static HRESULT PrepareRequest(WebView* wv, ICoreWebView2WebResourceRequest* req,
     if (FAILED(hr)) {
         return hr;
     }
-    out->headers = headerStore->len > 0 ? &(*headerStore)[0] : nullptr;
-    out->headerCount = headerStore->len;
+    out->headers = len(headerStore) > 0 ? &(*headerStore)[0] : nullptr;
+    out->headerCount = len(headerStore);
 
     IStream* content = nullptr;
     if (SUCCEEDED(req->get_Content(&content)) && content) {
@@ -17185,8 +17248,8 @@ static HRESULT PrepareRequest(WebView* wv, ICoreWebView2WebResourceRequest* req,
             return hr;
         }
     }
-    out->body = bodyStore->len > 0 ? &(*bodyStore)[0] : nullptr;
-    out->bodyLen = bodyStore->len;
+    out->body = len(bodyStore) > 0 ? &(*bodyStore)[0] : nullptr;
+    out->bodyLen = len(bodyStore);
     out->uri = RevertUriWorkAround(uri, Str(wv->httpOrHttps), protocol);
     return S_OK;
 }
@@ -17213,7 +17276,7 @@ static HRESULT OnWebResourceRequested(
     Str uri = TakePwstrTemp(rawUri);
 
     CustomProtocol* found = nullptr;
-    for (int i = 0; i < wv->protocols.len; i++) {
+    for (int i = 0; i < len(wv->protocols); i++) {
         if (IsWorkAroundUri(uri, Str(wv->httpOrHttps), wv->protocols[i].name)) {
             found = &wv->protocols[i];
             break;
@@ -17260,7 +17323,7 @@ static HRESULT OnWebResourceRequested(
 
 static bool AttachCustomProtocolHandler(WebView* wv,
                                         EventRegistrationToken* token) {
-    for (int i = 0; i < wv->protocols.len; i++) {
+    for (int i = 0; i < len(wv->protocols); i++) {
         Str filter = base::FormatTemp(
             "%s*",
             WorkAroundUriPrefix(Str(wv->httpOrHttps), wv->protocols[i].name));
@@ -17919,7 +17982,7 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
         return nullptr;
     }
     if (!AttachIpcHandler(wv, &token) ||
-        (wv->protocols.len > 0 && !AttachCustomProtocolHandler(wv, &token))) {
+        (len(wv->protocols) > 0 && !AttachCustomProtocolHandler(wv, &token))) {
         WebViewFree(wv);
         return nullptr;
     }
@@ -17947,7 +18010,7 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
     bool navigated = true;
     if (attrs->url.s) {
         Str url = attrs->url;
-        for (int i = 0; i < wv->protocols.len; i++) {
+        for (int i = 0; i < len(wv->protocols); i++) {
 
             Str prefix = base::FormatTemp("%s://", wv->protocols[i].name);
             if (base::StrStartsWith(url, prefix)) {

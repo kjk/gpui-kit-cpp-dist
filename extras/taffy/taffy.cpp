@@ -614,8 +614,7 @@ TempStr ReadBoundedFileTemp(Str path, int limit) {
     if (!path || limit <= 0) {
         return {};
     }
-    TempStr pathZ = StrDupTemp(path);
-    FILE* file = fopen(pathZ.s, "rb");
+    FILE* file = PlatFileOpen(path, "rb");
     if (!file) {
         return {};
     }
@@ -960,7 +959,7 @@ void StrVecFree(Vec<Str>* v) {
     if (!v) {
         return;
     }
-    for (int i = 0; i < len(*v); i++) {
+    for (int i = 0; i < len(v); i++) {
         StrFree((*v)[i]);
     }
     VecReset(*v);
@@ -8923,12 +8922,12 @@ struct FloatContext {
         if (atLeast > hwm) {
             hwm = atLeast;
         }
-        for (int i = hwm; i < segments.len; i++) {
+        for (int i = hwm; i < len(segments); i++) {
             if (segments[i].yEnd > *minY) {
                 return i;
             }
         }
-        return segments.len;
+        return len(segments);
     }
 
     ContentSlot FindContentSlot(float minY,
@@ -8973,8 +8972,8 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
             break;
     }
 
-    int startIdx = segments.len;
-    for (int i = hwm; i < segments.len; i++) {
+    int startIdx = len(segments);
+    for (int i = hwm; i < len(segments); i++) {
         if (segments[i].yEnd > minY) {
             startIdx = i;
             break;
@@ -8991,7 +8990,7 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
 
     while (true) {
 
-        if (startIdx >= segments.len) {
+        if (startIdx >= len(segments)) {
             haveStart = false;
             haveEnd = false;
             placedInset = containingBlockInsets[slot];
@@ -9016,7 +9015,7 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
 
         bool restartOuter = false;
         while (true) {
-            if (endIdx >= segments.len) {
+            if (endIdx >= len(segments)) {
                 haveStart = true;
                 foundStart = startIdx;
                 haveEnd = false;
@@ -9081,7 +9080,7 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
         seg.hasFloat[slot] = true;
         VecAppend(segments, seg);
 
-        int si = segments.len - 1;
+        int si = len(segments) - 1;
         UpdateLastPlacedFloat(direction, {si, si + 1});
 
         out.y = newStartY;
@@ -9108,7 +9107,7 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
             gap.yEnd = minY;
             VecAppend(segments, gap);
         }
-        ei = segments.len - 1;
+        ei = len(segments) - 1;
     } else {
         ei = foundEnd;
         float endY = startY + floatedBox.h;
@@ -9121,7 +9120,7 @@ PlacedFloatedBox FloatContext::PlaceFloatedBoxInner(
     }
 
     float placedInsetPlusWidth = placedInset + floatedBox.w;
-    for (int i = si; i <= ei && i < segments.len; i++) {
+    for (int i = si; i <= ei && i < len(segments); i++) {
         segments[i].insets[slot] = placedInsetPlusWidth;
         segments[i].hasFloat[slot] = true;
     }
@@ -9146,7 +9145,7 @@ ContentSlot FloatContext::FindContentSlot(float minY,
     }
 
     int startIdx = FirstSlotSegment(&minY, clear, after);
-    if (startIdx >= segments.len) {
+    if (startIdx >= len(segments)) {
         return fallback;
     }
 
@@ -9179,7 +9178,7 @@ BfcSlot FloatContext::FindBfcSlot(float minY,
     }
 
     int startIdx = FirstSlotSegment(&minY, clear, after);
-    if (startIdx >= segments.len) {
+    if (startIdx >= len(segments)) {
         fallback.y = F32Max(LastSegmentEnd(), minY);
         return fallback;
     }
@@ -9598,7 +9597,7 @@ InFlowResult PerformFinalLayoutOnInFlowChildren(
     bool activeMarginSetHasClearance = false;
     bool hasActiveFloats = blockCtx->HasActiveFloats(committedYOffset);
 
-    for (int itemIdx = 0; itemIdx < items->len; itemIdx++) {
+    for (int itemIdx = 0; itemIdx < len(items); itemIdx++) {
         BlockItem& item = (*items)[itemIdx];
         if (IsOutOfFlow(item.position)) {
             float x = direction == Direction::Ltr
@@ -10985,7 +10984,7 @@ static AvailableSpace LineBreakAvailableSpace(const AlgoConstants& c,
 void CollectFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
                       Vec<FlexItem>* flexItems, Vec<FlexLine>* lines) {
     FlexItem* items = flexItems->els;
-    int total = flexItems->len;
+    int total = len(flexItems);
 
     if (!c.isWrap || !c.knownMainSizeIsDefinite) {
         VecAppend(*lines, {items, total, 0.0f, 0.0f});
@@ -11034,7 +11033,7 @@ void CollectFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
 void CollectBalancedFlexLines(const AlgoConstants& c, SizeAvail availableSpace,
                               Vec<FlexItem>* flexItems, Vec<FlexLine>* lines) {
     FlexItem* items = flexItems->els;
-    int total = flexItems->len;
+    int total = len(flexItems);
     if (total == 0) {
         return;
     }
@@ -11086,7 +11085,7 @@ float LineTotalTargetSize(const FlexLine& line, const AlgoConstants& c) {
 
 float LongestLineLength(Vec<FlexLine>* lines, const AlgoConstants& c) {
     float longest = 0.0f;
-    for (int i = 0; i < lines->len; i++) {
+    for (int i = 0; i < len(lines); i++) {
         FlexLine& line = (*lines)[i];
         float lineGap = SumAxisGaps(Main(c.gap, c.dir), line.count);
         float total = LineTotalTargetSize(line, c) + lineGap;
@@ -11114,14 +11113,14 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
             if (c->isBalance) {
 
                 int itemCount = 0;
-                for (int i = 0; i < lines->len; i++) {
+                for (int i = 0; i < len(lines); i++) {
                     itemCount += (*lines)[i].count;
                 }
                 if (itemCount == 0) {
                     outerMainSize = size;
                 } else {
                     Vec<float> itemLengths;
-                    for (int li = 0; li < lines->len; li++) {
+                    for (int li = 0; li < len(lines); li++) {
                         FlexLine& line = (*lines)[li];
                         for (int ii = 0; ii < line.count; ii++) {
                             const FlexItem& child = line.items[ii];
@@ -11157,7 +11156,7 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
                 }
             } else {
                 outerMainSize =
-                    lines->len > 1 ? F32Max(size, mainAvail.value) : size;
+                    len(lines) > 1 ? F32Max(size, mainAvail.value) : size;
             }
         } else if (mainAvail.kind == AvailableSpace::Kind::MinContent &&
                    c->isWrap) {
@@ -11165,7 +11164,7 @@ void DetermineContainerMainSize(TaffyTree* tree, SizeAvail availableSpace,
         } else {
 
             float mainSize = 0.0f;
-            for (int li = 0; li < lines->len; li++) {
+            for (int li = 0; li < len(lines); li++) {
                 FlexLine& line = (*lines)[li];
                 for (int ii = 0; ii < line.count; ii++) {
                     FlexItem& item = line.items[ii];
@@ -11598,7 +11597,7 @@ void CalculateChildrenBaseLines(TaffyTree* tree, SizeFOpt nodeSize,
         return;
     }
 
-    for (int li = 0; li < lines->len; li++) {
+    for (int li = 0; li < len(lines); li++) {
         FlexLine& line = (*lines)[li];
 
         int participating = 0;
@@ -11646,7 +11645,7 @@ void CalculateChildrenBaseLines(TaffyTree* tree, SizeFOpt nodeSize,
 void CalculateCrossSize(Vec<FlexLine>* lines, SizeFOpt nodeSize,
                         const AlgoConstants& c) {
     FlexDirection dir = c.dir;
-    if (lines->len == 0) {
+    if (len(lines) == 0) {
         return;
     }
 
@@ -11662,7 +11661,7 @@ void CalculateCrossSize(Vec<FlexLine>* lines, SizeFOpt nodeSize,
         return;
     }
 
-    for (int li = 0; li < lines->len; li++) {
+    for (int li = 0; li < len(lines); li++) {
         FlexLine& line = (*lines)[li];
         float maxBaseline = 0.0f;
         for (int i = 0; i < line.count; i++) {
@@ -11695,7 +11694,7 @@ void CalculateCrossSize(Vec<FlexLine>* lines, SizeFOpt nodeSize,
 void HandleAlignContentStretch(Vec<FlexLine>* lines, SizeFOpt nodeSize,
                                const AlgoConstants& c) {
     if (c.alignContent.keyword != AlignContentKeyword::Stretch ||
-        lines->len == 0) {
+        len(lines) == 0) {
         return;
     }
     FlexDirection dir = c.dir;
@@ -11709,16 +11708,16 @@ void HandleAlignContentStretch(Vec<FlexLine>* lines, SizeFOpt nodeSize,
                  0.0f),
         0.0f);
 
-    float totalCrossAxisGap = SumAxisGaps(Cross(c.gap, dir), lines->len);
+    float totalCrossAxisGap = SumAxisGaps(Cross(c.gap, dir), len(lines));
     float linesTotalCross = totalCrossAxisGap;
-    for (int i = 0; i < lines->len; i++) {
+    for (int i = 0; i < len(lines); i++) {
         linesTotalCross += (*lines)[i].crossSize;
     }
 
     if (linesTotalCross < containerMinInnerCross) {
         float addition =
-            (containerMinInnerCross - linesTotalCross) / (float)lines->len;
-        for (int i = 0; i < lines->len; i++) {
+            (containerMinInnerCross - linesTotalCross) / (float)len(lines);
+        for (int i = 0; i < len(lines); i++) {
             (*lines)[i].crossSize += addition;
         }
     }
@@ -11728,7 +11727,7 @@ void DetermineUsedCrossSize(TaffyTree* tree, Vec<FlexLine>* lines,
                             const AlgoConstants& c) {
     CalcResolver calc = tree->calc;
     FlexDirection dir = c.dir;
-    for (int li = 0; li < lines->len; li++) {
+    for (int li = 0; li < len(lines); li++) {
         FlexLine& line = (*lines)[li];
         float lineCrossSize = line.crossSize;
 
@@ -11771,7 +11770,7 @@ void DetermineUsedCrossSize(TaffyTree* tree, Vec<FlexLine>* lines,
 void DistributeRemainingFreeSpace(Vec<FlexLine>* lines,
                                   const AlgoConstants& c) {
     FlexDirection dir = c.dir;
-    for (int li = 0; li < lines->len; li++) {
+    for (int li = 0; li < len(lines); li++) {
         FlexLine& line = (*lines)[li];
         float totalMainAxisGap = SumAxisGaps(Main(c.gap, dir), line.count);
         float usedSpace = totalMainAxisGap;
@@ -11877,7 +11876,7 @@ float AlignFlexItemsAlongCrossAxis(const FlexItem& child, float freeSpace,
 
 void ResolveCrossAxisAutoMargins(Vec<FlexLine>* lines, const AlgoConstants& c) {
     FlexDirection dir = c.dir;
-    for (int li = 0; li < lines->len; li++) {
+    for (int li = 0; li < len(lines); li++) {
         FlexLine& line = (*lines)[li];
         float lineCrossSize = line.crossSize;
         float maxBaseline = 0.0f;
@@ -11930,9 +11929,9 @@ void ResolveCrossAxisAutoMargins(Vec<FlexLine>* lines, const AlgoConstants& c) {
 float DetermineContainerCrossSize(Vec<FlexLine>* lines, SizeFOpt nodeSize,
                                   AlgoConstants* c) {
     FlexDirection dir = c->dir;
-    float totalCrossAxisGap = SumAxisGaps(Cross(c->gap, dir), lines->len);
+    float totalCrossAxisGap = SumAxisGaps(Cross(c->gap, dir), len(lines));
     float totalLineCrossSize = 0.0f;
-    for (int i = 0; i < lines->len; i++) {
+    for (int i = 0; i < len(lines); i++) {
         totalLineCrossSize += (*lines)[i].crossSize;
     }
 
@@ -11955,7 +11954,7 @@ float DetermineContainerCrossSize(Vec<FlexLine>* lines, SizeFOpt nodeSize,
 
 void AlignFlexLinesPerAlignContent(Vec<FlexLine>* lines, const AlgoConstants& c,
                                    float totalCrossSize) {
-    int numLines = lines->len;
+    int numLines = len(lines);
     float gap = Cross(c.gap, c.dir);
     float totalCrossAxisGap = SumAxisGaps(gap, numLines);
     float freeSpace =
@@ -12120,9 +12119,9 @@ RectF FinalLayoutPass(TaffyTree* tree, Vec<FlexLine>* lines,
 
     RectF overflowRect = RectF::Zero();
 
-    for (int i = 0; i < lines->len; i++) {
+    for (int i = 0; i < len(lines); i++) {
         FlexLine& line =
-            c.isWrapReverse ? (*lines)[lines->len - 1 - i] : (*lines)[i];
+            c.isWrapReverse ? (*lines)[len(lines) - 1 - i] : (*lines)[i];
         CalculateLayoutLine(tree, &line, &totalOffsetCross, &overflowRect, c,
                             oofPool);
     }
@@ -12146,7 +12145,7 @@ void CollectOofCandidates(TaffyTree* tree, NodeId node, const AlgoConstants& c,
     int lineIx = 0;
     int itemIx = 0;
     auto nextWithCandidates = [&]() -> FlexItem* {
-        while (lineIx < len(*flexLines)) {
+        while (lineIx < len(flexLines)) {
             FlexLine& line = (*flexLines)[lineIx];
             while (itemIx < line.count) {
                 FlexItem* item = &line.items[itemIx];
@@ -13228,10 +13227,10 @@ struct NamedLineResolver {
             edge = priorEdge == 0 || value < priorEdge ? value : priorEdge;
         }
 
-        for (int i = 0; i < map->len; i++) {
+        for (int i = 0; i < len(map); i++) {
             LineNameEntry& e = (*map)[i];
             if (base::StrEq(e.name, name)) {
-                for (int k = 0; k < e.lines.len; k++) {
+                for (int k = 0; k < len(e.lines); k++) {
                     if (e.lines[k] == value) {
                         return;
                     }
@@ -13261,7 +13260,7 @@ struct NamedLineResolver {
     }
 
     static void SortUnique(Vec<uint32_t>& lines) {
-        for (int i = 1; i < lines.len; i++) {
+        for (int i = 1; i < len(lines); i++) {
             uint32_t v = lines[i];
             int j = i;
             while (j > 0 && lines[j - 1] > v) {
@@ -13271,7 +13270,7 @@ struct NamedLineResolver {
             lines[j] = v;
         }
         int w = 0;
-        for (int i = 0; i < lines.len; i++) {
+        for (int i = 0; i < len(lines); i++) {
             if (w == 0 || lines[w - 1] != lines[i]) {
                 lines[w++] = lines[i];
             }
@@ -13413,9 +13412,9 @@ int NamedLineResolver::CollectLines(Str name, GridAreaAxis axis,
     const Vec<LineNameEntry>& lookup =
         axis == GridAreaAxis::Row ? rowLines : columnLines;
     const Vec<uint32_t>* lines = Find(lookup, name);
-    if (lines && lines->len > 0) {
+    if (lines && len(lines) > 0) {
         *data = lines->els;
-        return lines->len;
+        return len(lines);
     }
     Str areaName;
     GridAreaEnd edge;
@@ -14006,7 +14005,7 @@ void InitializeGridTracks(Vec<GridTrack>* tracks, TrackCounts counts,
 
             bool isLast = currentTrackIndex == counts.Len();
             if (isAutoFit && isLast) {
-                for (int t = tracks->len - 1; t >= 0; t--) {
+                for (int t = len(tracks) - 1; t >= 0; t--) {
                     GridTrack& prev = (*tracks)[t];
                     if (prev.kind == GridTrackKind::Track &&
                         !prev.isCollapsed) {
@@ -14027,9 +14026,9 @@ void InitializeGridTracks(Vec<GridTrack>* tracks, TrackCounts counts,
         (uint16_t)((int)counts.positiveImplicit + gridAreaTracks);
     CreateCycledImplicitTracks(tracks, positive, autoTracks, 0, gap);
 
-    if (tracks->len > 0) {
+    if (len(tracks) > 0) {
         (*tracks)[0].Collapse();
-        (*tracks)[tracks->len - 1].Collapse();
+        (*tracks)[len(tracks) - 1].Collapse();
     }
 }
 
@@ -18637,7 +18636,7 @@ static uint32_t IdGeneration(NodeId id) {
 
 NodeData* TaffyTree::Get(NodeId node) const {
     int32_t idx = IdIndex(node);
-    if (idx < 0 || idx >= slots.len) {
+    if (idx < 0 || idx >= len(slots)) {
         return nullptr;
     }
     NodeData* d = slots[idx];
@@ -18659,7 +18658,7 @@ void TaffyTree::Init(int capacity) {
 }
 
 void TaffyTree::Free() {
-    for (int i = 0; i < slots.len; i++) {
+    for (int i = 0; i < len(slots); i++) {
         NodeData* d = slots[i];
         if (!d) {
             continue;
@@ -18673,13 +18672,13 @@ void TaffyTree::Free() {
 }
 
 static int32_t AllocSlot(TaffyTree* tree) {
-    if (tree->freeSlots.len > 0) {
-        int32_t idx = tree->freeSlots[tree->freeSlots.len - 1];
+    if (len(tree->freeSlots) > 0) {
+        int32_t idx = tree->freeSlots[len(tree->freeSlots) - 1];
         tree->freeSlots.len--;
         return idx;
     }
     VecAppend(tree->slots, nullptr);
-    return tree->slots.len - 1;
+    return len(tree->slots) - 1;
 }
 
 static NodeId InsertNode(TaffyTree* tree, const Style& style) {
@@ -18745,7 +18744,7 @@ NodeId TaffyTree::NewWithChildren(const Style& style, const NodeId* children,
 void TaffyTree::Clear() {
 
     VecReset(freeSlots);
-    for (int i = 0; i < slots.len; i++) {
+    for (int i = 0; i < len(slots); i++) {
         NodeData* d = slots[i];
         if (!d) {
             continue;
@@ -18768,7 +18767,7 @@ void TaffyTree::Remove(NodeId node) {
         NodeData* p = Get(d->parent);
         if (p) {
             int w = 0;
-            for (int i = 0; i < p->children.len; i++) {
+            for (int i = 0; i < len(p->children); i++) {
                 if (p->children[i] != node) {
                     p->children[w++] = p->children[i];
                 }
@@ -18779,7 +18778,7 @@ void TaffyTree::Remove(NodeId node) {
         MarkDirty(d->parent);
     }
 
-    for (int i = 0; i < d->children.len; i++) {
+    for (int i = 0; i < len(d->children); i++) {
         NodeData* c = Get(d->children[i]);
         if (c) {
             c->hasParent = false;
@@ -18803,24 +18802,24 @@ static void MarkReachable(const TaffyTree* tree, NodeId id, uint8_t* seen,
         return;
     }
     seen[idx] = 1;
-    for (int i = 0; i < d->children.len; i++) {
+    for (int i = 0; i < len(d->children); i++) {
         MarkReachable(tree, d->children[i], seen, nSlots);
     }
 }
 
 void TaffyTree::EachUnreachable(NodeId root, void (*fn)(NodeId, void*),
                                 void* user) {
-    if (!fn || slots.len <= 0) {
+    if (!fn || len(slots) <= 0) {
         return;
     }
-    uint8_t* seen = (uint8_t*)base::Alloc(nullptr, slots.len);
+    uint8_t* seen = (uint8_t*)base::Alloc(nullptr, len(slots));
     if (!seen) {
         return;
     }
-    memset(seen, 0, (size_t)slots.len);
-    MarkReachable(this, root, seen, slots.len);
+    memset(seen, 0, (size_t)len(slots));
+    MarkReachable(this, root, seen, len(slots));
     Vec<NodeId> ids;
-    for (int i = 0; i < slots.len; i++) {
+    for (int i = 0; i < len(slots); i++) {
         NodeData* d = slots[i];
         if (d && d->alive && !seen[i]) {
             VecAppend(ids, MakeId((int32_t)i, d->generation));
@@ -18867,7 +18866,7 @@ bool TaffyTree::InsertChildAtIndex(NodeId parent, int childIndex,
     if (!p || !c) {
         return false;
     }
-    if (childIndex > p->children.len || childIndex < 0) {
+    if (childIndex > len(p->children) || childIndex < 0) {
         return false;
     }
     c->parent = parent;
@@ -18883,7 +18882,7 @@ void TaffyTree::SetChildren(NodeId parent, const NodeId* children, int n) {
         return;
     }
 
-    for (int i = 0; i < p->children.len; i++) {
+    for (int i = 0; i < len(p->children); i++) {
         NodeData* c = Get(p->children[i]);
         if (c) {
             c->hasParent = false;
@@ -18913,7 +18912,7 @@ NodeId TaffyTree::RemoveChild(NodeId parent, NodeId child) {
     if (!p) {
         return NodeId{};
     }
-    for (int i = 0; i < p->children.len; i++) {
+    for (int i = 0; i < len(p->children); i++) {
         if (p->children[i] == child) {
             return RemoveChildAtIndex(parent, i);
         }
@@ -18923,11 +18922,11 @@ NodeId TaffyTree::RemoveChild(NodeId parent, NodeId child) {
 
 NodeId TaffyTree::RemoveChildAtIndex(NodeId parent, int childIndex) {
     NodeData* p = Get(parent);
-    if (!p || childIndex < 0 || childIndex >= p->children.len) {
+    if (!p || childIndex < 0 || childIndex >= len(p->children)) {
         return NodeId{};
     }
     NodeId child = p->children[childIndex];
-    for (int i = childIndex; i + 1 < p->children.len; i++) {
+    for (int i = childIndex; i + 1 < len(p->children); i++) {
         p->children[i] = p->children[i + 1];
     }
     p->children.len--;
@@ -18947,8 +18946,8 @@ void TaffyTree::RemoveChildrenRange(NodeId parent, int start, int end) {
     if (start < 0) {
         start = 0;
     }
-    if (end > p->children.len) {
-        end = p->children.len;
+    if (end > len(p->children)) {
+        end = len(p->children);
     }
     if (end <= start) {
         return;
@@ -18960,7 +18959,7 @@ void TaffyTree::RemoveChildrenRange(NodeId parent, int start, int end) {
         }
     }
     int n = end - start;
-    for (int i = end; i < p->children.len; i++) {
+    for (int i = end; i < len(p->children); i++) {
         p->children[i - n] = p->children[i];
     }
     p->children.len -= n;
@@ -18970,7 +18969,7 @@ void TaffyTree::RemoveChildrenRange(NodeId parent, int start, int end) {
 NodeId TaffyTree::ReplaceChildAtIndex(NodeId parent, int childIndex,
                                       NodeId newChild) {
     NodeData* p = Get(parent);
-    if (!p || childIndex < 0 || childIndex >= p->children.len) {
+    if (!p || childIndex < 0 || childIndex >= len(p->children)) {
         return NodeId{};
     }
     NodeData* nc = Get(newChild);
@@ -18990,7 +18989,7 @@ NodeId TaffyTree::ReplaceChildAtIndex(NodeId parent, int childIndex,
 
 NodeId TaffyTree::ChildAtIndex(NodeId parent, int childIndex) const {
     NodeData* p = Get(parent);
-    if (!p || childIndex < 0 || childIndex >= p->children.len) {
+    if (!p || childIndex < 0 || childIndex >= len(p->children)) {
         return NodeId{};
     }
     return p->children[childIndex];
@@ -19068,13 +19067,13 @@ bool TaffyTree::Dirty(NodeId node) const {
 
 int TaffyTree::ChildCount(NodeId parent) const {
     NodeData* d = Get(parent);
-    return d ? d->children.len : 0;
+    return d ? len(d->children) : 0;
 }
 
 NodeId TaffyTree::GetChildId(NodeId parent, int index) const {
     NodeData* d = Get(parent);
-    return d && index >= 0 && index < d->children.len ? d->children[index]
-                                                      : NodeId{};
+    return d && index >= 0 && index < len(d->children) ? d->children[index]
+                                                       : NodeId{};
 }
 
 void TaffyTree::SetUnroundedLayout(NodeId node, const Layout& layout) {
@@ -19112,7 +19111,7 @@ const char* TaffyTree::GetDebugLabel(NodeId node) const {
     if (d->style.display == Display::None) {
         return "NONE";
     }
-    if (d->children.len == 0) {
+    if (len(d->children) == 0) {
         return "LEAF";
     }
     switch (d->style.display) {
@@ -19197,7 +19196,7 @@ LayoutOutput TaffyTree::ComputeBlockChildLayout(NodeId node, LayoutInput inputs,
     }
 
     Display displayMode = d->style.display;
-    bool hasChildren = d->children.len > 0;
+    bool hasChildren = len(d->children) > 0;
 
     d->gridOof.Clear();
 
@@ -19603,39 +19602,6 @@ const PlatFacts kPlatFacts = {
 
 namespace base {
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    struct rusage ru = {};
-    if (getrusage(RUSAGE_SELF, &ru) != 0) {
-        return false;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_utime.tv_usec +
-                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_stime.tv_usec;
-        *cpu100ns = us * 10ull;
-    }
-    if (memBytes) {
-        *memBytes = 0;
-        FILE* f = fopen("/proc/self/statm", "rb");
-        if (f) {
-            unsigned long total = 0, resident = 0;
-            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
-                long page = sysconf(_SC_PAGESIZE);
-                *memBytes =
-                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
-            }
-            fclose(f);
-        }
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
 
     .titleBarCloseIsElement = true,
@@ -19750,40 +19716,6 @@ static bool DisclaimSpeechResponsibility(int argc, char** argv, int* status) {
     return false;
 }
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    task_basic_info_data_t basic = {};
-    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
-                  &count) != KERN_SUCCESS) {
-        return false;
-    }
-    if (memBytes) {
-        *memBytes = (uint64_t)basic.resident_size;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
-                      (uint64_t)basic.user_time.microseconds +
-                      (uint64_t)basic.system_time.seconds * 1000000ull +
-                      (uint64_t)basic.system_time.microseconds;
-        count = TASK_THREAD_TIMES_INFO_COUNT;
-        task_thread_times_info_data_t threads = {};
-        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
-                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
-            us += (uint64_t)threads.user_time.seconds * 1000000ull +
-                  (uint64_t)threads.user_time.microseconds +
-                  (uint64_t)threads.system_time.seconds * 1000000ull +
-                  (uint64_t)threads.system_time.microseconds;
-        }
-        *cpu100ns = us * 10ull;
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
     .secondaryIsCommand = true,
     .wordDeleteStopsAtWhitespace = false,
@@ -19805,8 +19737,13 @@ const PlatFacts kPlatFacts = {
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/base_mem_posix.cpp"
 
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if GPUI_HAVE_MACH_TASK_INFO
+#include <mach/mach.h>
+#endif
 
 namespace base {
 
@@ -19858,6 +19795,71 @@ void PlatMemRelease(void* base, uint64_t size) {
         munmap(base, (size_t)size);
     }
 }
+
+void PlatGetExeDir(char* out, int cap) {
+    PlatExeDirFromExePath(out, cap);
+}
+
+#if GPUI_HAVE_MACH_TASK_INFO
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    task_basic_info_data_t basic = {};
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
+                  &count) != KERN_SUCCESS) {
+        return false;
+    }
+    if (memBytes) {
+        *memBytes = (uint64_t)basic.resident_size;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
+                      (uint64_t)basic.user_time.microseconds +
+                      (uint64_t)basic.system_time.seconds * 1000000ull +
+                      (uint64_t)basic.system_time.microseconds;
+        count = TASK_THREAD_TIMES_INFO_COUNT;
+        task_thread_times_info_data_t threads = {};
+        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
+                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
+            us += (uint64_t)threads.user_time.seconds * 1000000ull +
+                  (uint64_t)threads.user_time.microseconds +
+                  (uint64_t)threads.system_time.seconds * 1000000ull +
+                  (uint64_t)threads.system_time.microseconds;
+        }
+        *cpu100ns = us * 10ull;
+    }
+    return true;
+}
+#else
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    struct rusage ru = {};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return false;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_utime.tv_usec +
+                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_stime.tv_usec;
+        *cpu100ns = us * 10ull;
+    }
+    if (memBytes) {
+        *memBytes = 0;
+        FILE* f = fopen("/proc/self/statm", "rb");
+        if (f) {
+            unsigned long total = 0, resident = 0;
+            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
+                long page = sysconf(_SC_PAGESIZE);
+                *memBytes =
+                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
+            }
+            fclose(f);
+        }
+    }
+    return true;
+}
+#endif
 
 }
 
@@ -19942,6 +19944,24 @@ bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
         visit(Str(*at, (int)(eq - *at)), Str(eq + 1), user);
     }
     return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    return fopen(StrDupTemp(path).s, mode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && remove(StrDupTemp(path).s) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return rename(StrDupTemp(from).s, StrDupTemp(to).s) == 0;
 }
 
 bool PlatFileExists(const char* path) {
@@ -20040,6 +20060,8 @@ static void* ThreadMain(void* arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return nullptr;
 }
 
@@ -20251,11 +20273,45 @@ WCHAR* ToCWstrTemp(Str s) {
     return res;
 }
 
+static bool WideToUtf8Buf(const WCHAR* text, int wlen, char* out, int cap) {
+    out[0] = 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, wlen, nullptr, 0, nullptr,
+                                nullptr);
+    if (n <= 0 || n >= cap) {
+        return false;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, text, wlen, out, cap - 1, nullptr, nullptr);
+    out[n] = 0;
+    return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    WCHAR wmode[8] = {};
+    for (int i = 0; mode[i] && i < 7; i++) {
+        wmode[i] = (WCHAR)(unsigned char)mode[i];
+    }
+    return _wfopen(ToCWstrTemp(path), wmode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && _wremove(ToCWstrTemp(path)) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return _wrename(ToCWstrTemp(from), ToCWstrTemp(to)) == 0;
+}
+
 bool PlatDirExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -20264,7 +20320,7 @@ bool PlatFileExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
@@ -20274,7 +20330,11 @@ void PlatGetCwd(char* out, int cap) {
         return;
     }
     out[0] = 0;
-    GetCurrentDirectoryA((DWORD)cap, out);
+    WCHAR wide[kMaxPath] = {};
+    DWORD n = GetCurrentDirectoryW(kMaxPath, wide);
+    if (n > 0 && n < kMaxPath) {
+        WideToUtf8Buf(wide, (int)n, out, cap);
+    }
 }
 
 bool PlatCanonicalPath(const char* path, char* out, int cap) {
@@ -20331,13 +20391,14 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
 }
 
 static bool ExePath(char* out, int cap) {
-    DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
-    if (n == 0 || n >= (DWORD)cap) {
+    WCHAR wide[kMaxPath] = {};
+    DWORD wn = GetModuleFileNameW(nullptr, wide, kMaxPath);
+    if (wn == 0 || wn >= kMaxPath || !WideToUtf8Buf(wide, (int)wn, out, cap)) {
         out[0] = 0;
         return false;
     }
 
-    for (DWORD i = 0; i < n; i++) {
+    for (int i = 0; out[i]; i++) {
         if (out[i] == '\\') out[i] = '/';
     }
     return true;
@@ -20466,6 +20527,8 @@ static DWORD WINAPI ThreadMain(LPVOID arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return 0;
 }
 

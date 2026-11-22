@@ -613,8 +613,7 @@ TempStr ReadBoundedFileTemp(Str path, int limit) {
     if (!path || limit <= 0) {
         return {};
     }
-    TempStr pathZ = StrDupTemp(path);
-    FILE* file = fopen(pathZ.s, "rb");
+    FILE* file = PlatFileOpen(path, "rb");
     if (!file) {
         return {};
     }
@@ -959,7 +958,7 @@ void StrVecFree(Vec<Str>* v) {
     if (!v) {
         return;
     }
-    for (int i = 0; i < len(*v); i++) {
+    for (int i = 0; i < len(v); i++) {
         StrFree((*v)[i]);
     }
     VecReset(*v);
@@ -8854,7 +8853,7 @@ State DocumentContainerNewBefore(Tokenizer* t) {
         }
     }
 
-    int32_t tail = t->tokenizeState.documentContainerStack.len;
+    int32_t tail = len(t->tokenizeState.documentContainerStack);
     ContainerState fresh;
     fresh.kind = Container::BlockQuote;
     VecAppend(t->tokenizeState.documentContainerStack, fresh);
@@ -8927,13 +8926,13 @@ State DocumentContainerNewAfter(Tokenizer* t) {
 State DocumentContainersAfter(Tokenizer* t) {
     Tokenizer* child = t->tokenizeState.documentChild;
     child->lazy = t->tokenizeState.documentContinued !=
-                  t->tokenizeState.documentContainerStack.len;
+                  len(t->tokenizeState.documentContainerStack);
     DefineSkip(child, t->point);
 
     if (t->current < 0) {
         return StateRetry(StateName::DocumentFlowEnd);
     }
-    int32_t current = t->events.len;
+    int32_t current = len(t->events);
     int32_t previous = t->tokenizeState.documentDataIndex;
     if (previous != -1) {
         t->events[previous].link.next = current;
@@ -8984,10 +8983,10 @@ State DocumentFlowEnd(Tokenizer* t) {
             documentLazyContinuationCurrent = true;
         }
     }
-    if (!documentLazyContinuationCurrent && child->events.len > 0) {
+    if (!documentLazyContinuationCurrent && len(child->events) > 0) {
         Name lineEnding = Name::LineEnding;
         int32_t before =
-            SkipOptBack(child->events, child->events.len - 1, &lineEnding, 1);
+            SkipOptBack(child->events, len(child->events) - 1, &lineEnding, 1);
         Name name = child->events[before].name;
         if (name == Name::Content || name == Name::HeadingSetextUnderline) {
             documentLazyContinuationCurrent = true;
@@ -9025,7 +9024,7 @@ static void ExitContainers(Tokenizer* t, Phase phase) {
 
     Vec<ContainerState> stackClose;
     for (int32_t i = t->tokenizeState.documentContinued;
-         i < t->tokenizeState.documentContainerStack.len; i++) {
+         i < len(t->tokenizeState.documentContainerStack); i++) {
         VecAppend(stackClose, t->tokenizeState.documentContainerStack[i]);
     }
     t->tokenizeState.documentContainerStack.len = t->tokenizeState
@@ -9042,7 +9041,7 @@ static void ExitContainers(Tokenizer* t, Phase phase) {
     }
 
     if (len(stackClose) > 0) {
-        int32_t index = t->tokenizeState.documentExits.len -
+        int32_t index = len(t->tokenizeState.documentExits) -
                         (phase == Phase::After ? 2 : 1);
         ArenaVec<Event> exits{};
         while (len(stackClose) > 0) {
@@ -9082,20 +9081,20 @@ static void DocumentResolve(Tokenizer* t) {
 
     int32_t childIndex = 0;
     int32_t line = 0;
-    while (childIndex < child->events.len) {
+    while (childIndex < len(child->events)) {
         if (child->events[childIndex].kind == Kind::Exit &&
             (child->events[childIndex].name == Name::LineEnding ||
              child->events[childIndex].name == Name::BlankLineEnding)) {
             int32_t injectIndex = childIndex - 1;
             Point point = child->events[injectIndex].point;
 
-            while (childIndex + 1 < child->events.len &&
+            while (childIndex + 1 < len(child->events) &&
                    child->events[childIndex + 1].kind == Kind::Exit) {
                 childIndex += 1;
                 point = child->events[childIndex].point;
                 injectIndex = childIndex + 1;
             }
-            if (line < t->tokenizeState.documentExits.len) {
+            if (line < len(t->tokenizeState.documentExits)) {
                 ArenaVec<Event> exits = t->tokenizeState.documentExits[line];
                 if (len(exits) > 0) {
                     t->tokenizeState.documentExits[line] = ArenaVec<Event>{};
@@ -9115,7 +9114,7 @@ static void DocumentResolve(Tokenizer* t) {
 
     Name data = Name::Data;
     int32_t flowIndex = SkipTo(t->events, 0, &data, 1);
-    while (flowIndex < t->events.len &&
+    while (flowIndex < len(t->events) &&
            (!t->events[flowIndex].hasLink ||
             t->events[flowIndex].link.content != ContentKind::Flow)) {
         flowIndex = SkipTo(t->events, flowIndex + 1, &data, 1);
@@ -9125,7 +9124,7 @@ static void DocumentResolve(Tokenizer* t) {
     DivideEvents(t->map, t->events, flowIndex, child->events, &accA, &accB);
     EditMapConsume(t->map, t->events);
 
-    if (line < t->tokenizeState.documentExits.len) {
+    if (line < len(t->tokenizeState.documentExits)) {
         ArenaVec<Event> exits = t->tokenizeState.documentExits[line];
         if (len(exits) > 0) {
             t->tokenizeState.documentExits[line] = ArenaVec<Event>{};
@@ -9136,11 +9135,11 @@ static void DocumentResolve(Tokenizer* t) {
         }
     }
 
-    for (int32_t i = 0; i < child->resolvers.len; i++) {
+    for (int32_t i = 0; i < len(child->resolvers); i++) {
         VecAppend(t->resolvers, child->resolvers[i]);
     }
     child->resolvers.len = 0;
-    for (int32_t i = 0; i < child->tokenizeState.definitions.len; i++) {
+    for (int32_t i = 0; i < len(child->tokenizeState.definitions); i++) {
         VecAppend(t->tokenizeState.definitions, child->tokenizeState
                                                     .definitions[i]);
     }
@@ -9292,20 +9291,20 @@ State ContentDefinitionAfter(Tokenizer* t) {
 
 bool ContentResolve(Tokenizer* t, Subresult* out) {
     int32_t index = 0;
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.kind == Kind::Enter && event.name == Name::Content) {
             int32_t exitIndex = index + 1;
             for (;;) {
                 int32_t enterIndex = exitIndex + 1;
-                if (enterIndex == t->events.len ||
+                if (enterIndex == len(t->events) ||
                     t->events[enterIndex].name != Name::LineEnding) {
                     break;
                 }
 
                 enterIndex += 2;
 
-                while (enterIndex < t->events.len) {
+                while (enterIndex < len(t->events)) {
                     Name name = t->events[enterIndex].name;
                     if (name != Name::SpaceOrTab &&
                         name != Name::BlockQuotePrefix &&
@@ -9314,7 +9313,7 @@ bool ContentResolve(Tokenizer* t, Subresult* out) {
                     }
                     enterIndex += 1;
                 }
-                if (enterIndex == t->events.len ||
+                if (enterIndex == len(t->events) ||
                     t->events[enterIndex].name != Name::Content) {
                     break;
                 }
@@ -9346,7 +9345,7 @@ State ParagraphLineStart(Tokenizer* t) {
     link.content = ContentKind::Text;
     EnterLink(t, Name::Data, link);
     if (t->tokenizeState.connect) {
-        SubtokenizeLink(t->events, t->events.len - 1);
+        SubtokenizeLink(t->events, len(t->events) - 1);
     } else {
         t->tokenizeState.connect = true;
     }
@@ -9630,7 +9629,7 @@ bool HeadingAtxResolve(Tokenizer* t, Subresult*) {
     bool headingInside = false;
     int32_t dataStart = -1;
     int32_t dataEnd = -1;
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.name == Name::HeadingAtx) {
             if (event.kind == Kind::Enter) {
@@ -9672,11 +9671,11 @@ bool HeadingAtxResolve(Tokenizer* t, Subresult*) {
 
 State HeadingSetextStart(Tokenizer* t) {
     if (!t->parseState->options->constructs.headingSetext || t->lazy ||
-        t->pierce || t->events.len == 0) {
+        t->pierce || len(t->events) == 0) {
         return StateNok();
     }
     Name names[2] = {Name::LineEnding, Name::SpaceOrTab};
-    int32_t before = SkipOptBack(t->events, t->events.len - 1, names, 2);
+    int32_t before = SkipOptBack(t->events, len(t->events) - 1, names, 2);
     Name name = t->events[before].name;
     if (name != Name::Content && name != Name::HeadingSetextUnderline) {
         return StateNok();
@@ -9728,7 +9727,7 @@ State HeadingSetextAfter(Tokenizer* t) {
 bool HeadingSetextResolve(Tokenizer* t, Subresult*) {
     Name underline = Name::HeadingSetextUnderline;
     int32_t enter = SkipTo(t->events, 0, &underline, 1);
-    while (enter < t->events.len) {
+    while (enter < len(t->events)) {
         int32_t exit = SkipTo(t->events, enter + 1, &underline, 1);
 
         Name names[3] = {Name::SpaceOrTab, Name::LineEnding,
@@ -9750,7 +9749,7 @@ bool HeadingSetextResolve(Tokenizer* t, Subresult*) {
             Event headingExit = t->events[exit];
             headingExit.name = Name::HeadingSetext;
             EditMapAdd(t->map, exit + 1, 0, &headingExit, 1);
-        } else if (exit + 3 < t->events.len &&
+        } else if (exit + 3 < len(t->events) &&
                    t->events[exit + 1].name == Name::LineEnding &&
                    t->events[exit + 3].name == Name::Paragraph) {
 
@@ -9898,7 +9897,7 @@ State ListItemAfter(Tokenizer* t) {
     }
 
     Name listItem = Name::ListItem;
-    int32_t start = SkipToBack(t->events, t->events.len - 1, &listItem, 1);
+    int32_t start = SkipToBack(t->events, len(t->events) - 1, &listItem, 1);
     Position position;
     position.start = t->events[start].point;
     position.end = t->point;
@@ -9965,7 +9964,7 @@ bool ListItemResolve(Tokenizer* t, Subresult*) {
     int32_t index = 0;
     int32_t balance = 0;
 
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.name == Name::ListItem) {
             if (event.kind == Kind::Enter) {
@@ -10060,11 +10059,11 @@ State DefinitionStart(Tokenizer* t) {
     }
     if (t->interrupt) {
 
-        if (t->events.len == 0) {
+        if (len(t->events) == 0) {
             return StateNok();
         }
         Name names[2] = {Name::LineEnding, Name::SpaceOrTab};
-        int32_t before = SkipOptBack(t->events, t->events.len - 1, names, 2);
+        int32_t before = SkipOptBack(t->events, len(t->events) - 1, names, 2);
         if (t->events[before].name != Name::Definition) {
             return StateNok();
         }
@@ -10094,7 +10093,7 @@ State DefinitionLabelAfter(Tokenizer* t) {
     if (t->current == ':') {
         Name labelString = Name::DefinitionLabelString;
         t->tokenizeState
-            .end = SkipToBack(t->events, t->events.len - 1, &labelString, 1);
+            .end = SkipToBack(t->events, len(t->events) - 1, &labelString, 1);
         Enter(t, Name::DefinitionMarker);
         Consume(t);
         Exit(t, Name::DefinitionMarker);
@@ -10345,8 +10344,8 @@ State GfmLabelStartFootnoteOpen(Tokenizer* t) {
         Exit(t, Name::GfmFootnoteCallLabel);
         LabelStartMark mark;
         mark.kind = LabelKind::GfmFootnote;
-        mark.startA = t->events.len - 6;
-        mark.startB = t->events.len - 1;
+        mark.startA = len(t->events) - 6;
+        mark.startB = len(t->events) - 1;
         VecAppend(t->tokenizeState.labelStarts, mark);
         RegisterResolverBefore(t, ResolveName::Label);
         return StateOk();
@@ -10498,7 +10497,8 @@ State GfmFootnoteDefinitionLabelEscape(Tokenizer* t) {
 State GfmFootnoteDefinitionLabelAfter(Tokenizer* t) {
     if (t->current == ':') {
         Name labelString = Name::GfmFootnoteDefinitionLabelString;
-        int32_t end = SkipToBack(t->events, t->events.len - 1, &labelString, 1);
+        int32_t end =
+            SkipToBack(t->events, len(t->events) - 1, &labelString, 1);
         Position position = PositionFromExitEvent(t->events, end);
         Slice slice = SliceFromPosition(t->parseState->bytes, position);
         VecAppend(t->tokenizeState.gfmFootnoteDefinitions,
@@ -10543,9 +10543,9 @@ State GfmTableStart(Tokenizer* t) {
     if (!t->parseState->options->constructs.gfmTable) {
         return StateNok();
     }
-    if (!t->pierce && t->events.len > 0) {
+    if (!t->pierce && len(t->events) > 0) {
         Name names[2] = {Name::LineEnding, Name::SpaceOrTab};
-        int32_t at = SkipOptBack(t->events, t->events.len - 1, names, 2);
+        int32_t at = SkipOptBack(t->events, len(t->events) - 1, names, 2);
         Name name = t->events[at].name;
         if (name == Name::GfmTableHead || name == Name::GfmTableRow) {
             return StateRetry(StateName::GfmTableBodyRowStart);
@@ -10918,7 +10918,7 @@ bool GfmTableResolve(Tokenizer* t, Subresult*) {
     int32_t lastTableEnd = 0;
     bool lastTableHasBody = false;
 
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.kind == Kind::Enter) {
             if (event.name == Name::GfmTableHead) {
@@ -11326,7 +11326,7 @@ void GfmAutolinkLiteralResolve(Tokenizer* t) {
 
     int32_t index = 0;
     int32_t links = 0;
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.kind == Kind::Enter) {
             if (event.name == Name::Link) {
@@ -11535,7 +11535,7 @@ State HtmlFlowCdataOpenInside(Tokenizer* t) {
                           .s[t->tokenizeState.size]) {
         Consume(t);
         t->tokenizeState.size += 1;
-        if (t->tokenizeState.size == kHtmlCdataPrefix.len) {
+        if (t->tokenizeState.size == len(kHtmlCdataPrefix)) {
             t->tokenizeState.size = 0;
             t->concrete = true;
             return StateNext(StateName::HtmlFlowContinuation);
@@ -11969,7 +11969,7 @@ State HtmlTextCdataOpenInside(Tokenizer* t) {
                           .s[t->tokenizeState.size]) {
         t->tokenizeState.size += 1;
         Consume(t);
-        if (t->tokenizeState.size == kHtmlCdataPrefix.len) {
+        if (t->tokenizeState.size == len(kHtmlCdataPrefix)) {
             t->tokenizeState.size = 0;
             return StateNext(StateName::HtmlTextCdata);
         }
@@ -12256,10 +12256,10 @@ static bool DefinitionsContain(const Vec<Str>& definitions, Str id) {
 
 State LabelEndStart(Tokenizer* t) {
     if (t->current == ']' && t->parseState->options->constructs.labelEnd &&
-        t->tokenizeState.labelStarts.len > 0) {
+        len(t->tokenizeState.labelStarts) > 0) {
         const LabelStartMark& labelStart =
-            t->tokenizeState.labelStarts[t->tokenizeState.labelStarts.len - 1];
-        t->tokenizeState.end = t->events.len;
+            t->tokenizeState.labelStarts[len(t->tokenizeState.labelStarts) - 1];
+        t->tokenizeState.end = len(t->events);
 
         if (labelStart.inactive) {
             return StateRetry(StateName::LabelEndNok);
@@ -12275,7 +12275,7 @@ State LabelEndStart(Tokenizer* t) {
 }
 
 State LabelEndAfter(Tokenizer* t) {
-    int32_t startIndex = t->tokenizeState.labelStarts.len - 1;
+    int32_t startIndex = len(t->tokenizeState.labelStarts) - 1;
     const LabelStartMark& start = t->tokenizeState.labelStarts[startIndex];
     int32_t from = t->events[start.startB].point.index;
     int32_t to = t->events[t->tokenizeState.end].point.index;
@@ -12328,7 +12328,7 @@ State LabelEndOk(Tokenizer* t) {
         t->tokenizeState.labelStarts[--t->tokenizeState.labelStarts.len];
 
     if (labelStart.kind != LabelKind::Image) {
-        for (int32_t index = 0; index < t->tokenizeState.labelStarts.len;
+        for (int32_t index = 0; index < len(t->tokenizeState.labelStarts);
              index++) {
             if (t->tokenizeState.labelStarts[index].kind != LabelKind::Image) {
                 t->tokenizeState.labelStarts[index].inactive = true;
@@ -12341,7 +12341,7 @@ State LabelEndOk(Tokenizer* t) {
     label.startA = labelStart.startA;
     label.startB = labelStart.startB;
     label.endA = t->tokenizeState.end;
-    label.endB = t->events.len - 1;
+    label.endB = len(t->events) - 1;
     VecAppend(t->tokenizeState.labels, label);
     t->tokenizeState.end = 0;
     RegisterResolverBefore(t, ResolveName::Label);
@@ -12448,7 +12448,7 @@ State LabelEndReferenceFull(Tokenizer* t) {
 State LabelEndReferenceFullAfter(Tokenizer* t) {
     ResetLabelTokens(t);
     Name referenceString = Name::ReferenceString;
-    int32_t at = SkipToBack(t->events, t->events.len - 1, &referenceString, 1);
+    int32_t at = SkipToBack(t->events, len(t->events) - 1, &referenceString, 1);
     Position position = PositionFromExitEvent(t->events, at);
     Slice slice = SliceFromPosition(t->parseState->bytes, position);
     Str id = NormalizeIdentifier(t->parseState->scratch, slice.bytes);
@@ -12574,14 +12574,14 @@ bool LabelEndResolve(Tokenizer* t, Subresult*) {
     InjectLabels(t, labels);
 
     Vec<LabelStartMark> starts;
-    for (int32_t i = 0; i < t->tokenizeState.labelStarts.len; i++) {
+    for (int32_t i = 0; i < len(t->tokenizeState.labelStarts); i++) {
         VecAppend(starts, t->tokenizeState.labelStarts[i]);
     }
     t->tokenizeState.labelStarts.len = 0;
     MarkAsData(t, starts);
 
     starts.len = 0;
-    for (int32_t i = 0; i < t->tokenizeState.labelStartsLoose.len; i++) {
+    for (int32_t i = 0; i < len(t->tokenizeState.labelStartsLoose); i++) {
         VecAppend(starts, t->tokenizeState.labelStartsLoose[i]);
     }
     t->tokenizeState.labelStartsLoose.len = 0;
@@ -12631,7 +12631,7 @@ State SpaceOrTabStart(Tokenizer* t) {
             Enter(t, t->tokenizeState.spaceOrTabToken);
         }
         if (t->tokenizeState.spaceOrTabConnect) {
-            SubtokenizeLink(t->events, t->events.len - 1);
+            SubtokenizeLink(t->events, len(t->events) - 1);
         } else {
             t->tokenizeState.spaceOrTabConnect = true;
         }
@@ -12719,7 +12719,7 @@ State SpaceOrTabEolAtEol(Tokenizer* t) {
             Enter(t, Name::LineEnding);
         }
         if (t->tokenizeState.spaceOrTabEolConnect) {
-            SubtokenizeLink(t->events, t->events.len - 1);
+            SubtokenizeLink(t->events, len(t->events) - 1);
         } else if (t->tokenizeState.spaceOrTabEolContentSome) {
             t->tokenizeState.spaceOrTabEolConnect = true;
         }
@@ -12793,12 +12793,12 @@ State DataInside(Tokenizer* t) {
 
 bool DataResolve(Tokenizer* t, Subresult*) {
     int32_t index = 0;
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.kind == Kind::Enter && event.name == Name::Data) {
             index += 1;
             int32_t exitIndex = index;
-            while (exitIndex + 1 < t->events.len &&
+            while (exitIndex + 1 < len(t->events) &&
                    t->events[exitIndex + 1].name == Name::Data) {
                 exitIndex += 2;
             }
@@ -12925,7 +12925,7 @@ static void EnterConnectedStringData(Tokenizer* t) {
     link.content = ContentKind::String;
     EnterLink(t, Name::Data, link);
     if (t->tokenizeState.connect) {
-        SubtokenizeLink(t->events, t->events.len - 1);
+        SubtokenizeLink(t->events, len(t->events) - 1);
     } else {
         t->tokenizeState.connect = true;
     }
@@ -13096,7 +13096,7 @@ static void TrimData(Tokenizer* t, int32_t exitIndex, bool trimStart,
     Slice slice = SliceFromPosition(t->parseState->bytes, position);
 
     if (trimEnd) {
-        int32_t index = slice.bytes.len;
+        int32_t index = len(slice.bytes);
         bool spacesOnly = slice.after == 0;
         while (index > 0) {
             char byte = slice.bytes.s[index - 1];
@@ -13109,10 +13109,10 @@ static void TrimData(Tokenizer* t, int32_t exitIndex, bool trimStart,
             }
             index -= 1;
         }
-        int32_t diff = slice.bytes.len - index;
+        int32_t diff = len(slice.bytes) - index;
         Name name =
             (hardBreak && spacesOnly && diff >= kHardBreakPrefixSizeMin &&
-             exitIndex + 1 < t->events.len)
+             exitIndex + 1 < len(t->events))
                 ? Name::HardBreakTrailing
                 : Name::SpaceOrTab;
         if (index == 0) {
@@ -13141,7 +13141,7 @@ static void TrimData(Tokenizer* t, int32_t exitIndex, bool trimStart,
 
     if (trimStart) {
         int32_t index = 0;
-        while (index < slice.bytes.len) {
+        while (index < len(slice.bytes)) {
             char byte = slice.bytes.s[index];
             if (byte == ' ' || byte == '\t') {
                 index += 1;
@@ -13149,7 +13149,7 @@ static void TrimData(Tokenizer* t, int32_t exitIndex, bool trimStart,
                 break;
             }
         }
-        if (index == slice.bytes.len) {
+        if (index == len(slice.bytes)) {
             t->events[exitIndex - 1].name = Name::SpaceOrTab;
             t->events[exitIndex].name = Name::SpaceOrTab;
             return;
@@ -13175,14 +13175,14 @@ static void TrimData(Tokenizer* t, int32_t exitIndex, bool trimStart,
 
 void ResolveWhitespace(Tokenizer* t, bool hardBreak, bool trimWhole) {
     int32_t index = 0;
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& event = t->events[index];
         if (event.kind == Kind::Exit && event.name == Name::Data) {
             bool trimStart =
                 (trimWhole && index == 1) ||
                 (index > 1 && t->events[index - 2].name == Name::LineEnding);
-            bool trimEnd = (trimWhole && index == t->events.len - 1) ||
-                           (index + 1 < t->events.len &&
+            bool trimEnd = (trimWhole && index == len(t->events) - 1) ||
+                           (index + 1 < len(t->events) &&
                             t->events[index + 1].name == Name::LineEnding);
             TrimData(t, index, trimStart, trimEnd, hardBreak);
         }
@@ -13283,9 +13283,10 @@ State RawFlowStart(Tokenizer* t) {
 
 State RawFlowBeforeSequenceOpen(Tokenizer* t) {
     int32_t prefix = 0;
-    if (t->events.len > 0 && t->events[t->events.len - 1]
-                                     .name == Name::SpaceOrTab) {
-        Position position = PositionFromExitEvent(t->events, t->events.len - 1);
+    if (len(t->events) > 0 && t->events[len(t->events) - 1]
+                                      .name == Name::SpaceOrTab) {
+        Position position =
+            PositionFromExitEvent(t->events, len(t->events) - 1);
         prefix = SliceFromPosition(t->parseState->bytes, position).Len();
     }
 
@@ -13528,8 +13529,9 @@ State RawTextStart(Tokenizer* t) {
         t->parseState->options->constructs.codeText && t->current == '`';
     bool math =
         t->parseState->options->constructs.mathText && t->current == '$';
-    bool afterEscape = t->events.len > 0 && t->events[t->events.len - 1].name ==
-                                                Name::CharacterEscape;
+    bool afterEscape =
+        len(t->events) > 0 && t->events[len(t->events) - 1]
+                                      .name == Name::CharacterEscape;
     if ((code || math) && (t->previous != t->current || afterEscape)) {
         uint8_t marker = (uint8_t)t->current;
         if (marker == '`') {
@@ -13920,8 +13922,8 @@ State LabelStartImageAfter(Tokenizer* t) {
     }
     LabelStartMark start;
     start.kind = LabelKind::Image;
-    start.startA = t->events.len - 6;
-    start.startB = t->events.len - 1;
+    start.startA = len(t->events) - 6;
+    start.startB = len(t->events) - 1;
     VecAppend(t->tokenizeState.labelStarts, start);
     RegisterResolverBefore(t, ResolveName::Label);
     return StateOk();
@@ -13930,7 +13932,7 @@ State LabelStartImageAfter(Tokenizer* t) {
 State LabelStartLinkStart(Tokenizer* t) {
     if (t->parseState->options->constructs.labelStartLink &&
         t->current == '[') {
-        int32_t start = t->events.len;
+        int32_t start = len(t->events);
         Enter(t, Name::LabelLink);
         Enter(t, Name::LabelMarker);
         Consume(t);
@@ -13939,7 +13941,7 @@ State LabelStartLinkStart(Tokenizer* t) {
         LabelStartMark mark;
         mark.kind = LabelKind::Link;
         mark.startA = start;
-        mark.startB = t->events.len - 1;
+        mark.startB = len(t->events) - 1;
         VecAppend(t->tokenizeState.labelStarts, mark);
         RegisterResolverBefore(t, ResolveName::Label);
         return StateOk();
@@ -14048,7 +14050,7 @@ State AutolinkEmailLabel(Tokenizer* t) {
         return StateNext(StateName::AutolinkEmailAtSignOrDot);
     }
     if (t->current == '>') {
-        int32_t index = t->events.len;
+        int32_t index = len(t->events);
         Exit(t, Name::AutolinkProtocol);
 
         t->events[index - 1].name = Name::AutolinkEmail;
@@ -14131,7 +14133,7 @@ static void GetSequences(Tokenizer* t, Vec<Sequence>& sequences) {
     Arena* a = t->parseState->scratch;
     int32_t index = 0;
     ArenaVec<int32_t> stack{};
-    while (index < t->events.len) {
+    while (index < len(t->events)) {
         const Event& enter = t->events[index];
         if (enter.name == Name::AttentionSequence) {
             if (enter.kind == Kind::Enter) {
@@ -14351,9 +14353,9 @@ Node* ToMdast(Arena* a, Str source, const ParseOptions& options,
         if (positions) VecClear(positions->spans);
         return nullptr;
     }
-    if (positions && positions->spans.len > 1) {
+    if (positions && len(positions->spans) > 1) {
 
-        qsort(positions->spans.els, (size_t)positions->spans.len,
+        qsort(positions->spans.els, (size_t)len(positions->spans),
               sizeof(NodeSpan), [](const void* l, const void* r) -> int {
                   uintptr_t a = (uintptr_t)((const NodeSpan*)l)->node;
                   uintptr_t b = (uintptr_t)((const NodeSpan*)r)->node;
@@ -14369,7 +14371,7 @@ bool NodePosition(const NodePositions* positions, const Node* n, int32_t* start,
         return false;
     }
     int32_t lo = 0;
-    int32_t hi = positions->spans.len;
+    int32_t hi = len(positions->spans);
     while (lo < hi) {
         int32_t mid = lo + (hi - lo) / 2;
         const NodeSpan& span = positions->spans[mid];
@@ -14379,7 +14381,7 @@ bool NodePosition(const NodePositions* positions, const Node* n, int32_t* start,
             hi = mid;
         }
     }
-    if (lo >= positions->spans.len || positions->spans[lo].node != n) {
+    if (lo >= len(positions->spans) || positions->spans[lo].node != n) {
         return false;
     }
     *start = positions->spans[lo].start;
@@ -14955,8 +14957,8 @@ Vec<Event> Parse(ParseState* parseState) {
 
     Tokenizer* tokenizer = TokenizerNew(start, parseState);
 
-    VecReserve(tokenizer->events, parseState->bytes.len / 2);
-    State state = Push(tokenizer, 0, 0, parseState->bytes.len, 0,
+    VecReserve(tokenizer->events, len(parseState->bytes) / 2);
+    State state = Push(tokenizer, 0, 0, len(parseState->bytes), 0,
                        StateNext(StateName::DocumentStart));
     Subresult result = Flush(tokenizer, state, true);
 
@@ -14970,11 +14972,11 @@ Vec<Event> Parse(ParseState* parseState) {
     TokenizerFree(tokenizer);
 
     for (;;) {
-        for (int32_t i = 0; i < result.gfmFootnoteDefinitions.len; i++) {
+        for (int32_t i = 0; i < len(result.gfmFootnoteDefinitions); i++) {
             VecAppend(parseState->gfmFootnoteDefinitions,
                       result.gfmFootnoteDefinitions[i]);
         }
-        for (int32_t i = 0; i < result.definitions.len; i++) {
+        for (int32_t i = 0; i < len(result.definitions); i++) {
             VecAppend(parseState->definitions, result.definitions[i]);
         }
         result.gfmFootnoteDefinitions.len = 0;
@@ -15083,7 +15085,7 @@ static Str TrimEol(Str value, bool atStart, bool atEnd) {
 }
 
 static TreeFrame& TreeTail(CompileContext* c) {
-    return c->trees[c->trees.len - 1];
+    return c->trees[len(c->trees) - 1];
 }
 
 static void Keep(CompileContext* c, Node* n, NodeStrKind k, Str s) {
@@ -15100,12 +15102,14 @@ static void Grow(CompileContext* c, Node* n, NodeStrKind k, Str more) {
 
 static Node* TailMut(CompileContext* c) {
     TreeFrame& frame = TreeTail(c);
-    return frame.stack.len > 0 ? frame.stack[frame.stack.len - 1] : frame.tree;
+    return len(frame.stack) > 0 ? frame.stack[len(frame.stack) - 1]
+                                : frame.tree;
 }
 
 static Node* TailPenultimateMut(CompileContext* c) {
     TreeFrame& frame = TreeTail(c);
-    return frame.stack.len > 1 ? frame.stack[frame.stack.len - 2] : frame.tree;
+    return len(frame.stack) > 1 ? frame.stack[len(frame.stack) - 2]
+                                : frame.tree;
 }
 
 static void Buffer(CompileContext* c) {
@@ -15121,7 +15125,7 @@ static Node* Resume(CompileContext* c) {
 
 static int32_t SpanIndexOf(CompileContext* c, const Node* n) {
     NodePositions* p = c->positions;
-    for (int32_t i = p->spans.len - 1; i >= 0; i--) {
+    for (int32_t i = len(p->spans) - 1; i >= 0; i--) {
         if (p->spans[i].node == n) {
             return i;
         }
@@ -15142,7 +15146,7 @@ static void TailPush(CompileContext* c, Node* child) {
         span.node = child;
         span.start = at;
         span.end = at;
-        frame.spanStack.Append(c->a, c->positions->spans.len);
+        frame.spanStack.Append(c->a, len(c->positions->spans));
         VecAppend(c->positions->spans, span);
     }
 }
@@ -15166,9 +15170,9 @@ static void TailPop(CompileContext* c) {
     }
     frame.stack.Pop();
     frame.eventStack.Pop();
-    if (c->positions && frame.spanStack.len > 0) {
+    if (c->positions && len(frame.spanStack) > 0) {
 
-        int32_t ix = frame.spanStack[frame.spanStack.len - 1];
+        int32_t ix = frame.spanStack[len(frame.spanStack) - 1];
         frame.spanStack.Pop();
         if (ix >= 0) {
             c->positions->spans[ix].end = (*c->events)[c->index].point.index;
@@ -15355,13 +15359,13 @@ static void Enter(CompileContext* c) {
             TailPush(c, NodeNew(c->a, NodeKind::Paragraph));
             break;
         case Name::Reference:
-            c->mediaReferenceStack[c->mediaReferenceStack.len - 1]
+            c->mediaReferenceStack[len(c->mediaReferenceStack) - 1]
                 .kind = ReferenceKind::Collapsed;
-            c->mediaReferenceStack[c->mediaReferenceStack.len - 1]
+            c->mediaReferenceStack[len(c->mediaReferenceStack) - 1]
                 .kindSome = true;
             break;
         case Name::Resource:
-            c->mediaReferenceStack[c->mediaReferenceStack.len - 1]
+            c->mediaReferenceStack[len(c->mediaReferenceStack) - 1]
                 .kindSome = false;
             break;
         case Name::Strong:
@@ -15527,7 +15531,7 @@ static void OnExitLabelText(CompileContext* c) {
     Str identifier = IdentifierFrom(c->a, ExitSlice(c).bytes);
 
     Reference& reference =
-        c->mediaReferenceStack[c->mediaReferenceStack.len - 1];
+        c->mediaReferenceStack[len(c->mediaReferenceStack) - 1];
     reference.label = label;
     reference.identifier = identifier;
 
@@ -15663,7 +15667,7 @@ static void OnExitReferenceString(CompileContext* c) {
     Str label = NodeToString(c->a, Resume(c));
     Str identifier = IdentifierFrom(c->a, ExitSlice(c).bytes);
     Reference& reference =
-        c->mediaReferenceStack[c->mediaReferenceStack.len - 1];
+        c->mediaReferenceStack[len(c->mediaReferenceStack) - 1];
     reference.kind = ReferenceKind::Full;
     reference.kindSome = true;
     reference.label = label;
@@ -15988,10 +15992,10 @@ bool IsVoidEvent(Name name) {
 }
 
 void SubresultAppend(Subresult& dst, Subresult& src) {
-    for (int32_t i = 0; i < src.gfmFootnoteDefinitions.len; i++) {
+    for (int32_t i = 0; i < len(src.gfmFootnoteDefinitions); i++) {
         VecAppend(dst.gfmFootnoteDefinitions, src.gfmFootnoteDefinitions[i]);
     }
-    for (int32_t i = 0; i < src.definitions.len; i++) {
+    for (int32_t i = 0; i < len(src.definitions); i++) {
         VecAppend(dst.definitions, src.definitions[i]);
     }
     src.gfmFootnoteDefinitions.len = 0;
@@ -16017,7 +16021,7 @@ void TokenizerFree(Tokenizer* t) {
 }
 
 void RegisterResolver(Tokenizer* t, ResolveName name) {
-    for (int32_t i = 0; i < t->resolvers.len; i++) {
+    for (int32_t i = 0; i < len(t->resolvers); i++) {
         if (t->resolvers[i] == name) {
             return;
         }
@@ -16026,7 +16030,7 @@ void RegisterResolver(Tokenizer* t, ResolveName name) {
 }
 
 void RegisterResolverBefore(Tokenizer* t, ResolveName name) {
-    for (int32_t i = 0; i < t->resolvers.len; i++) {
+    for (int32_t i = 0; i < len(t->resolvers); i++) {
         if (t->resolvers[i] == name) {
             return;
         }
@@ -16045,7 +16049,7 @@ static void MoveTo(Tokenizer* t, int32_t toIndex, int32_t toVs) {
 
 static void AccountForPotentialSkip(Tokenizer* t) {
     int32_t at = t->point.line - t->firstLine;
-    if (t->point.column == 1 && at != t->columnStart.len) {
+    if (t->point.column == 1 && at != len(t->columnStart)) {
         MoveTo(t, t->columnStart[at].index, t->columnStart[at].vs);
     }
 }
@@ -16065,7 +16069,7 @@ void DefineSkip(Tokenizer* t, Point point) {
     MovePointBack(t, &point);
     IndexVs info = {point.index, point.vs};
     int32_t at = point.line - t->firstLine;
-    if (at >= t->columnStart.len) {
+    if (at >= len(t->columnStart)) {
         VecAppend(t->columnStart, info);
     } else {
         t->columnStart[at] = info;
@@ -16091,7 +16095,7 @@ static void MoveOne(Tokenizer* t) {
     if (action.byte == '\n') {
         t->point.line += 1;
         t->point.column = 1;
-        if (t->point.line - t->firstLine + 1 > t->columnStart.len) {
+        if (t->point.line - t->firstLine + 1 > len(t->columnStart)) {
             IndexVs info = {t->point.index, t->point.vs};
             VecAppend(t->columnStart, info);
         }
@@ -16155,8 +16159,8 @@ static Progress Capture(Tokenizer* t) {
     p.previous = t->previous;
     p.current = t->current;
     p.point = t->point;
-    p.eventsLen = t->events.len;
-    p.stackLen = t->stack.len;
+    p.eventsLen = len(t->events);
+    p.stackLen = len(t->stack);
     return p;
 }
 
@@ -16195,7 +16199,7 @@ static State PushImpl(Tokenizer* t, int32_t fromIndex, int32_t fromVs,
     MoveTo(t, fromIndex, fromVs);
     for (;;) {
         if (state.kind == State::Kind::Ok || state.kind == State::Kind::Nok) {
-            if (t->attempts.len == 0) {
+            if (len(t->attempts) == 0) {
                 break;
             }
             Attempt attempt = t->attempts[--t->attempts.len];
@@ -16246,11 +16250,11 @@ Subresult Flush(Tokenizer* t, State state, bool resolve) {
 
     Subresult value;
     value.done = false;
-    for (int32_t i = 0; i < t->tokenizeState.gfmFootnoteDefinitions.len; i++) {
+    for (int32_t i = 0; i < len(t->tokenizeState.gfmFootnoteDefinitions); i++) {
         VecAppend(value.gfmFootnoteDefinitions, t->tokenizeState
                                                     .gfmFootnoteDefinitions[i]);
     }
-    for (int32_t i = 0; i < t->tokenizeState.definitions.len; i++) {
+    for (int32_t i = 0; i < len(t->tokenizeState.definitions); i++) {
         VecAppend(value.definitions, t->tokenizeState.definitions[i]);
     }
     t->tokenizeState.gfmFootnoteDefinitions.len = 0;
@@ -16620,7 +16624,7 @@ static void RehashBuckets(EditMap& map, int32_t wanted) {
     VecReserve(map.buckets, wanted);
     map.buckets.len = wanted;
     memset((void*)map.buckets.els, 0, (size_t)wanted * sizeof(int32_t));
-    for (int32_t i = 0; i < map.map.len; i++) {
+    for (int32_t i = 0; i < len(map.map); i++) {
         map.buckets[BucketFor(map.buckets, map.map, map.map[i].at)] = i + 1;
     }
 }
@@ -16640,7 +16644,7 @@ static void AddImpl(EditMap& map, int32_t at, int32_t remove, const Event* add,
         e.remove += remove;
         if (before) {
             ArenaVec<Event> merged{};
-            merged.Reserve(map.a, addLen + e.add.len);
+            merged.Reserve(map.a, addLen + len(e.add));
             merged.AppendMany(map.a, add, addLen);
             for (const Event& ev : e.add) {
                 merged.Append(map.a, ev);
@@ -16656,7 +16660,7 @@ static void AddImpl(EditMap& map, int32_t at, int32_t remove, const Event* add,
     e.remove = remove;
     e.add.AppendMany(map.a, add, addLen);
     VecAppend(map.map, e);
-    map.buckets[bucket] = map.map.len;
+    map.buckets[bucket] = len(map.map);
 }
 
 void EditMapAdd(EditMap& map, int32_t index, int32_t remove, const Event* add,
@@ -16706,17 +16710,17 @@ static void SortEntries(Vec<EditMap::Entry>& entries) {
 
 void EditMapConsume(EditMap& map, Vec<Event>& events) {
     SortEntries(map.map);
-    if (map.map.len == 0) {
+    if (len(map.map) == 0) {
         return;
     }
 
     Vec<Jump> jumps;
-    VecReserve(jumps, map.map.len);
+    VecReserve(jumps, len(map.map));
     int32_t addAcc = 0;
     int32_t removeAcc = 0;
-    for (int32_t index = 0; index < map.map.len; index++) {
+    for (int32_t index = 0; index < len(map.map); index++) {
         removeAcc += map.map[index].remove;
-        addAcc += map.map[index].add.len;
+        addAcc += len(map.map[index].add);
         Jump j = {map.map[index].at, removeAcc, addAcc};
         VecAppend(jumps, j);
     }
@@ -16726,7 +16730,7 @@ void EditMapConsume(EditMap& map, Vec<Event>& events) {
     Vec<Event> out;
     VecReserve(out, len(events) + addAcc - removeAcc);
     int32_t index = 0;
-    for (int32_t i = 0; i < map.map.len; i++) {
+    for (int32_t i = 0; i < len(map.map); i++) {
         const EditMap::Entry& e = map.map[i];
         for (int32_t j = index; j < e.at; j++) {
             VecAppend(out, events[j]);
@@ -17099,39 +17103,6 @@ const PlatFacts kPlatFacts = {
 
 namespace base {
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    struct rusage ru = {};
-    if (getrusage(RUSAGE_SELF, &ru) != 0) {
-        return false;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_utime.tv_usec +
-                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_stime.tv_usec;
-        *cpu100ns = us * 10ull;
-    }
-    if (memBytes) {
-        *memBytes = 0;
-        FILE* f = fopen("/proc/self/statm", "rb");
-        if (f) {
-            unsigned long total = 0, resident = 0;
-            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
-                long page = sysconf(_SC_PAGESIZE);
-                *memBytes =
-                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
-            }
-            fclose(f);
-        }
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
 
     .titleBarCloseIsElement = true,
@@ -17246,40 +17217,6 @@ static bool DisclaimSpeechResponsibility(int argc, char** argv, int* status) {
     return false;
 }
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    task_basic_info_data_t basic = {};
-    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
-                  &count) != KERN_SUCCESS) {
-        return false;
-    }
-    if (memBytes) {
-        *memBytes = (uint64_t)basic.resident_size;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
-                      (uint64_t)basic.user_time.microseconds +
-                      (uint64_t)basic.system_time.seconds * 1000000ull +
-                      (uint64_t)basic.system_time.microseconds;
-        count = TASK_THREAD_TIMES_INFO_COUNT;
-        task_thread_times_info_data_t threads = {};
-        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
-                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
-            us += (uint64_t)threads.user_time.seconds * 1000000ull +
-                  (uint64_t)threads.user_time.microseconds +
-                  (uint64_t)threads.system_time.seconds * 1000000ull +
-                  (uint64_t)threads.system_time.microseconds;
-        }
-        *cpu100ns = us * 10ull;
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
     .secondaryIsCommand = true,
     .wordDeleteStopsAtWhitespace = false,
@@ -17301,8 +17238,13 @@ const PlatFacts kPlatFacts = {
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/base_mem_posix.cpp"
 
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if GPUI_HAVE_MACH_TASK_INFO
+#include <mach/mach.h>
+#endif
 
 namespace base {
 
@@ -17354,6 +17296,71 @@ void PlatMemRelease(void* base, uint64_t size) {
         munmap(base, (size_t)size);
     }
 }
+
+void PlatGetExeDir(char* out, int cap) {
+    PlatExeDirFromExePath(out, cap);
+}
+
+#if GPUI_HAVE_MACH_TASK_INFO
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    task_basic_info_data_t basic = {};
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
+                  &count) != KERN_SUCCESS) {
+        return false;
+    }
+    if (memBytes) {
+        *memBytes = (uint64_t)basic.resident_size;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
+                      (uint64_t)basic.user_time.microseconds +
+                      (uint64_t)basic.system_time.seconds * 1000000ull +
+                      (uint64_t)basic.system_time.microseconds;
+        count = TASK_THREAD_TIMES_INFO_COUNT;
+        task_thread_times_info_data_t threads = {};
+        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
+                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
+            us += (uint64_t)threads.user_time.seconds * 1000000ull +
+                  (uint64_t)threads.user_time.microseconds +
+                  (uint64_t)threads.system_time.seconds * 1000000ull +
+                  (uint64_t)threads.system_time.microseconds;
+        }
+        *cpu100ns = us * 10ull;
+    }
+    return true;
+}
+#else
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    struct rusage ru = {};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return false;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_utime.tv_usec +
+                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_stime.tv_usec;
+        *cpu100ns = us * 10ull;
+    }
+    if (memBytes) {
+        *memBytes = 0;
+        FILE* f = fopen("/proc/self/statm", "rb");
+        if (f) {
+            unsigned long total = 0, resident = 0;
+            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
+                long page = sysconf(_SC_PAGESIZE);
+                *memBytes =
+                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
+            }
+            fclose(f);
+        }
+    }
+    return true;
+}
+#endif
 
 }
 
@@ -17438,6 +17445,24 @@ bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
         visit(Str(*at, (int)(eq - *at)), Str(eq + 1), user);
     }
     return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    return fopen(StrDupTemp(path).s, mode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && remove(StrDupTemp(path).s) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return rename(StrDupTemp(from).s, StrDupTemp(to).s) == 0;
 }
 
 bool PlatFileExists(const char* path) {
@@ -17536,6 +17561,8 @@ static void* ThreadMain(void* arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return nullptr;
 }
 
@@ -17747,11 +17774,45 @@ WCHAR* ToCWstrTemp(Str s) {
     return res;
 }
 
+static bool WideToUtf8Buf(const WCHAR* text, int wlen, char* out, int cap) {
+    out[0] = 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, wlen, nullptr, 0, nullptr,
+                                nullptr);
+    if (n <= 0 || n >= cap) {
+        return false;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, text, wlen, out, cap - 1, nullptr, nullptr);
+    out[n] = 0;
+    return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    WCHAR wmode[8] = {};
+    for (int i = 0; mode[i] && i < 7; i++) {
+        wmode[i] = (WCHAR)(unsigned char)mode[i];
+    }
+    return _wfopen(ToCWstrTemp(path), wmode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && _wremove(ToCWstrTemp(path)) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return _wrename(ToCWstrTemp(from), ToCWstrTemp(to)) == 0;
+}
+
 bool PlatDirExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -17760,7 +17821,7 @@ bool PlatFileExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
@@ -17770,7 +17831,11 @@ void PlatGetCwd(char* out, int cap) {
         return;
     }
     out[0] = 0;
-    GetCurrentDirectoryA((DWORD)cap, out);
+    WCHAR wide[kMaxPath] = {};
+    DWORD n = GetCurrentDirectoryW(kMaxPath, wide);
+    if (n > 0 && n < kMaxPath) {
+        WideToUtf8Buf(wide, (int)n, out, cap);
+    }
 }
 
 bool PlatCanonicalPath(const char* path, char* out, int cap) {
@@ -17827,13 +17892,14 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
 }
 
 static bool ExePath(char* out, int cap) {
-    DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
-    if (n == 0 || n >= (DWORD)cap) {
+    WCHAR wide[kMaxPath] = {};
+    DWORD wn = GetModuleFileNameW(nullptr, wide, kMaxPath);
+    if (wn == 0 || wn >= kMaxPath || !WideToUtf8Buf(wide, (int)wn, out, cap)) {
         out[0] = 0;
         return false;
     }
 
-    for (DWORD i = 0; i < n; i++) {
+    for (int i = 0; out[i]; i++) {
         if (out[i] == '\\') out[i] = '/';
     }
     return true;
@@ -17962,6 +18028,8 @@ static DWORD WINAPI ThreadMain(LPVOID arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return 0;
 }
 

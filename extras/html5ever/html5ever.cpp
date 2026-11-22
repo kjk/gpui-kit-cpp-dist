@@ -613,8 +613,7 @@ TempStr ReadBoundedFileTemp(Str path, int limit) {
     if (!path || limit <= 0) {
         return {};
     }
-    TempStr pathZ = StrDupTemp(path);
-    FILE* file = fopen(pathZ.s, "rb");
+    FILE* file = PlatFileOpen(path, "rb");
     if (!file) {
         return {};
     }
@@ -959,7 +958,7 @@ void StrVecFree(Vec<Str>* v) {
     if (!v) {
         return;
     }
-    for (int i = 0; i < len(*v); i++) {
+    for (int i = 0; i < len(v); i++) {
         StrFree((*v)[i]);
     }
     VecReset(*v);
@@ -8854,6 +8853,34 @@ static uint32_t NumericEntity(Str value, int radix) {
     return cp;
 }
 
+static const char* const kLegacyCharRefs[] = {
+    "AElig",  "AMP",    "Aacute", "Acirc",  "Agrave", "Aring",  "Atilde",
+    "Auml",   "COPY",   "Ccedil", "ETH",    "Eacute", "Ecirc",  "Egrave",
+    "Euml",   "GT",     "Iacute", "Icirc",  "Igrave", "Iuml",   "LT",
+    "Ntilde", "Oacute", "Ocirc",  "Ograve", "Oslash", "Otilde", "Ouml",
+    "QUOT",   "REG",    "THORN",  "Uacute", "Ucirc",  "Ugrave", "Uuml",
+    "Yacute", "aacute", "acirc",  "acute",  "aelig",  "agrave", "amp",
+    "aring",  "atilde", "auml",   "brvbar", "ccedil", "cedil",  "cent",
+    "copy",   "curren", "deg",    "divide", "eacute", "ecirc",  "egrave",
+    "eth",    "euml",   "frac12", "frac14", "frac34", "gt",     "iacute",
+    "icirc",  "iexcl",  "igrave", "iquest", "iuml",   "laquo",  "lt",
+    "macr",   "micro",  "middot", "nbsp",   "not",    "ntilde", "oacute",
+    "ocirc",  "ograve", "ordf",   "ordm",   "oslash", "otilde", "ouml",
+    "para",   "plusmn", "pound",  "quot",   "raquo",  "reg",    "sect",
+    "shy",    "sup1",   "sup2",   "sup3",   "szlig",  "thorn",  "times",
+    "uacute", "ucirc",  "ugrave", "uml",    "uuml",   "yacute", "yen",
+    "yuml",
+};
+
+static bool IsLegacyCharRef(Str name) {
+    for (const char* legacy : kLegacyCharRefs) {
+        if (StrEq(name, Str(legacy))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static ArenaStr Decode(Arena* a, Str value, bool attribute) {
     bool needsDecode = false;
     for (int i = 0; i < len(value); i++) {
@@ -8900,10 +8927,16 @@ static ArenaStr Decode(Arena* a, Str value, bool attribute) {
                (IsAlpha(value.s[end]) || html5ever_html5ever_IsDigit(value.s[end]))) {
             end++;
         }
+
         int matched = -1;
         Str decoded = {};
         for (int n = end - i; n > 0; n--) {
-            decoded = HtmlNamedCharRef(Str(value.s + i, n));
+            Str name(value.s + i, n);
+            bool hasSemi = i + n < len(value) && value.s[i + n] == ';';
+            if (!hasSemi && !IsLegacyCharRef(name)) {
+                continue;
+            }
+            decoded = HtmlNamedCharRef(name);
             if (decoded.s) {
                 matched = n;
                 break;
@@ -9147,6 +9180,8 @@ static void TokenizeRun(Scanner* s) {
             while (s->at < len(s->source) && s->source.s[s->at] != '>') {
                 s->at++;
             }
+
+            if (s->at >= len(s->source) && NeedMore(s, tokenStart)) return;
             Str body = StrTrimAscii(Str(s->source.s + start, s->at - start));
             if (s->at < len(s->source)) s->at++;
             Token token;
@@ -9276,11 +9311,11 @@ struct Builder {
 };
 
 static Node* Current(Builder* b) {
-    return b->open.len ? b->open[b->open.len - 1] : b->doc;
+    return len(b->open) ? b->open[len(b->open) - 1] : b->doc;
 }
 
 static int OpenIndex(Builder* b, Str name) {
-    for (int i = b->open.len - 1; i >= 0; i--) {
+    for (int i = len(b->open) - 1; i >= 0; i--) {
         if (StrEq(NodeName(b->a, b->open[i]), name)) return i;
     }
     return -1;
@@ -9332,7 +9367,7 @@ static bool AllSpace(Str value) {
 }
 
 static Node* TableInScope(Builder* b) {
-    for (int i = b->open.len - 1; i >= 0; i--) {
+    for (int i = len(b->open) - 1; i >= 0; i--) {
         if (StrEq(NodeName(b->a, b->open[i]), StrL("table"))) {
             return b->open[i];
         }
@@ -9460,7 +9495,7 @@ static void CloseImplied(Builder* b, Str name) {
     }
     if (len(name) == 2 && name.s[0] == 'h' && name.s[1] >= '1' &&
         name.s[1] <= '6') {
-        for (int i = b->open.len - 1; i >= 0; i--) {
+        for (int i = len(b->open) - 1; i >= 0; i--) {
             Str n = NodeName(b->a, b->open[i]);
             if (len(n) == 2 && n.s[0] == 'h' && n.s[1] >= '1' &&
                 n.s[1] <= '6') {
@@ -9512,7 +9547,7 @@ static void StartTag(Builder* b, const Token* token) {
         Node* html = EnsureWrapper(b, &b->html, StrL("html"), b->doc);
         html->implicit = false;
         MergeAttrs(b->a, html, TokenAttrs(b->a, token));
-        if (b->open.len == 0) b->open.Append(b->a, html);
+        if (len(b->open) == 0) b->open.Append(b->a, html);
         return;
     }
     if (!b->fragment && StrEq(name, StrL("head"))) {
@@ -9526,7 +9561,7 @@ static void StartTag(Builder* b, const Token* token) {
     if (!b->fragment && StrEq(name, StrL("body"))) {
         Body(b)->implicit = false;
         MergeAttrs(b->a, b->body, TokenAttrs(b->a, token));
-        while (b->open.len && b->open[b->open.len - 1] != b->html)
+        while (len(b->open) && b->open[len(b->open) - 1] != b->html)
             b->open.Pop();
         if (!HasOpen(b, StrL("html"))) b->open.Append(b->a, b->html);
         b->open.Append(b->a, b->body);
@@ -9543,7 +9578,7 @@ static void StartTag(Builder* b, const Token* token) {
         return;
     }
     Body(b);
-    if (!b->fragment && b->open.len == 0) {
+    if (!b->fragment && len(b->open) == 0) {
         b->open.Append(b->a, b->html);
         b->open.Append(b->a, b->body);
     } else if (!b->fragment && Current(b) == b->html) {
@@ -9588,7 +9623,7 @@ static void EndFormatting(Builder* b, Str name) {
     int at = OpenIndex(b, name);
     if (at < 0) return;
     ArenaVec<Node*> reopen;
-    for (int i = at + 1; i < b->open.len; i++) {
+    for (int i = at + 1; i < len(b->open); i++) {
         if (IsFormatting(NodeName(b->a, b->open[i]))) {
             reopen.Append(b->a, b->open[i]);
         }
@@ -9612,7 +9647,7 @@ static void EndTag(Builder* b, const Token* token) {
         return;
     }
     if (StrEq(name, StrL("body")) || StrEq(name, StrL("html"))) {
-        while (b->open.len && b->open[b->open.len - 1] != b->html)
+        while (len(b->open) && b->open[len(b->open) - 1] != b->html)
             b->open.Pop();
         return;
     }
@@ -9931,39 +9966,6 @@ const PlatFacts kPlatFacts = {
 
 namespace base {
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    struct rusage ru = {};
-    if (getrusage(RUSAGE_SELF, &ru) != 0) {
-        return false;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_utime.tv_usec +
-                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_stime.tv_usec;
-        *cpu100ns = us * 10ull;
-    }
-    if (memBytes) {
-        *memBytes = 0;
-        FILE* f = fopen("/proc/self/statm", "rb");
-        if (f) {
-            unsigned long total = 0, resident = 0;
-            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
-                long page = sysconf(_SC_PAGESIZE);
-                *memBytes =
-                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
-            }
-            fclose(f);
-        }
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
 
     .titleBarCloseIsElement = true,
@@ -10078,40 +10080,6 @@ static bool DisclaimSpeechResponsibility(int argc, char** argv, int* status) {
     return false;
 }
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    task_basic_info_data_t basic = {};
-    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
-                  &count) != KERN_SUCCESS) {
-        return false;
-    }
-    if (memBytes) {
-        *memBytes = (uint64_t)basic.resident_size;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
-                      (uint64_t)basic.user_time.microseconds +
-                      (uint64_t)basic.system_time.seconds * 1000000ull +
-                      (uint64_t)basic.system_time.microseconds;
-        count = TASK_THREAD_TIMES_INFO_COUNT;
-        task_thread_times_info_data_t threads = {};
-        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
-                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
-            us += (uint64_t)threads.user_time.seconds * 1000000ull +
-                  (uint64_t)threads.user_time.microseconds +
-                  (uint64_t)threads.system_time.seconds * 1000000ull +
-                  (uint64_t)threads.system_time.microseconds;
-        }
-        *cpu100ns = us * 10ull;
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
     .secondaryIsCommand = true,
     .wordDeleteStopsAtWhitespace = false,
@@ -10133,8 +10101,13 @@ const PlatFacts kPlatFacts = {
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/base_mem_posix.cpp"
 
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if GPUI_HAVE_MACH_TASK_INFO
+#include <mach/mach.h>
+#endif
 
 namespace base {
 
@@ -10186,6 +10159,71 @@ void PlatMemRelease(void* base, uint64_t size) {
         munmap(base, (size_t)size);
     }
 }
+
+void PlatGetExeDir(char* out, int cap) {
+    PlatExeDirFromExePath(out, cap);
+}
+
+#if GPUI_HAVE_MACH_TASK_INFO
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    task_basic_info_data_t basic = {};
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
+                  &count) != KERN_SUCCESS) {
+        return false;
+    }
+    if (memBytes) {
+        *memBytes = (uint64_t)basic.resident_size;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
+                      (uint64_t)basic.user_time.microseconds +
+                      (uint64_t)basic.system_time.seconds * 1000000ull +
+                      (uint64_t)basic.system_time.microseconds;
+        count = TASK_THREAD_TIMES_INFO_COUNT;
+        task_thread_times_info_data_t threads = {};
+        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
+                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
+            us += (uint64_t)threads.user_time.seconds * 1000000ull +
+                  (uint64_t)threads.user_time.microseconds +
+                  (uint64_t)threads.system_time.seconds * 1000000ull +
+                  (uint64_t)threads.system_time.microseconds;
+        }
+        *cpu100ns = us * 10ull;
+    }
+    return true;
+}
+#else
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    struct rusage ru = {};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return false;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_utime.tv_usec +
+                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_stime.tv_usec;
+        *cpu100ns = us * 10ull;
+    }
+    if (memBytes) {
+        *memBytes = 0;
+        FILE* f = fopen("/proc/self/statm", "rb");
+        if (f) {
+            unsigned long total = 0, resident = 0;
+            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
+                long page = sysconf(_SC_PAGESIZE);
+                *memBytes =
+                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
+            }
+            fclose(f);
+        }
+    }
+    return true;
+}
+#endif
 
 }
 
@@ -10270,6 +10308,24 @@ bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
         visit(Str(*at, (int)(eq - *at)), Str(eq + 1), user);
     }
     return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    return fopen(StrDupTemp(path).s, mode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && remove(StrDupTemp(path).s) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return rename(StrDupTemp(from).s, StrDupTemp(to).s) == 0;
 }
 
 bool PlatFileExists(const char* path) {
@@ -10368,6 +10424,8 @@ static void* ThreadMain(void* arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return nullptr;
 }
 
@@ -10579,11 +10637,45 @@ WCHAR* ToCWstrTemp(Str s) {
     return res;
 }
 
+static bool WideToUtf8Buf(const WCHAR* text, int wlen, char* out, int cap) {
+    out[0] = 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, wlen, nullptr, 0, nullptr,
+                                nullptr);
+    if (n <= 0 || n >= cap) {
+        return false;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, text, wlen, out, cap - 1, nullptr, nullptr);
+    out[n] = 0;
+    return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    WCHAR wmode[8] = {};
+    for (int i = 0; mode[i] && i < 7; i++) {
+        wmode[i] = (WCHAR)(unsigned char)mode[i];
+    }
+    return _wfopen(ToCWstrTemp(path), wmode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && _wremove(ToCWstrTemp(path)) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return _wrename(ToCWstrTemp(from), ToCWstrTemp(to)) == 0;
+}
+
 bool PlatDirExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -10592,7 +10684,7 @@ bool PlatFileExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
@@ -10602,7 +10694,11 @@ void PlatGetCwd(char* out, int cap) {
         return;
     }
     out[0] = 0;
-    GetCurrentDirectoryA((DWORD)cap, out);
+    WCHAR wide[kMaxPath] = {};
+    DWORD n = GetCurrentDirectoryW(kMaxPath, wide);
+    if (n > 0 && n < kMaxPath) {
+        WideToUtf8Buf(wide, (int)n, out, cap);
+    }
 }
 
 bool PlatCanonicalPath(const char* path, char* out, int cap) {
@@ -10659,13 +10755,14 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
 }
 
 static bool ExePath(char* out, int cap) {
-    DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
-    if (n == 0 || n >= (DWORD)cap) {
+    WCHAR wide[kMaxPath] = {};
+    DWORD wn = GetModuleFileNameW(nullptr, wide, kMaxPath);
+    if (wn == 0 || wn >= kMaxPath || !WideToUtf8Buf(wide, (int)wn, out, cap)) {
         out[0] = 0;
         return false;
     }
 
-    for (DWORD i = 0; i < n; i++) {
+    for (int i = 0; out[i]; i++) {
         if (out[i] == '\\') out[i] = '/';
     }
     return true;
@@ -10794,6 +10891,8 @@ static DWORD WINAPI ThreadMain(LPVOID arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return 0;
 }
 

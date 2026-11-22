@@ -613,8 +613,7 @@ TempStr ReadBoundedFileTemp(Str path, int limit) {
     if (!path || limit <= 0) {
         return {};
     }
-    TempStr pathZ = StrDupTemp(path);
-    FILE* file = fopen(pathZ.s, "rb");
+    FILE* file = PlatFileOpen(path, "rb");
     if (!file) {
         return {};
     }
@@ -959,7 +958,7 @@ void StrVecFree(Vec<Str>* v) {
     if (!v) {
         return;
     }
-    for (int i = 0; i < len(*v); i++) {
+    for (int i = 0; i < len(v); i++) {
         StrFree((*v)[i]);
     }
     VecReset(*v);
@@ -8848,39 +8847,6 @@ const PlatFacts kPlatFacts = {
 
 namespace base {
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    struct rusage ru = {};
-    if (getrusage(RUSAGE_SELF, &ru) != 0) {
-        return false;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_utime.tv_usec +
-                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
-                      (uint64_t)ru.ru_stime.tv_usec;
-        *cpu100ns = us * 10ull;
-    }
-    if (memBytes) {
-        *memBytes = 0;
-        FILE* f = fopen("/proc/self/statm", "rb");
-        if (f) {
-            unsigned long total = 0, resident = 0;
-            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
-                long page = sysconf(_SC_PAGESIZE);
-                *memBytes =
-                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
-            }
-            fclose(f);
-        }
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
 
     .titleBarCloseIsElement = true,
@@ -8995,40 +8961,6 @@ static bool DisclaimSpeechResponsibility(int argc, char** argv, int* status) {
     return false;
 }
 
-void PlatGetExeDir(char* out, int cap) {
-    PlatExeDirFromExePath(out, cap);
-}
-
-bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
-
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    task_basic_info_data_t basic = {};
-    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
-                  &count) != KERN_SUCCESS) {
-        return false;
-    }
-    if (memBytes) {
-        *memBytes = (uint64_t)basic.resident_size;
-    }
-    if (cpu100ns) {
-        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
-                      (uint64_t)basic.user_time.microseconds +
-                      (uint64_t)basic.system_time.seconds * 1000000ull +
-                      (uint64_t)basic.system_time.microseconds;
-        count = TASK_THREAD_TIMES_INFO_COUNT;
-        task_thread_times_info_data_t threads = {};
-        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
-                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
-            us += (uint64_t)threads.user_time.seconds * 1000000ull +
-                  (uint64_t)threads.user_time.microseconds +
-                  (uint64_t)threads.system_time.seconds * 1000000ull +
-                  (uint64_t)threads.system_time.microseconds;
-        }
-        *cpu100ns = us * 10ull;
-    }
-    return true;
-}
-
 const PlatFacts kPlatFacts = {
     .secondaryIsCommand = true,
     .wordDeleteStopsAtWhitespace = false,
@@ -9050,8 +8982,13 @@ const PlatFacts kPlatFacts = {
 #if GPUI_OS_LINUX || GPUI_OS_MAC || GPUI_OS_IOS || GPUI_OS_ANDROID
 #line 1 "src/base_mem_posix.cpp"
 
+#include <stdio.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if GPUI_HAVE_MACH_TASK_INFO
+#include <mach/mach.h>
+#endif
 
 namespace base {
 
@@ -9103,6 +9040,71 @@ void PlatMemRelease(void* base, uint64_t size) {
         munmap(base, (size_t)size);
     }
 }
+
+void PlatGetExeDir(char* out, int cap) {
+    PlatExeDirFromExePath(out, cap);
+}
+
+#if GPUI_HAVE_MACH_TASK_INFO
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    task_basic_info_data_t basic = {};
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&basic,
+                  &count) != KERN_SUCCESS) {
+        return false;
+    }
+    if (memBytes) {
+        *memBytes = (uint64_t)basic.resident_size;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)basic.user_time.seconds * 1000000ull +
+                      (uint64_t)basic.user_time.microseconds +
+                      (uint64_t)basic.system_time.seconds * 1000000ull +
+                      (uint64_t)basic.system_time.microseconds;
+        count = TASK_THREAD_TIMES_INFO_COUNT;
+        task_thread_times_info_data_t threads = {};
+        if (task_info(mach_task_self(), TASK_THREAD_TIMES_INFO,
+                      (task_info_t)&threads, &count) == KERN_SUCCESS) {
+            us += (uint64_t)threads.user_time.seconds * 1000000ull +
+                  (uint64_t)threads.user_time.microseconds +
+                  (uint64_t)threads.system_time.seconds * 1000000ull +
+                  (uint64_t)threads.system_time.microseconds;
+        }
+        *cpu100ns = us * 10ull;
+    }
+    return true;
+}
+#else
+bool PlatSelfUsage(uint64_t* cpu100ns, uint64_t* memBytes) {
+
+    struct rusage ru = {};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return false;
+    }
+    if (cpu100ns) {
+        uint64_t us = (uint64_t)ru.ru_utime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_utime.tv_usec +
+                      (uint64_t)ru.ru_stime.tv_sec * 1000000ull +
+                      (uint64_t)ru.ru_stime.tv_usec;
+        *cpu100ns = us * 10ull;
+    }
+    if (memBytes) {
+        *memBytes = 0;
+        FILE* f = fopen("/proc/self/statm", "rb");
+        if (f) {
+            unsigned long total = 0, resident = 0;
+            if (fscanf(f, "%lu %lu", &total, &resident) == 2) {
+                long page = sysconf(_SC_PAGESIZE);
+                *memBytes =
+                    (uint64_t)resident * (uint64_t)(page > 0 ? page : 4096);
+            }
+            fclose(f);
+        }
+    }
+    return true;
+}
+#endif
 
 }
 
@@ -9187,6 +9189,24 @@ bool PlatVisitEnv(void (*visit)(Str name, Str value, void* user), void* user) {
         visit(Str(*at, (int)(eq - *at)), Str(eq + 1), user);
     }
     return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    return fopen(StrDupTemp(path).s, mode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && remove(StrDupTemp(path).s) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return rename(StrDupTemp(from).s, StrDupTemp(to).s) == 0;
 }
 
 bool PlatFileExists(const char* path) {
@@ -9285,6 +9305,8 @@ static void* ThreadMain(void* arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return nullptr;
 }
 
@@ -9496,11 +9518,45 @@ WCHAR* ToCWstrTemp(Str s) {
     return res;
 }
 
+static bool WideToUtf8Buf(const WCHAR* text, int wlen, char* out, int cap) {
+    out[0] = 0;
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, wlen, nullptr, 0, nullptr,
+                                nullptr);
+    if (n <= 0 || n >= cap) {
+        return false;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, text, wlen, out, cap - 1, nullptr, nullptr);
+    out[n] = 0;
+    return true;
+}
+
+FILE* PlatFileOpen(Str path, const char* mode) {
+    if (!path.s || len(path) <= 0 || !mode) {
+        return nullptr;
+    }
+    WCHAR wmode[8] = {};
+    for (int i = 0; mode[i] && i < 7; i++) {
+        wmode[i] = (WCHAR)(unsigned char)mode[i];
+    }
+    return _wfopen(ToCWstrTemp(path), wmode);
+}
+
+bool PlatFileRemove(Str path) {
+    return path.s && len(path) > 0 && _wremove(ToCWstrTemp(path)) == 0;
+}
+
+bool PlatFileRename(Str from, Str to) {
+    if (!from.s || !to.s || len(from) <= 0 || len(to) <= 0) {
+        return false;
+    }
+    return _wrename(ToCWstrTemp(from), ToCWstrTemp(to)) == 0;
+}
+
 bool PlatDirExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
@@ -9509,7 +9565,7 @@ bool PlatFileExists(const char* path) {
     if (!path || !path[0]) {
         return false;
     }
-    DWORD attr = GetFileAttributesA(path);
+    DWORD attr = GetFileAttributesW(ToCWstrTemp(Str(path)));
     return attr != INVALID_FILE_ATTRIBUTES &&
            (attr & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
@@ -9519,7 +9575,11 @@ void PlatGetCwd(char* out, int cap) {
         return;
     }
     out[0] = 0;
-    GetCurrentDirectoryA((DWORD)cap, out);
+    WCHAR wide[kMaxPath] = {};
+    DWORD n = GetCurrentDirectoryW(kMaxPath, wide);
+    if (n > 0 && n < kMaxPath) {
+        WideToUtf8Buf(wide, (int)n, out, cap);
+    }
 }
 
 bool PlatCanonicalPath(const char* path, char* out, int cap) {
@@ -9576,13 +9636,14 @@ bool PlatCanonicalPath(const char* path, char* out, int cap) {
 }
 
 static bool ExePath(char* out, int cap) {
-    DWORD n = GetModuleFileNameA(nullptr, out, (DWORD)cap);
-    if (n == 0 || n >= (DWORD)cap) {
+    WCHAR wide[kMaxPath] = {};
+    DWORD wn = GetModuleFileNameW(nullptr, wide, kMaxPath);
+    if (wn == 0 || wn >= kMaxPath || !WideToUtf8Buf(wide, (int)wn, out, cap)) {
         out[0] = 0;
         return false;
     }
 
-    for (DWORD i = 0; i < n; i++) {
+    for (int i = 0; out[i]; i++) {
         if (out[i] == '\\') out[i] = '/';
     }
     return true;
@@ -9711,6 +9772,8 @@ static DWORD WINAPI ThreadMain(LPVOID arg) {
     auto* call = (Func0*)arg;
     call->Call();
     free(call);
+
+    DestroyTempArena();
     return 0;
 }
 
