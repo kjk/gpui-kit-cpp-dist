@@ -8753,6 +8753,18 @@ bool WebViewLoadHtml(WebView*, Str) {
 bool WebViewReload(WebView*) {
     return false;
 }
+bool WebViewGoBack(WebView*) {
+    return false;
+}
+bool WebViewGoForward(WebView*) {
+    return false;
+}
+bool WebViewCanGoBack(WebView*, bool*) {
+    return false;
+}
+bool WebViewCanGoForward(WebView*, bool*) {
+    return false;
+}
 bool WebViewBounds(WebView*, Rect*) {
     return false;
 }
@@ -8834,6 +8846,29 @@ bool WebViewAvailable() {
 #line 1 "src/wry/wry.cpp"
 
 namespace wry {
+
+PermissionResponse WebViewMediaPermission(const WebViewHandlers* handlers,
+                                          bool audio, bool video) {
+    if (!handlers || !handlers->permissionHandler) {
+        return PermissionResponse::Default;
+    }
+    auto ask = [&](PermissionKind kind) {
+        return handlers->permissionHandler(handlers->ctx, kind);
+    };
+    if (!audio && !video) return ask(PermissionKind::DisplayCapture);
+    auto microphone =
+        audio ? ask(PermissionKind::Microphone) : PermissionResponse::Allow;
+    auto camera =
+        video ? ask(PermissionKind::Camera) : PermissionResponse::Allow;
+    if (microphone == PermissionResponse::Deny ||
+        camera == PermissionResponse::Deny) {
+        return PermissionResponse::Deny;
+    }
+    return microphone == PermissionResponse::Allow &&
+                   camera == PermissionResponse::Allow
+               ? PermissionResponse::Allow
+               : PermissionResponse::Default;
+}
 
 bool MacCookieMatchesUrl(const Cookie* cookie, Str scheme, Str domain) {
     if (!cookie || !domain.s || !base::StrEq(cookie->domain, domain))
@@ -10404,6 +10439,43 @@ static void OnTitle(GObject*, GParamSpec*, gpointer data) {
     }
 }
 
+static gboolean OnWryPermissionRequest(WebKitWebView*,
+                                       WebKitPermissionRequest* request,
+                                       gpointer data) {
+    WebView* wv = (WebView*)data;
+    PermissionResponse decision;
+    if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)) {
+        auto* media = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(request);
+        if (webkit_user_media_permission_is_for_display_device(media)) {
+            decision =
+                wv->permissionHandler(wv->ctx, PermissionKind::DisplayCapture);
+        } else {
+            bool audio =
+                webkit_user_media_permission_is_for_audio_device(media);
+            bool video =
+                webkit_user_media_permission_is_for_video_device(media);
+            decision = WebViewMediaPermission(wv, audio, video);
+        }
+    } else {
+        PermissionKind kind = PermissionKind::Other;
+        if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST(request)) {
+            kind = PermissionKind::Geolocation;
+        } else if (WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST(request)) {
+            kind = PermissionKind::Notifications;
+        } else if (WEBKIT_IS_POINTER_LOCK_PERMISSION_REQUEST(request)) {
+            kind = PermissionKind::PointerLock;
+        }
+        decision = wv->permissionHandler(wv->ctx, kind);
+    }
+    if (decision == PermissionResponse::Default) return FALSE;
+    if (decision == PermissionResponse::Allow) {
+        webkit_permission_request_allow(request);
+    } else {
+        webkit_permission_request_deny(request);
+    }
+    return TRUE;
+}
+
 static void OnLoadChanged(WebKitWebView* webview, WebKitLoadEvent event,
                           gpointer data) {
     WebView* wv = (WebView*)data;
@@ -11043,6 +11115,10 @@ static WebView* NewGtk(GtkWidget* container, const WebViewAttributes* attrs,
         g_signal_connect(view, "notify::title", Cb(OnTitle), wv);
     }
     g_signal_connect(view, "load-changed", Cb(OnLoadChanged), wv);
+    if (wv->permissionHandler) {
+        g_signal_connect(view, "permission-request", Cb(OnWryPermissionRequest),
+                         wv);
+    }
     if (wv->newWindowReqHandler) {
         g_signal_connect(view, "create", Cb(OnCreate), wv);
     }
@@ -11419,6 +11495,30 @@ bool WebViewReload(WebView* wv) {
         return false;
     }
     webkit_web_view_reload(wv->webview);
+    return true;
+}
+
+bool WebViewGoBack(WebView* wv) {
+    if (!wv) return false;
+    webkit_web_view_go_back(wv->webview);
+    return true;
+}
+
+bool WebViewGoForward(WebView* wv) {
+    if (!wv) return false;
+    webkit_web_view_go_forward(wv->webview);
+    return true;
+}
+
+bool WebViewCanGoBack(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = webkit_web_view_can_go_back(wv->webview) != 0;
+    return true;
+}
+
+bool WebViewCanGoForward(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = webkit_web_view_can_go_forward(wv->webview) != 0;
     return true;
 }
 
@@ -12348,8 +12448,22 @@ API_AVAILABLE(macos(11.3))
     (void)webView;
     (void)origin;
     (void)frame;
-    (void)type;
-    handler(WKPermissionDecisionGrant);
+    wry::WebView* wv = self.wv;
+    if (!wv || !wv->permissionHandler) {
+        handler(WKPermissionDecisionGrant);
+        return;
+    }
+    bool audio = type == WKMediaCaptureTypeMicrophone ||
+                 type == WKMediaCaptureTypeCameraAndMicrophone;
+    bool video = type == WKMediaCaptureTypeCamera ||
+                 type == WKMediaCaptureTypeCameraAndMicrophone;
+    auto result = audio || video ? wry::WebViewMediaPermission(wv, audio, video)
+                                 : wv->permissionHandler(
+                                       wv->ctx, wry::PermissionKind::Other);
+    handler(result == wry::PermissionResponse::Allow ? WKPermissionDecisionGrant
+            : result == wry::PermissionResponse::Deny
+                ? WKPermissionDecisionDeny
+                : WKPermissionDecisionPrompt);
 }
 
 - (WKWebView*)webView:(WKWebView*)webView
@@ -13068,6 +13182,30 @@ bool WebViewReload(WebView* wv) {
     return true;
 }
 
+bool WebViewGoBack(WebView* wv) {
+    if (!wv) return false;
+    [wv->webview goBack];
+    return true;
+}
+
+bool WebViewGoForward(WebView* wv) {
+    if (!wv) return false;
+    [wv->webview goForward];
+    return true;
+}
+
+bool WebViewCanGoBack(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = wv->webview.canGoBack;
+    return true;
+}
+
+bool WebViewCanGoForward(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = wv->webview.canGoForward;
+    return true;
+}
+
 bool WebViewBounds(WebView* wv, Rect* out) {
     if (!wv || !out) {
         return false;
@@ -13164,6 +13302,8 @@ bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
     if (!wv || !wv->webview) {
         return false;
     }
+
+    [wv->webview setValue:@NO forKey:@"drawsBackground"];
     ApplyWebViewBackground(wv->webview, color);
     return true;
 }
@@ -14866,8 +15006,8 @@ enum : uint8_t {
     kDownloadStateInProgress = 0,
     kDownloadStateCompleted = 2,
     kMoveFocusReasonProgrammatic = 0,
-    kPermissionKindClipboardRead = 6,
     kPermissionStateAllow = 1,
+    kPermissionStateDeny = 2,
     kPreferredColorSchemeAuto = 0,
     kPreferredColorSchemeLight = 1,
     kPreferredColorSchemeDark = 2,
@@ -16080,7 +16220,7 @@ struct EnvironmentOptions
           ICoreWebView2EnvironmentOptions7, ICoreWebView2EnvironmentOptions8> {
     WCHAR* additionalBrowserArguments = nullptr;
     WCHAR* language = nullptr;
-    WCHAR* targetCompatibleBrowserVersion = WStrDup(L"137.0.3296.44");
+    WCHAR* targetCompatibleBrowserVersion = WStrDup(L"145.0.3800.47");
     BOOL allowSingleSignOn = FALSE;
     BOOL exclusiveUserDataFolderAccess = FALSE;
     BOOL customCrashReportingEnabled = FALSE;
@@ -16452,6 +16592,15 @@ static bool SetWebViewSettings(ICoreWebView2* webview,
                                                (void**)&s3))) {
             hr = s3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
             Rel(&s3);
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        ICoreWebView2Settings4* s4 = nullptr;
+        if (SUCCEEDED(settings->QueryInterface(__uuidof(ICoreWebView2Settings4),
+                                               (void**)&s4))) {
+            hr = s4->put_IsGeneralAutofillEnabled(
+                attrs->generalAutofillEnabled ? TRUE : FALSE);
+            Rel(&s4);
         }
     }
     if (SUCCEEDED(hr)) {
@@ -17550,8 +17699,10 @@ static HRESULT OnNewWindowRequested(
 }
 
 static HRESULT OnPermissionRequested(
-    void*, ICoreWebView2*, ICoreWebView2PermissionRequestedEventArgs* args) {
-    if (!args) {
+    void* ctx, ICoreWebView2*,
+    ICoreWebView2PermissionRequestedEventArgs* args) {
+    WebView* wv = LiveWebView(ctx);
+    if (!wv || !args) {
         return S_OK;
     }
     COREWEBVIEW2_PERMISSION_KIND kind = 0;
@@ -17559,10 +17710,36 @@ static HRESULT OnPermissionRequested(
     if (FAILED(hr)) {
         return hr;
     }
-    if (kind == kPermissionKindClipboardRead) {
-        return args->put_State(kPermissionStateAllow);
+    static constexpr PermissionKind mapped[] = {
+        PermissionKind::Other,
+        PermissionKind::Microphone,
+        PermissionKind::Camera,
+        PermissionKind::Geolocation,
+        PermissionKind::Notifications,
+        PermissionKind::Sensors,
+        PermissionKind::ClipboardRead,
+        PermissionKind::AutomaticDownloads,
+        PermissionKind::FileSystemAccess,
+        PermissionKind::Autoplay,
+        PermissionKind::LocalFonts,
+        PermissionKind::Midi,
+        PermissionKind::WindowManagement,
+    };
+    PermissionKind request =
+        kind >= 0 && kind < (int)(sizeof(mapped) / sizeof(mapped[0]))
+            ? mapped[kind]
+            : PermissionKind::Other;
+    auto response = PermissionResponse::Default;
+    if (wv->permissionHandler) {
+        response = wv->permissionHandler(wv->ctx, request);
+    } else if (request == PermissionKind::ClipboardRead) {
+
+        response = PermissionResponse::Allow;
     }
-    return S_OK;
+    if (response == PermissionResponse::Default) return S_OK;
+    return args->put_State(response == PermissionResponse::Allow
+                               ? kPermissionStateAllow
+                               : kPermissionStateDeny);
 }
 
 static HRESULT OnDownloadStarting(
@@ -18015,12 +18192,11 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
             return nullptr;
         }
     }
-    if (attrs->clipboard) {
-        auto* h =
-            MkHandler<Handler2<ICoreWebView2PermissionRequestedEventHandler,
-                               ICoreWebView2*,
-                               ICoreWebView2PermissionRequestedEventArgs*>>(
-                nullptr, OnPermissionRequested);
+    if (attrs->clipboard || wv->permissionHandler) {
+        auto* h = MkWebViewHandler<Handler2<
+            ICoreWebView2PermissionRequestedEventHandler, ICoreWebView2*,
+            ICoreWebView2PermissionRequestedEventArgs*>>(wv,
+                                                         OnPermissionRequested);
         HRESULT hr = webview->add_PermissionRequested(h, &token);
         h->Release();
         if (FAILED(hr)) {
@@ -18190,6 +18366,29 @@ bool WebViewReload(WebView* wv) {
         return false;
     }
     return SUCCEEDED(wv->webview->Reload());
+}
+
+bool WebViewGoBack(WebView* wv) {
+    return wv && SUCCEEDED(wv->webview->GoBack());
+}
+
+bool WebViewGoForward(WebView* wv) {
+    return wv && SUCCEEDED(wv->webview->GoForward());
+}
+
+bool WebViewCanGoBack(WebView* wv, bool* out) {
+    BOOL can = FALSE;
+    if (!wv || !out || FAILED(wv->webview->get_CanGoBack(&can))) return false;
+    *out = can != FALSE;
+    return true;
+}
+
+bool WebViewCanGoForward(WebView* wv, bool* out) {
+    BOOL can = FALSE;
+    if (!wv || !out || FAILED(wv->webview->get_CanGoForward(&can)))
+        return false;
+    *out = can != FALSE;
+    return true;
 }
 
 bool WebViewBounds(WebView* wv, Rect* out) {

@@ -74,7 +74,7 @@ extras/              the ported library crates as standalone amalgams, one
                      Also inside gpui.cpp — this copy is standalone
   html5ever-mini/    a smaller parser implementing the same html5ever.h API;
                      selected with -html=mini
-  wry/               the webview, crate lb-wry 0.53.3 (WebView2 on
+  wry/               the webview, crate lb-wry 0.57.3 (WebView2 on
                      Windows, WKWebView on macOS, stubs elsewhere). Also
                      inside gpui.cpp
   unicode-linebreak/  Unicode 15.0 line breaks, crate unicode-linebreak
@@ -192,7 +192,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## This copy
 
-Amalgamated from gpui-kit-cpp [`87c5108f2a4ad0ee9e46756b2f2420a7c2a95b48`](https://github.com/kjk/gpui-kit-cpp/commit/87c5108f2a4ad0ee9e46756b2f2420a7c2a95b48).
+Amalgamated from gpui-kit-cpp [`ea5d8e60bf3afbe30fe73029608ee6108fe5753e`](https://github.com/kjk/gpui-kit-cpp/commit/ea5d8e60bf3afbe30fe73029608ee6108fe5753e).
 
-[What has changed in gpui-kit-cpp since](https://github.com/kjk/gpui-kit-cpp/compare/87c5108f2a4ad0ee9e46756b2f2420a7c2a95b48...main)
+[What has changed in gpui-kit-cpp since](https://github.com/kjk/gpui-kit-cpp/compare/ea5d8e60bf3afbe30fe73029608ee6108fe5753e...main)
 shows every commit this copy is behind by; if that page is empty, it is current.

@@ -109,6 +109,8 @@ static const StoryInfo kMeta[StoryCount] = {
     {"dropdown-button", "DropdownButton",
      "A button with an attached dropdown menu for additional "
      "options."},
+    {"editor-diff", "Editor Diff",
+     "Compare two source versions with ordinary or center-facing gutters."},
     {"editor", "Editor",
      "Code editor with theme-aware syntax highlighting and "
      "folding."},
@@ -137,6 +139,8 @@ static const StoryInfo kMeta[StoryCount] = {
     {"layout-direction", "Layout Direction",
      "Right-to-left layout follows one global direction for the whole app."},
     {"list", "List", "A list displays a series of items."},
+    {"live-region", "LiveRegion",
+     "Announce status changes to screen readers without moving focus."},
     {"menu", "Menu", "Popup menu and context menu"},
     {"marker", "Marker",
      "A compact row for conversation status, notifications, and separators."},
@@ -1900,9 +1904,9 @@ static El* Footer(StoryApp* app, Ctx* cx) {
 // height and scroll.
 static El* StoryContainerBody(StoryApp* app, Ctx* cx, Arena* frame) {
     if (app->story == StoryDock || app->story == StoryScrollbar ||
-        app->story == StoryEditor || app->story == StorySettings ||
-        app->story == StoryList || app->story == StoryDataTable ||
-        app->story == StoryVirtualList) {
+        app->story == StoryEditor || app->story == StoryEditorDiff ||
+        app->story == StorySettings || app->story == StoryList ||
+        app->story == StoryDataTable || app->story == StoryVirtualList) {
         // DockStory and SettingsStory have paddings() of 0.
         bool unpadded = app->story == StoryDock || app->story == StorySettings;
         return Div(frame)

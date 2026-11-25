@@ -7770,6 +7770,21 @@ static float ScrollbarThumbInset(const El* e, ScrollbarPaintState state) {
                       : e->scrollThumbInset);
 }
 
+static Edges EditorHorizontalScrollbarInsets(const El* e) {
+    InputState* s = e->input;
+    if (!s || s->gutterLaneW <= 0) {
+        return {};
+    }
+    if (s->gutterSide == Side::Right) {
+        return Edges::New(
+            0, std::min(e->w, e->style.pad.right + s->gutterLaneW), 0, 0);
+    }
+    return Edges::New(ScrollbarIsLeft(s->scrollbarPlacement)
+                          ? 0.f
+                          : std::min(e->w, e->style.pad.left + s->gutterLaneW),
+                      0, 0, 0);
+}
+
 static float ScrollbarThumbMinLength(const El* e, ScrollbarPaintState state) {
     if (!e->scrollThemeSet) return 48.f;
     return state == ScrollbarPaintState::Active
@@ -7781,17 +7796,17 @@ static float ScrollbarThumbMinLength(const El* e, ScrollbarPaintState state) {
 
 static ScrollbarPaintState ScrollbarAxisPaintState(
     const El* e, float origin, float length, float viewport, float content,
-    float marginEnd, float scroll, bool onBar, float crossPointer,
-    float crossEnd, float alongPointer, bool axisDragging) {
+    float scroll, bool onBar, float crossDistance, float alongPointer,
+    bool axisDragging) {
     if (axisDragging) {
         return ScrollbarPaintState::Active;
     }
     float normalInset = ScrollbarThumbInset(e, ScrollbarPaintState::Normal);
     ScrollbarThumbGeometry normal = ScrollbarGeometry(
-        origin, length, viewport, content, marginEnd, normalInset,
+        origin, length, viewport, content, 0, normalInset,
         ScrollbarThumbMinLength(e, ScrollbarPaintState::Normal));
     float normalStart = normal.Start(scroll);
-    bool pointerOnThumb = onBar && crossPointer <= crossEnd - normalInset &&
+    bool pointerOnThumb = onBar && crossDistance >= normalInset &&
                           alongPointer >= normalStart &&
                           alongPointer < normalStart + normal.length;
     if (pointerOnThumb) {
@@ -8292,6 +8307,10 @@ El* El::ScrollMode(ScrollbarMode m) {
     scrollMode = m;
     return this;
 }
+El* El::ScrollPlacement(ScrollbarPlacement placement) {
+    scrollbarPlacement = placement;
+    return this;
+}
 El* El::ScrollId(int v) {
     scrollId = v;
     scrollFromPath = false;
@@ -8316,6 +8335,10 @@ El* El::AccessibilityId(Str authorId) {
 }
 El* El::AriaLabel(Str label) {
     accessibility.label = label;
+    return this;
+}
+El* El::AriaLive(AccessibilityLive live) {
+    accessibility.live = live;
     return this;
 }
 El* El::AccessibilityDocument(const AccessibilityDocumentSource& source) {
@@ -14259,6 +14282,15 @@ static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
         ctx->idChain = &idLink;
     }
 #endif
+    const Bounds* paintMask = e->lifecycle ? e->lifecycle->paintMask : nullptr;
+    Bounds previousMask = ctx->hitMask;
+    bool hadMask = ctx->hasHitMask;
+    if (paintMask) {
+        ctx->hitMask = HitMaskedBounds(ctx, *paintMask);
+        ctx->hasHitMask = true;
+        CanvasPushClip(ctx, paintMask->x, paintMask->y, paintMask->w,
+                       paintMask->h);
+    }
     if (e->style.opacity >= 1.f) {
         PaintElNodeInner(ctx, e, skipOverlay);
     } else {
@@ -14266,6 +14298,11 @@ static void PaintElNode(PaintCtx* ctx, El* e, bool skipOverlay) {
         ctx->opacity = prev * e->style.opacity;
         PaintElNodeInner(ctx, e, skipOverlay);
         ctx->opacity = prev;
+    }
+    if (paintMask) {
+        CanvasPopClip(ctx);
+        ctx->hitMask = previousMask;
+        ctx->hasHitMask = hadMask;
     }
 #ifndef NDEBUG
     if (e->debugBelow) {
@@ -14454,10 +14491,11 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         sr.scrollY = e->scrollY;
         sr.contentW = e->contentW;
         sr.scrollX = e->scrollX;
-        if (e->input && e->input->gutterLaneW > 0) {
-            sr.horizontalBarInset =
-                std::min(e->w, e->style.pad.left + e->input->gutterLaneW);
-        }
+        sr.placement =
+            e->input ? e->input->scrollbarPlacement : e->scrollbarPlacement;
+        Edges barInsets = EditorHorizontalScrollbarInsets(e);
+        sr.horizontalBarInset = barInsets.left;
+        sr.horizontalBarEndInset = barInsets.right;
 
         if (e->input && e->style.overflowY == Overflow::Scroll &&
             e->input->contentH > 0 && e->input->viewH > 0) {
@@ -14581,6 +14619,19 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
         if (!seen) {
             recordedInput = true;
             e->input->inputBounds = e->Bounds();
+            float clearance = 0;
+            if (e->style.overflowY == Overflow::Scroll &&
+                ScrollbarIsLeft(e->input->scrollbarPlacement)) {
+                constexpr auto active = ScrollbarPaintState::Active;
+                float width = std::max(ScrollbarTrackWidth(e),
+                                       ScrollbarThumbWidth(e, active) +
+                                           ScrollbarThumbInset(e, active));
+                clearance = std::max(10.f, width - e->style.pad.left);
+            }
+            if (e->input->scrollbarClearance != clearance) {
+                e->input->scrollbarClearance = clearance;
+                AppInvalidate(ctx->window);
+            }
 
             float viewW = e->w - e->style.pad.HorizontalAxisSum();
             float viewH = e->input->viewH;
@@ -15050,18 +15101,25 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
     bool canVertical = !e->noScrollbarY &&
                        e->style.overflowY == Overflow::Scroll &&
                        scrollContentH > scrollViewportH + 1.f && e->h > 0;
-    float horizontalInset =
-        e->input && e->input->gutterLaneW > 0
-            ? std::min(e->w, e->style.pad.left + e->input->gutterLaneW)
-            : 0.f;
+    ScrollbarPlacement placement =
+        e->input ? e->input->scrollbarPlacement : e->scrollbarPlacement;
+    bool left = ScrollbarIsLeft(placement);
+    bool top = ScrollbarIsTop(placement);
+    Edges barInsets = EditorHorizontalScrollbarInsets(e);
+    float horizontalInset = barInsets.HorizontalAxisSum();
     bool canHorizontal = !e->noScrollbarX &&
                          e->style.overflowX == Overflow::Scroll &&
                          e->contentW > e->w + 1.f && e->w > horizontalInset;
+    Bounds vertical =
+        ScrollbarTrackBounds(e->Bounds(), Axis::Vertical, placement, trackW);
+    Bounds horizontal = ScrollbarTrackBounds(
+        e->Bounds(), Axis::Horizontal, placement, trackW, barInsets.left,
+        canVertical ? trackW : 0, barInsets.right);
+    Point mouse = {ctx->mouseX, ctx->mouseY};
+    bool onVerticalBand = canVertical && vertical.Contains(mouse);
+    bool onHorizontalBand = canHorizontal && horizontal.Contains(mouse);
 
-    bool onBand = overBox && !covered &&
-                  ((canVertical && ctx->mouseX >= e->x + e->w - trackW) ||
-                   (canHorizontal && ctx->mouseX >= e->x + horizontalInset &&
-                    ctx->mouseY >= e->y + e->h - trackW));
+    bool onBand = overBox && !covered && (onVerticalBand || onHorizontalBand);
     bool barVisible = !e->noScrollbar;
     float barAlpha = 1.f;
     float barSlide = 0.f;
@@ -15122,10 +15180,11 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
     bool hasVertical = barVisible && canVertical;
     bool hasHorizontal = barVisible && canHorizontal;
     if (hasVertical) {
-        bool onBar = overBox && !covered && ctx->mouseX >= e->x + e->w - trackW;
+        bool onBar = overBox && !covered && onVerticalBand;
+        float distance = left ? mouse.x - e->x : e->Bounds().Right() - mouse.x;
         ScrollbarPaintState state = ScrollbarAxisPaintState(
-            e, e->y, e->h, scrollViewportH, scrollContentH, 0, logicalScrollY,
-            onBar, ctx->mouseX, e->x + e->w, ctx->mouseY,
+            e, e->y, e->h, scrollViewportH, scrollContentH, logicalScrollY,
+            onBar, distance, ctx->mouseY,
             dragging && !ctx->scrollDragHorizontal);
         float inset = ScrollbarThumbInset(e, state);
         ScrollbarThumbGeometry geometry =
@@ -15139,7 +15198,8 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
                 WidthTarget(&barState->widthY, &barState->widthYSet, wantW,
                             barMotion.expand, TimeNow(), &ctx->wantsAnimFrame);
         }
-        float thumbX = e->x + e->w - thumbW - inset;
+        float thumbX =
+            left ? vertical.x + inset : vertical.Right() - thumbW - inset;
         float thumbY = geometry.Start(logicalScrollY);
 
         if (e->input && e->input->overviewDecorations) {
@@ -15150,33 +15210,30 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
             double contentHeight = e->input->contentH + e->h - viewport;
             float lineH =
                 e->input->lastLineH > 0.f ? e->input->lastLineH : 20.f;
-            InputPaintOverviewRuler(e->input, ctx, e->x + e->w - trackW, e->y,
-                                    trackW, e->h, contentHeight, padTop, lineH);
+            InputPaintOverviewRuler(e->input, ctx, vertical.x, e->y, trackW,
+                                    e->h, contentHeight, padTop, lineH);
         }
-
-        FillBackground(ctx, e->x + e->w - trackW + barSlide, e->y, trackW, e->h,
-                       0, nullptr,
+        float slide = left ? -barSlide : barSlide;
+        FillBackground(ctx, vertical.x + slide, e->y, trackW, e->h, 0, nullptr,
                        ScrollbarBarBg(e, barTheme, state, barAlpha));
-        FillBackground(ctx, thumbX + barSlide, thumbY, thumbW, thumbH,
+        FillBackground(ctx, thumbX + slide, thumbY, thumbW, thumbH,
                        ThumbRadius(e, barTheme, state, thumbW, thumbH), nullptr,
                        ScrollbarThumbBg(e, barTheme, state, barAlpha));
     }
     if (hasHorizontal) {
 
-        float barX = e->x + horizontalInset;
-        float barW = e->w - horizontalInset;
+        float viewportW = e->w - horizontalInset;
         float contentW = e->contentW - horizontalInset;
-        bool onBar = overBox && !covered && ctx->mouseX >= barX &&
-                     ctx->mouseY >= e->y + e->h - trackW;
-        float marginEnd = hasVertical ? trackW : 0;
+        bool onBar = overBox && !covered && onHorizontalBand;
+        float distance = top ? mouse.y - e->y : e->Bounds().Bottom() - mouse.y;
         ScrollbarPaintState state = ScrollbarAxisPaintState(
-            e, barX, barW, barW, contentW, marginEnd, e->scrollX, onBar,
-            ctx->mouseY, e->y + e->h, ctx->mouseX,
+            e, horizontal.x, horizontal.w, viewportW, contentW, e->scrollX,
+            onBar, distance, ctx->mouseX,
             dragging && ctx->scrollDragHorizontal);
         float inset = ScrollbarThumbInset(e, state);
         ScrollbarThumbGeometry geometry =
-            ScrollbarGeometry(barX, barW, barW, contentW, marginEnd, inset,
-                              ScrollbarThumbMinLength(e, state));
+            ScrollbarGeometry(horizontal.x, horizontal.w, viewportW, contentW,
+                              0, inset, ScrollbarThumbMinLength(e, state));
         float thumbW = geometry.length;
         float wantH = ScrollbarThumbWidth(e, state);
         float thumbH = wantH;
@@ -15185,13 +15242,14 @@ static void PaintElNodeInner(PaintCtx* ctx, El* e, bool skipOverlay) {
                 WidthTarget(&barState->widthX, &barState->widthXSet, wantH,
                             barMotion.expand, TimeNow(), &ctx->wantsAnimFrame);
         }
-        float thumbY = e->y + e->h - thumbH - inset;
+        float thumbY =
+            top ? horizontal.y + inset : horizontal.Bottom() - thumbH - inset;
         float thumbX = geometry.Start(e->scrollX);
-
-        FillBackground(ctx, barX, e->y + e->h - trackW + barSlide, barW, trackW,
-                       0, nullptr,
+        float slide = top ? -barSlide : barSlide;
+        FillBackground(ctx, horizontal.x, horizontal.y + slide, horizontal.w,
+                       trackW, 0, nullptr,
                        ScrollbarBarBg(e, barTheme, state, barAlpha));
-        FillBackground(ctx, thumbX, thumbY + barSlide, thumbW, thumbH,
+        FillBackground(ctx, thumbX, thumbY + slide, thumbW, thumbH,
                        ThumbRadius(e, barTheme, state, thumbH, thumbW), nullptr,
                        ScrollbarThumbBg(e, barTheme, state, barAlpha));
     }
@@ -16541,11 +16599,30 @@ static bool AccessibilityNameFromContents(AccessibilityRole role) {
 }
 
 static void AccessibilityInfoOwnStrings(Arena* a, AccessibilityInfo* info) {
+
     info->authorId = StrDup(a, info->authorId);
     info->label = StrDup(a, info->label);
     info->description = StrDup(a, info->description);
     info->value = StrDup(a, info->value);
     info->placeholder = StrDup(a, info->placeholder);
+}
+
+static void AccessibilityCaptureInputText(Arena* a, AccessibilityNode* node) {
+    if (!node->info.value.s || !node->input ||
+        InputExposesFullAccessibilityText(node->input)) {
+        return;
+    }
+    constexpr int kExcerptBytes = 4 * 1024;
+    Str text = InputValue(node->input);
+    int focus = ClampI(InputCursor(node->input), 0, len(text));
+    while (!Utf8IsCharBoundary(text, focus)) focus--;
+    int start = std::max(0, focus - kExcerptBytes / 2);
+    int end = focus + std::min(len(text) - focus, kExcerptBytes / 2);
+    while (!Utf8IsCharBoundary(text, start)) start++;
+    while (!Utf8IsCharBoundary(text, end)) end--;
+    node->info.value = {};
+    node->textExcerpt = StrDup(a, Str(text.s + start, end - start));
+    node->textExcerptStart = start;
 }
 
 static void AccessibilityCollectNode(El* e, Vec<AccessibilityNode>* out,
@@ -16560,6 +16637,14 @@ static void AccessibilityCollectNode(El* e, Vec<AccessibilityNode>* out,
         node.parent = semanticParent;
         node.bounds = e->Bounds();
         node.info = e->accessibility;
+        if (node.info.live != AccessibilityLive::Off) {
+            node.livePath = e->pathId;
+        }
+        node.input = e->input;
+        if (!node.input && node.info.role != AccessibilityRole::Document) {
+            node.input = AccessibilityInput(e);
+        }
+        AccessibilityCaptureInputText(e->arena, &node);
         AccessibilityInfoOwnStrings(e->arena, &node.info);
         AccessibilityDocumentText document;
         if (e->lifecycle && e->lifecycle->accessibilityDocument) {
@@ -16597,17 +16682,9 @@ static void AccessibilityCollectNode(El* e, Vec<AccessibilityNode>* out,
         node.clickActionArg = e->clickActionArg;
         node.clickActionFocusId = e->clickActionFocusId;
         node.slider = e->slider;
-        node.input = e->input;
         if (!node.slider && node.info.role == AccessibilityRole::Slider) {
 
             node.slider = AccessibilitySlider(e);
-        }
-        if (!node.input && node.info.role != AccessibilityRole::Document) {
-            node.input = AccessibilityInput(e);
-        }
-        if (node.input && node.info.value.s) {
-
-            node.info.value = StrDup(e->arena, node.info.value);
         }
         if (!node.focusId && AccessibilityRoleCanFocus(node.info.role)) {
             node.focusId =
@@ -16634,7 +16711,8 @@ static void AccessibilityCollectNode(El* e, Vec<AccessibilityNode>* out,
             node.actions |= AccessibilityActionFocus;
         }
         if (!node.info.disabled && node.input && !node.input->disabled &&
-            !node.input->readonly) {
+            !node.input->readonly &&
+            InputExposesFullAccessibilityText(node.input)) {
             node.actions |= AccessibilityActionSetValue;
         }
         VecAppend(*out, node);
@@ -23940,6 +24018,34 @@ static uint64_t AccessibilityHashStr(uint64_t hash, Str value) {
                : hash;
 }
 
+static bool AccessibilityTrackLiveRegions(Window* win) {
+    int previous = win->accessibilityLiveFrame;
+    win->accessibilityLiveFrame = 1 - previous;
+    const auto& last = win->accessibilityLive[previous];
+    auto& current = win->accessibilityLive[win->accessibilityLiveFrame];
+    VecClear(current);
+    bool announce = false;
+    for (int i = 0; i < len(win->accessibility); i++) {
+        auto& node = win->accessibility[i];
+        Str text = node.info.label;
+        if (node.info.live == AccessibilityLive::Off || len(text) == 0) {
+            continue;
+        }
+        uint32_t path = node.livePath ? node.livePath : node.id;
+        uint64_t textHash = AccessibilityHashStr(0xcbf29ce484222325ull, text);
+        node.liveChanged = true;
+        for (int j = 0; j < len(last); j++) {
+            if (last[j].path == path) {
+                node.liveChanged = last[j].textHash != textHash;
+                break;
+            }
+        }
+        announce |= node.liveChanged;
+        VecAppend(current, AccessibilityLiveSnapshot{path, textHash});
+    }
+    return announce;
+}
+
 static uint64_t AccessibilityTreeHash(const Vec<AccessibilityNode>& nodes) {
     uint64_t hash = 0xcbf29ce484222325ull;
     hash = AccessibilityHashBytes(hash, &nodes.len, (int)sizeof(len(nodes)));
@@ -23961,6 +24067,7 @@ static uint64_t AccessibilityTreeHash(const Vec<AccessibilityNode>& nodes) {
         GPUI_A11Y_HASH(node.document.textRevision);
         GPUI_A11Y_HASH(node.document.selectionRevision);
         GPUI_A11Y_HASH(info.role);
+        GPUI_A11Y_HASH(info.live);
         hash = AccessibilityHashStr(hash, info.authorId);
         hash = AccessibilityHashStr(hash, info.label);
         hash = AccessibilityHashStr(hash, info.description);
@@ -24198,6 +24305,7 @@ static void DrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
     win->rendered.len = 0;
     VecClear(win->debugViewRoots);
     win->hasRovingTabs = false;
+    win->hasLiveRegions = false;
     El* root = EntityRender(win->app, win, win->frameArena, win->root);
 
     El* prompt = win->prompt.IsValid()
@@ -24248,12 +24356,14 @@ static void DrawFrame(Window* win, void* native, int pxW, int pxH, float dipW,
             AccessibilityCollect(root, &win->accessibility);
             uint64_t accessibilityHash =
                 AccessibilityTreeHash(win->accessibility);
-            if (accessibilityHash != win->accessibilityHash) {
+            bool announce = AccessibilityTrackLiveRegions(win);
+            if (announce || accessibilityHash != win->accessibilityHash) {
                 win->accessibilityHash = accessibilityHash;
                 PlatAccessibilityTreeChanged(win);
             }
         } else {
             win->accessibilityHash = 0;
+            VecClear(win->accessibilityLive[win->accessibilityLiveFrame]);
         }
 
         FocusTrapApplyPending(win);
@@ -25065,10 +25175,13 @@ Str WindowAccessibilityTextValue(const AccessibilityNode& node) {
         return text.s ? text : StrL("");
     }
     if (node.info.role == AccessibilityRole::Document) return node.info.value;
-    if (!node.input || !node.info.value.s ||
-        !AccessibilityRoleTakesText(node.info.role) ||
+    if (!node.input || !AccessibilityRoleTakesText(node.info.role) ||
         node.info.role == AccessibilityRole::PasswordInput ||
         node.input->masked || !node.input->accessibilityValueExposed) {
+        return {};
+    }
+    if (node.textExcerpt.s) return node.textExcerpt;
+    if (!node.info.value.s || !InputExposesFullAccessibilityText(node.input)) {
         return {};
     }
     Str text = InputValue(node.input);
@@ -25137,6 +25250,13 @@ bool WindowAccessibilityTextSelection(const AccessibilityNode& node,
     if (!WindowAccessibilityTextValue(node).s) return false;
     if (node.input) {
         *out = node.input->selectedRange;
+        if (node.textExcerpt.s) {
+            out->start =
+                std::max(0, std::min(out->start - node.textExcerptStart,
+                                     len(node.textExcerpt)));
+            out->end = std::max(0, std::min(out->end - node.textExcerptStart,
+                                            len(node.textExcerpt)));
+        }
         return true;
     }
     if (node.textSelectionStart < 0) return false;
@@ -25144,8 +25264,28 @@ bool WindowAccessibilityTextSelection(const AccessibilityNode& node,
     return true;
 }
 
+bool WindowAccessibilitySetTextSelection(Window* win,
+                                         const AccessibilityNode& node,
+                                         Selection range) {
+    Str text = WindowAccessibilityTextValue(node);
+    if (!win || !node.input || !text.s) return false;
+    int start = node.textExcerpt.s ? node.textExcerptStart : 0;
+    InputSetSelectedRange(node.input, win->app, win,
+                          start + ClampI(range.start, 0, len(text)),
+                          start + ClampI(range.end, 0, len(text)));
+    AppInvalidate(win);
+    return true;
+}
+
 int WindowAccessibilityTextCaret(const AccessibilityNode& node) {
-    if (node.input) return InputCursor(node.input);
+    if (node.input) {
+        int focus = InputCursor(node.input);
+        if (node.textExcerpt.s) {
+            focus = std::max(0, std::min(focus - node.textExcerptStart,
+                                         len(node.textExcerpt)));
+        }
+        return focus;
+    }
     Selection selection;
     if (node.document.text) {
         return WindowAccessibilityTextSelection(node, &selection)
@@ -25267,10 +25407,9 @@ bool WindowAccessibilityPerform(Window* win, uint32_t nodeId,
     }
     if (action == AccessibilityAction::SetValue) {
 
-        if (!node.input || !InputIsEditable(node.input)) {
+        if (!InputAccessibilitySetValue(node.input, win->app, win, &value)) {
             return false;
         }
-        InputReplaceAll(node.input, win->app, win, value);
         AppInvalidate(win);
         return true;
     }
@@ -25442,6 +25581,22 @@ static bool ScrollsX(const ScrollRect& s) {
     return s.contentW > ScrollViewportW(s) + 1.f;
 }
 
+static Bounds ScrollbarTrackFor(const ScrollRect& s, bool horizontal) {
+    float other = horizontal && s.barY && ScrollsY(s) ? s.trackWidth : 0;
+    return ScrollbarTrackBounds(
+        s.bounds, horizontal ? Axis::Horizontal : Axis::Vertical, s.placement,
+        s.trackWidth, s.horizontalBarInset, other, s.horizontalBarEndInset);
+}
+
+static float ScrollbarOuterDistance(const ScrollRect& s, bool horizontal,
+                                    float x, float y) {
+    if (horizontal) {
+        return ScrollbarIsTop(s.placement) ? y - s.bounds.y
+                                           : s.bounds.Bottom() - y;
+    }
+    return ScrollbarIsLeft(s.placement) ? x - s.bounds.x : s.bounds.Right() - x;
+}
+
 static float ClampScroll(float off, float content, float viewport) {
     float most = content - viewport;
     if (most < 0) {
@@ -25472,15 +25627,13 @@ static ScrollRect* ScrollbarAt(PaintCtx* ctx, float x, float y,
         if (!s.barVisible) {
             continue;
         }
-        if (s.barY && ScrollsY(s) && y >= s.bounds.y &&
-            y <= s.bounds.Bottom() && x >= s.bounds.Right() - s.trackWidth &&
-            x <= s.bounds.Right()) {
+        if (s.barY && ScrollsY(s) &&
+            ScrollbarTrackFor(s, false).Contains({x, y})) {
             *horizontal = false;
             return &ctx->scrolls[i];
         }
-        if (s.barX && ScrollsX(s) && x >= s.bounds.x + s.horizontalBarInset &&
-            x <= s.bounds.Right() && y >= s.bounds.Bottom() - s.trackWidth &&
-            y <= s.bounds.Bottom()) {
+        if (s.barX && ScrollsX(s) &&
+            ScrollbarTrackFor(s, true).Contains({x, y})) {
             *horizontal = true;
             return &ctx->scrolls[i];
         }
@@ -25508,15 +25661,11 @@ static void NoteScrollbarOcclusion(Window* win) {
         if (s.id == 0) {
             continue;
         }
-        bool onY = s.barY && ScrollsY(s) && win->mouseY >= s.bounds.y &&
-                   win->mouseY <= s.bounds.Bottom() &&
-                   win->mouseX >= s.bounds.Right() - s.trackWidth &&
-                   win->mouseX <= s.bounds.Right();
-        bool onX = s.barX && ScrollsX(s) &&
-                   win->mouseX >= s.bounds.x + s.horizontalBarInset &&
-                   win->mouseX <= s.bounds.Right() &&
-                   win->mouseY >= s.bounds.Bottom() - s.trackWidth &&
-                   win->mouseY <= s.bounds.Bottom();
+        Point mouse = {win->mouseX, win->mouseY};
+        bool onY = s.barY && ScrollsY(s) &&
+                   ScrollbarTrackFor(s, false).Contains(mouse);
+        bool onX =
+            s.barX && ScrollsX(s) && ScrollbarTrackFor(s, true).Contains(mouse);
         if ((onY || onX) &&
             ScrollbarCovered(win->paint, s, win->mouseX, win->mouseY)) {
             VecAppend(win->scrollbarOccluded, s.id);
@@ -25613,29 +25762,27 @@ struct ScrollbarTrackAxis {
     float track = 0;
     float viewport = 0;
     float content = 0;
-    float marginEnd = 0;
     float current = 0;
 
     ScrollbarThumbGeometry Geometry(float inset, float minLength) const {
-        return ScrollbarGeometry(origin, track, viewport, content, marginEnd,
-                                 inset, minLength);
+        return ScrollbarGeometry(origin, track, viewport, content, 0, inset,
+                                 minLength);
     }
 };
 
 static ScrollbarTrackAxis ScrollbarTrackAxisOf(const ScrollRect* s,
                                                bool horizontal) {
     ScrollbarTrackAxis a;
-    a.track = horizontal ? s->bounds.w : s->bounds.h;
+    Bounds track = ScrollbarTrackFor(*s, horizontal);
+    a.track = horizontal ? track.w : track.h;
     a.viewport = horizontal ? ScrollViewportW(*s) : ScrollViewportH(*s);
     a.content = horizontal ? s->contentW : s->contentH;
-    a.origin = horizontal ? s->bounds.x : s->bounds.y;
+    a.origin = horizontal ? track.x : track.y;
     if (horizontal) {
-        a.origin += s->horizontalBarInset;
-        a.track -= s->horizontalBarInset;
-        a.viewport -= s->horizontalBarInset;
-        a.content -= s->horizontalBarInset;
+        float insets = s->horizontalBarInset + s->horizontalBarEndInset;
+        a.viewport -= insets;
+        a.content -= insets;
     }
-    a.marginEnd = horizontal && s->barY && ScrollsY(*s) ? s->trackWidth : 0;
     a.current = horizontal ? s->scrollX : s->scrollY;
     return a;
 }
@@ -25655,8 +25802,8 @@ static bool ScrollbarPress(Window* win, ScrollRect* s, float x, float y,
         axis.Geometry(s->thumbInset, s->thumbMinLength);
     float thumbStart = geometry.Start(current);
     float thumbLength = geometry.length;
-    bool crossInside = horizontal ? y <= s->bounds.Bottom() - s->thumbInset
-                                  : x <= s->bounds.Right() - s->thumbInset;
+    float distance = ScrollbarOuterDistance(*s, horizontal, x, y);
+    bool crossInside = distance >= s->thumbInset;
     bool onThumb =
         crossInside && at >= thumbStart && at <= thumbStart + thumbLength;
     if (!onThumb) {
@@ -25665,9 +25812,7 @@ static bool ScrollbarPress(Window* win, ScrollRect* s, float x, float y,
             axis.Geometry(s->thumbHoverInset, s->thumbHoverMinLength);
         float hoverStart = hover.Start(current);
         float hoverLength = hover.length;
-        bool hoverCross = horizontal
-                              ? y <= s->bounds.Bottom() - s->thumbHoverInset
-                              : x <= s->bounds.Right() - s->thumbHoverInset;
+        bool hoverCross = distance >= s->thumbHoverInset;
         if (hoverCross && at >= hoverStart && at <= hoverStart + hoverLength) {
             onThumb = true;
             thumbStart = hoverStart;
@@ -25679,8 +25824,7 @@ static bool ScrollbarPress(Window* win, ScrollRect* s, float x, float y,
         geometry = axis.Geometry(s->thumbHoverInset, s->thumbHoverMinLength);
         thumbStart = geometry.Start(current);
         thumbLength = geometry.length;
-        crossInside = horizontal ? y <= s->bounds.Bottom() - s->thumbHoverInset
-                                 : x <= s->bounds.Right() - s->thumbHoverInset;
+        crossInside = distance >= s->thumbHoverInset;
         onThumb =
             crossInside && at >= thumbStart && at <= thumbStart + thumbLength;
     }
@@ -33431,6 +33575,7 @@ El* SplitHandle(const AreaCtx& ac, int node, int ix, Axis axis) {
     h.axis = axis;
     h.state = hst ? hst->Get() : ResizeHandleState::Idle;
     h.active = ResizeHandleStateIsActive(h.state);
+    h.dock = ac.state;
     if (ac.r->splitHandle) {
 
         IdScope handleScope(cx, hid);
@@ -39135,6 +39280,7 @@ InputPresentation InputPresentation::Of(Arena* a, const InputState* state) {
     value.masked = state->masked || state->maskPatternSet;
     value.multiLine = InputIsMultiLine(state);
     value.codeEditor = state->kind == InputKind::Editor;
+    value.gutterSide = state->gutterSide;
     value.textAlign = state->align;
     value.placeholder = state->placeholder;
     if (a && state->maskPatternSet) {
@@ -40480,11 +40626,18 @@ int RangeDecorationsNormalize(Str text, const RangeDecoration* in, int n,
     return added;
 }
 
+struct LineDecorationEntry {
+    uint64_t id = 0;
+    LineDecorationProvider provider;
+};
+
 struct RangeDecorationsState {
     int refs = 1;
     bool ownerAlive = true;
     InputState* input = nullptr;
     RangeDecorationCollections collections;
+    Vec<LineDecorationEntry> lineProviders;
+    uint64_t nextLineId = 0;
 };
 
 static void RangeDecorationsRetain(RangeDecorationsState* state) {
@@ -40577,23 +40730,134 @@ bool RangeDecorationCollection::IsValid() const {
     return live && live->Get(id);
 }
 
+static RangeDecorationsState* EnsureEditorDecorations(InputState* s) {
+    if (!s->rangeDecorations) {
+        s->rangeDecorations = new RangeDecorationsState();
+        s->rangeDecorations->input = s;
+    }
+    return s->rangeDecorations;
+}
+
 RangeDecorationCollection InputCreateRangeDecorationsCollection(
     InputState* s, const RangeDecoration* decorations, int n) {
     RangeDecorationCollection result;
     if (!s) {
         return result;
     }
-    if (!s->rangeDecorations) {
-        s->rangeDecorations = new RangeDecorationsState();
-        s->rangeDecorations->input = s;
-    }
     Vec<RangeDecoration> normalized;
     RangeDecorationsNormalize(InputValue(s), decorations, n, &normalized);
-    result.state = s->rangeDecorations;
-    result.id = s->rangeDecorations->collections
+    result.state = EnsureEditorDecorations(s);
+    result.id = result.state->collections
                     .Create(normalized.els, len(normalized));
     RangeDecorationsRetain(result.state);
     return result;
+}
+
+LineDecorationCollection::LineDecorationCollection(
+    const LineDecorationCollection& other)
+    : state(other.state), id(other.id) {
+    RangeDecorationsRetain(state);
+}
+
+LineDecorationCollection& LineDecorationCollection::operator=(
+    const LineDecorationCollection& other) {
+    RangeDecorationsRetain(other.state);
+    RangeDecorationsRelease(state);
+    state = other.state;
+    id = other.id;
+    return *this;
+}
+
+LineDecorationCollection::~LineDecorationCollection() {
+    RangeDecorationsRelease(state);
+}
+
+static int LineProviderIndex(const RangeDecorationsState* state, uint64_t id) {
+    if (state && state->ownerAlive) {
+        for (int i = 0; i < len(state->lineProviders); i++) {
+            if (state->lineProviders[i].id == id) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+void LineDecorationCollection::SetProvider(LineDecorationProvider provider,
+                                           Ctx* cx) {
+    int index = LineProviderIndex(state, id);
+    if (index >= 0) {
+        state->lineProviders[index].provider = provider;
+        if (cx) Notify(cx);
+    }
+}
+
+void LineDecorationCollection::Clear(Ctx* cx) {
+    SetProvider({}, cx);
+}
+
+void LineDecorationCollection::Dispose(Ctx* cx) {
+    int index = LineProviderIndex(state, id);
+    if (index >= 0) {
+        VecRemoveAt(state->lineProviders, index);
+        if (cx) Notify(cx);
+    }
+}
+
+bool LineDecorationCollection::HasProvider() const {
+    int index = LineProviderIndex(state, id);
+    return index >= 0 && state->lineProviders[index].provider.query;
+}
+
+LineDecorationCollection InputCreateLineDecorationsCollection(
+    InputState* s, LineDecorationProvider provider, Ctx* cx) {
+    LineDecorationCollection result;
+    if (!s || s->kind != InputKind::Editor) {
+        return result;
+    }
+    RangeDecorationsState* state = EnsureEditorDecorations(s);
+    LineDecorationEntry entry = {++state->nextLineId, provider};
+    if (VecAppend(state->lineProviders, entry)) {
+        result.state = state;
+        result.id = entry.id;
+        RangeDecorationsRetain(state);
+        if (cx) Notify(cx);
+    }
+    return result;
+}
+
+bool InputHasLineDecorationProviders(const InputState* s) {
+    if (s && s->rangeDecorations) {
+        for (const auto& entry : s->rangeDecorations->lineProviders) {
+            if (entry.provider.query) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void InputLineDecorationsForRows(const InputState* s, Selection rows, Ctx* cx,
+                                 ArenaVec<LineDecoration>* out) {
+    if (!s || !s->rangeDecorations || rows.start >= rows.end) {
+        return;
+    }
+    for (const auto& entry : s->rangeDecorations->lineProviders) {
+        const auto& provider = entry.provider;
+        if (!provider.query) {
+            continue;
+        }
+        int first = len(*out);
+        provider.query(s, rows, cx->app, cx->a, out, provider.data);
+        int write = first;
+        for (int i = first; i < len(*out); i++) {
+            const auto& decoration = (*out)[i];
+            if (decoration.row >= rows.start && decoration.row < rows.end) {
+                (*out)[write++] = decoration;
+            }
+        }
+        out->Truncate(write);
+    }
 }
 
 int InputRangeDecorations(const InputState* s, const Selection* ranges,
@@ -40633,6 +40897,7 @@ void InputDecorationsFree(InputState* s) {
         while (len(state->collections.entries) > 0) {
             state->collections.Remove(state->collections.entries[0]->id);
         }
+        VecReset(state->lineProviders);
         RangeDecorationsRelease(state);
         s->rangeDecorations = nullptr;
     }
@@ -41373,6 +41638,12 @@ static int RowsOnLine(const InputState* s, int line) {
 }
 
 static Selection DisplayRangeOfLine(const InputState* s, int line) {
+    if (s && s->spacers) {
+        Selection display = {};
+        if (InputBufferLineDisplayRows(InputDisplayMap(s), line, &display)) {
+            return display;
+        }
+    }
     if (RowsOnLine(s, line) <= 0) {
         return {-1, -1};
     }
@@ -41391,12 +41662,22 @@ static int DisplayRowOfLine(const InputState* s, int line) {
 }
 
 static int DisplayRowCountOf(const InputState* s) {
-    return s ? RowsBeforeLine(s, InputLinesLen(s)) : 0;
+    if (!s) return 0;
+    int displayed = s->spacers ? InputDisplayRowCount(InputDisplayMap(s)) : 0;
+    return displayed > 0 ? displayed : RowsBeforeLine(s, InputLinesLen(s));
 }
 
 static int BufferLineAtDisplay(const InputState* s, int displayRow) {
     if (!s) {
         return 0;
+    }
+    if (s->spacers) {
+        InputDisplayMapRef map = InputDisplayMap(s);
+        int rows = InputDisplayRowCount(map);
+        if (rows > 0) {
+            return InputDisplayRowBufferLine(
+                map, std::max(0, std::min(displayRow, rows - 1)));
+        }
     }
     int lines = InputLinesLen(s);
     bool wrapped = s->softWrap && s->wrap.valid && s->wrap.width > 0;
@@ -41511,8 +41792,14 @@ int InputLayoutGutterMarks(const InputState* s, float originX, double originY,
     Selection span = {0, len(text)};
     bool clip = viewBottom >= viewTop;
     if (clip) {
-        int first = (int)((viewTop - originY) / lineH);
-        int last = (int)((viewBottom - originY) / lineH) + 1;
+        int rows = DisplayRowCountOf(s);
+        int first = (int)std::min((viewTop - originY) / lineH, (double)rows);
+        int last =
+            (int)std::min((viewBottom - originY) / lineH, (double)rows) + 1;
+        if (s->spacers) {
+            first = BufferLineAtDisplay(s, first);
+            last = BufferLineAtDisplay(s, last) + 1;
+        }
         if (first < 0) {
             first = 0;
         }
@@ -44325,9 +44612,15 @@ void InputAccessibilityFocus(InputState* state, Window* win) {
     FocusHandleFocus(win, state->focus);
 }
 
+bool InputExposesFullAccessibilityText(const InputState* state) {
+    return state && (InputIsSingleLine(state) ||
+                     len(state->text) <= kFullAccessibilityTextLimit);
+}
+
 bool InputAccessibilitySetValue(InputState* state, App* app, Window* win,
                                 const Str* value) {
-    if (!state || !value || !InputIsEditable(state)) {
+    if (!state || !value || !InputIsEditable(state) ||
+        !InputExposesFullAccessibilityText(state)) {
         return false;
     }
     InputReplaceAll(state, app, win, *value);
@@ -45856,6 +46149,288 @@ int InputWrapRows(const InputState* s, int line, const int** starts,
     return item.nRows;
 }
 
+struct EditorSpacerRun {
+    Spacer spacer;
+    int ordinal = 0;
+    int prefix = 0;
+    int displayStart = 0;
+};
+
+struct EditorSpacers {
+    SpacerProvider provider;
+    Vec<EditorSpacerRun> runs;
+    uint64_t askedAt = 0;
+    uint64_t revision = 0;
+    bool asked = false;
+    int total = 0;
+};
+
+static uint64_t InputRowsVersion(InputDisplayMapRef map) {
+    const InputState* s = map.state;
+    if (!s) return 0;
+    WrapMapOf(s, nullptr);
+    uint64_t changes = s->docVersion + s->folds.version + s->wrap.wrappedLines;
+    return (changes << 2) | (s->softWrap ? 1u : 0u) |
+           (LayoutModeIsFolding(s->mode) ? 2u : 0u);
+}
+
+uint64_t InputDisplayMapVersion(InputDisplayMapRef map) {
+    return InputRowsVersion(map) +
+           (map.state && map.state->spacers ? map.state->spacers->revision : 0);
+}
+
+void InputSetSpacerProvider(InputState* s, SpacerProvider provider, App* app,
+                            Window* win) {
+    if (!s || (!s->spacers && !provider.query)) return;
+    if (!s->spacers) s->spacers = new (std::nothrow) EditorSpacers;
+    if (!s->spacers) return;
+    s->spacers->provider = provider;
+    InputRefreshSpacers(s, app, win);
+}
+
+void InputRefreshSpacers(InputState* s, App* app, Window* win) {
+    if (s && s->spacers) {
+        s->spacers->asked = false;
+        Notify(app, win);
+    }
+}
+
+static int SpacerRowsTotal(const InputState* s) {
+    return s && s->spacers ? s->spacers->total : 0;
+}
+
+static int SpacerRunAtLine(const EditorSpacers* data, int line) {
+    int lo = 0;
+    int hi = len(data->runs);
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (data->runs[mid].spacer.line < line)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static int SpacerRowsBeforeLine(const InputState* s, int line) {
+    const EditorSpacers* data = s->spacers;
+    if (!data || data->total == 0) return 0;
+    int at = SpacerRunAtLine(data, line);
+    return at == len(data->runs) ? data->total : data->runs[at].prefix;
+}
+
+static int SpacerRowsAboveLine(const InputState* s, int line) {
+    const EditorSpacers* data = s->spacers;
+    if (!data || data->total == 0) return 0;
+    int rows = 0;
+    for (int i = SpacerRunAtLine(data, line); i < len(data->runs); i++) {
+        const Spacer& spacer = data->runs[i].spacer;
+        if (spacer.line != line || !spacer.above) break;
+        rows += spacer.rows;
+    }
+    return rows;
+}
+
+static const EditorSpacerRun* SpacerRunAtRow(const InputState* s, int row) {
+    const EditorSpacers* data = s ? s->spacers : nullptr;
+    if (!data || data->total == 0) return nullptr;
+    int lo = 0;
+    int hi = len(data->runs);
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        const EditorSpacerRun& run = data->runs[mid];
+        if (row < run.displayStart)
+            hi = mid;
+        else if (row >= run.displayStart + run.spacer.rows)
+            lo = mid + 1;
+        else
+            return &run;
+    }
+    return nullptr;
+}
+
+bool InputIsSpacerRow(InputDisplayMapRef map, int row) {
+    return SpacerRunAtRow(map.state, row) != nullptr;
+}
+
+static int InputPreparedBufferLines(const InputState* s) {
+
+    bool preparingSpacers = s && s->spacers && s->spacers->asked;
+    return preparingSpacers || InputWrapRowCount(InputDisplayMap(s)) > 0
+               ? InputLinesLen(s)
+               : 0;
+}
+
+static int InputTextRowsAbove(const InputState* s, int line) {
+    const InputWrapMap* wrap = WrapMapOf(s, nullptr);
+    auto above = [wrap](int row) {
+        return !wrap ? row
+                     : (row >= wrap->tree.LineCount()
+                            ? wrap->totalRows
+                            : wrap->tree.RowsAbove(row));
+    };
+    int visible = above(line);
+    if (!LayoutModeIsFolding(s->mode)) return visible;
+
+    int past = 0;
+    for (const FoldRange& fold : s->folds.folded) {
+        if (fold.startLine >= line - 1) break;
+        int first = std::max(past, fold.startLine + 1);
+        int end = std::min(line, fold.endLine);
+        if (first < end) {
+            visible -= above(end) - above(first);
+            past = end;
+        }
+    }
+    return visible;
+}
+
+static int InputDisplayBlockStart(const InputState* s, int line) {
+    return InputTextRowsAbove(s, line) + SpacerRowsBeforeLine(s, line);
+}
+
+static void PrepareEditorSpacers(Ctx* cx, InputState* s, int lines) {
+    EditorSpacers* data = s->spacers;
+    if (!data) return;
+    uint64_t version = InputRowsVersion(InputDisplayMap(s));
+    if (data->asked && data->askedAt == version) return;
+    data->asked = true;
+    data->askedAt = version;
+    ArenaVec<Spacer> requested;
+    if (data->provider.query) {
+        data->provider.query(s, {0, lines}, cx->app, cx->a, &requested,
+                             data->provider.data);
+    }
+    Vec<EditorSpacerRun> runs;
+    int rowLimit = INT_MAX - InputTextRowsAbove(s, lines);
+    int total = 0;
+    for (int i = 0; i < len(requested); i++) {
+        Spacer spacer = requested[i];
+        if (spacer.rows <= 0 || spacer.line < 0 || spacer.line >= lines ||
+            (LayoutModeIsFolding(s->mode) &&
+             FoldMapLineHidden(&s->folds, spacer.line)))
+            continue;
+        spacer.rows = std::min(spacer.rows, rowLimit - total);
+        if (spacer.rows <= 0) break;
+        VecAppend(runs, EditorSpacerRun{spacer, i});
+        total += spacer.rows;
+    }
+    if (len(runs) > 1) {
+        qsort(runs.els, (size_t)len(runs), sizeof(EditorSpacerRun),
+              [](const void* lhs, const void* rhs) {
+                  const auto& a = *(const EditorSpacerRun*)lhs;
+                  const auto& b = *(const EditorSpacerRun*)rhs;
+                  if (a.spacer.line != b.spacer.line)
+                      return a.spacer.line < b.spacer.line ? -1 : 1;
+                  if (a.spacer.above != b.spacer.above)
+                      return a.spacer.above ? -1 : 1;
+                  return a.ordinal - b.ordinal;
+              });
+    }
+    int prefix = 0;
+    bool equal = len(runs) == len(data->runs);
+    for (int i = 0; i < len(runs); i++) {
+        auto& run = runs[i];
+        const auto& spacer = run.spacer;
+        run.prefix = prefix;
+        run.displayStart =
+            InputTextRowsAbove(s, spacer.line + !spacer.above) + prefix;
+        prefix += spacer.rows;
+        if (equal) {
+            const auto& old = data->runs[i];
+            equal = old.displayStart == run.displayStart &&
+                    old.spacer.line == spacer.line &&
+                    old.spacer.above == spacer.above &&
+                    old.spacer.rows == spacer.rows &&
+                    old.spacer.hasBackground == spacer.hasBackground &&
+                    (!spacer.hasBackground ||
+                     RgbaEq(old.spacer.background, spacer.background));
+        }
+    }
+    if (!equal) {
+        data->runs = std::move(runs);
+        data->total = total;
+        data->revision += 4;
+    }
+}
+
+static void AppendEditorSpacers(Ctx* cx, El* column, const InputState* s,
+                                int line, bool above, float lineH) {
+    const EditorSpacers* data = s->spacers;
+    if (!data || data->total == 0) return;
+    for (int i = SpacerRunAtLine(data, line); i < len(data->runs); i++) {
+        const Spacer& sp = data->runs[i].spacer;
+        if (sp.line != line) break;
+        if (sp.above != above) continue;
+        El* blank = Div(cx->a)->W(kFill)->Shrink0()->H(sp.rows * lineH);
+        if (sp.hasBackground) blank->Bg(sp.background);
+        column->Child(blank);
+    }
+}
+
+int InputDisplayRowCount(InputDisplayMapRef map) {
+    const InputState* s = map.state;
+    int lines = InputPreparedBufferLines(s);
+    return lines > 0 ? InputDisplayBlockStart(s, lines) : 0;
+}
+
+bool InputBufferLineDisplayRows(InputDisplayMapRef map, int line,
+                                Selection* rows) {
+    const InputState* s = map.state;
+    if (line < 0 || line >= InputPreparedBufferLines(s)) return false;
+    Selection span = {InputTextRowsAbove(s, line),
+                      InputTextRowsAbove(s, line + 1)};
+    if (span.IsEmpty()) return false;
+    int offset = SpacerRowsBeforeLine(s, line) + SpacerRowsAboveLine(s, line);
+    span.start += offset;
+    span.end += offset;
+    if (rows) *rows = span;
+    return true;
+}
+
+int InputBufferLineDisplayRow(InputDisplayMapRef map, int line) {
+    const InputState* s = map.state;
+    if (line < 0 || line >= InputPreparedBufferLines(s)) return 0;
+    Selection span = {};
+    if (InputBufferLineDisplayRows(map, line, &span)) return span.start;
+    if (SpacerRowsTotal(s) > 0) {
+        FoldMapRebuild(const_cast<FoldMap*>(&s->folds), InputLinesLen(s));
+        int visible = FoldMapNearestVisibleLine(&s->folds, line);
+        if (InputBufferLineDisplayRows(map, visible, &span)) {
+            return span.end - 1;
+        }
+    }
+    return std::max(0, InputTextRowsAbove(s, line) - 1);
+}
+
+int InputDisplayRowBufferLine(InputDisplayMapRef map, int row) {
+    if (row < 0 || row >= InputDisplayRowCount(map)) return 0;
+    int lo = 0;
+    int hi = InputPreparedBufferLines(map.state);
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (InputDisplayBlockStart(map.state, mid + 1) <= row) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+static int NearestTextDisplayRow(InputDisplayMapRef map, int row, bool down) {
+    const int total = InputDisplayRowCount(map);
+    auto walk = [&](int at, bool forward) {
+        while (const auto* run = SpacerRunAtRow(map.state, at)) {
+            at = forward ? run->displayStart + run->spacer.rows
+                         : run->displayStart - 1;
+        }
+        return at;
+    };
+    int text = walk(row, down);
+    return text >= 0 && text < total ? text : walk(row, !down);
+}
+
 void InputSetWrappingIndent(InputState* s, App* app, Window* win,
                             WrappingIndent indent) {
     if (!s) {
@@ -45875,6 +46450,38 @@ static int WrapRowOfOffset(const int* starts, int nRows, int local,
         k--;
     }
     return k;
+}
+
+DisplayPoint InputBufferToDisplayPoint(InputDisplayMapRef map,
+                                       BufferPoint point) {
+    int lines = InputPreparedBufferLines(map.state);
+    if (lines <= 0) return {};
+    int line = ClampI(point.line, 0, lines - 1);
+    Selection display = {};
+    if (!InputBufferLineDisplayRows(map, line, &display)) {
+        return {InputBufferLineDisplayRow(map, line), 0};
+    }
+    const int* starts = nullptr;
+    int count = InputWrapRows(map.state, line, &starts, nullptr);
+    Str source = InputSliceLine(map.state, line);
+    int col =
+        RopeClipOffset(source, ClampI(point.col, 0, len(source)), Bias::Left);
+    int row = WrapRowOfOffset(starts, count, col, false);
+    return {display.start + row, col - starts[row]};
+}
+
+BufferPoint InputDisplayToBufferPoint(InputDisplayMapRef map,
+                                      DisplayPoint point) {
+    int line = InputDisplayRowBufferLine(map, point.row);
+    Selection display = {};
+    if (!InputBufferLineDisplayRows(map, line, &display)) return {};
+    int row = ClampI(point.row, display.start, display.end - 1) - display.start;
+    Str source = InputSliceLine(map.state, line);
+    const int* starts = nullptr;
+    int count = InputWrapRows(map.state, line, &starts, nullptr);
+    int last = row + 1 < count ? starts[row + 1] : len(source);
+    int col = starts[row] + ClampI(point.col, 0, last - starts[row]);
+    return {line, RopeClipOffset(source, col, Bias::Left)};
 }
 
 static void RowExtraCursors(Arena* a, El* el, const InputState* state,
@@ -46847,11 +47454,72 @@ struct EditorUnderlay {
     InputEditorStyle projected = {};
     bool lineNumbers = false;
     float textOriginOffset = 0;
+    ArenaVec<El*> gutters;
+    ArenaVec<El*> gutterMarks;
+    float gutterStrip = 0;
+    float decorationsX = 0;
+    bool mirrorMarks = false;
+    float leftGutterInset = 0;
+    Bounds textMask = {};
+    El** lineBands = nullptr;
+    Selection bandRows = {};
+    ArenaVec<LineDecorationBackground> lineBackgrounds;
 
     El* foldBands[64] = {};
     int nFoldBands = 0;
     Rgba foldColor = {};
 };
+
+static void TrackLineDecorationBands(EditorUnderlay* u, Arena* a,
+                                     Selection rows) {
+    int count = rows.end - rows.start;
+    u->lineBands = (El**)Alloc(a, (int)sizeof(El*) * count);
+    if (u->lineBands) {
+        memset(u->lineBands, 0, sizeof(El*) * (size_t)count);
+        u->bandRows = rows;
+    }
+}
+
+static bool EditorLineBandVisible(const El* band, Bounds viewport) {
+    return band && band->y < viewport.Bottom() &&
+           band->Bounds().Bottom() > viewport.y;
+}
+
+static void PaintEditorLineBackgrounds(PaintCtx* ctx, EditorUnderlay* u,
+                                       Bounds viewport) {
+    if (!u->lineBands) {
+        return;
+    }
+    u->lineBackgrounds.Truncate(0);
+    Selection visible = u->bandRows;
+    while (visible.start < visible.end &&
+           !EditorLineBandVisible(
+               u->lineBands[visible.start - u->bandRows.start], viewport)) {
+        visible.start++;
+    }
+    while (visible.end > visible.start &&
+           !EditorLineBandVisible(
+               u->lineBands[visible.end - 1 - u->bandRows.start], viewport)) {
+        visible.end--;
+    }
+    ArenaVec<LineDecoration> decorations;
+    InputLineDecorationsForRows(u->state, visible, &u->cx, &decorations);
+    for (const auto& decoration : decorations) {
+        const El* band = u->lineBands[decoration.row - u->bandRows.start];
+        if (!decoration.hasBackground ||
+            !EditorLineBandVisible(band, viewport)) {
+            continue;
+        }
+        Bounds bounds = {viewport.x, band->y, viewport.w, band->h};
+        Rgba color = decoration.background;
+        if (u->state->disabled) {
+            color = RgbaOpacity(color, 0.5f);
+        }
+        u->lineBackgrounds.Append(u->cx.a, {decoration.row, bounds, color});
+        FillRound(ctx, bounds.x, bounds.y, bounds.w, bounds.h, 0,
+                  PaintFade(ctx, color));
+    }
+}
 
 static void RewrapEditorColumn(PaintCtx* ctx, El* e, void* user) {
     EditorUnderlay* u = (EditorUnderlay*)user;
@@ -46884,15 +47552,43 @@ static void RewrapEditorColumn(PaintCtx* ctx, El* e, void* user) {
 
 static void PaintEditorUnderlay(PaintCtx* ctx, El* e, void* user) {
     EditorUnderlay* u = (EditorUnderlay*)user;
-    if (!u) {
+    if (!u || !u->state) {
         return;
     }
 
     InputState* s = u->state;
-    if (s) {
-        s->textOriginOffset = u->textOriginOffset;
+    s->textOriginOffset = u->textOriginOffset;
+    Bounds viewport = ctx->hasHitMask ? ctx->hitMask : e->Bounds();
+    bool rightGutter = s->gutterSide == Side::Right;
+    float fixedX = e->x + s->scrollX;
+    float gutterX = fixedX + u->leftGutterInset;
+    float left = fixedX + (rightGutter ? u->textOriginOffset
+                                       : gutterX - fixedX + s->gutterLaneW);
+    float right = viewport.Right();
+    if (rightGutter && s->gutterLaneW > 0) {
+        if (s->viewW > 0) {
+            right = std::min(right, fixedX + s->viewW);
+        }
+        right -= s->gutterLaneW;
+        gutterX = right;
     }
-    if (s && s->softWrap && e->w > 0 && e->w != s->wrap.measuredWidth &&
+    for (int i = 0; i < len(u->gutters); i++) {
+        El* gutter = u->gutters[i];
+        gutter->PaintOffset(gutterX - gutter->x, 0);
+        if (i == 0) {
+            s->gutterBox = {gutterX, gutter->y, gutter->w, gutter->h};
+        }
+    }
+    for (int i = 0; i < len(u->gutterMarks); i++) {
+        El* mark = u->gutterMarks[i];
+        float x = mark->x - e->x;
+        if (u->mirrorMarks) x = u->gutterStrip - x - mark->w;
+        mark->PaintOffset(gutterX + u->decorationsX + x - mark->x, 0);
+    }
+    left = ClampF(left, viewport.x, viewport.x + viewport.w);
+    u->textMask = {left, viewport.y, std::max(0.f, right - left), viewport.h};
+    PaintEditorLineBackgrounds(ctx, u, viewport);
+    if (s->softWrap && e->w > 0 && e->w != s->wrap.measuredWidth &&
         ctx->window) {
         AppInvalidate(ctx->window);
     }
@@ -46921,8 +47617,7 @@ static void PaintEditorUnderlay(PaintCtx* ctx, El* e, void* user) {
         return;
     }
     if (!p->built) {
-        Bounds mask = ctx->hasHitMask ? ctx->hitMask : e->Bounds();
-        BuildRangeDecorationPaths(ctx, p, mask);
+        BuildRangeDecorationPaths(ctx, p, u->textMask);
     }
     for (int i = 0; i < p->nPaths; i++) {
         const RangeDecorationPath& path = p->paths[i];
@@ -46943,6 +47638,43 @@ static void PaintEditorUnderlay(PaintCtx* ctx, El* e, void* user) {
         }
         PathFree(shape);
     }
+}
+
+static void MaskEditorText(El* el, const EditorUnderlay* underlay) {
+    if (underlay) {
+        if (!el->lifecycle) {
+            el->lifecycle = ArenaNew<ElLifecycle>(el->arena);
+        }
+        if (el->lifecycle) {
+            el->lifecycle->paintMask = &underlay->textMask;
+        }
+    }
+}
+
+bool InputLastTextMask(const InputState* s, const Window* win, Bounds* out) {
+    const InputPaintedRows* rows = LastPaintedRows(s, win);
+    if (!rows || !rows->underlay) {
+        return false;
+    }
+    if (out) {
+        *out = rows->underlay->textMask;
+    }
+    return true;
+}
+
+int InputLastLineDecorationBackgrounds(const InputState* s, const Window* win,
+                                       LineDecorationBackground* out, int cap) {
+    const auto* rows = LastPaintedRows(s, win);
+    if (!rows || !rows->underlay) {
+        return 0;
+    }
+    const auto& backgrounds = rows->underlay->lineBackgrounds;
+    int i = 0;
+    for (const auto& background : backgrounds) {
+        if (!out || i >= cap) break;
+        out[i++] = background;
+    }
+    return len(backgrounds);
 }
 
 bool InputLastActiveLine(const InputState* s, const Window* win, Bounds* out) {
@@ -47170,15 +47902,31 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     El* col = Div(a)->FlexCol()->W(kFill)->BindInput(state);
     col->BoundsOut(&state->contentBox);
     ApplyEditorAccessibility(col, state, style.mask || state->masked, text);
-    if (len(text) == 0) {
+    bool layoutSpacers = state->spacers && (state->spacers->provider.query ||
+                                            state->spacers->total > 0);
+    if (len(text) == 0 && !layoutSpacers) {
         state->scrollY = 0;
         state->layoutOriginY = 0;
         state->gutterLaneW = 0;
+        state->gutterGap = 0;
         state->contentH = lineH;
         state->hasDeferredScrollY = false;
         col->customPaint = [](PaintCtx*, El* element, void*) {
             element->input->textOriginOffset = 0;
         };
+        if (InputHasLineDecorationProviders(state)) {
+            auto* underlay = ArenaNew<EditorUnderlay>(a);
+            if (underlay) {
+                underlay->state = state;
+                underlay->cx = *cx;
+                TrackLineDecorationBands(underlay, a, {0, 1});
+                if (underlay->lineBands) {
+                    underlay->lineBands[0] = col;
+                    col->customPaint = &PaintEditorUnderlay;
+                    col->customUser = underlay;
+                }
+            }
+        }
         if (caret) {
             col->Caret(0, style.caret);
         }
@@ -47191,6 +47939,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     }
 
     int rows = InputLinesLen(state);
+    if (len(text) == 0) text = StrL("");
     int digits = lineNumbers ? InputLineNumberLen(rows) : 0;
     uint16_t bodyWord = InputFontWordCascaded(style, state->cascadeFontWord);
     const EditorLineNumberRenderer& renderer = style.lineNumbers;
@@ -47215,8 +47964,26 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
             : 0.f;
 
     float gutterStrip = InputGutterStripWidth(state);
+    const float laneWidths[] = {foldW, numW, gutterStrip};
     state->gutterLaneW = gutterStrip + numW + foldW;
-    float textOriginOffset = state->gutterLaneW + numberGap;
+    state->gutterGap = numberGap;
+    bool rightGutter = state->gutterSide == Side::Right;
+    GutterColumn order[3];
+    float laneX[3];
+    int laneIndex[3];
+    float laneOffset = 0;
+    for (int i = 0; i < 3; i++) {
+        GutterColumn lane = state->gutterOrder[rightGutter ? i : 2 - i];
+        order[i] = lane;
+        laneIndex[(int)lane] = i;
+        laneX[(int)lane] = laneOffset;
+        laneOffset += laneWidths[(int)lane];
+    }
+    float gutterWidth = state->gutterLaneW + numberGap;
+    float textOriginOffset =
+        std::max(rightGutter ? 0.f : gutterWidth, state->scrollbarClearance);
+    float textReservation =
+        rightGutter ? textOriginOffset + gutterWidth : textOriginOffset;
 
     if (state->softWrap && !state->wrap.buildingRows) {
         auto* underlay = ArenaNew<EditorUnderlay>(a);
@@ -47248,7 +48015,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         float colW = state->contentBox.w;
         float textW = 0;
         if (colW > 0) {
-            textW = colW - textOriginOffset - kEditorRightMargin;
+            textW = colW - textReservation - kEditorRightMargin;
             if (textW < 1) {
                 textW = 1;
             }
@@ -47297,6 +48064,11 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
     bool indentGuides = style.indentGuide.a != 0 && style.indentWidth > 0;
     int lastIndent = 0;
 
+    if (layoutSpacers) {
+        PrepareEditorSpacers(cx, state, rows);
+        state->contentH = (double)InputDisplayBlockStart(state, rows) * lineH;
+    }
+
     float vh = InputViewportHeight(cx, state);
 
     float emptyBottom =
@@ -47320,7 +48092,20 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         double top = state->scrollY;
         double bottom = top + vh;
         bool folded = len(state->folds.folded) != 0;
-        if (!wrap && !folded) {
+        if (SpacerRowsTotal(state) > 0) {
+            InputDisplayMapRef display = InputDisplayMap(state);
+            int last = InputDisplayBlockStart(state, rows) - 1;
+            int firstDisplay = (int)std::min(top / lineH, (double)last);
+            int lastDisplay = (int)std::min(bottom / lineH, (double)last);
+            firstRow = std::max(
+                0, InputDisplayRowBufferLine(display, firstDisplay) - kSlack);
+            endRow =
+                std::min(rows, InputDisplayRowBufferLine(display, lastDisplay) +
+                                   1 + kSlack);
+            padTop = DisplayRowDocY(state, firstRow, lineH);
+            padBottom = DisplayRowDocY(state, rows, lineH) -
+                        DisplayRowDocY(state, endRow, lineH);
+        } else if (!wrap && !folded) {
             int first = (int)std::min(top / lineH, (double)rows) - kSlack;
             int end = (int)std::min(bottom / lineH + 1 + kSlack, (double)rows);
             firstRow = first < 0 ? 0 : (first > rows ? rows : first);
@@ -47604,6 +48389,15 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         underlay->projected = projected;
         underlay->lineNumbers = lineNumbers;
         underlay->textOriginOffset = textOriginOffset;
+        underlay->gutterStrip = gutterStrip;
+        underlay->decorationsX = laneX[(int)GutterColumn::Decorations];
+        underlay->mirrorMarks = laneIndex[(int)GutterColumn::Decorations] >
+                                laneIndex[(int)GutterColumn::LineNumbers];
+        underlay->leftGutterInset =
+            rightGutter ? 0 : textOriginOffset - gutterWidth;
+        if (InputHasLineDecorationProviders(state)) {
+            TrackLineDecorationBands(underlay, a, {firstRow, endRow});
+        }
         col->customPaint = &PaintEditorUnderlay;
         col->customUser = underlay;
         if (state->softWrap && !state->wrap.buildingRows) {
@@ -47622,6 +48416,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
         if (folding && FoldMapLineHidden(&state->folds, row)) {
             continue;
         }
+        AppendEditorSpacers(cx, col, state, row, true, lineH);
 
         if (row == firstRow) {
             while (spanAt < nDocSpans && docSpans[spanAt].hi <= lineStart) {
@@ -47680,10 +48475,12 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
             } else {
                 shown = ShowTabs(a, cx->win ? &cx->win->paint : nullptr, state,
                                  line);
-                el = TextEl(a, shown.text)
+                bool placeholder = len(text) == 0;
+                el = TextEl(a, placeholder ? state->placeholder : shown.text)
                          ->Font(font)
                          ->LineHeight(lineMult)
-                         ->Fg(style.foreground);
+                         ->Fg(placeholder ? style.mutedForeground
+                                          : style.foreground);
                 InputFace(el, style);
             }
             if (paintedRow) {
@@ -47925,7 +48722,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                     .w;
             float indent = nVis > 1 ? wrapIndent : 0;
             indent += TextAlignedRowLeft(
-                rowAlign, state->contentBox.w - textOriginOffset, end);
+                rowAlign, state->contentBox.w - textReservation, end);
             El* mark = state->foldPlaceholder
                            .render(state->foldPlaceholder.data, cx, row);
             if (mark) {
@@ -47955,14 +48752,19 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                 }
             }
         }
-        if (!lineNumbers && !folding) {
-            if (textOriginOffset > 0) {
+        MaskEditorText(el, underlay);
+        if (state->gutterLaneW <= 0.f) {
+            if (textReservation > 0) {
 
                 el = Div(a)
                          ->W(kFill)
                          ->FlexCol()
                          ->PadL(textOriginOffset)
+                         ->PadR(textReservation - textOriginOffset)
                          ->Child(el);
+            }
+            if (underlay && underlay->lineBands) {
+                underlay->lineBands[row - firstRow] = el;
             }
             if (underlay && foldedLine && state->hasFoldBackground &&
                 underlay->nFoldBands < (int)(sizeof(underlay->foldBands) /
@@ -47971,6 +48773,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                 underlay->foldColor = state->foldBackground;
             }
             col->Child(el);
+            AppendEditorSpacers(cx, col, state, row, false, lineH);
             continue;
         }
 
@@ -47980,8 +48783,11 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                        ->Gap(numberGap)
                        ->H((float)nVis * lineH)
                        ->ItemsStart();
-        if (gutterStrip > 0) {
-            band->PadL(gutterStrip);
+        if (rightGutter) {
+            band->PadL(textOriginOffset);
+            band->Child(el);
+        } else {
+            band->PadL(textOriginOffset - gutterWidth);
         }
 
         if (row == activeRow && style.activeLine.a != 0 && underlay) {
@@ -48002,32 +48808,44 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                                         row == activeRow, numberLayout, lineH)
                           : InputRenderLineNumber(cx, number, style.foreground,
                                                   numberLayout, lineH);
-            numCell =
-                Div(a)->W(numW)->H(lineH)->Shrink0()->JustifyEnd()->Child(num);
+            numCell = Div(a)->W(numW)->H(lineH)->Shrink0()->Child(num);
+            if (!rightGutter) {
+                numCell->JustifyEnd();
+            }
         }
+        El* gutter = Div(a)->FlexRow()->ItemsCenter()->H(lineH)->Shrink0();
+        El* fold = nullptr;
         if (folding) {
 
-            El* gutter = Div(a)->FlexRow()->ItemsCenter()->H(lineH)->PathClick(
-                StrDup(a, fmt("gutter-%d", row)));
-            gutter->Child(numCell);
-            gutter->Child(FoldChevron(a, state, style, row, activeRow, lineH,
-                                      gutterHover));
-            if (row == firstRow) {
-                gutter->BoundsOut(&state->gutterBox);
-            }
-            band->Child(gutter);
-        } else {
-            if (row == firstRow) {
-                numCell->BoundsOut(&state->gutterBox);
-            }
-            band->Child(numCell);
+            gutter->PathClick(StrDup(a, fmt("gutter-%d", row)));
+            fold = FoldChevron(a, state, style, row, activeRow, lineH,
+                               gutterHover);
         }
+        El* decorations = gutterStrip > 0.f
+                              ? Div(a)->W(gutterStrip)->H(lineH)->Shrink0()
+                              : nullptr;
+        El* lanes[] = {fold, numCell, decorations};
+        for (GutterColumn lane : order) {
+            gutter->Child(lanes[(int)lane]);
+        }
+        if (underlay) {
+            underlay->gutters.Append(a, gutter);
+        } else if (row == firstRow) {
+            gutter->BoundsOut(&state->gutterBox);
+        }
+        band->Child(gutter);
         if (wrap || rowAlign != TextAlign::Left) {
 
             el->Flex1();
         }
-        band->Child(el);
+        if (!rightGutter) {
+            band->Child(el);
+        }
+        if (underlay && underlay->lineBands) {
+            underlay->lineBands[row - firstRow] = band;
+        }
         col->Child(band);
+        AppendEditorSpacers(cx, col, state, row, false, lineH);
     }
     if (rangePaint && painted) {
         rangePaint->nRows = painted->geometry.nRows;
@@ -48043,7 +48861,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                             laidFont, InputFontWord(style), firstRow, endRow);
         if (state->longestLineW > 0) {
 
-            col->MinW(state->longestLineW + textOriginOffset +
+            col->MinW(state->longestLineW + textReservation +
                       kEditorRightMargin);
         }
     }
@@ -48075,6 +48893,7 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                 El* run = TextEl(a, one)->Font(font)->LineHeight(lineMult)->Fg(
                     ghostFg);
                 InputFace(run, style);
+                MaskEditorText(ghost, underlay);
                 col->Child(ghost->Child(run));
             }
             if (nl < 0) {
@@ -48114,6 +48933,9 @@ El* Textarea::New(Ctx* cx, InputState* state, const InputEditorStyle& projected,
                         mark->Radius(markW * 0.5f);
                     }
                     col->Child(mark);
+                    if (underlay) {
+                        underlay->gutterMarks.Append(a, mark);
+                    }
                 }
             }
         }
@@ -48222,6 +49044,7 @@ InputState::~InputState() {
         gPendingPaste.state = nullptr;
     }
     InputDecorationsFree(this);
+    delete spacers;
     if (contextMenuDrop && contextMenuData) {
         contextMenuDrop(contextMenuData);
     }
@@ -48685,12 +49508,14 @@ void FoldMapSetCandidates(FoldMap* m, const FoldRange* ranges, int n) {
     FoldSort(&m->candidates);
     FoldDedup(&m->candidates);
 
+    int wasFolded = len(m->folded);
     for (int i = len(m->folded) - 1; i >= 0; i--) {
         if (FoldFindAt(m->candidates, m->folded[i].startLine) < 0) {
             FoldRemoveAt(&m->folded, i);
             m->needsRebuild = true;
         }
     }
+    if (len(m->folded) != wasFolded) m->version++;
 }
 
 void FoldMapSetFolded(FoldMap* m, int startLine, bool folded) {
@@ -48704,12 +49529,14 @@ void FoldMapSetFolded(FoldMap* m, int startLine, bool folded) {
         }
         VecAppend(m->folded, m->candidates[ix]);
         FoldSort(&m->folded);
+        m->version++;
         m->needsRebuild = true;
         return;
     }
     int ix = FoldFindAt(m->folded, startLine);
     if (ix >= 0) {
         FoldRemoveAt(&m->folded, ix);
+        m->version++;
         m->needsRebuild = true;
     }
 }
@@ -48733,14 +49560,20 @@ void FoldMapSetFoldedLines(FoldMap* m, const int* starts, int count) {
         starts = sorted.els;
         break;
     }
-    VecClear(m->folded);
+    Vec<FoldRange> folded;
     int at = 0;
     for (const FoldRange& candidate : m->candidates) {
         while (at < count && starts[at] < candidate.startLine) at++;
         if (at == count) break;
-        if (starts[at] == candidate.startLine) VecAppend(m->folded, candidate);
+        if (starts[at] == candidate.startLine) VecAppend(folded, candidate);
     }
-    m->needsRebuild = true;
+    if (len(folded) != len(m->folded) ||
+        (len(folded) > 0 && memcmp(folded.els, m->folded.els,
+                                   sizeof(FoldRange) * (size_t)len(folded)))) {
+        m->folded = std::move(folded);
+        m->needsRebuild = true;
+        m->version++;
+    }
 }
 
 void FoldMapToggle(FoldMap* m, int startLine) {
@@ -48758,6 +49591,7 @@ bool FoldMapIsCandidate(const FoldMap* m, int startLine) {
 void FoldMapClearFolds(FoldMap* m) {
     if (m && len(m->folded) > 0) {
         VecClear(m->folded);
+        m->version++;
         m->needsRebuild = true;
     }
 }
@@ -48793,6 +49627,7 @@ void FoldMapAdjustForEdit(FoldMap* m, int editStartLine, int editEndLine,
     if (!m || (len(m->folded) == 0 && len(m->candidates) == 0)) {
         return;
     }
+    if (len(m->folded)) m->version++;
     FoldShiftForEdit(&m->folded, editStartLine, editEndLine, lineDelta);
     FoldShiftForEdit(&m->candidates, editStartLine, editEndLine, lineDelta);
     m->needsRebuild = true;
@@ -49398,9 +50233,11 @@ static double InputOffsetDisplayY(const InputState* s, int offset,
     int row = RopeOffsetToPoint(InputValue(s), offset).row;
     if (FoldMapLineHidden(&s->folds, row)) {
         row = FoldMapNearestVisibleLine(&s->folds, row);
-        return DisplayRowDocY(s, row, lineH);
+        return DisplayRowDocY(s, row, lineH) +
+               SpacerRowsAboveLine(s, row) * lineH;
     }
-    double y = DisplayRowDocY(s, row, lineH);
+    double y =
+        DisplayRowDocY(s, row, lineH) + SpacerRowsAboveLine(s, row) * lineH;
 
     const InputWrapMap* m = &s->wrap;
     if (!s->softWrap || !m->valid || m->width <= 0 || row < 0 ||
@@ -49577,10 +50414,12 @@ static void InputScrollToCaretWithPaddingF64(InputState* s, float caretX,
     float lineH = s->lastLineH > 0 ? s->lastLineH : kInputLineH;
 
     if (s->viewW > 0 && caretX >= 0) {
+        float rightGutter = s->gutterSide == Side::Right ? s->gutterLaneW : 0.f;
         if (caretX - kInputRightMargin < s->scrollX) {
             s->scrollX = caretX - kInputRightMargin;
-        } else if (caretX + kInputRightMargin > s->scrollX + s->viewW) {
-            s->scrollX = caretX + kInputRightMargin - s->viewW;
+        } else if (caretX + kInputRightMargin + rightGutter >
+                   s->scrollX + s->viewW) {
+            s->scrollX = caretX + kInputRightMargin + rightGutter - s->viewW;
         }
         float mostX = s->contentW - s->viewW;
         if (mostX < 0) {
@@ -49802,6 +50641,42 @@ void InputSetEditorPaddings(InputState* s, Edges paddings) {
     s->editorPaddingsSet = true;
 }
 
+void InputSetGutterSide(InputState* s, Side side, App* app, Window* win) {
+    if (s && s->gutterSide != side) {
+        s->gutterSide = side;
+        Notify(app, win);
+    }
+}
+
+void InputSetGutterOrder(InputState* s, const GutterColumn* columns, int count,
+                         App* app, Window* win) {
+    if (!s) return;
+    GutterColumn order[3];
+    unsigned seen = 0;
+    int n = 0;
+    auto add = [&](GutterColumn column) {
+        unsigned index = (unsigned)column;
+        if (index < 3 && !(seen & (1u << index))) {
+            order[n++] = column;
+            seen |= 1u << index;
+        }
+    };
+    for (int i = 0; columns && i < count && n < 3; i++) add(columns[i]);
+    for (GutterColumn column : kDefaultGutterOrder) add(column);
+    if (memcmp(s->gutterOrder, order, sizeof(order)) != 0) {
+        memcpy(s->gutterOrder, order, sizeof(order));
+        Notify(app, win);
+    }
+}
+
+void InputSetScrollbarPlacement(InputState* s, ScrollbarPlacement placement,
+                                App* app, Window* win) {
+    if (s && s->scrollbarPlacement != placement) {
+        s->scrollbarPlacement = placement;
+        Notify(app, win);
+    }
+}
+
 void SetScrollbarRenderer(InputState* s, EditorScrollbarRenderer renderer,
                           void* user, void (*drop)(void*)) {
     if (!s) return;
@@ -49831,12 +50706,16 @@ void EditorScrollbarPrePaint(PaintCtx* ctx, El* e, void*) {
     if (inputBounds.h < 0) inputBounds.h = 0;
     EditorScrollbarContext presented;
     presented.state = s;
-    float lane = std::min(s->gutterLaneW, inputBounds.w);
-    presented.viewport = {inputBounds.x + lane, inputBounds.y - pad.top,
-                          inputBounds.w + pad.right - lane,
-                          inputBounds.h + pad.top + pad.bottom};
+    presented.placement = s->scrollbarPlacement;
+    float left = ScrollbarIsLeft(presented.placement)
+                     ? -pad.left
+                     : (s->gutterSide == Side::Left
+                            ? std::min(s->gutterLaneW, inputBounds.w)
+                            : 0.f);
+    presented.viewport = {inputBounds.x + left, inputBounds.y - pad.top,
+                          inputBounds.w + pad.right - left, outer.h};
     presented.scrollViewport = {presented.viewport.w, inputBounds.h};
-    presented.content = {std::max(0.f, s->contentW - lane), (float)s->contentH};
+    presented.content = {std::max(0.f, s->contentW - left), (float)s->contentH};
     presented
         .axis = s->softWrap ? ScrollbarAxis::Vertical : ScrollbarAxis::Both;
     if (!ctx || !ctx->window || !ctx->window->frameArena) return;
@@ -52855,12 +53734,17 @@ static double DisplayLineH(const InputState* s, int row, float lineH) {
     if (FoldMapLineHidden(&s->folds, row)) {
         return 0;
     }
-    return (double)InputWrapRows(s, row, nullptr, nullptr) * lineH;
+    int blanks =
+        SpacerRowsBeforeLine(s, row + 1) - SpacerRowsBeforeLine(s, row);
+    return ((double)InputWrapRows(s, row, nullptr, nullptr) + blanks) * lineH;
 }
 
 static double DisplayRowDocY(const InputState* s, int row, float lineH) {
     if (!s || row <= 0) {
         return 0;
+    }
+    if (SpacerRowsTotal(s) > 0) {
+        return (double)InputDisplayBlockStart(s, row) * lineH;
     }
     const InputWrapMap* m = WrapMapOf(s, nullptr);
     bool folded = len(s->folds.folded) > 0;
@@ -53025,6 +53909,9 @@ static void AlignWrapRow(PaintCtx* ctx, const InputState* state, Str line,
     }
     float width = WrapRowX(ctx, state, line, *row, row->hi) - row->x;
     float column = state->contentBox.w - std::max(0.f, state->textOriginOffset);
+    if (state->gutterSide == Side::Right) {
+        column -= state->gutterLaneW + state->gutterGap;
+    }
     row->x += TextAlignedRowLeft(align, column, width);
 }
 
@@ -53082,7 +53969,8 @@ static bool VerticalTargetDisplay(const InputState* s, Window* win, int lines,
         return false;
     }
     PaintCtx* ctx = &win->paint;
-    if (!WrapMapOf(s, ctx)) {
+    bool spaced = SpacerRowsTotal(s) > 0;
+    if (!WrapMapOf(s, ctx) && !spaced) {
         return false;
     }
     RopePoint p = RopeOffsetToPoint(t, from);
@@ -53107,6 +53995,23 @@ static bool VerticalTargetDisplay(const InputState* s, Window* win, int lines,
     int maxLine = RopeLinesLen(t) - 1;
     int line = p.row;
     int row = k;
+    if (spaced) {
+        InputDisplayMapRef map = InputDisplayMap(s);
+        Selection current = {};
+        int display = InputBufferLineDisplayRows(map, line, &current)
+                          ? current.start + k
+                          : InputBufferLineDisplayRow(map, line);
+        int last = InputDisplayRowCount(map) - 1;
+        int64_t shifted = (int64_t)display + lines;
+        int targetRow =
+            shifted < 0 ? 0 : (shifted > last ? last : (int)shifted);
+        targetRow = NearestTextDisplayRow(map, targetRow, lines > 0);
+        line = InputDisplayRowBufferLine(map, targetRow);
+        Selection target = {};
+        if (!InputBufferLineDisplayRows(map, line, &target)) return false;
+        row = targetRow - target.start;
+        lines = 0;
+    }
     for (int step = lines; step < 0; step++) {
         if (row > 0) {
             row--;
@@ -54469,7 +55374,12 @@ static int FirstVisibleOffset(const InputState* s) {
     int rows = InputLinesLen(s);
     int row = rows - 1;
     const InputWrapMap* map = WrapMapOf(s, nullptr);
-    if (len(s->folds.folded) == 0) {
+    if (SpacerRowsTotal(s) > 0) {
+        InputDisplayMapRef display = InputDisplayMap(s);
+        int last = InputDisplayRowCount(display) - 1;
+        row = InputDisplayRowBufferLine(
+            display, (int)std::min(s->scrollY / lineH, (double)last));
+    } else if (len(s->folds.folded) == 0) {
         row = map ? map->tree.LineAtRow((int)std::min(s->scrollY / lineH,
                                                       (double)map->totalRows))
                   : (int)std::min(s->scrollY / lineH, (double)(rows - 1));
@@ -54807,7 +55717,22 @@ int InputIndexForPosition(const InputState* s, PaintCtx* ctx, float x, float y,
 
     double relY = 0;
     const InputWrapMap* map = WrapMapOf(s, ctx);
-    if (len(s->folds.folded) == 0 && lineH > 0) {
+    if (SpacerRowsTotal(s) > 0 && lineH > 0) {
+        InputDisplayMapRef display = InputDisplayMap(s);
+        int last = InputDisplayRowCount(display) - 1;
+        int displayRow =
+            (int)std::min(std::max(0., docY) / lineH, (double)last);
+        if (const auto* run = SpacerRunAtRow(s, displayRow)) {
+            int line = run->spacer.line;
+            int start = InputLineStartOffset(s, line);
+            return run->spacer.above ? start
+                                     : start + len(InputSliceLine(s, line));
+        }
+        row = InputDisplayRowBufferLine(display, displayRow);
+        Selection range = {};
+        InputBufferLineDisplayRows(display, row, &range);
+        relY = std::max(0., docY - (double)range.start * lineH);
+    } else if (len(s->folds.folded) == 0 && lineH > 0) {
         double displayRow = std::max(0., docY) / lineH;
         row = map ? map->tree.LineAtRow(
                         (int)std::min(displayRow, (double)map->totalRows))
@@ -67192,10 +68117,29 @@ float ScrollbarThumbPos(float track, float thumb, float offset, float container,
     return ScrollbarThumbPos(track, thumb, offset, container, content, 0);
 }
 
+Bounds ScrollbarTrackBounds(Bounds viewport, Axis axis,
+                            ScrollbarPlacement placement, float trackWidth,
+                            float leadingInset, float otherTrackWidth,
+                            float trailingInset) {
+    bool left = ScrollbarIsLeft(placement);
+    if (axis == Axis::Vertical) {
+        float x = left ? viewport.x : viewport.Right() - trackWidth;
+        return {x, viewport.y, trackWidth, viewport.h};
+    }
+    float x = viewport.x + leadingInset + (left ? otherTrackWidth : 0);
+    float y =
+        ScrollbarIsTop(placement) ? viewport.y : viewport.Bottom() - trackWidth;
+    return {x, y,
+            std::max(0.f, viewport.w - leadingInset - trailingInset -
+                              otherTrackWidth),
+            trackWidth};
+}
+
 AxisPrepaintState ScrollbarPrepaintAxis(Axis axis, Bounds track, float offset,
                                         float containerSize, float contentSize,
                                         const ScrollbarThumbStyle& style,
-                                        float viewportSize) {
+                                        float viewportSize,
+                                        ScrollbarPlacement placement) {
     AxisPrepaintState out;
     out.axis = axis;
     out.barHitbox = track;
@@ -67221,16 +68165,18 @@ AxisPrepaintState ScrollbarPrepaintAxis(Axis axis, Bounds track, float offset,
     float thumbWidth = style.hasWidth ? style.width : 6.f;
 
     if (axis == Axis::Vertical) {
-        out.thumbBounds = {track.x + track.w - inset - out.trackWidth,
-                           thumbStart, out.trackWidth, thumbLength};
-        out.thumbFillBounds = {track.x + track.w - inset - thumbWidth,
-                               thumbStart, thumbWidth, thumbLength};
+        bool left = ScrollbarIsLeft(placement);
+        float edge = left ? track.x + inset : track.Right() - inset;
+        out.thumbBounds = {left ? edge : edge - out.trackWidth, thumbStart,
+                           out.trackWidth, thumbLength};
+        out.thumbFillBounds = {left ? edge : edge - thumbWidth, thumbStart,
+                               thumbWidth, thumbLength};
     } else {
-        out.thumbBounds = {thumbStart,
-                           track.y + track.h - inset - out.trackWidth,
+        bool top = ScrollbarIsTop(placement);
+        float edge = top ? track.y + inset : track.Bottom() - inset;
+        out.thumbBounds = {thumbStart, top ? edge : edge - out.trackWidth,
                            thumbLength, out.trackWidth};
-        out.thumbFillBounds = {thumbStart,
-                               track.y + track.h - inset - thumbWidth,
+        out.thumbFillBounds = {thumbStart, top ? edge : edge - thumbWidth,
                                thumbLength, thumbWidth};
     }
 
@@ -67338,6 +68284,10 @@ El* Scrollbar::ApplyStyles(Ctx* cx, El* element,
                            theme.tokens.colors.foreground);
     box->scrollMotion = theme.scrollbar.motion;
     return box;
+}
+
+El* Scrollbar::Placement(El* element, ScrollbarPlacement placement) {
+    return element->ScrollPlacement(placement);
 }
 
 El* Scrollbar::Vertical(Ctx* cx, Str id, float scrollY, Listener onScroll) {
@@ -75765,6 +76715,30 @@ RenderContext RenderContextWithForegroundRanges(Arena* a, RenderContext rcx,
     return rcx;
 }
 
+static int HangingPrefix(Str text) {
+    int at = 0;
+    for (int i = 0; i < 2 && at < len(text); i++) {
+        uint32_t c = 0;
+        int step = Utf8At(text, at, &c);
+        if (step <= 0 || !(c == '.' || c == ',' || c == ';' || c == ':' ||
+                           c == '!' || c == '?' || c == ')' || c == ']' ||
+                           c == '}' || c == 0x201D || c == 0x2019)) {
+            break;
+        }
+        at += step;
+    }
+    if (at < len(text)) {
+        uint32_t c = 0;
+        if (Utf8At(text, at, &c) <= 0 || !IsUnicodeWhitespace(c)) {
+            return 0;
+        }
+    }
+    while (at < len(text) && text.s[at] == ' ') {
+        at++;
+    }
+    return at;
+}
+
 El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
                      uint8_t align) {
 
@@ -75856,13 +76830,18 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
     bool hasReveal = RevealIn(n, &revealOffset);
     El* lastWord = nullptr;
     int lastWordLo = 0;
-    auto flush = [&]() {
+    El* pending = nullptr;
+    auto appendPending = [&]() {
+        row->Child(pending);
+        pending = nullptr;
+    };
+    auto flush = [&](bool hanging = false, bool shapeLine = false) {
         if (wordLen <= 0) {
             return;
         }
         El* w = Word(StrDup(a, Str(word, wordLen)), font, color, marks, weight,
                      href, highlight, hasHighlight);
-        if (marks & MdCode) {
+        if (shapeLine || (marks & MdCode)) {
 
             w->Wrap()->MaxWFrac(1.f)->MinW(0);
         }
@@ -75882,7 +76861,14 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
         }
         ApplyTextForeground(a, w, w->text, wordLeaf, ranges, nRanges);
         reportPiece(w, wordLeaf, wordLeaf + wordLen, false);
-        row->Child(w);
+        if (hanging) {
+
+            pending = Div(a)->FlexRow()->MaxWFrac(1.f)->Child(pending)->Child(
+                w->FlexNone());
+        } else {
+            appendPending();
+            pending = w;
+        }
         wordLen = 0;
     };
     for (MdRun* r = n->runFirst; r; r = r->next) {
@@ -75903,6 +76889,7 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
         runOffset = nextRunOffset;
         nextRunOffset += len(r->text);
         if (r->hasCustom) {
+            appendPending();
             const MarkdownInlineRenderer* renderer =
                 markdownExtensions.InlineRenderer(r->custom.name);
             InlineRenderContext context;
@@ -75995,6 +76982,7 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
             continue;
         }
         if (len(r->imgSrc) > 0) {
+            appendPending();
             El* image =
                 SrcImage(InlineImageElement(this, r, font, color, inFlow), r);
             BindLinkedImage(image, href);
@@ -76004,10 +76992,16 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
             continue;
         }
         wordRun = r;
+        int hanging = 0;
+        if (pending && len(pending->text) > 0 &&
+            pending->text.s[len(pending->text) - 1] != ' ') {
+            hanging = HangingPrefix(r->text);
+        }
         for (int i = 0; i < len(r->text); i++) {
             char c = r->text.s[i];
             if (c == '\n') {
                 flush();
+                appendPending();
                 SrcBreak();
                 col->Child(row);
                 row = AlignRow(Div(a)->FlexRow()->FlexWrap()->W(kFill), align);
@@ -76016,15 +77010,34 @@ El* TextView::Inline(MdNode* n, float font, Rgba color, int weight,
             if (wordLen == 0) {
                 wordStart = i;
                 wordLeaf = leafAt + i;
+                if (marks == 0 && !pending && !row->first) {
+                    const char* start = r->text.s + i;
+                    const char* breakAt = (const char*)memchr(
+                        start, '\n', (size_t)(len(r->text) - i));
+                    bool nextIsBreak = r->next && len(r->next->text) > 0 &&
+                                       r->next->text.s[0] == '\n';
+                    if (breakAt || !r->next || nextIsBreak) {
+
+                        wordLen =
+                            breakAt ? (int)(breakAt - start) : len(r->text) - i;
+                        memcpy(word, start, (size_t)wordLen);
+                        i += wordLen - 1;
+                        flush(false, true);
+                        continue;
+                    }
+                }
             }
             word[wordLen++] = c;
-            if (c == ' ' && !(marks & MdCode)) {
+            if (i + 1 == hanging) {
+                flush(true);
+            } else if (i >= hanging && c == ' ' && !(marks & MdCode)) {
                 flush();
             }
         }
         leafAt += len(r->text);
     }
     flush();
+    appendPending();
 
     if (hasReveal && revealOut && lastWord) {
         RevealMark(lastWord, lastWordLo, revealOffset);
@@ -97332,6 +98345,18 @@ void DockSkin::SetCollapsedTabBarVisible(App* app, Window* win, bool visible) {
     }
 }
 
+bool DockSkin::IsSplitDividerLineVisible(App* app) const {
+    DockState* value = state.Get(app);
+    return value ? value->splitDividerLineVisible : true;
+}
+
+void DockSkin::SetSplitDividerLineVisible(App* app, Window* win, bool visible) {
+    if (DockState* value = state.Get(app)) {
+        value->splitDividerLineVisible = visible;
+        NotifyEntity(app, state.id, win);
+    }
+}
+
 El* DockInvalidPanelRender(Ctx* cx, void* data) {
     (void)data;
     Arena* a = cx->a;
@@ -97727,7 +98752,8 @@ static El* SkinTabContent(Ctx* cx, void*, const DockTabGroup* g) {
 static El* SkinSplitHandle(Ctx* cx, void*, const DockHandleCtx* h) {
 
     ResizeHandleContext handle = {h->axis, h->state};
-    return RenderResizeHandle(nullptr, &handle, cx);
+    bool line = DockSkin::New(h->dock).IsSplitDividerLineVisible(cx->app);
+    return RenderResizeHandleWith(cx, &handle, line);
 }
 
 static ResizeHandle* SkinDockResizeHandle(Ctx* cx, const DockCtx* d) {
@@ -98175,6 +99201,9 @@ static El* FieldRender(Ctx* cx, const Field& fld, const FieldProps& props) {
         head->Child(label);
     }
     El* control = Div(a)->W(kFill)->Flex1();
+    if (props.horizontal) {
+        control->MinW(0);
+    }
     if (fld.control) {
         control->Child(fld.control);
     }
@@ -98188,14 +99217,22 @@ static El* FieldRender(Ctx* cx, const Field& fld, const FieldProps& props) {
     if (fld.description.IsSet()) {
 
         if (props.horizontal && hasLabel) {
-            desc->Child(Div(a)->W(lw));
+            desc->Child(Div(a)->W(lw)->Shrink0());
+        }
+        El* note = Div(a)->Font(12)->Fg(th.mutedFg);
+        if (props.horizontal) {
+            note->MinW(0);
         }
         if (fld.description.kind == FieldBuilderKind::Element) {
-            desc->Child(fld.description.element);
+            note->Child(fld.description.element);
         } else {
-            desc->Child(
-                TextEl(a, fld.description.string)->Font(12)->Fg(th.mutedFg));
+            El* text = TextEl(a, fld.description.string);
+            if (props.horizontal) {
+                text->Wrap();
+            }
+            note->Child(text);
         }
+        desc->Child(note);
     }
     f->Child(desc);
     return f;
@@ -99353,6 +100390,47 @@ struct SynHlJob {
     Vec<FoldRange> folds;
 };
 
+static int SkipFoldWhitespace(Str text, int at, bool separators = false) {
+    while (at < len(text) && text.s[at] != '\n') {
+        uint32_t c = 0;
+        int step = Utf8At(text, at, &c);
+        if (step <= 0 || (!IsUnicodeWhitespace(c) &&
+                          !(separators && (c == ';' || c == ',')))) {
+            break;
+        }
+        at += step;
+    }
+    return at;
+}
+
+static bool FoldLineEnd(Str text, int at) {
+    return at == len(text) || text.s[at] == '\n';
+}
+
+static bool HasCodeAfterFold(Str text, int at) {
+    at = SkipFoldWhitespace(text, at, true);
+    if (FoldLineEnd(text, at)) {
+        return false;
+    }
+    Str rest(text.s + at, len(text) - at);
+    return !StrStartsWith(rest, StrL("--")) &&
+           !StrStartsWith(rest, StrL("//")) && !StrStartsWith(rest, StrL("#"));
+}
+
+static void AppendSqlSelectFolds(Vec<FoldRange>* folds, int start, int from,
+                                 int lastLine, bool trailingCode) {
+    if (start < 0 || lastLine <= start) {
+        return;
+    }
+    int end = trailingCode ? lastLine : lastLine + 1;
+    if (end > start + 1) {
+        VecAppend(*folds, FoldRange{start, end});
+    }
+    if (from > start && end > from + 1) {
+        VecAppend(*folds, FoldRange{from, end});
+    }
+}
+
 static void SynHlLexInto(SyntaxLang lang, Str text, Vec<HlRun>* runs,
                          Vec<FoldRange>* folds) {
     VecClear(*runs);
@@ -99361,10 +100439,21 @@ static void SynHlLexInto(SyntaxLang lang, Str text, Vec<HlRun>* runs,
         return;
     }
 
-    int starts[64];
+    struct Bracket {
+        int offset;
+        int line;
+        char closer;
+    };
+    Bracket starts[64];
+    const int capacity = (int)(sizeof(starts) / sizeof(starts[0]));
     int nOpen = 0;
     int line = 0;
+    int lineStart = 0;
     int at = 0;
+    bool sql = StrEq(SyntaxLangName(lang), StrL("sql"));
+    int sqlStart = -1;
+    int sqlFrom = -1;
+    int lastSqlLine = -1;
     SyntaxLexer lx;
     SyntaxLexStart(&lx, lang, text);
     while (SyntaxLexNext(&lx)) {
@@ -99372,36 +100461,70 @@ static void SynHlLexInto(SyntaxLang lang, Str text, Vec<HlRun>* runs,
         for (; at < tokStart && at < len(text); at++) {
             if (text.s[at] == '\n') {
                 line++;
+                lineStart = at + 1;
             }
         }
         bool literal =
             lx.tok == SyntaxTok::String || lx.tok == SyntaxTok::Comment;
+        if (sql && nOpen == 0 && lx.tok == SyntaxTok::Keyword) {
+            if (sqlStart < 0 && StrEqI(lx.text, StrL("select"))) {
+                sqlStart = line;
+            } else if (sqlStart >= 0 && sqlFrom < 0 &&
+                       StrEqI(lx.text, StrL("from"))) {
+                sqlFrom = line;
+            }
+        }
         for (int i = 0; i < len(lx.text); i++) {
             char c = lx.text.s[i];
+            int offset = tokStart + i;
+            if (sqlStart >= 0 && lx.tok != SyntaxTok::Comment &&
+                (uint8_t)c > ' ') {
+                lastSqlLine = line;
+                if (!literal && c == ';' && nOpen == 0) {
+                    AppendSqlSelectFolds(folds, sqlStart, sqlFrom, line,
+                                         HasCodeAfterFold(text, offset + 1));
+                    sqlStart = sqlFrom = -1;
+                }
+            }
             if (c == '\n') {
                 line++;
+                lineStart = tokStart + i + 1;
                 continue;
             }
             if (literal) {
                 continue;
             }
-            if (c == '{') {
-                if (nOpen < (int)(sizeof(starts) / sizeof(starts[0]))) {
-                    starts[nOpen] = line;
+            char closer = c == '{' ? '}' : c == '(' ? ')' : c == '[' ? ']' : 0;
+            if (closer) {
+                if (nOpen < capacity) {
+                    starts[nOpen] = {offset, line, closer};
                 }
                 nOpen++;
-            } else if (c == '}' && nOpen > 0) {
+            } else if ((c == '}' || c == ')' || c == ']') && nOpen > 0) {
+                if (nOpen <= capacity) {
+                    int match = nOpen - 1;
+                    while (match >= 0 && starts[match].closer != c) match--;
+                    if (match < 0) continue;
+                    nOpen = match + 1;
+                }
                 nOpen--;
-                if (nOpen >= (int)(sizeof(starts) / sizeof(starts[0]))) {
+                if (nOpen >= capacity) {
                     continue;
                 }
-                int startLine = starts[nOpen];
-
-                if (startLine < line) {
-                    FoldRange fr;
-                    fr.startLine = startLine;
-                    fr.endLine = line;
-                    VecAppend(*folds, fr);
+                const Bracket& open = starts[nOpen];
+                if (open.line == line) {
+                    continue;
+                }
+                bool standaloneCloser =
+                    FoldLineEnd(text,
+                                SkipFoldWhitespace(text, open.offset + 1)) &&
+                    SkipFoldWhitespace(text, lineStart) == offset;
+                int end =
+                    (standaloneCloser || HasCodeAfterFold(text, offset + 1))
+                        ? line
+                        : line + 1;
+                if (end > open.line + 1) {
+                    VecAppend(*folds, FoldRange{open.line, end});
                 }
             }
         }
@@ -99422,6 +100545,7 @@ static void SynHlLexInto(SyntaxLang lang, Str text, Vec<HlRun>* runs,
         run.tok = lx.tok;
         VecAppend(*runs, run);
     }
+    AppendSqlSelectFolds(folds, sqlStart, sqlFrom, lastSqlLine, false);
 }
 
 static Str SynHlLanguage(void* data) {
@@ -101094,8 +102218,10 @@ El* Editor::IntoEl() {
     } else {
         float unusedH = 0, padX = 0, padY = 0, unusedFont = 0;
         InputSizeMetrics(cx, size, &unusedH, &padX, &padY, &unusedFont);
-        float left = padX < 6.f ? padX : 6.f;
-        highlighter->editorPad = Edges::New(left, padX, padY, padY);
+        float narrow = std::min(padX, 6.f);
+        bool left = state->gutterSide == Side::Left;
+        highlighter->editorPad =
+            Edges::New(left ? narrow : padX, left ? padX : narrow, padY, padY);
     }
     InputAccessibility access = InputAccessibility::New(&accessibilityRole)
                                     .WithValueExposed(true);
@@ -105008,6 +106134,39 @@ El* List::IntoEl() {
 }
 }
 
+#line 1 "src/ui/live_region.cpp"
+
+namespace gpui::component {
+
+LiveRegion* LiveRegion::New(Ctx* cx, Str id, Str text) {
+    LiveRegion* self = StyledBuilder<LiveRegion>::New(cx);
+    self->id = StrDup(cx->a, id);
+    self->text = StrDup(cx->a, text);
+    return self;
+}
+
+LiveRegion* LiveRegion::Assertive() {
+    live = AccessibilityLive::Assertive;
+    return this;
+}
+
+El* LiveRegion::IntoEl() {
+    if (cx->win) {
+        cx->win->hasLiveRegions = true;
+    }
+    El* region =
+        Div(a)->Id(id)->Role(AccessibilityRole::Status)->AriaLive(live);
+    if (styleSet) {
+        region->Refine(style, styleSet);
+    }
+    if (len(text) > 0) {
+        region->AriaLabel(text)->AriaValue(text)->Child(TextEl(a, text));
+    }
+    return region;
+}
+
+}
+
 #line 1 "src/ui/locale_data.cpp"
 
 namespace gpui {
@@ -106838,11 +107997,16 @@ ContextMenu* ContextMenu::Menu(PopupMenu* m) {
     return this;
 }
 
-static void ContextMenuOpenAt(ContextMenuState* self, Ctx* cx, float x, float y,
+static bool ContextMenuOpenAt(ContextMenuState* self, Ctx* cx, float x, float y,
                               Bounds el) {
     PopupMenuState* menu = self->menu.Get(cx);
-    if (!menu) {
-        return;
+    if (!menu || (self->canOpen ? !self->canOpen(cx, self->openData, self->menu)
+                                : self->empty)) {
+        self->open = false;
+        if (menu && menu->open) {
+            PopupMenuDismiss(menu, cx);
+        }
+        return false;
     }
     self->position = {x - el.x, y - el.y};
     self->windowPosition = {x, y};
@@ -106860,6 +108024,7 @@ static void ContextMenuOpenAt(ContextMenuState* self, Ctx* cx, float x, float y,
     }
 
     FocusHandleFocus(cx->win, menu->focus);
+    return true;
 }
 
 void ContextMenuState::OnMouseDown(ContextMenuState* self, Ctx* cx,
@@ -106869,8 +108034,9 @@ void ContextMenuState::OnMouseDown(ContextMenuState* self, Ctx* cx,
         return;
     }
 
-    WindowStopPropagation(cx);
-    ContextMenuOpenAt(self, cx, ev->x, ev->y, ev->el);
+    if (ContextMenuOpenAt(self, cx, ev->x, ev->y, ev->el)) {
+        WindowStopPropagation(cx);
+    }
 }
 
 void ContextMenuState::OnLongPress(ContextMenuState* self, Ctx* cx,
@@ -106887,9 +108053,10 @@ void ContextMenuState::OnLongPress(ContextMenuState* self, Ctx* cx,
         return;
     }
 
-    WindowPreventDefault(cx);
-    ContextMenuOpenAt(self, cx, ev->startPosition.x, ev->startPosition.y,
-                      ev->el);
+    if (ContextMenuOpenAt(self, cx, ev->startPosition.x, ev->startPosition.y,
+                          ev->el)) {
+        WindowPreventDefault(cx);
+    }
 }
 
 void ContextMenuState::OnMouseUpOut(ContextMenuState* self, Ctx* cx,
@@ -106916,6 +108083,7 @@ El* ContextMenu::IntoEl() {
         return box;
     }
     context->menu = menu->state;
+    context->empty = len(menu->items) == 0;
     context->open = st->open;
     context->position = {st->x, st->y};
     if (!context->triggerFocus.IsValid()) {
@@ -111868,6 +113036,11 @@ ResizeIndicator ResizeHandleIndicator(ResizeHandleState state) {
 }
 
 El* RenderResizeHandle(void*, const ResizeHandleContext* handle, Ctx* cx) {
+    return RenderResizeHandleWith(cx, handle, true);
+}
+
+El* RenderResizeHandleWith(Ctx* cx, const ResizeHandleContext* handle,
+                           bool showLine) {
     Arena* a = cx->a;
     const Theme& th = ThemeNow(cx->app);
     bool horizontal = AxisIsHorizontal(handle->AxisValue());
@@ -111884,7 +113057,10 @@ El* RenderResizeHandle(void*, const ResizeHandleContext* handle, Ctx* cx) {
 
     opacity = ClampF01(opacity);
 
-    El* line = Div(a)->FlexNone()->FlexRow()->Bg(th.border);
+    El* line = Div(a)->FlexNone()->FlexRow();
+    if (showLine) {
+        line->Bg(th.border);
+    }
     if (horizontal) {
         line->W(1)->H(kFill)->ItemsCenter();
     } else {
@@ -112171,6 +113347,7 @@ Scrollable* Scrollable::New(Ctx* cx, El* element, ScrollAxis axis) {
     Scrollable* s = New(cx);
     s->element = element ? element : Div(cx->a);
     s->axis = axis;
+    s->placement = s->element->scrollbarPlacement;
     return s;
 }
 Scrollable* Scrollable::Id(Str v) {
@@ -112202,6 +113379,10 @@ Scrollable* Scrollable::Axis(ScrollAxis v) {
 Scrollable* Scrollable::Mode(ScrollbarMode v) {
     mode = v;
     modeSet = true;
+    return this;
+}
+Scrollable* Scrollable::Placement(ScrollbarPlacement v) {
+    placement = v;
     return this;
 }
 Scrollable* Scrollable::H(float v) {
@@ -112266,6 +113447,7 @@ El* Scrollable::IntoEl() {
     El* box =
         Scrollbar::Apply(cx, element, scrollId, scrollY, scrollX, onScroll,
                          axis, modeSet ? mode : ScrollbarModeNow(cx->app));
+    box->ScrollPlacement(placement);
     if (hSet) {
         box->H(h);
     }
@@ -116147,8 +117329,12 @@ El* SidebarMenuItem::IntoEl(Str id) {
                   ->Font(14)
                   ->PathId(StrL("item"))
                   ->Role(AccessibilityRole::TreeItem)
+                  ->AccessibilityId(StrL("sidebar-item"))
                   ->AriaLabel(accessibilityLabel.s ? accessibilityLabel : label)
                   ->AriaSelected(active);
+    if (isSubmenu && !collapsed) {
+        row->AriaExpanded(isOpen);
+    }
 
     StyleApplyFields(&row->style, style, styleSet);
     bool hoverable = !active && !disabled;
@@ -116199,6 +117385,7 @@ El* SidebarMenuItem::IntoEl(Str id) {
                     ->WithSize(UiSize::XSmall)
 
                     ->AccessibilityLabel(fmt("Toggle %s submenu", label))
+                    ->AriaExpanded(isOpen)
                     ->OnClick(ListenTo(st, &SidebarMenuState::OnCaretClick))
                     ->IntoEl()
 
@@ -116223,6 +117410,8 @@ El* SidebarMenuItem::IntoEl(Str id) {
     if (isOpen) {
 
         El* sub = Div(a)
+                      ->Id(StrL("sidebar-submenu"))
+                      ->Role(AccessibilityRole::Group)
                       ->FlexCol()
                       ->Gap(Rems(cx, 0.25f))
                       ->PadY(Rems(cx, 0.125f))
@@ -116252,7 +117441,12 @@ SidebarMenu* SidebarMenu::Child(SidebarMenuItem* item) {
 }
 El* SidebarMenu::IntoEl(Str id) {
     IdScope scope(cx, id);
-    El* col = Div(a)->FlexCol()->W(kFill)->Gap(Rems(cx, 0.5f));
+    El* col = Div(a)
+                  ->Id(id)
+                  ->Role(AccessibilityRole::Tree)
+                  ->FlexCol()
+                  ->W(kFill)
+                  ->Gap(Rems(cx, 0.5f));
     StyleApplyFields(&col->style, style, styleSet);
     refiner.Apply(col);
     for (int i = 0; i < len(items); i++) {
@@ -122191,24 +123385,69 @@ static El* LastEmptyColEl(Ctx* cx, El* (*fn)(Ctx*, void*), void* data) {
     return Div(cx->a)->FlexRow()->W(Rems(cx, 0.75f))->Shrink0();
 }
 
-static El* WrapContextMenu(Ctx* cx, Str id, El* box, const TableState* s,
+struct TableContextMenu {
+    Entity<TableState> table;
+    EntityId owner;
+    PopupMenu* (*build)(Ctx*, void*, int, PopupMenu*);
+    void* data;
+};
+
+static bool TableContextMenuHasItems(Ctx* cx, void* data,
+                                     Entity<PopupMenuState> state) {
+    auto* context = (TableContextMenu*)data;
+    TableState* table = context->table.Get(cx);
+    if (!table) return false;
+    if (table->rightClickedRow < 0) {
+        if (table->rightClickedCellRow < 0) {
+            TableState::OnRightClickOutside(table, cx, nullptr);
+        }
+        return false;
+    }
+
+    Ctx buildCx = *cx;
+    buildCx.self = context->owner;
+    auto* menu = PopupMenu::New(&buildCx, StrL("ctx-menu"), state);
+    menu = context
+               ->build(&buildCx, context->data, table->rightClickedRow, menu);
+    return menu && len(menu->items) > 0;
+}
+
+static void TableCaptureContextPress(TableState* state, Ctx*,
+                                     const MouseDownEvent* ev) {
+    if (ev->button == MouseButton::Right) {
+        state->rightClickedRow = -1;
+        state->rightClickedCellRow = -1;
+        state->rightClickedCellCol = -1;
+    }
+}
+
+static El* WrapContextMenu(Ctx* cx, Str id, El* box, Entity<TableState> table,
                            PopupMenu* (*build)(Ctx*, void*, int, PopupMenu*),
                            void* data) {
     Arena* a = cx->a;
 
     IdScope scope(cx, id);
     PopupMenu* menu = PopupMenu::New(cx, StrL("ctx-menu"));
-    if (s && s->rightClickedRow >= 0) {
+    const TableState* s = table.Get(cx);
+    const PopupMenuState* menuState = menu->state.Get(cx);
+    if (s && s->rightClickedRow >= 0 && menuState && menuState->open) {
         menu = build(cx, data, s->rightClickedRow, menu);
     }
     if (!menu) {
         return box;
     }
+    box->OnMouseDown(ListenTo(table, &TableCaptureContextPress),
+                     DispatchPhase::Capture);
     El* wrap = Div(a)->FlexCol()->W(kFill)->Child(box);
-    return ContextMenu::New(cx, StrDup(a, fmt("%s-ctx", id)))
-        ->Child(wrap)
-        ->Menu(menu)
-        ->IntoEl();
+    auto* trigger = ContextMenu::New(cx, StrDup(a, fmt("%s-ctx", id)))
+                        ->Child(wrap)
+                        ->Menu(menu);
+    if (auto* state = trigger->state.Get(cx)) {
+        state->canOpen = &TableContextMenuHasItems;
+        state->openData = ArenaNew<TableContextMenu>(
+            a, TableContextMenu{table, cx->self, build, data});
+    }
+    return trigger->IntoEl();
 }
 
 static bool DataTableAt(void* data, Ctx* cx, El* box, float) {
@@ -122228,7 +123467,7 @@ El* DataTable::IntoEl() {
     if (!contextMenu) {
         return box;
     }
-    return WrapContextMenu(cx, id, box, state.Get(cx), contextMenu, data);
+    return WrapContextMenu(cx, id, box, state, contextMenu, data);
 }
 
 static El* RowHeaderCell(Ctx* cx, Entity<TableState> state, int row,
@@ -122389,6 +123628,8 @@ El* DataTable::BuildEl() {
     El* rightPane = Div(a)->FlexCol()->Shrink0();
 
     bool rowHeaderOn = s && s->cellSelectable && s->rowHeader;
+    float headRadius = bordered ? std::max(0.f, th.radius - 1.f) : 0.f;
+    bool fixedLeft = nFixed > 0 || rowHeaderOn;
     if (nFixed > 0 || rowHeaderOn) {
         main->Child(fixedPane);
     }
@@ -122419,6 +123660,15 @@ El* DataTable::BuildEl() {
         gsWrap->Child(gs);
         El* gr =
             Div(a)->FlexRow()->Shrink0()->H(headerH)->BorderB(1, th.border);
+        gf->Bg(th.tokens.tableHead);
+        gsWrap->Bg(th.tokens.tableHead);
+        gr->Bg(th.tokens.tableHead);
+        if (g == 0 && headRadius > 0) {
+            gf->Corners(headRadius, 0, 0, 0);
+            gsWrap->Corners(fixedLeft ? 0 : headRadius,
+                            nRight > 0 ? 0 : headRadius, 0, 0);
+            gr->Corners(0, headRadius, 0, 0);
+        }
         int col = 0;
         const TableGroupCell* cells = groupHeaders[g].cells;
         for (int i = 0; i < groupHeaders[g].n; i++) {
@@ -122477,6 +123727,12 @@ El* DataTable::BuildEl() {
                               ->Bg(th.tokens.tableHead)
                               ->Fg(th.tableHeadFg)
                               ->BorderB(1, th.border));
+    if (len(groupHeaders) == 0 && headRadius > 0) {
+        headFixed->Corners(headRadius, 0, 0, 0);
+        headRight->Corners(0, headRadius, 0, 0);
+        headWrap->Corners(fixedLeft ? 0 : headRadius,
+                          nRight > 0 ? 0 : headRadius, 0, 0);
+    }
     El* headScroll = hasDelegate && delegate.renderHeader
                          ? delegate.renderHeader(cx, data)
                          : nullptr;
@@ -122494,7 +123750,11 @@ El* DataTable::BuildEl() {
         TableEnsureCols(s, nColumns);
     }
     if (rowHeaderOn) {
-        headFixed->Child(RowHeaderCell(cx, state, 0, true));
+        El* rowHead = RowHeaderCell(cx, state, 0, true);
+        if (len(groupHeaders) == 0 && headRadius > 0) {
+            rowHead->Corners(headRadius, 0, 0, 0);
+        }
+        headFixed->Child(rowHead);
     }
     for (int d = 0; d < nColumns; d++) {
 
@@ -142486,6 +143746,11 @@ struct StringPayload {
     Str value;
 };
 
+struct LiveRegionPayload {
+    Str id;
+    Str text;
+};
+
 struct LabelOp {
     enum Kind : uint8_t {
         Secondary,
@@ -142520,6 +143785,21 @@ static bool ConstructString(PayloadBuild* build, const ComponentArgument* args,
 static bool component_shell_controls_text_ConstructLabel(PayloadBuild* build, const ComponentArgument* args,
                            int) {
     return ConstructString(build, args, "Label", "text");
+}
+
+static bool ConstructLiveRegion(PayloadBuild* build,
+                                const ComponentArgument* args, int) {
+    if (len(args[0].string) == 0) {
+        return build->Fail(StrL("LiveRegion id must not be empty"));
+    }
+    *build->New<LiveRegionPayload>() = {args[0].string, args[1].string};
+    return true;
+}
+
+static bool RecordAssertive(PayloadBuild* build, const ComponentArgument*,
+                            int) {
+    *build->New<bool>() = true;
+    return true;
 }
 
 static bool ConstructLink(PayloadBuild* build, const ComponentArgument* args,
@@ -142600,6 +143880,25 @@ static El* MaterializeLabel(MaterializeRequest* request) {
         }
     });
     return request->Finish(Div(cx->a)->Child(label->IntoEl()));
+}
+
+static El* MaterializeLiveRegion(MaterializeRequest* request) {
+    if (request->ChildrenLen() != 0) {
+        return request
+            ->Fail(StrL("LiveRegion does not accept children; pass its text to "
+                        "the constructor"));
+    }
+    const auto* payload = request->PayloadAs<LiveRegionPayload>();
+    if (!payload) {
+        return request
+            ->Fail(StrL("LiveRegion received an incompatible payload"));
+    }
+    auto* region =
+        component::LiveRegion::New(request->cx, payload->id, payload->text);
+    EachMethod<bool>(request, [&](bool assertive) {
+        if (assertive) region->Assertive();
+    });
+    return request->Finish(region->IntoEl());
 }
 
 struct OpenHref {
@@ -142686,6 +143985,22 @@ static constexpr ComponentDescriptor component_shell_controls_text_kLabel = {
     "presentation.",
     &MaterializeLabel};
 
+static constexpr ArgumentDescriptor kLiveRegionArgs[] = {
+    {"id", SchemaString()},
+    {"text", SchemaString()}};
+static constexpr ConstructorDescriptor kLiveRegionConstructors[] = {
+    {"LiveRegion", kLiveRegionArgs, &ConstructLiveRegion}};
+static constexpr MethodDescriptor kLiveRegionMethods[] = {
+    {"assertive",
+     {},
+     "Interrupts current speech instead of waiting for it.",
+     &RecordAssertive}};
+static constexpr ComponentDescriptor kLiveRegion = {
+    "LiveRegion", kLiveRegionConstructors, kLiveRegionMethods,
+    "Text that screen readers announce whenever it changes. Keep the id "
+    "stable.",
+    &MaterializeLiveRegion};
+
 static constexpr ConstructorDescriptor kLinkConstructors[] = {
     {"Link", kIdArguments, &ConstructLink}};
 static constexpr MethodDescriptor kLinkMethods[] = {
@@ -142723,7 +144038,8 @@ bool RegisterControlsText(shell::ComponentRegistry* registry,
                           shell::RegistryError* error) {
     return registry->Register(&controls::text::component_shell_controls_text_kLabel, error) &&
            registry->Register(&controls::text::kLink, error) &&
-           registry->Register(&controls::text::kKbd, error);
+           registry->Register(&controls::text::kKbd, error) &&
+           registry->Register(&controls::text::kLiveRegion, error);
 }
 
 }
@@ -200728,7 +202044,7 @@ namespace gpui::shell {
 
 static const char kShellTypes0[] = R"GPUI_DTS(// Auto-generated — add `gpui-kit.d.ts` to your .gitignore.
 //
-// The built-in modules, as TypeScript declarations, for gpui-shell 0.9.0.
+// The built-in modules, as TypeScript declarations, for gpui-shell 0.11.0.
 // Do not edit: gpui-shell rewrites this on every run, in every directory that
 // imports one of them, from the runtime that is about to execute the script. A
 // committed copy could only ever be the stale one.
@@ -236245,6 +237561,18 @@ bool WebViewLoadHtml(WebView*, Str) {
 bool WebViewReload(WebView*) {
     return false;
 }
+bool WebViewGoBack(WebView*) {
+    return false;
+}
+bool WebViewGoForward(WebView*) {
+    return false;
+}
+bool WebViewCanGoBack(WebView*, bool*) {
+    return false;
+}
+bool WebViewCanGoForward(WebView*, bool*) {
+    return false;
+}
 bool WebViewBounds(WebView*, Rect*) {
     return false;
 }
@@ -236326,6 +237654,29 @@ bool WebViewAvailable() {
 #line 1 "src/wry/wry.cpp"
 
 namespace wry {
+
+PermissionResponse WebViewMediaPermission(const WebViewHandlers* handlers,
+                                          bool audio, bool video) {
+    if (!handlers || !handlers->permissionHandler) {
+        return PermissionResponse::Default;
+    }
+    auto ask = [&](PermissionKind kind) {
+        return handlers->permissionHandler(handlers->ctx, kind);
+    };
+    if (!audio && !video) return ask(PermissionKind::DisplayCapture);
+    auto microphone =
+        audio ? ask(PermissionKind::Microphone) : PermissionResponse::Allow;
+    auto camera =
+        video ? ask(PermissionKind::Camera) : PermissionResponse::Allow;
+    if (microphone == PermissionResponse::Deny ||
+        camera == PermissionResponse::Deny) {
+        return PermissionResponse::Deny;
+    }
+    return microphone == PermissionResponse::Allow &&
+                   camera == PermissionResponse::Allow
+               ? PermissionResponse::Allow
+               : PermissionResponse::Default;
+}
 
 bool MacCookieMatchesUrl(const Cookie* cookie, Str scheme, Str domain) {
     if (!cookie || !domain.s || !base::StrEq(cookie->domain, domain))
@@ -238443,7 +239794,7 @@ static Bounds TextBounds(const LinuxAccessible& object,
                          const AccessibilityNode& node, Selection bytes,
                          uint32_t coordType) {
     if (object.part >= 0) return ComponentBounds(object, coordType);
-    if (!node.input) return {};
+    if (!node.input || node.textExcerpt.s) return {};
     if (!InputIsSingleLine(node.input)) {
         return ComponentBounds(object, coordType);
     }
@@ -238522,13 +239873,10 @@ static bool HandleText(const Incoming& in, const LinuxAccessible& object) {
         }
         int lo = (int)ReadU32(in.body, in.bodyLen, &at);
         int hi = (int)ReadU32(in.body, in.bodyLen, &at);
-        if (node.input) {
-            InputSetSelectedRange(node.input, object.win->app, object.win,
-                                  Utf8ByteForCharacter(text, lo),
-                                  Utf8ByteForCharacter(text, hi));
-            AppInvalidate(object.win);
-        }
-        PutBool(&body, node.input != nullptr);
+        PutBool(&body, WindowAccessibilitySetTextSelection(
+                           object.win, node,
+                           {Utf8ByteForCharacter(text, lo),
+                            Utf8ByteForCharacter(text, hi)}));
         signature = "b";
     } else if (textInterface && StrIs(in.member, "RemoveSelection")) {
         if (node.input) {
@@ -238546,7 +239894,7 @@ static bool HandleText(const Incoming& in, const LinuxAccessible& object) {
         int y = ReadI32(in.body, in.bodyLen, &at);
         uint32_t coordType = ReadU32(in.body, in.bodyLen, &at);
         Point point = ComponentPointInWindow(object, x, y, coordType);
-        int offset = node.input
+        int offset = node.input && !node.textExcerpt.s
                          ? InputIndexForPosition(node.input, &object.win->paint,
                                                  point.x, point.y)
                          : -1;
@@ -238590,12 +239938,9 @@ static bool HandleText(const Incoming& in, const LinuxAccessible& object) {
         signature = "a{ss}ii";
     } else if (textInterface && StrIs(in.member, "SetCaretOffset")) {
         int offset = (int)ReadU32(in.body, in.bodyLen, &at);
-        if (node.input) {
-            InputMoveTo(node.input, object.win->app, object.win,
-                        Utf8ByteForCharacter(text, offset));
-            AppInvalidate(object.win);
-        }
-        PutBool(&body, node.input != nullptr);
+        int byte = Utf8ByteForCharacter(text, offset);
+        PutBool(&body, WindowAccessibilitySetTextSelection(object.win, node,
+                                                           {byte, byte}));
         signature = "b";
     } else if (editableInterface && StrIs(in.member, "SetTextContents")) {
         Str value = ReadString(in.body, in.bodyLen, &at);
@@ -238876,7 +240221,7 @@ void AccessibilityLinuxPump() {
 }
 
 static void SendEvent(Window* win, uint32_t nodeId, const char* member,
-                      const char* detail, int detail1) {
+                      const char* detail, int detail1, Str payload = {}) {
     if (!gA11y.ready || !win || !gA11y.app) return;
     int wi = -1;
     for (int i = 0; i < len(gA11y.app->windows); i++) {
@@ -238896,7 +240241,7 @@ static void SendEvent(Window* win, uint32_t nodeId, const char* member,
     PutString(&body, detail);
     PutI32(&body, detail1);
     PutI32(&body, 0);
-    PutVariantString(&body, "s", Str{});
+    PutVariantString(&body, "s", payload);
     PutEmptyStringDict(&body);
     SendMessage(4, 0, &fields, &body);
     VecReset(fields.bytes);
@@ -238905,6 +240250,14 @@ static void SendEvent(Window* win, uint32_t nodeId, const char* member,
 
 void AccessibilityLinuxTreeChanged(Window* win) {
     SendEvent(win, 0, "ChildrenChanged", "invalidate", 0);
+    if (!win) return;
+    for (int i = 0; i < len(win->accessibility); i++) {
+        const auto& node = win->accessibility[i];
+        if (node.liveChanged) {
+            SendEvent(win, node.id, "Announcement", "", (int)node.info.live,
+                      node.info.label);
+        }
+    }
 }
 
 void AccessibilityLinuxFocusChanged(Window* win, int focusId) {
@@ -239223,6 +240576,8 @@ static int AccessibilityControlType(AccessibilityRole role) {
             return UIA_SliderControlTypeId;
         case AccessibilityRole::SpinButton:
             return UIA_SpinnerControlTypeId;
+        case AccessibilityRole::Status:
+            return UIA_StatusBarControlTypeId;
         case AccessibilityRole::Tab:
             return UIA_TabItemControlTypeId;
         case AccessibilityRole::Table:
@@ -239303,6 +240658,8 @@ static const wchar_t* AccessibilityRoleName(AccessibilityRole role) {
             return L"slider";
         case AccessibilityRole::SpinButton:
             return L"spinbutton";
+        case AccessibilityRole::Status:
+            return L"status";
         case AccessibilityRole::Switch:
             return L"switch";
         case AccessibilityRole::Tab:
@@ -240108,6 +241465,8 @@ HRESULT WinAccessibilityNode::GetPropertyValue(PROPERTYID property,
         VariantInit(out);
         out->vt = VT_BSTR;
         out->bstrVal = SysAllocString(AccessibilityRoleName(info.role));
+    } else if (property == UIA_LiveSettingPropertyId) {
+        VariantInt(out, (int)info.live);
     } else if (property == UIA_IsEnabledPropertyId) {
         VariantBool(out, !info.disabled);
     } else if (property == UIA_IsControlElementPropertyId ||
@@ -240742,7 +242101,7 @@ HRESULT WinAccessibilityNode::RangeFromPoint(UiaPoint point,
         return hr;
     }
     Str text = WindowAccessibilityTextValue(*node);
-    if (!node->input) {
+    if (!node->input || node->textExcerpt.s) {
         *out = new WinTextRange(root, id, 0, 0);
         return S_OK;
     }
@@ -241274,12 +242633,12 @@ HRESULT WinTextRange::Select() {
         return UIA_E_ELEMENTNOTAVAILABLE;
     }
     Clamp();
-    Str text = InputValue(node->input);
+    Str text = WindowAccessibilityTextValue(*node);
     int lo = RopeOffsetUtf16ToOffset(text, start);
     int hi = RopeOffsetUtf16ToOffset(text, end);
-    InputSetSelectedRange(node->input, root->win->app, root->win, lo, hi);
-    AppInvalidate(root->win);
-    return S_OK;
+    return WindowAccessibilitySetTextSelection(root->win, *node, {lo, hi})
+               ? S_OK
+               : UIA_E_ELEMENTNOTAVAILABLE;
 }
 
 HRESULT WinTextRange::AddToSelection() {
@@ -241569,6 +242928,13 @@ void AccessibilityWinTreeChanged(WinAccessibility* accessibility) {
         UiaRaiseStructureChangedEvent(
             static_cast<IRawElementProviderSimple*>(accessibility),
             StructureChangeType_ChildrenInvalidated, nullptr, 0);
+        const auto& nodes = accessibility->win->accessibility;
+        for (int i = 0; i < len(nodes); i++) {
+            if (nodes[i].liveChanged) {
+                AccessibilityRaiseNodeEvent(accessibility, i,
+                                            UIA_LiveRegionChangedEventId);
+            }
+        }
     }
     AccessibilityDocumentsChanged(accessibility, listening);
 }
@@ -251421,6 +252787,13 @@ static NSArray* GpuiAccessibilityChildren(gpui::Window* win, int parent) {
     return node ? GpuiAccessibilityRole(node->info.role)
                 : NSAccessibilityUnknownRole;
 }
+- (NSString*)accessibilitySubrole {
+    const gpui::AccessibilityNode* node = GpuiAccessibilityNode(self);
+    if (node && node->info.role == gpui::AccessibilityRole::Status) {
+        return @"AXApplicationStatus";
+    }
+    return [super accessibilitySubrole];
+}
 - (NSString*)accessibilityLabel {
     const gpui::AccessibilityNode* node = GpuiAccessibilityNode(self);
     return node ? GpuiAccessibilityString(node->info.label) : @"";
@@ -251612,9 +252985,7 @@ static NSArray* GpuiAccessibilityChildren(gpui::Window* win, int parent) {
     int lo = gpui::RopeOffsetUtf16ToOffset(text, (int)range.location);
     int hi = gpui::RopeOffsetUtf16ToOffset(
         text, (int)(range.location + range.length));
-    gpui::InputSetSelectedRange(node->input, gpuiWindow->app, gpuiWindow, lo,
-                                hi);
-    gpui::AppInvalidate(gpuiWindow);
+    gpui::WindowAccessibilitySetTextSelection(gpuiWindow, *node, {lo, hi});
 }
 - (NSRange)accessibilityVisibleCharacterRange {
     NSInteger length = [self accessibilityNumberOfCharacters];
@@ -251669,7 +253040,7 @@ static NSArray* GpuiAccessibilityChildren(gpui::Window* win, int parent) {
     const gpui::AccessibilityNode* node = GpuiAccessibilityNode(self);
     gpui::Str text =
         node ? gpui::WindowAccessibilityTextValue(*node) : gpui::Str{};
-    if (!text.s || !node->input || !gpuiWindow->plat ||
+    if (!text.s || !node->input || node->textExcerpt.s || !gpuiWindow->plat ||
         !gpuiWindow->plat->view) {
         return NSMakeRange(NSNotFound, 0);
     }
@@ -253510,6 +254881,21 @@ void PlatAccessibilityTreeChanged(Window* win) {
     [win->plat->accessibilityElements removeObjectsForKeys:stale];
     NSAccessibilityPostNotification(win->plat->view,
                                     NSAccessibilityLayoutChangedNotification);
+    for (int i = 0; i < len(win->accessibility); i++) {
+        const auto& node = win->accessibility[i];
+        if (!node.liveChanged) continue;
+        NSString* announcement = GpuiAccessibilityString(node.info.value);
+        if (!announcement) continue;
+        auto priority = node.info.live == AccessibilityLive::Assertive
+                            ? NSAccessibilityPriorityHigh
+                            : NSAccessibilityPriorityMedium;
+        NSAccessibilityPostNotificationWithUserInfo(
+            win->plat->window, NSAccessibilityAnnouncementRequestedNotification,
+            @{
+                NSAccessibilityAnnouncementKey : announcement,
+                NSAccessibilityPriorityKey : @(priority)
+            });
+    }
 }
 
 void PlatAccessibilityFocusChanged(Window* win, int focusId) {
@@ -255763,8 +257149,37 @@ void PlatInstallAccessibilityHitTest(Window* win) {
     (void)win;
 }
 
+EM_JS(void, GpJsAnnounceStatus, (int assertive, const char* bytes, int size), {
+    const text = UTF8ToString(bytes, size);
+    const id = assertive ? "gpui-assertive-status" : "gpui-polite-status";
+    let region = document.getElementById(id);
+    if (!region) {
+        region = document.createElement("div");
+        region.id = id;
+        region.setAttribute("aria-live", assertive ? "assertive" : "polite");
+        region.style.cssText =
+            "position:absolute;width:1px;height:1px;overflow:hidden;" +
+            "clip-path:inset(50%)";
+        document.body.appendChild(region);
+    }
+    requestAnimationFrame(function() {
+        const message = document.createElement("div");
+        message.textContent = text;
+        region.appendChild(message);
+        setTimeout(function() { message.remove(); }, 5000);
+    });
+});
+
 void PlatAccessibilityTreeChanged(Window* win) {
-    (void)win;
+    if (!win || !win->plat) return;
+    for (int i = 0; i < len(win->accessibility); i++) {
+        const auto& node = win->accessibility[i];
+        if (node.liveChanged) {
+            Str text = node.info.label;
+            GpJsAnnounceStatus(node.info.live == AccessibilityLive::Assertive,
+                               text.s, len(text));
+        }
+    }
 }
 
 void PlatAccessibilityFocusChanged(Window* win, int focusId) {
@@ -255773,8 +257188,7 @@ void PlatAccessibilityFocusChanged(Window* win, int focusId) {
 }
 
 bool PlatAccessibilityWanted(Window* win) {
-    (void)win;
-    return false;
+    return win && win->hasLiveRegions;
 }
 
 bool PlatReduceMotion() {
@@ -269357,6 +270771,43 @@ static void OnTitle(GObject*, GParamSpec*, gpointer data) {
     }
 }
 
+static gboolean OnWryPermissionRequest(WebKitWebView*,
+                                       WebKitPermissionRequest* request,
+                                       gpointer data) {
+    WebView* wv = (WebView*)data;
+    PermissionResponse decision;
+    if (WEBKIT_IS_USER_MEDIA_PERMISSION_REQUEST(request)) {
+        auto* media = WEBKIT_USER_MEDIA_PERMISSION_REQUEST(request);
+        if (webkit_user_media_permission_is_for_display_device(media)) {
+            decision =
+                wv->permissionHandler(wv->ctx, PermissionKind::DisplayCapture);
+        } else {
+            bool audio =
+                webkit_user_media_permission_is_for_audio_device(media);
+            bool video =
+                webkit_user_media_permission_is_for_video_device(media);
+            decision = WebViewMediaPermission(wv, audio, video);
+        }
+    } else {
+        PermissionKind kind = PermissionKind::Other;
+        if (WEBKIT_IS_GEOLOCATION_PERMISSION_REQUEST(request)) {
+            kind = PermissionKind::Geolocation;
+        } else if (WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST(request)) {
+            kind = PermissionKind::Notifications;
+        } else if (WEBKIT_IS_POINTER_LOCK_PERMISSION_REQUEST(request)) {
+            kind = PermissionKind::PointerLock;
+        }
+        decision = wv->permissionHandler(wv->ctx, kind);
+    }
+    if (decision == PermissionResponse::Default) return FALSE;
+    if (decision == PermissionResponse::Allow) {
+        webkit_permission_request_allow(request);
+    } else {
+        webkit_permission_request_deny(request);
+    }
+    return TRUE;
+}
+
 static void OnLoadChanged(WebKitWebView* webview, WebKitLoadEvent event,
                           gpointer data) {
     WebView* wv = (WebView*)data;
@@ -269996,6 +271447,10 @@ static WebView* NewGtk(GtkWidget* container, const WebViewAttributes* attrs,
         g_signal_connect(view, "notify::title", Cb(OnTitle), wv);
     }
     g_signal_connect(view, "load-changed", Cb(OnLoadChanged), wv);
+    if (wv->permissionHandler) {
+        g_signal_connect(view, "permission-request", Cb(OnWryPermissionRequest),
+                         wv);
+    }
     if (wv->newWindowReqHandler) {
         g_signal_connect(view, "create", Cb(OnCreate), wv);
     }
@@ -270372,6 +271827,30 @@ bool WebViewReload(WebView* wv) {
         return false;
     }
     webkit_web_view_reload(wv->webview);
+    return true;
+}
+
+bool WebViewGoBack(WebView* wv) {
+    if (!wv) return false;
+    webkit_web_view_go_back(wv->webview);
+    return true;
+}
+
+bool WebViewGoForward(WebView* wv) {
+    if (!wv) return false;
+    webkit_web_view_go_forward(wv->webview);
+    return true;
+}
+
+bool WebViewCanGoBack(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = webkit_web_view_can_go_back(wv->webview) != 0;
+    return true;
+}
+
+bool WebViewCanGoForward(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = webkit_web_view_can_go_forward(wv->webview) != 0;
     return true;
 }
 
@@ -271276,8 +272755,22 @@ API_AVAILABLE(macos(11.3))
     (void)webView;
     (void)origin;
     (void)frame;
-    (void)type;
-    handler(WKPermissionDecisionGrant);
+    wry::WebView* wv = self.wv;
+    if (!wv || !wv->permissionHandler) {
+        handler(WKPermissionDecisionGrant);
+        return;
+    }
+    bool audio = type == WKMediaCaptureTypeMicrophone ||
+                 type == WKMediaCaptureTypeCameraAndMicrophone;
+    bool video = type == WKMediaCaptureTypeCamera ||
+                 type == WKMediaCaptureTypeCameraAndMicrophone;
+    auto result = audio || video ? wry::WebViewMediaPermission(wv, audio, video)
+                                 : wv->permissionHandler(
+                                       wv->ctx, wry::PermissionKind::Other);
+    handler(result == wry::PermissionResponse::Allow ? WKPermissionDecisionGrant
+            : result == wry::PermissionResponse::Deny
+                ? WKPermissionDecisionDeny
+                : WKPermissionDecisionPrompt);
 }
 
 - (WKWebView*)webView:(WKWebView*)webView
@@ -271996,6 +273489,30 @@ bool WebViewReload(WebView* wv) {
     return true;
 }
 
+bool WebViewGoBack(WebView* wv) {
+    if (!wv) return false;
+    [wv->webview goBack];
+    return true;
+}
+
+bool WebViewGoForward(WebView* wv) {
+    if (!wv) return false;
+    [wv->webview goForward];
+    return true;
+}
+
+bool WebViewCanGoBack(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = wv->webview.canGoBack;
+    return true;
+}
+
+bool WebViewCanGoForward(WebView* wv, bool* out) {
+    if (!wv || !out) return false;
+    *out = wv->webview.canGoForward;
+    return true;
+}
+
 bool WebViewBounds(WebView* wv, Rect* out) {
     if (!wv || !out) {
         return false;
@@ -272092,6 +273609,8 @@ bool WebViewSetBackgroundColor(WebView* wv, Rgba color) {
     if (!wv || !wv->webview) {
         return false;
     }
+
+    [wv->webview setValue:@NO forKey:@"drawsBackground"];
     ApplyWebViewBackground(wv->webview, color);
     return true;
 }
@@ -273784,8 +275303,8 @@ enum : uint8_t {
     kDownloadStateInProgress = 0,
     kDownloadStateCompleted = 2,
     kMoveFocusReasonProgrammatic = 0,
-    kPermissionKindClipboardRead = 6,
     kPermissionStateAllow = 1,
+    kPermissionStateDeny = 2,
     kPreferredColorSchemeAuto = 0,
     kPreferredColorSchemeLight = 1,
     kPreferredColorSchemeDark = 2,
@@ -274998,7 +276517,7 @@ struct EnvironmentOptions
           ICoreWebView2EnvironmentOptions7, ICoreWebView2EnvironmentOptions8> {
     WCHAR* additionalBrowserArguments = nullptr;
     WCHAR* language = nullptr;
-    WCHAR* targetCompatibleBrowserVersion = WStrDup(L"137.0.3296.44");
+    WCHAR* targetCompatibleBrowserVersion = WStrDup(L"145.0.3800.47");
     BOOL allowSingleSignOn = FALSE;
     BOOL exclusiveUserDataFolderAccess = FALSE;
     BOOL customCrashReportingEnabled = FALSE;
@@ -275370,6 +276889,15 @@ static bool SetWebViewSettings(ICoreWebView2* webview,
                                                (void**)&s3))) {
             hr = s3->put_AreBrowserAcceleratorKeysEnabled(FALSE);
             wry_wry_win_Rel(&s3);
+        }
+    }
+    if (SUCCEEDED(hr)) {
+        ICoreWebView2Settings4* s4 = nullptr;
+        if (SUCCEEDED(settings->QueryInterface(__uuidof(ICoreWebView2Settings4),
+                                               (void**)&s4))) {
+            hr = s4->put_IsGeneralAutofillEnabled(
+                attrs->generalAutofillEnabled ? TRUE : FALSE);
+            wry_wry_win_Rel(&s4);
         }
     }
     if (SUCCEEDED(hr)) {
@@ -276468,8 +277996,10 @@ static HRESULT OnNewWindowRequested(
 }
 
 static HRESULT OnPermissionRequested(
-    void*, ICoreWebView2*, ICoreWebView2PermissionRequestedEventArgs* args) {
-    if (!args) {
+    void* ctx, ICoreWebView2*,
+    ICoreWebView2PermissionRequestedEventArgs* args) {
+    WebView* wv = LiveWebView(ctx);
+    if (!wv || !args) {
         return S_OK;
     }
     COREWEBVIEW2_PERMISSION_KIND kind = 0;
@@ -276477,10 +278007,36 @@ static HRESULT OnPermissionRequested(
     if (FAILED(hr)) {
         return hr;
     }
-    if (kind == kPermissionKindClipboardRead) {
-        return args->put_State(kPermissionStateAllow);
+    static constexpr PermissionKind mapped[] = {
+        PermissionKind::Other,
+        PermissionKind::Microphone,
+        PermissionKind::Camera,
+        PermissionKind::Geolocation,
+        PermissionKind::Notifications,
+        PermissionKind::Sensors,
+        PermissionKind::ClipboardRead,
+        PermissionKind::AutomaticDownloads,
+        PermissionKind::FileSystemAccess,
+        PermissionKind::Autoplay,
+        PermissionKind::LocalFonts,
+        PermissionKind::Midi,
+        PermissionKind::WindowManagement,
+    };
+    PermissionKind request =
+        kind >= 0 && kind < (int)(sizeof(mapped) / sizeof(mapped[0]))
+            ? mapped[kind]
+            : PermissionKind::Other;
+    auto response = PermissionResponse::Default;
+    if (wv->permissionHandler) {
+        response = wv->permissionHandler(wv->ctx, request);
+    } else if (request == PermissionKind::ClipboardRead) {
+
+        response = PermissionResponse::Allow;
     }
-    return S_OK;
+    if (response == PermissionResponse::Default) return S_OK;
+    return args->put_State(response == PermissionResponse::Allow
+                               ? kPermissionStateAllow
+                               : kPermissionStateDeny);
 }
 
 static HRESULT OnDownloadStarting(
@@ -276933,12 +278489,11 @@ WebView* WebViewNew(void* parentWindow, const WebViewAttributes* attrs,
             return nullptr;
         }
     }
-    if (attrs->clipboard) {
-        auto* h =
-            MkHandler<Handler2<ICoreWebView2PermissionRequestedEventHandler,
-                               ICoreWebView2*,
-                               ICoreWebView2PermissionRequestedEventArgs*>>(
-                nullptr, OnPermissionRequested);
+    if (attrs->clipboard || wv->permissionHandler) {
+        auto* h = MkWebViewHandler<Handler2<
+            ICoreWebView2PermissionRequestedEventHandler, ICoreWebView2*,
+            ICoreWebView2PermissionRequestedEventArgs*>>(wv,
+                                                         OnPermissionRequested);
         HRESULT hr = webview->add_PermissionRequested(h, &token);
         h->Release();
         if (FAILED(hr)) {
@@ -277108,6 +278663,29 @@ bool WebViewReload(WebView* wv) {
         return false;
     }
     return SUCCEEDED(wv->webview->Reload());
+}
+
+bool WebViewGoBack(WebView* wv) {
+    return wv && SUCCEEDED(wv->webview->GoBack());
+}
+
+bool WebViewGoForward(WebView* wv) {
+    return wv && SUCCEEDED(wv->webview->GoForward());
+}
+
+bool WebViewCanGoBack(WebView* wv, bool* out) {
+    BOOL can = FALSE;
+    if (!wv || !out || FAILED(wv->webview->get_CanGoBack(&can))) return false;
+    *out = can != FALSE;
+    return true;
+}
+
+bool WebViewCanGoForward(WebView* wv, bool* out) {
+    BOOL can = FALSE;
+    if (!wv || !out || FAILED(wv->webview->get_CanGoForward(&can)))
+        return false;
+    *out = can != FALSE;
+    return true;
 }
 
 bool WebViewBounds(WebView* wv, Rect* out) {

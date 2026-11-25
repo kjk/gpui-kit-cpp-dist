@@ -532,35 +532,35 @@ function findDebugger(want: "any" | DebuggerKind, plat: Platform, exe: string, a
 /** Spec we port: crates/base, crates/component, crates/story, crates/webview, crates/shell, crates/component-shell, examples. */
 export const gpuiComponent = {
   repo: "https://github.com/longbridge/gpui-kit",
-  sha: "1c7e7f7c6c8d6585da909804496614da01bb8663",
-  date: "2026-11-23",
-  subject: "input: Report the document length so the iOS keyboard shows (#4082)",
+  sha: "832cfdc0baef92855191dfdbbbcacd75f59d3df0",
+  date: "2026-11-25",
+  subject: "editor: Add spacer rows to the display map (#4118)",
   crates: {
-    "gpui-kit": "0.10.0",
-    "gpui-base": "0.10.0",
-    "gpui-component": "0.10.0",
-    "gpui-component-story": "0.10.0",
-    "gpui-webview": "0.10.0",
-    "gpui-shell": "0.10.0",
+    "gpui-kit": "0.11.0",
+    "gpui-base": "0.11.0",
+    "gpui-component": "0.11.0",
+    "gpui-component-story": "0.11.0",
+    "gpui-webview": "0.11.0",
+    "gpui-shell": "0.11.0",
   },
   dir: ".work/gpui-component",
 } as const;
 
 /**
- * Zed reference snapshot recorded in gpui-pre 0.3.12's package metadata.
+ * Zed reference snapshot recorded in gpui-pre 0.3.14's package metadata.
  * Cargo.lock now resolves registry packages rather than a Zed git source.
  */
 export const zedGpui = {
   repo: "https://github.com/zed-industries/zed",
-  sha: "d2a4fb6ded7c470be25d1541281da3882495b65b",
-  date: "2026-11-08",
-  subject: "tabular_data_preview: Range selection, edge jumps, and page navigation (#65161)",
+  sha: "f126950f9d3b62666f97437ae5d4ccac2272c4db",
+  date: "2026-11-22",
+  subject: "Stop two clients from fighting over one remote server (#67336)",
   crates: {
-    "gpui-pre": "0.3.12",
-    "gpui-pre-platform": "0.3.12",
-    "gpui-pre-macros": "0.3.12",
+    "gpui-pre": "0.3.14",
+    "gpui-pre-platform": "0.3.14",
+    "gpui-pre-macros": "0.3.14",
   },
-  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.12",
+  lock: "registry+https://github.com/rust-lang/crates.io-index#gpui-pre@0.3.14",
 } as const;
 
 /**
@@ -603,16 +603,16 @@ export const html5ever = {
 
 /**
  * The webview crate `crates/webview` (the `gpui-webview` crate) is built on:
- * `wry = { version = "0.53.3", package = "lb-wry" }`, longbridge's fork. We
+ * `wry = "0.57.3"`, from tauri-apps. We
  * port it: `src/wry/` is a C++ port of exactly this version, and
  * `src/webview/` is the gpui-side view `crates/webview` is. See
  * `src/wry/readme.md` for what is ported and what is not.
  */
 export const wry = {
   repo: "https://github.com/tauri-apps/wry",
-  crate: "lb-wry",
-  version: "0.53.3",
-  crateSha256: "d9cfe72bff8acf9af0d6d276569be5b9cb3f313f9882761ada5a50d3044214d4",
+  crate: "wry",
+  version: "0.57.3",
+  crateSha256: "ceb43f824178e8110e3181bfd478359c43b041452a9560d321bd8d121e468f86",
   dir: "src/wry",
 } as const;
 

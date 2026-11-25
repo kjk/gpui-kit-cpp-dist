@@ -1694,6 +1694,31 @@ void CookieListFree(Vec<Cookie>* cookies);
 bool MacCookieMatchesUrl(const Cookie* cookie, Str scheme, Str domain);
 Str MacDownloadFileNameTemp(Str suggested, int collision);
 
+enum class PermissionKind : uint8_t {
+    Microphone,
+    Camera,
+    Geolocation,
+    Notifications,
+    ClipboardRead,
+    DisplayCapture,
+    Midi,
+    Sensors,
+    MediaKeySystemAccess,
+    LocalFonts,
+    WindowManagement,
+    PointerLock,
+    AutomaticDownloads,
+    FileSystemAccess,
+    Autoplay,
+    Other,
+};
+
+enum class PermissionResponse : uint8_t {
+    Default,
+    Allow,
+    Deny
+};
+
 struct WebViewHandlers {
     static bool AllowDownload(void*, Str, Str*) { return true; }
 
@@ -1711,11 +1736,16 @@ struct WebViewHandlers {
     DownloadStartedHandler downloadStartedHandler = AllowDownload;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;
     DragDropHandler dragDropHandler = nullptr;
+    PermissionResponse (*permissionHandler)(void* ctx,
+                                            PermissionKind kind) = nullptr;
 
     NewWindowResponse (*newWindowReqHandler)(
         void* ctx, Str url, const NewWindowFeatures* features,
         WebView** createdWebView) = nullptr;
 };
+
+PermissionResponse WebViewMediaPermission(const WebViewHandlers* handlers,
+                                          bool audio, bool video);
 
 inline void WebViewHandlersSet(WebViewHandlers* dst,
                                const WebViewHandlers* attrs) {
@@ -1740,6 +1770,7 @@ struct WebViewAttributes : WebViewHandlers {
 
     Str html;
     bool zoomHotkeysEnabled = false;
+    bool generalAutofillEnabled = true;
     const InitializationScript* initializationScripts = nullptr;
     int initializationScriptCount = 0;
     const CustomProtocol* customProtocols = nullptr;
@@ -1815,6 +1846,10 @@ bool WebViewLoadUrlWithHeaders(WebView* webview, Str url, const Header* headers,
 bool WebViewLoadHtml(WebView* webview, Str html);
 
 bool WebViewReload(WebView* webview);
+bool WebViewGoBack(WebView* webview);
+bool WebViewGoForward(WebView* webview);
+bool WebViewCanGoBack(WebView* webview, bool* out);
+bool WebViewCanGoForward(WebView* webview, bool* out);
 
 bool WebViewBounds(WebView* webview, Rect* out);
 

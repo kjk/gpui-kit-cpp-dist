@@ -44,6 +44,8 @@ import {
   DescriptionItem,
   DescriptionList,
   Dialog,
+  Diff,
+  DiffState,
   DropdownButton,
   DropdownMenu,
   Editor,
@@ -78,6 +80,7 @@ import {
   LineChart,
   Link,
   List,
+  LiveRegion,
   Menu,
   MenuBar,
   MenuItem,
@@ -152,6 +155,7 @@ import {
   SuccessAlert,
   Toggle,
   Toolbar,
+  TitleBar,
   Tooltip,
   Tree,
   WarningAlert,
@@ -166,6 +170,18 @@ import {
  * @returns {import("gpui-kit").Element}
  */
 const asElement = (value) => /** @type {import("gpui-kit").Element} */ (/** @type {unknown} */ (value));
+
+const REVIEW_PATCH = [
+  "diff --git a/src/retry.rs b/src/retry.rs",
+  "--- a/src/retry.rs",
+  "+++ b/src/retry.rs",
+  "@@ -1,3 +1,3 @@",
+  " fn retry_delay(attempt: u32) -> u64 {",
+  "-    100 * attempt as u64",
+  "+    100 * 2_u64.pow(attempt.min(6))",
+  " }",
+  "",
+].join("\n");
 
 /**
  * Per-case demo state.
@@ -315,6 +331,7 @@ export function initializeRegisteredExamples() {
   retained("scrollbar-horizontal-handle", () => ScrollbarHandle());
   retained("editor-rust", () => EditorState('fn main() {\n    println!("hello");\n}', "rust"));
   retained("editor-readonly", () => EditorState("// generated, do not edit", "rust"));
+  retained("diff-review", () => DiffState(REVIEW_PATCH));
 }
 
 /**
@@ -1876,6 +1893,21 @@ export function registeredExamples(surface, cx) {
             .child(asElement(new Kbd("cmd-shift-p").outline())),
         },
       ];
+    case "LiveRegion":
+      return [
+        {
+          label: "Polite, and assertive",
+          element: v_flex()
+            .gap(8)
+            .child(asElement(new LiveRegion("save-status", "Saved 3 files")))
+            .child(
+              asElement(
+                new LiveRegion("save-error", "Could not save: disk full")
+                  .assertive(),
+              ),
+            ),
+        },
+      ];
     case "Separator":
       return [
         {
@@ -2123,6 +2155,32 @@ export function registeredExamples(surface, cx) {
               .right_content(asElement(new Button("status-position").ghost().size("xsmall").label("Ln 12, Col 34")))
               .right_content(asElement(new VerticalSeparator().h(14)))
               .right_content(asElement(new Button("status-language").ghost().size("xsmall").label("JavaScript"))),
+          ),
+        },
+      ];
+    case "TitleBar":
+      return [
+        {
+          label: "Window title bar",
+          description:
+            "The bar above this gallery uses the same component. Press an empty part to move the window. The trailing buttons remain clickable.",
+          element: asElement(
+            div()
+              .w_full()
+              .border(1)
+              .child(
+                asElement(
+                  new TitleBar()
+                    .child(asElement(new Text("Untitled document")))
+                    .child(
+                      h_flex()
+                        .px(8)
+                        .gap(4)
+                        .on_mouse_down("left", (_event, cx) => cx.stop_propagation())
+                        .child(asElement(new Button("title-bar-share").ghost().size("small").label("Share"))),
+                    ),
+                ),
+              ),
           ),
         },
       ];
@@ -3239,6 +3297,15 @@ export function registeredExamples(surface, cx) {
                   ),
               ),
             ),
+        },
+      ];
+    case "Diff":
+      return [
+        {
+          label: "Unified patch",
+          element: asElement(
+            new Diff(retained("diff-review", () => DiffState(REVIEW_PATCH))).w_full().h(220),
+          ),
         },
       ];
     case "Editor":

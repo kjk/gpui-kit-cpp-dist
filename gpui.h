@@ -3978,6 +3978,21 @@ struct Window;
 using WindowShouldCloseFn = bool (*)(void* data, Window* win);
 struct KeyChord;
 
+enum class Side : uint8_t {
+    Left,
+    Right
+};
+
+enum class GutterColumn : uint8_t {
+    FoldIcons,
+    LineNumbers,
+    Decorations,
+};
+
+inline constexpr GutterColumn kDefaultGutterOrder[] = {
+    GutterColumn::FoldIcons, GutterColumn::LineNumbers,
+    GutterColumn::Decorations};
+
 struct ClipboardItem {
     Str text = {};
     const uint8_t* imageBytes = nullptr;
@@ -4116,6 +4131,7 @@ struct RangeDecorationsState;
 struct DecorationCollectionsState;
 
 struct GutterDecorationsState;
+struct EditorSpacers;
 struct OverviewRulerDecorationsState;
 
 struct InputSyntaxCache;
@@ -4789,6 +4805,13 @@ enum class ScrollbarMode : uint8_t {
     Always,
     Hover,
     Scrolling
+};
+
+enum class ScrollbarPlacement : uint8_t {
+    BottomRight,
+    BottomLeft,
+    TopRight,
+    TopLeft,
 };
 
 struct RuntimeStyle {
@@ -5875,11 +5898,18 @@ enum class AccessibilityAction : uint8_t {
     SetValue
 };
 
+enum class AccessibilityLive : uint8_t {
+    Off,
+    Polite,
+    Assertive,
+};
+
 struct AccessibilityInfo {
     AccessibilityRole role = AccessibilityRole::None;
 
     AccessibilityToggled toggled = AccessibilityToggled::Unset;
     AccessibilityOrientation orientation = AccessibilityOrientation::Unset;
+    AccessibilityLive live = AccessibilityLive::Off;
 
     Str authorId = {};
     Str label = {};
@@ -6006,6 +6036,7 @@ struct ElLifecycle {
     AccessibilityDocumentText (*accessibilityDocument)(void*) = nullptr;
     void* accessibilityDocumentData = nullptr;
     const AccessibilityDocumentSource* documentSource = nullptr;
+    const Bounds* paintMask = nullptr;
     bool auxiliaryClick = false;
     bool auxiliaryRightClick = false;
 };
@@ -6272,7 +6303,8 @@ struct El {
     ObjectFit objectFit = ObjectFit::Contain;
     ImageLoadState imageLoadState = ImageLoadState::Loading;
 
-    ScrollbarMode scrollMode = ScrollbarMode::Always;
+    ScrollbarMode scrollMode : 2 = ScrollbarMode::Always;
+    ScrollbarPlacement scrollbarPlacement : 2 = ScrollbarPlacement::BottomRight;
 
     uint8_t scrollMaskAxes = 0;
     uint8_t measCount = 0;
@@ -6401,11 +6433,13 @@ struct El {
     El* PaintOffset(float dx, float dy);
     El* ClipX();
     El* ScrollMode(ScrollbarMode m);
+    El* ScrollPlacement(ScrollbarPlacement placement);
     El* ScrollId(int v);
     El* Click(int v);
     El* Role(AccessibilityRole role);
     El* AccessibilityId(Str authorId);
     El* AriaLabel(Str label);
+    El* AriaLive(AccessibilityLive live);
 
     El* AccessibilityDocument(const AccessibilityDocumentSource& source);
 
@@ -6761,6 +6795,8 @@ struct HitRect {
 
 struct AccessibilityNode {
     uint32_t id = 0;
+    uint32_t livePath = 0;
+    bool liveChanged = false;
     int parent = -1;
     Bounds bounds = {};
     AccessibilityInfo info = {};
@@ -6783,6 +6819,13 @@ struct AccessibilityNode {
     int textSelectionStart = -1;
     int textSelectionEnd = -1;
     AccessibilityDocumentSource document = {};
+    Str textExcerpt = {};
+    int textExcerptStart = 0;
+};
+
+struct AccessibilityLiveSnapshot {
+    uint32_t path = 0;
+    uint64_t textHash = 0;
 };
 
 struct ScrollRect {
@@ -6796,7 +6839,9 @@ struct ScrollRect {
     float viewportW = 0;
     float viewportH = 0;
     float horizontalBarInset = 0;
+    float horizontalBarEndInset = 0;
     ScrollbarMode mode = ScrollbarMode::Always;
+    ScrollbarPlacement placement = ScrollbarPlacement::BottomRight;
 
     bool barX = true;
     bool barY = true;
@@ -7575,6 +7620,7 @@ struct FoldHiddenRows {
 };
 
 struct FoldMap {
+    uint64_t version = 0;
 
     Vec<FoldRange> candidates;
 
@@ -8099,6 +8145,7 @@ struct InputState {
     bool editorPaddingsSet = false;
 
     EditorScrollbarRenderer scrollbarRenderer = nullptr;
+    ScrollbarPlacement scrollbarPlacement = ScrollbarPlacement::BottomRight;
     void* scrollbarRendererUser = nullptr;
     void (*scrollbarRendererDrop)(void* data) = nullptr;
 
@@ -8152,6 +8199,11 @@ struct InputState {
 
     Bounds gutterBox = {};
     float gutterLaneW = 0;
+    float gutterGap = 0;
+    float scrollbarClearance = 0;
+    Side gutterSide = Side::Left;
+    GutterColumn gutterOrder[3] = {
+        kDefaultGutterOrder[0], kDefaultGutterOrder[1], kDefaultGutterOrder[2]};
     bool softWrap = true;
 
     bool showWhitespaces = false;
@@ -8213,6 +8265,7 @@ struct InputState {
     RangeDecorationsState* rangeDecorations = nullptr;
 
     GutterDecorationsState* gutterDecorations = nullptr;
+    EditorSpacers* spacers = nullptr;
     OverviewRulerDecorationsState* overviewDecorations = nullptr;
     float gutterDecorationsWidth = 3.f;
     Rgba editorForeground = {0x17, 0x17, 0x17, 255};
@@ -9333,6 +9386,9 @@ struct Window {
     Vec<int> scrollbarOccluded;
 
     Vec<AccessibilityNode> accessibility;
+    Vec<AccessibilityLiveSnapshot> accessibilityLive[2];
+    int accessibilityLiveFrame = 0;
+    bool hasLiveRegions = false;
 
     uint64_t accessibilityHash = 0;
 
@@ -10257,6 +10313,9 @@ bool WindowAccessibilityPartRange(const AccessibilityNode& node, int part,
                                   Selection* out);
 bool WindowAccessibilityTextSelection(const AccessibilityNode& node,
                                       Selection* out);
+bool WindowAccessibilitySetTextSelection(Window* win,
+                                         const AccessibilityNode& node,
+                                         Selection range);
 int WindowAccessibilityTextCaret(const AccessibilityNode& node);
 
 Selection AccessibilityTextLineAt(Str text, int offset);
@@ -12673,11 +12732,6 @@ enum class Placement : uint8_t {
     Right
 };
 
-enum class Side : uint8_t {
-    Left,
-    Right
-};
-
 inline bool SideIsLeft(Side s) {
     return s == Side::Left;
 }
@@ -13361,6 +13415,7 @@ struct DockState {
 
     bool closeButtonVisible = false;
     bool collapsedTabBarVisible = true;
+    bool splitDividerLineVisible = true;
 
     float closedBottomExtent = kClosedBottomStrip;
 
@@ -13525,6 +13580,7 @@ struct DockHandleCtx {
     Axis axis = Axis::Horizontal;
     bool active = false;
     ResizeHandleState state = ResizeHandleState::Idle;
+    Entity<DockState> dock = {};
 };
 
 struct DockTabGroup {
@@ -14746,6 +14802,7 @@ struct InputPresentation {
     bool masked = false;
     bool multiLine = false;
     bool codeEditor = false;
+    Side gutterSide = Side::Left;
     int textAlign = 0;
     Str placeholder = {};
     Str maskPlaceholder = {};
@@ -15008,6 +15065,21 @@ enum class ScrollbarAxis : uint8_t {
 
 using ScrollAxis = ScrollbarAxis;
 
+constexpr bool ScrollbarIsLeft(ScrollbarPlacement placement) {
+    return placement == ScrollbarPlacement::BottomLeft ||
+           placement == ScrollbarPlacement::TopLeft;
+}
+
+constexpr bool ScrollbarIsTop(ScrollbarPlacement placement) {
+    return placement == ScrollbarPlacement::TopLeft ||
+           placement == ScrollbarPlacement::TopRight;
+}
+
+Bounds ScrollbarTrackBounds(Bounds viewport, Axis axis,
+                            ScrollbarPlacement placement, float trackWidth,
+                            float leadingInset = 0, float otherTrackWidth = 0,
+                            float trailingInset = 0);
+
 struct AxisPrepaintState {
     Axis axis = Axis::Vertical;
 
@@ -15037,10 +15109,10 @@ struct PrepaintState {
     int statesLen = 0;
 };
 
-AxisPrepaintState ScrollbarPrepaintAxis(Axis axis, Bounds track, float offset,
-                                        float containerSize, float contentSize,
-                                        const ScrollbarThumbStyle& style,
-                                        float viewportSize = 0);
+AxisPrepaintState ScrollbarPrepaintAxis(
+    Axis axis, Bounds track, float offset, float containerSize,
+    float contentSize, const ScrollbarThumbStyle& style, float viewportSize = 0,
+    ScrollbarPlacement placement = ScrollbarPlacement::BottomRight);
 
 struct Scrollbar {
 
@@ -15057,6 +15129,7 @@ struct Scrollbar {
                      Listener onScroll, ScrollAxis axis, ScrollbarMode mode);
 
     static El* ApplyStyles(Ctx* cx, El* element, const ScrollbarStyles& styles);
+    static El* Placement(El* element, ScrollbarPlacement placement);
 
     static El* Vertical(Ctx* cx, Str id, float scrollY, Listener onScroll);
     static El* Vertical(Ctx* cx, Str id, float scrollY, Listener onScroll,
@@ -15296,6 +15369,71 @@ struct RangeDecorationCollection {
 
 RangeDecorationCollection InputCreateRangeDecorationsCollection(
     InputState* s, const RangeDecoration* decorations, int n);
+
+struct LineDecoration {
+    int row = 0;
+    Rgba background = {};
+    bool hasBackground = false;
+
+    static LineDecoration New(int row) { return {row}; }
+    LineDecoration WithBackground(Rgba color) const {
+        return {row, color, true};
+    }
+};
+
+struct Spacer {
+    int line = 0;
+    int rows = 0;
+    bool above = false;
+    bool hasBackground = false;
+    Rgba background = {};
+
+    static Spacer Above(int line, int rows) { return {line, rows, true}; }
+    static Spacer Below(int line, int rows) { return {line, rows, false}; }
+    Spacer WithBackground(Rgba color) const {
+        return {line, rows, above, true, color};
+    }
+};
+
+struct SpacerProvider {
+
+    void (*query)(const InputState* input, Selection lines, const App* app,
+                  Arena* a, ArenaVec<Spacer>* out, void* data) = nullptr;
+    void* data = nullptr;
+};
+
+void InputSetSpacerProvider(InputState* s, SpacerProvider provider, App* app,
+                            Window* win);
+void InputRefreshSpacers(InputState* s, App* app, Window* win);
+
+struct LineDecorationProvider {
+
+    void (*query)(const InputState* input, Selection rows, const App* app,
+                  Arena* a, ArenaVec<LineDecoration>* out,
+                  void* data) = nullptr;
+    void* data = nullptr;
+};
+
+struct LineDecorationCollection {
+    RangeDecorationsState* state = nullptr;
+    uint64_t id = 0;
+
+    LineDecorationCollection() = default;
+    LineDecorationCollection(const LineDecorationCollection& other);
+    LineDecorationCollection& operator=(const LineDecorationCollection& other);
+    ~LineDecorationCollection();
+
+    void SetProvider(LineDecorationProvider provider, Ctx* cx = nullptr);
+    void Clear(Ctx* cx = nullptr);
+    void Dispose(Ctx* cx = nullptr);
+    bool HasProvider() const;
+};
+
+LineDecorationCollection InputCreateLineDecorationsCollection(
+    InputState* s, LineDecorationProvider provider, Ctx* cx = nullptr);
+bool InputHasLineDecorationProviders(const InputState* s);
+void InputLineDecorationsForRows(const InputState* s, Selection rows, Ctx* cx,
+                                 ArenaVec<LineDecoration>* out);
 
 void InputTextareaSetDecorations(InputState* s,
                                  const TextDecoration* decorations, int n,
@@ -16132,8 +16270,10 @@ struct EditorScrollbarContext {
     Size scrollViewport = {};
     Size content = {};
     ScrollbarAxis axis = ScrollbarAxis::Both;
+    ScrollbarPlacement placement = ScrollbarPlacement::BottomRight;
 
     ScrollbarAxis Axis() const { return axis; }
+    ScrollbarPlacement Placement() const { return placement; }
     Size ScrollViewportSize() const { return scrollViewport; }
     Bounds ViewportBounds() const { return viewport; }
 
@@ -16146,6 +16286,12 @@ struct EditorScrollbarContext {
 };
 
 void InputSetEditorPaddings(InputState* s, Edges paddings);
+void InputSetGutterSide(InputState* s, Side side, App* app, Window* win);
+
+void InputSetGutterOrder(InputState* s, const GutterColumn* columns, int count,
+                         App* app, Window* win);
+void InputSetScrollbarPlacement(InputState* s, ScrollbarPlacement placement,
+                                App* app, Window* win);
 void SetScrollbarRenderer(InputState* s, EditorScrollbarRenderer renderer,
                           void* user = nullptr, void (*drop)(void*) = nullptr);
 void EditorScrollbarPrePaint(PaintCtx* ctx, El* e, void* user);
@@ -16182,6 +16328,8 @@ void InputSetAccessibility(InputState* state, const InputAccessibility& value);
 void InputAccessibilityFocus(InputState* state, Window* win);
 bool InputAccessibilitySetValue(InputState* state, App* app, Window* win,
                                 const Str* value);
+constexpr int kFullAccessibilityTextLimit = 1024 * 1024;
+bool InputExposesFullAccessibilityText(const InputState* state);
 
 struct EditorLineNumberLayout {
     float width = 0;
@@ -16304,6 +16452,15 @@ int InputLastVisualRows(const InputState* s, Window* win,
                         InputPaintedVisualRow* out, int cap);
 
 bool InputLastActiveLine(const InputState* s, const Window* win, Bounds* out);
+bool InputLastTextMask(const InputState* s, const Window* win, Bounds* out);
+
+struct LineDecorationBackground {
+    int row = 0;
+    Bounds bounds = {};
+    Rgba color = {};
+};
+int InputLastLineDecorationBackgrounds(const InputState* s, const Window* win,
+                                       LineDecorationBackground* out, int cap);
 
 void InputUpdateWrapMap(InputState* s, PaintCtx* ctx, float width,
                         float fontSize, uint16_t fontWord);
@@ -16314,6 +16471,19 @@ struct InputDisplayMapRef {
 InputDisplayMapRef InputDisplayMap(const InputState* s);
 
 int InputWrapRowCount(InputDisplayMapRef map);
+
+uint64_t InputDisplayMapVersion(InputDisplayMapRef map);
+int InputDisplayRowCount(InputDisplayMapRef map);
+
+bool InputBufferLineDisplayRows(InputDisplayMapRef map, int line,
+                                Selection* rows);
+int InputBufferLineDisplayRow(InputDisplayMapRef map, int line);
+int InputDisplayRowBufferLine(InputDisplayMapRef map, int row);
+bool InputIsSpacerRow(InputDisplayMapRef map, int row);
+DisplayPoint InputBufferToDisplayPoint(InputDisplayMapRef map,
+                                       BufferPoint point);
+BufferPoint InputDisplayToBufferPoint(InputDisplayMapRef map,
+                                      DisplayPoint point);
 
 void InputPrewrap(InputState* s, PaintCtx* ctx, float fontSize,
                   uint16_t fontWord, float width);
@@ -28614,6 +28784,8 @@ struct DockSkin {
     void SetCloseButtonVisible(App* app, Window* win, bool visible);
     bool IsCollapsedTabBarVisible(App* app) const;
     void SetCollapsedTabBarVisible(App* app, Window* win, bool visible);
+    bool IsSplitDividerLineVisible(App* app) const;
+    void SetSplitDividerLineVisible(App* app, Window* win, bool visible);
     const DockRenderer* Renderer() const;
 };
 
@@ -29254,6 +29426,12 @@ struct Tree {};
 }
 
 using CursorBlink = ::gpui::CursorBlink;
+using gpui::GutterColumn;
+using gpui::LineDecoration;
+using gpui::LineDecorationCollection;
+using gpui::LineDecorationProvider;
+using gpui::Spacer;
+using gpui::SpacerProvider;
 
 void InputLanguageInit(App* app);
 
@@ -29932,6 +30110,22 @@ struct Label {
 }
 }
 
+#line 1 "src/ui/live_region.h"
+
+namespace gpui::component {
+
+struct LiveRegion : StyledBuilder<LiveRegion> {
+    Str id = {};
+    Str text = {};
+    AccessibilityLive live = AccessibilityLive::Polite;
+
+    static LiveRegion* New(Ctx* cx, Str id, Str text);
+    LiveRegion* Assertive();
+    El* IntoEl();
+};
+
+}
+
 #line 1 "src/ui/link.h"
 
 namespace gpui {
@@ -30324,6 +30518,10 @@ struct DropdownMenuPopover : DropdownMenu {
 struct ContextMenuState {
     Entity<PopupMenuState> menu = {};
 
+    bool empty = false;
+    bool (*canOpen)(Ctx* cx, void* data, Entity<PopupMenuState> menu) = nullptr;
+    void* openData = nullptr;
+
     bool open = false;
     Point position = {};
     Point windowPosition = {};
@@ -30412,6 +30610,7 @@ namespace component {
 
 using ScrollbarAxis = gpui::ScrollAxis;
 using ScrollAxis = ScrollbarAxis;
+using ScrollbarPlacement = gpui::ScrollbarPlacement;
 
 struct Scrollable {
     Arena* a = nullptr;
@@ -30424,6 +30623,7 @@ struct Scrollable {
     float h = 0;
     bool hSet = false;
     ScrollAxis axis = ScrollAxis::Vertical;
+    ScrollbarPlacement placement = ScrollbarPlacement::BottomRight;
 
     ScrollbarMode mode = ScrollbarMode::Scrolling;
     bool modeSet = false;
@@ -30441,6 +30641,7 @@ struct Scrollable {
     Scrollable* ScrollY(float v);
     Scrollable* ScrollX(float v);
     Scrollable* Axis(ScrollAxis v);
+    Scrollable* Placement(ScrollbarPlacement v);
     Scrollable* Mode(ScrollbarMode v);
     Scrollable* H(float v);
     Scrollable* OnScroll(Listener fn);
@@ -31519,6 +31720,8 @@ struct ResizeIndicator {
 ResizeIndicator ResizeHandleIndicator(ResizeHandleState state);
 
 El* RenderResizeHandle(void* user, const ResizeHandleContext* handle, Ctx* cx);
+El* RenderResizeHandleWith(Ctx* cx, const ResizeHandleContext* handle,
+                           bool showLine);
 
 inline ResizeHandleRenderer ResizeHandleAppearance() {
     return &RenderResizeHandle;
@@ -46952,6 +47155,31 @@ void CookieListFree(Vec<Cookie>* cookies);
 bool MacCookieMatchesUrl(const Cookie* cookie, Str scheme, Str domain);
 Str MacDownloadFileNameTemp(Str suggested, int collision);
 
+enum class PermissionKind : uint8_t {
+    Microphone,
+    Camera,
+    Geolocation,
+    Notifications,
+    ClipboardRead,
+    DisplayCapture,
+    Midi,
+    Sensors,
+    MediaKeySystemAccess,
+    LocalFonts,
+    WindowManagement,
+    PointerLock,
+    AutomaticDownloads,
+    FileSystemAccess,
+    Autoplay,
+    Other,
+};
+
+enum class PermissionResponse : uint8_t {
+    Default,
+    Allow,
+    Deny
+};
+
 struct WebViewHandlers {
     static bool AllowDownload(void*, Str, Str*) { return true; }
 
@@ -46969,11 +47197,16 @@ struct WebViewHandlers {
     DownloadStartedHandler downloadStartedHandler = AllowDownload;
     DownloadCompletedHandler downloadCompletedHandler = nullptr;
     DragDropHandler dragDropHandler = nullptr;
+    PermissionResponse (*permissionHandler)(void* ctx,
+                                            PermissionKind kind) = nullptr;
 
     NewWindowResponse (*newWindowReqHandler)(
         void* ctx, Str url, const NewWindowFeatures* features,
         WebView** createdWebView) = nullptr;
 };
+
+PermissionResponse WebViewMediaPermission(const WebViewHandlers* handlers,
+                                          bool audio, bool video);
 
 inline void WebViewHandlersSet(WebViewHandlers* dst,
                                const WebViewHandlers* attrs) {
@@ -46998,6 +47231,7 @@ struct WebViewAttributes : WebViewHandlers {
 
     Str html;
     bool zoomHotkeysEnabled = false;
+    bool generalAutofillEnabled = true;
     const InitializationScript* initializationScripts = nullptr;
     int initializationScriptCount = 0;
     const CustomProtocol* customProtocols = nullptr;
@@ -47073,6 +47307,10 @@ bool WebViewLoadUrlWithHeaders(WebView* webview, Str url, const Header* headers,
 bool WebViewLoadHtml(WebView* webview, Str html);
 
 bool WebViewReload(WebView* webview);
+bool WebViewGoBack(WebView* webview);
+bool WebViewGoForward(WebView* webview);
+bool WebViewCanGoBack(WebView* webview, bool* out);
+bool WebViewCanGoForward(WebView* webview, bool* out);
 
 bool WebViewBounds(WebView* webview, Rect* out);
 
