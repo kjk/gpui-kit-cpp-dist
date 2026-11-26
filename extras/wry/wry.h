@@ -1854,6 +1854,31 @@ bool WebViewCanGoForward(WebView* webview, bool* out);
 bool WebViewBounds(WebView* webview, Rect* out);
 
 bool WebViewSetBounds(WebView* webview, Rect bounds);
+#if GPUI_OS_MAC || (GPUI_OS_LINUX && !GPUI_WRY_UNSUPPORTED)
+#define GPUI_WRY_CLIPPED_CHILD 1
+
+bool WebViewSetClippedBounds(WebView* webview, Rect document, Rect visible);
+
+bool WebViewSetVisibleRegion(WebView* webview, const Rect* pieces, int count);
+#else
+#define GPUI_WRY_CLIPPED_CHILD 0
+#endif
+#if GPUI_OS_MAC || \
+    (GPUI_WRY_CLIPPED_CHILD && defined(GPUI_HAVE_X11_NATIVE_OVERLAY))
+#define GPUI_WRY_INPUT_REGION 1
+
+bool WebViewSetInputRegion(WebView* webview, const Rect* pieces, int count);
+#else
+#define GPUI_WRY_INPUT_REGION 0
+#endif
+#if GPUI_OS_WINDOWS || GPUI_WRY_CLIPPED_CHILD
+#define GPUI_WRY_SNAPSHOT 1
+
+using WebViewSnapshotFn = void (*)(void*, const uint8_t*, int);
+void WebViewSnapshot(WebView* webview, void* user, WebViewSnapshotFn complete);
+#else
+#define GPUI_WRY_SNAPSHOT 0
+#endif
 
 bool WebViewSetVisible(WebView* webview, bool visible);
 

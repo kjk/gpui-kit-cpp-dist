@@ -190,6 +190,7 @@ export const simpleExamples = [
   "brush",
   "editor",
   "webview",
+  "tig",
   "speech",
 ];
 
@@ -199,10 +200,9 @@ export const dirExamples = ["showcase", "story", "gpui_perf"];
 /** Not examples: console programs, so -all leaves them out. */
 export const consoleTargets = new Set(["tests", "bench", "gpui_shell"]);
 
-// There is no webview on the web: wry has no browser back end, and a page
-// inside a page is not what crates/webview is.
+// Webview needs a native browser widget. Tig needs a native Git process.
 function skippedOn(plat: Platform): Set<string> {
-  return plat === "wasm" ? new Set(["webview", "gpui_shell"]) : new Set<string>();
+  return plat === "wasm" ? new Set(["webview", "tig", "gpui_shell"]) : new Set<string>();
 }
 
 /** Every example this platform builds, in the order -all builds them. */
@@ -991,6 +991,7 @@ const macFrameworks = [
   "CoreServices",
   "CoreText",
   "CoreGraphics",
+  "QuartzCore",
   "ImageIO",
   "IOKit",
   "WebKit",
@@ -1046,6 +1047,27 @@ function linuxDeps(fail: (msg: string) => never): LinuxDeps {
   if ((webkit.exitCode ?? 1) === 0) {
     cflags.push(...pkgConfig(["webkit2gtk-4.1"], "--cflags", fail), "-DGPUI_HAVE_WEBKITGTK=1");
     libs.push(...pkgConfig(["webkit2gtk-4.1"], "--libs", fail));
+    const shape = ["xext"];
+    const haveShape = Bun.spawnSync(["pkg-config", "--exists", ...shape]).exitCode === 0;
+    if (haveShape) {
+      cflags.push(...pkgConfig(shape, "--cflags", fail), "-DGPUI_HAVE_X11_SHAPE=1");
+      libs.push(...pkgConfig(shape, "--libs", fail));
+    }
+    const overlay = ["xrender", "xfixes"];
+    if (haveShape && Bun.spawnSync(["pkg-config", "--exists", ...overlay]).exitCode === 0) {
+      cflags.push(...pkgConfig(overlay, "--cflags", fail), "-DGPUI_HAVE_X11_NATIVE_OVERLAY=1");
+      libs.push(...pkgConfig(overlay, "--libs", fail));
+      const redirect = ["xcomposite"];
+      if (Bun.spawnSync(["pkg-config", "--exists", ...redirect]).exitCode === 0) {
+        cflags.push(...pkgConfig(redirect, "--cflags", fail), "-DGPUI_HAVE_X11_OVERLAY_REDIRECT=1");
+        libs.push(...pkgConfig(redirect, "--libs", fail));
+        const damage = ["xdamage"];
+        if (Bun.spawnSync(["pkg-config", "--exists", ...damage]).exitCode === 0) {
+          cflags.push(...pkgConfig(damage, "--cflags", fail), "-DGPUI_HAVE_X11_OVERLAY_DAMAGE=1");
+          libs.push(...pkgConfig(damage, "--libs", fail));
+        }
+      }
+    }
   } else {
     console.log(`webkit2gtk-4.1 not found: webviews will be empty. Install it with: ${installDeps}`);
   }
@@ -1603,7 +1625,7 @@ function link(
       // they are console apps. The entry point is the amalgam's wWinMain
       // either way.
       // gpui_perf writes the --auto table to the console it was launched from.
-      consoleTargets.has(name) || name === "gpui_perf" ? "/SUBSYSTEM:CONSOLE" : "/SUBSYSTEM:WINDOWS",
+      consoleTargets.has(name) || name === "gpui_perf" || name === "tig" ? "/SUBSYSTEM:CONSOLE" : "/SUBSYSTEM:WINDOWS",
       // Layout recurses once per level of the tree, and taffy's `superdeep`
       // benchmarks nest a thousand of them. Windows reserves 1 MB by default,
       // where the Rust benchmarks get the 8 MB of a Rust main thread, so this
